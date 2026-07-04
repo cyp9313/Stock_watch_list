@@ -914,7 +914,7 @@ def get_kline_data():
     """获取K线图数据"""
     try:
         ticker = request.args.get('ticker', '').upper()
-        time_span = int(request.args.get('period', 365))
+        time_span = max(1, int(request.args.get('period', 365)))
         interval = request.args.get('interval', '1d')
         
         if not ticker:
@@ -927,7 +927,8 @@ def get_kline_data():
         if '1d' in interval:
             stock_data = ticker_info.history(start=start_date, end=end_date)
         elif interval in ['5m','15m','1h','4h']:
-            stock_data = ticker_info.history(period="60d", interval = interval)
+            intraday_days = min(time_span, 60)
+            stock_data = ticker_info.history(period=f"{intraday_days}d", interval = interval)
         elif '1wk' in interval:
             stock_data = ticker_info.history(start=start_date, end=end_date, interval = interval)
         else:

@@ -1,119 +1,242 @@
 # Stock Watch List
 
-一个功能强大的美股观察列表应用，提供实时股票数据展示、技术分析图表和市场广度指标。支持 Tkinter 桌面版和 Streamlit 网页版两种界面。
+一个面向美股与跨市场观察的本地股票看板。项目提供两个前端：
 
-## 功能特性
+- `app_tkinter.py`：Windows 桌面版，使用 Tkinter + tksheet + Matplotlib。
+- `app_streamlit.py`：网页看板版，使用 Streamlit + Plotly。
 
-### 📊 核心功能
+两个前端都会在本地自动启动同一个 Flask 后端线程，后端通过 Yahoo Finance、StockAnalysis.com、CNN Fear & Greed、Alternative.me 等数据源获取数据，并用 SQLite 缓存部分基本面与 Beta 数据。
 
-- **实时股票数据展示**
-  - 实时价格、涨跌幅（1日、5日、1月、YTD）
-  - 相对动量指标
-  - 与各均线的偏离度（EMA5/10/20/50/100/200）
-  - 布林带位置（上轨/下轨偏离度）
-  - 成交量比率
-  - 下一次财报日期
-  - 估值指标：市盈率（Trailing/Forward）、PEG、市销率、市净率
-  - 分析师评级与目标价
-  - 市值信息
+> 本项目用于个人投资研究和数据观察，不构成投资建议。外部数据源可能限流、延迟、字段变更或返回空值。
 
-- **交互式 K 线图分析**
-  - 基于 Plotly 的交互式 K 线图，支持缩放、平移
-  - 显示均线（MA20, MA50, MA200）
-  - Volume 成交量柱状图
-  - RSI 相对强弱指标
-  - MACD 指数平滑异同移动平均线
-  - Stochastics 随机指标
-  - TD Sequential 神奇九转指标（主图 + 子图）
-  - 自定义斐波那契回调线绘制
-  - StockAnalysis 链接快速跳转
+## 主要功能
 
-- **市场广度指标**
-  - McClellan Oscillator 麦克莱伦振荡器
-  - McClellan Summation Index 麦克莱伦求和指数
-  - Advance-Decline Line (AD Line) 涨跌线
-  - 涨跌数量柱状图
-  - 52周新高/新低统计
-  - 标普500、纳斯达克、道琼斯指数表现
-  - 20日/50日/200日均线以上股票占比
+### 1. 股票观察列表
 
-- **分组管理**
-  - 按行业/主题分组展示股票列表（Mag7、芯片/AI、金融/加密、医疗等）
-  - 大盘指标分组（市场方向、广度、利率/外汇、波动率等）
-  - 滚动时表头固定，便于查看
-  - 颜色高亮显示涨跌状态
+默认股票分组包括：
 
-### 🔧 技术特性
+- `Mag7`
+- `Chips/AI`
+- `Fin/Crypto`
+- `Health`
+- `Energy`
+- `Defense`
+- `Consumer`
+- `China`
+- `Themes`
 
-- **双界面支持**：Tkinter 桌面版 + Streamlit 网页版，功能完全一致
-- **本地缓存**：使用 SQLite 数据库缓存股票数据，减少网络请求
-- **自动更新**：定期刷新股票数据
-- **统一数据来源**：通过 Flask 后端统一提供数据，双前端共用
-- **智能缓存**：requests_cache 缓存 HTTP 请求
+表格展示字段：
 
-## 项目结构详解
+- `Ticker`
+- `Price`
+- `1D%`
+- `5D%`
+- `1M%`
+- `YTD%`
+- `Rel. Momentum`
+- `Diff_EMA5%`
+- `Diff_EMA10%`
+- `Diff_EMA20%`
+- `Diff_EMA50%`
+- `Diff_EMA100%`
+- `Diff_EMA200%`
+- `Diff_BB_Up%`
+- `Diff_BB_Low%`
+- `Volume_Ratio`
+- `Next Earnings`
+- `Trailing PE`
+- `Forward PE`
+- `PEG Ratio`
+- `Analysts`
+- `Price Target`
+- `Market Cap`
 
+表格支持按分组插入标题行，并对涨跌幅、EMA 偏离、布林带位置、成交量比率、财报日期、分析师评级、目标价等字段进行颜色标记。后端返回的 `Beta` 不作为独立列显示，而是用于给 `Ticker` 单元格着色：Beta 高于 1 偏红，低于 1 偏绿。Tkinter 版使用 `tksheet`，Streamlit 版渲染自定义 HTML 表格。
+
+### 2. 大盘与跨市场仪表盘
+
+默认大盘分组包括：
+
+- `Dashboard`：核心市场概览。
+- `US Mkt Dir`：标普 500、纳指 100、道指、罗素 2000。
+- `Breadth`：等权指数与纳指等权 ETF。
+- `AI/Tech Risk`：科技风险偏好相关标的。
+- `China Beta`：A 股、港股、中国科技相关标的。
+- `Rates/FX`：美债收益率与外汇。
+- `Fear/Vol`：波动率指数。
+- `Safe Haven`：黄金、白银。
+- `Oil/Geopol`：布伦特原油。
+- `Crypto`：BTC、ETH。
+- `Strat Resources`：战略资源相关标的。
+
+### 3. 市场宽度
+
+市场宽度模块会从 Wikipedia 获取最新 S&P 500 成分股列表，然后通过 Yahoo Finance 下载一年日线数据，计算：
+
+- `20MA_Ratio`：收盘价高于 20 日均线的成分股比例。
+- `50MA_Ratio`：收盘价高于 50 日均线的成分股比例。
+- `200MA_Ratio`：收盘价高于 200 日均线的成分股比例。
+
+结果会以表格和折线图展示，便于观察指数内部强弱。
+
+### 4. K 线与技术分析
+
+支持输入任意 Yahoo Finance 可识别的 ticker，绘制 K 线图。
+
+支持周期（单位：天，决定 K 线图向前获取多少天的数据）：Tkinter 版和 Streamlit 版的“时间周期（天）”都是输入框，可以填写自定义整数天数。Streamlit 版当前限制为 `1` 到 `3650` 天，例如 `30`、`365`、`730` 等。
+
+注意：对于 `5m`、`15m`、`1h`、`4h` 等日内间隔，后端也会按输入天数取数，但受 Yahoo Finance 可用范围限制，最多取最近 `60` 天。比如周期填 `10` 且间隔选 `15m`，会绘制最近约 10 天的 15 分钟 K 线；周期填 `120` 时则按 60 天封顶。
+
+支持间隔：
+
+- `1d`
+- `1wk`
+- `1h`
+- `4h`
+- `15m`
+- `5m`
+
+图表包含：
+
+- K 线。
+- 成交量。
+- MA5、MA10、MA20、MA50、MA100、MA200。
+- Bollinger Upper / Lower。
+- MACD、Signal、Histogram。
+- KDJ。
+- RSI。
+- 神奇九转（TD Sequential 简化版）。
+- 最近约 30 天、4 小时间隔数据估算的筹码分布和筹码峰。
+- StockAnalysis.com 快速链接。
+
+Streamlit 版额外提供 Fibonacci Retracement / Extension 表单，可输入 A、B、C 三个价格点并在主图上绘制常用回撤与扩展水平。
+
+Tkinter 版在 K 线窗口中使用 Matplotlib 工具栏，并支持在图上交互选择 Fibonacci 点位。
+
+### 5. 恐惧与贪婪指数
+
+应用顶部会展示：
+
+- CNN Fear & Greed Index。
+- Crypto Fear & Greed Index，数据来自 Alternative.me。
+
+### 6. 基本面与分析师数据
+
+后端优先从 StockAnalysis.com 抓取以下字段，并在缺失时回退到 yfinance 可用字段：
+
+- Forward PE
+- PEG Ratio
+- Trailing PE
+- Market Cap
+- Earnings Date
+- P/S Ratio
+- P/B Ratio
+- Analyst Consensus
+- Price Target
+
+注意：P/S 和 P/B 当前主要用于 K 线图标题中的财务信息展示，不在主表格列中显示。
+
+### 7. 相对动量与 Beta
+
+`Rel. Momentum` 使用 S&P 500 作为基准。后端先下载 `^GSPC` 过去两年日线数据，取约 3 个月、6 个月、12 个月对应的参考交易日，再将每只标的与这些参考日期对齐计算相对收益差：
+
+```text
+Rel. Momentum = 0.2 * M3M + 0.3 * M6M + 0.5 * M12M
 ```
+
+其中 `M3M`、`M6M`、`M12M` 分别是标的相对 S&P 500 的 3 个月、6 个月、12 个月收益差。
+
+Beta 使用标的与 `^GSPC` 的共同交易日收益率计算，窗口最多取最近 252 个交易日，并按美东日期缓存到 SQLite。
+
+## 项目结构
+
+```text
 Stock_watch_list/
-├── app_tkinter.py              # Tkinter 桌面版前端
-│   ├── 使用 tksheet 实现高性能表格
-│   ├── Matplotlib 绘制技术分析图表
-│   ├── 支持鼠标交互和缩放
-│   └── 右键菜单功能
-│
-├── app_streamlit.py            # Streamlit 网页版前端
-│   ├── 使用 Plotly 绘制交互式图表
-│   ├── 响应式布局，支持宽屏显示
-│   ├── 侧边栏导航
-│   └── 固定表头的可滚动表格
-│
-├── stock_watch_list_back_end.py # 后端 API 服务
-│   ├── Flask Web 服务器
-│   ├── SQLite 数据缓存层
-│   ├── yfinance 数据获取
-│   ├── StockAnalysis 数据爬取
-│   └── 技术指标计算
-│
-├── stockanalysis_scraper.py    # StockAnalysis 网站数据爬取
-│   ├── 批量获取 Forward PE、PEG 等数据
-│   ├── 分析师评级与目标价
-│   └── 财报日期获取
-│
-├── qwen_forward_pe.py          # 远期市盈率数据处理（备用）
-│
-├── launch_tkinter.bat          # Windows 一键启动 Tkinter 版本
-├── launch_streamlit.bat        # Windows 一键启动 Streamlit 版本
-│
-├── requirements.txt            # Python 依赖包
-├── .gitignore                  # Git 忽略文件配置
-└── README.md                   # 项目说明文档
+|-- app_tkinter.py
+|   |-- Tkinter 桌面前端
+|   |-- 自动启动本地 Flask 后端线程
+|   |-- tksheet 三个表格页：Stocks、Broad Market、Market Breadth
+|   |-- Matplotlib / mplfinance K 线图
+|   |-- K 线窗口包含成交量、MACD、KDJ、RSI、神奇九转（TD Sequential 简化版）、筹码分布、Fibonacci
+|
+|-- app_streamlit.py
+|   |-- Streamlit 网页前端
+|   |-- 自动启动本地 Flask 后端线程
+|   |-- 三个主标签页：Stocks、Broad Market、Market Breadth
+|   |-- Plotly K 线图与市场宽度图
+|   |-- st.cache_data 缓存前端 API 请求
+|
+|-- stock_watch_list_back_end.py
+|   |-- Flask API 后端
+|   |-- yfinance 数据下载
+|   |-- StockAnalysis.com 数据缓存与回退逻辑
+|   |-- SQLite 表：stock_analysis_data、beta_cache
+|   |-- 市场宽度、相对动量、Beta、K 线指标、恐惧贪婪指数接口
+|
+|-- stockanalysis_scraper.py
+|   |-- StockAnalysis.com 抓取模块
+|   |-- 并发抓取 Forward PE、PEG、Trailing PE、Market Cap、Earnings Date、P/S、P/B、Analyst、Price Target
+|   |-- 纯抓取逻辑，不负责缓存
+|
+|-- qwen_forward_pe.py
+|   |-- 旧版/备用 Forward PE 抓取与缓存脚本
+|   |-- 使用 forward_pe_cache.db
+|   |-- 当前主流程已由 stockanalysis_scraper.py + stock_watch_list_back_end.py 接管
+|
+|-- launch_tkinter.bat
+|   |-- Windows Tkinter 一键启动脚本
+|
+|-- launch_streamlit.bat
+|   |-- Windows Streamlit 一键启动脚本
+|
+|-- requirements.txt
+|   |-- Python 依赖列表
+|
+|-- stock_cache.db
+|   |-- SQLite 运行期缓存文件，首次运行后生成或更新
+|
+|-- .env
+|   |-- 可选环境变量文件
+|
+|-- .gitignore
+|-- README.md
 ```
 
 ## 技术架构
 
-```
-┌─────────────────┐         ┌─────────────────┐
-│  app_tkinter.py │         │ app_streamlit.py│
-│   (Tkinter UI)  │         │  (Streamlit UI) │
-└────────┬────────┘         └────────┬────────┘
-         │                           │
-         └────────────┬──────────────┘
-                      │ HTTP API
-                      ▼
-         ┌──────────────────────────┐
-         │stock_watch_list_back_end.py│
-         │    (Flask Backend)        │
-         └────────────┬─────────────┘
-                      │
-        ┌─────────────┼─────────────┐
-        ▼             ▼             ▼
-   ┌──────────┐  ┌─────────┐  ┌───────────┐
-   │  SQLite  │  │yfinance │  │StockAnalysis│
-   │  Cache   │  │  (API)  │  │ (Scraper)  │
-   └──────────┘  └─────────┘  └───────────┘
+```text
+Tkinter UI              Streamlit UI
+app_tkinter.py          app_streamlit.py
+     |                       |
+     | local HTTP API        | local HTTP API
+     +-----------+-----------+
+                 |
+                 v
+      Flask Backend: stock_watch_list_back_end.py
+                 |
+     +-----------+-----------+----------------+
+     |                       |                |
+     v                       v                v
+Yahoo Finance       StockAnalysis.com       External APIs
+yfinance            scraper + SQLite        CNN F&G / Alternative.me
+     |
+     v
+Price, volume, K-line, market breadth, technical indicators
 ```
 
-## 安装方法
+两个前端默认访问：
+
+```text
+http://127.0.0.1:5000
+```
+
+Streamlit 默认运行在：
+
+```text
+http://localhost:8501
+```
+
+## 安装
 
 ### 1. 克隆项目
 
@@ -122,15 +245,17 @@ git clone https://github.com/cyp9313/Stock_watch_list.git
 cd Stock_watch_list
 ```
 
-### 2. 创建虚拟环境（推荐）
+### 2. 创建虚拟环境
 
 Windows:
+
 ```bash
 python -m venv .venv
 .venv\Scripts\activate
 ```
 
-Linux/Mac:
+macOS / Linux:
+
 ```bash
 python -m venv .venv
 source .venv/bin/activate
@@ -142,239 +267,342 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## 使用方法
+依赖包括：
 
-### Windows 用户（推荐）
+- `fear_and_greed`
+- `Flask`
+- `matplotlib`
+- `mplfinance`
+- `numpy`
+- `pandas`
+- `plotly`
+- `python-dotenv`
+- `pytz`
+- `Requests`
+- `requests_cache`
+- `streamlit`
+- `tksheet`
+- `yfinance`
+- `lxml`
 
-#### 启动 Tkinter 桌面版
-双击 `launch_tkinter.bat` 文件即可自动启动 Tkinter 版本。
+## 启动方式
 
-#### 启动 Streamlit 网页版
-双击 `launch_streamlit.bat` 文件即可自动启动 Streamlit 版本。浏览器会自动打开 http://localhost:8501
+### Windows 一键启动
 
-### 手动启动
+启动 Tkinter 桌面版：
 
-#### Tkinter 版本
+```text
+双击 launch_tkinter.bat
+```
+
+启动 Streamlit 网页版：
+
+```text
+双击 launch_streamlit.bat
+```
+
+`launch_streamlit.bat` 会在缺少 `.venv` 时自动创建虚拟环境、升级 pip、安装 `requirements.txt`，然后启动 Streamlit。
+
+`launch_tkinter.bat` 会在缺少 `.venv` 时自动创建虚拟环境并安装依赖，然后启动桌面应用。
+
+### 手动启动 Tkinter 版
+
 ```bash
 python app_tkinter.py
 ```
 
-#### Streamlit 版本
+### 手动启动 Streamlit 版
+
 ```bash
-python -m streamlit run app_streamlit.py --server.port 8501 --server.address localhost
+python -m streamlit run app_streamlit.py --server.port 8501 --server.address localhost --browser.gatherUsageStats false
 ```
 
-#### 后端服务（可选）
-如果需要使用 API 服务，可以单独启动后端：
+### 单独启动后端
+
+通常不需要手动启动后端，因为两个前端都会自动启动 Flask 后端线程。若只想调试 API，可以单独运行：
+
 ```bash
 python stock_watch_list_back_end.py
 ```
 
-## 如何定制 Watch List
+注意：如果你已经启动了 Tkinter 或 Streamlit 前端，它们通常会占用 `127.0.0.1:5000`。此时再单独启动后端可能出现端口占用。
 
-本项目支持完全自定义你的股票观察列表。只需要修改相应文件中的分组配置即可。
+## 使用说明
 
-### 修改 Tkinter 版本的股票列表
+### Tkinter 桌面版
 
-编辑 [`app_tkinter.py`](file:///c:/Users/Administrator/Desktop/development/Stock_watch_list/app_tkinter.py) 文件中的 `stock_groups` 字典：
+启动后会自动加载：
+
+- 股票观察列表。
+- 大盘指标。
+- 市场宽度。
+- CNN Fear & Greed Index。
+- Crypto Fear & Greed Index。
+
+底部按钮：
+
+- `Refresh Stocks`：刷新股票与大盘数据。
+- `Refresh Breadth`：刷新市场宽度数据。
+
+K 线输入区：
+
+- 股票代码：例如 `AAPL`。
+- 时间周期：例如 `365`。
+- 时间间隔：例如 `1d`、`1wk`、`1h`、`4h`、`15m`、`5m`。
+- 点击“绘制K线图”打开图表窗口。
+
+### Streamlit 网页版
+
+侧边栏：
+
+- `Refresh All`：清空 Streamlit 前端缓存并重新加载。
+- 显示当前页面刷新时间。
+
+主页面：
+
+- 顶部显示 CNN 与 Crypto Fear & Greed。
+- `Stocks` 标签页显示股票观察列表。
+- `Broad Market` 标签页显示大盘与跨市场指标。
+- `Market Breadth` 标签页显示市场宽度表格和图表。
+- 页面下方 `K-Line Chart` 区域用于绘制单个 ticker 的 K 线图。
+
+Fibonacci：
+
+1. 先输入 ticker、周期、间隔并点击 `Plot`。
+2. 在 `Fibonacci Retracement / Extension` 区域输入 A、B、C 价格点。
+3. 点击 `Calculate Fibonacci` 后，图表会显示回撤与扩展水平。
+4. 点击 `Clear Fibonacci` 清除线条。
+
+## 自定义 Watch List
+
+项目当前没有单独的配置文件。股票分组与大盘分组分别写在两个前端文件中。若你想让两个前端显示一致，需要同时修改两个文件。
+
+### Tkinter 版
+
+编辑 `app_tkinter.py`：
 
 ```python
 stock_groups = {
     "Mag7": ["AAPL", "MSFT", "GOOG", "AMZN", "META", "TSLA", "NVDA", "SPCX"],
     "Chips/AI": ["MU", "ORCL", "AMD", "INTC", "AVGO", "SMCI", "PLTR", "RGTI", "DXYZ", "SNPS", "APP"],
-    "Fin/Crypto": ["V", "JPM", "BRK-B", "COIN", "HOOD", "MSTR", "CRCL", "SOFI", "OSCR"],
-    "Health": ["LLY", "NVO", "ABBV", "UNH"],
-    "Energy": ["SMR", "VST", "OKLO", "NEE", "ENPH", "GE", "GEV"],
-    "Defense": ["LMT", "BA", "ACHR", "AXON"],
-    "Consumer": ["LULU", "NKE", "CMG", "COST"],
-    "China": ["BYDDY", "XIACY", "PDD", "BABA", "TCEHY", "BIDU"],
-    "Themes": ["ASTS", "CRWV", "NBIS", "MP", "RKLB"],
 }
 ```
 
-#### 如何修改：
+大盘分组：
 
-1. **添加新分组**：在字典中添加新的键值对，键是分组名称，值是股票代码列表
-   ```python
-   "My Favorites": ["AAPL", "MSFT", "GOOGL"],
-   ```
+```python
+broad_market_groups = {
+    "Dashboard": ["^GSPC", "^NDX", "RSP", "QQQE", "^TNX", "EURUSD=X", "^VIX", "GC=F", "BZ=F", "BTC-USD", "510300.SS"],
+}
+```
 
-2. **修改现有分组**：直接编辑分组中的股票代码列表
-   ```python
-   "Mag7": ["AAPL", "MSFT", "TSLA"],  # 只保留这三只
-   ```
+### Streamlit 版
 
-3. **删除分组**：删除对应的键值对
-
-4. **添加单只股票**：在对应分组的列表中添加股票代码
-   ```python
-   "Chips/AI": ["MU", "ORCL", "AMD", "你的股票代码"],
-   ```
-
-### 修改 Streamlit 版本的股票列表
-
-编辑 [`app_streamlit.py`](file:///c:/Users/Administrator/Desktop/development/Stock_watch_list/app_streamlit.py) 文件中的 `STOCK_GROUPS` 字典：
+编辑 `app_streamlit.py`：
 
 ```python
 STOCK_GROUPS = {
     "Mag7": ["AAPL", "MSFT", "GOOG", "AMZN", "META", "TSLA", "NVDA", "SPCX"],
-    "Chips/AI": ["MU","ORCL", "AMD", "INTC", "AVGO", "SMCI", "PLTR", "RGTI", "DXYZ", "SNPS", "APP"],
-    "Fin/Crypto": ["V", "JPM", "BRK-B", "COIN", "HOOD", "MSTR", "CRCL", "SOFI", "OSCR"],
-    "Health": ["LLY", "NVO", "ABBV", "UNH"],
-    "Energy": ["SMR", "VST", "OKLO", "NEE", "ENPH", "GE", "GEV"],
-    "Defense": ["LMT", "BA", "ACHR", "AXON"],
-    "Consumer": ["LULU", "NKE", "CMG", "COST"],
-    "China": ["BYDDY", "XIACY", "PDD", "BABA", "TCEHY", "BIDU"],
-    "Themes": ["ASTS", "CRWV", "NBIS", "MP", "RKLB"],
+    "Chips/AI": ["MU", "ORCL", "AMD", "INTC", "AVGO", "SMCI", "PLTR", "RGTI", "DXYZ", "SNPS", "APP"],
 }
 ```
 
-修改方法与 Tkinter 版本完全相同。**建议两个文件保持一致，方便切换使用。**
-
-### 修改大盘指标列表
-
-同样可以定制大盘指标（指数、外汇、商品、加密货币等）：
-
-#### Tkinter 版本
-编辑 [`app_tkinter.py`](file:///c:/Users/Administrator/Desktop/development/Stock_watch_list/app_tkinter.py) 中的 `broad_market_groups` 字典。
-
-#### Streamlit 版本
-编辑 [`app_streamlit.py`](file:///c:/Users/Administrator/Desktop/development/Stock_watch_list/app_streamlit.py) 中的 `BROAD_MARKET_GROUPS` 字典。
+大盘分组：
 
 ```python
 BROAD_MARKET_GROUPS = {
-    "Dashboard": [
-        "^GSPC", "^NDX", "RSP", "QQQE", "^TNX",
-        "EURUSD=X", "^VIX", "GC=F", "BZ=F", "BTC-USD", "510300.SS"
-    ],
-    "US Mkt Dir": ["^GSPC", "^NDX", "^DJI", "^RUT"],
-    "Breadth": ["RSP", "QQQE"],
-    "AI/Tech Risk": ["TQQQ", "^SOX"],
-    "China Beta": ["510300.SS", "510050.SS", "159915.SZ", "588000.SS", "3033.HK"],
-    "Rates/FX": ["^TNX", "EURUSD=X", "EURCNY=X"],
-    "Fear/Vol": ["^VIX", "^VXN"],
-    "Safe Haven": ["GC=F", "SI=F"],
-    "Oil/Geopol": ["BZ=F"],
-    "Crypto": ["BTC-USD", "ETH-USD"],
-    "Strat Resources": ["WNUC.DE", "REMX"],
+    "Dashboard": ["^GSPC", "^NDX", "RSP", "QQQE", "^TNX", "EURUSD=X", "^VIX", "GC=F", "BZ=F", "BTC-USD", "510300.SS"],
 }
 ```
 
-### 股票代码格式说明
+### 修改示例
 
-- **美股**：直接使用代码，如 `AAPL`、`MSFT`
-- **指数**：使用 Yahoo Finance 格式，如 `^GSPC`（标普500）、`^NDX`（纳斯达克100）
-- **外汇**：格式为 `XXXYYY=X`，如 `EURUSD=X`（欧元兑美元）
-- **商品期货**：格式为 `XXX=F`，如 `GC=F`（黄金）、`BZ=F`（布伦特原油）
-- **加密货币**：格式为 `XXX-USD`，如 `BTC-USD`（比特币）
-- **A股/港股**：使用相应后缀，如 `510300.SS`（沪深300）、`3033.HK`（港股）
-
-### 配置示例
-
-假设你想添加一个"新能源"分组，包含特斯拉、蔚来、理想、小鹏：
+新增一个新能源分组：
 
 ```python
 "New Energy": ["TSLA", "NIO", "LI", "XPEV"],
 ```
 
-将这一行添加到 `stock_groups` 或 `STOCK_GROUPS` 字典中即可。
+修改后需要重启应用才能生效。
 
-## 主要功能说明
+## Ticker 格式
 
-### 1. 股票观察列表
-- 显示实时价格、涨跌幅、成交量等信息
-- 按行业分组显示，方便管理
-- 支持颜色高亮显示涨跌状态（绿色涨、红色跌）
-- 滚动时表头固定，便于查看
-- 20+ 个数据列，涵盖技术面和基本面
+项目使用 Yahoo Finance ticker 格式。
 
-### 2. K线图分析
-- 交互式 Plotly / Matplotlib K 线图
-- 显示均线（MA20, MA50, MA200）
-- TD Sequential 神奇九转指标（数字标注，第9个加粗显示）
-- Volume 成交量柱状图
-- RSI、MACD、Stochastics 等技术指标
-- TD Seq 专门子图，柱状图 + 数字标注
-- 自定义斐波那契回调线，支持输入点位
-- StockAnalysis 链接快速跳转
+常见示例：
 
-### 3. 市场广度指标
-- McClellan Oscillator：衡量市场内部动量
-- McClellan Summation Index：长期市场广度指标
-- Advance-Decline Line (AD Line)：涨跌趋势线
-- 涨跌数量柱状图：直观展示市场涨跌比
-- 52周新高/新低统计：识别极端情绪
-- 标普500、纳斯达克、道琼斯指数表现：大盘风向标
-- 均线占比指标：20日/50日/200日均线以上股票比例
+- 美股：`AAPL`、`MSFT`、`NVDA`
+- 美股特殊代码：`BRK-B`
+- 指数：`^GSPC`、`^NDX`、`^DJI`、`^RUT`
+- 外汇：`EURUSD=X`、`EURCNY=X`
+- 商品期货：`GC=F`、`SI=F`、`BZ=F`
+- 加密货币：`BTC-USD`、`ETH-USD`
+- A 股 / ETF：`510300.SS`、`159915.SZ`
+- 港股：`3033.HK`
+- 欧洲市场：`WNUC.DE`
 
-## 技术栈
+StockAnalysis.com 抓取只适合普通股票类 ticker。后端会跳过指数、加密货币、商品、外汇和市场宽度伪 ticker。
 
-- **前端界面**：Tkinter + tksheet / Streamlit + Plotly
-- **数据获取**：yfinance, requests, requests_cache
-- **数据处理**：pandas, numpy
-- **可视化**：matplotlib, mplfinance, plotly
-- **后端**：Flask
-- **数据库**：SQLite
+## 后端 API
 
-## 依赖项
+后端默认监听：
 
-主要依赖包：
-- streamlit - 网页应用框架
-- plotly - 交互式图表
-- pandas - 数据处理
-- numpy - 数值计算
-- matplotlib - 数据可视化
-- mplfinance - 金融图表库
-- yfinance - Yahoo Finance 数据接口
-- Flask - 后端 Web 框架
-- tksheet - Tkinter 表格组件
-- requests_cache - HTTP 请求缓存
-- python-dotenv - 环境变量管理
-- fear_and_greed - 恐惧与贪婪指数
-
-完整列表请见 [requirements.txt](requirements.txt)
-
-## 配置说明
-
-如需配置环境变量，可以创建 `.env` 文件：
-
-```env
-# 可选配置
-FLASK_ENV=development
-FLASK_PORT=5000
+```text
+http://127.0.0.1:5000
 ```
 
-## 注意事项
+### GET `/api/stock_data`
 
-- 首次运行会下载股票数据，可能需要几分钟
-- 数据缓存在 `stock_cache.db` 中，下次启动会更快
-- 建议保持稳定的网络连接以获取实时数据
-- 修改股票分组后需要重启应用才能生效
-- 两个前端文件的分组配置建议保持一致
+获取股票、大盘和跨市场指标表格数据。
+
+查询参数：
+
+- `groups`：JSON 字符串，格式为 `{group_name: [ticker, ...]}`。
+- `broad_market_tickers`：JSON 字符串，用于告诉后端哪些 ticker 属于大盘/跨市场指标，避免对它们抓取 StockAnalysis 基本面数据。
+
+返回：
+
+- `success`
+- `data`
+
+### POST `/api/breadth_data`
+
+获取市场宽度数据。
+
+表单参数：
+
+- `sp500_symbols`：JSON 字符串，S&P 500 成分股 ticker 列表。
+
+返回：
+
+- `success`
+- `data`
+- `breadth_chart_data`
+
+### GET `/api/kline_data`
+
+获取单个 ticker 的 K 线、技术指标、筹码分布和财务信息。
+
+查询参数：
+
+- `ticker`
+- `period`
+- `interval`
+
+返回：
+
+- `success`
+- `ticker`
+- `dates`
+- `ohlc`
+- `indicators`
+- `financials`
+
+### GET `/api/fear_greed`
+
+获取 CNN Fear & Greed Index。
+
+返回：
+
+- `success`
+- `value`
+- `description`
+
+### GET `/api/fear_greed_crypto`
+
+获取 Crypto Fear & Greed Index。
+
+返回：
+
+- `success`
+- `value`
+- `description`
+
+### POST `/api/sp500_symbols`
+
+当前代码中保留的实验/辅助接口，读取表单中的 `sp500_symbols` JSON。主流程市场宽度使用 `/api/breadth_data`。
+
+## 缓存与生成文件
+
+### `stock_cache.db`
+
+主后端使用的 SQLite 缓存文件，包含：
+
+- `stock_analysis_data`：按 ticker 和美东日期缓存 StockAnalysis.com 基本面与分析师数据。
+- `beta_cache`：按 ticker 和美东日期缓存 Beta。
+
+删除 `stock_cache.db` 后重启应用，会重新抓取和计算缓存数据。
+
+### Streamlit 前端缓存
+
+`app_streamlit.py` 使用 `st.cache_data`：
+
+- 股票数据缓存约 300 秒。
+- Fear & Greed 缓存约 600 秒。
+- 市场宽度缓存约 600 秒。
+- K 线数据缓存约 60 秒。
+- S&P 500 成分股列表缓存约 3600 秒。
+
+点击侧边栏 `Refresh All` 可清空 Streamlit 缓存。
+
+### `forward_pe_cache.db`
+
+这是 `qwen_forward_pe.py` 旧版/备用脚本使用的缓存文件。当前主应用流程不依赖它。
+
+## 环境变量
+
+项目会加载 `.env`，但当前主流程没有强制要求配置环境变量。README 旧版中提到的 `FLASK_ENV`、`FLASK_PORT` 不会自动改变前端内置的后端端口；当前两个前端都硬编码访问 `127.0.0.1:5000`。
+
+如需修改端口，需要同步修改：
+
+- `app_tkinter.py` 中的 Flask 启动端口和 `API_BASE_URL`。
+- `app_streamlit.py` 中的 Flask 启动端口和 `API_BASE`。
 
 ## 常见问题
 
-**Q: 如何同时使用两个版本？**
-A: 两个版本共用后端，启动一个即可，也可以同时运行两个前端。
+### 首次启动很慢
 
-**Q: 数据更新频率是多少？**
-A: 应用启动时会刷新数据，后续会定期更新。
+首次启动会下载股票价格、S&P 500 数据、市场宽度数据，并抓取 StockAnalysis.com 基本面字段。等待时间取决于网络和外部数据源响应速度。
 
-**Q: 可以添加美股以外的股票吗？**
-A: 可以，只要 Yahoo Finance 支持该股票代码即可。
+### Streamlit 或 Tkinter 报后端连接失败
 
-**Q: 如何清空缓存重新获取数据？**
-A: 删除 `stock_cache.db` 文件，重启应用即可。
+检查 `127.0.0.1:5000` 是否被其他进程占用。两个前端都会自动启动 Flask 后端，如果同一时间重复启动多个实例，可能出现端口冲突。
 
-## 贡献
+### 市场宽度加载失败
 
-欢迎提交 Issue 和 Pull Request！
+市场宽度依赖 Wikipedia 的 S&P 500 成分股表和 Yahoo Finance 批量下载。如果其中任一数据源不可访问，可能返回空数据或失败。
 
-## 许可证
+### 某些 ticker 没有基本面数据
+
+StockAnalysis.com 不一定支持所有 ticker。后端会尽量回退到 yfinance；如果两个来源都缺失，对应字段会为空。
+
+### 如何清空缓存
+
+关闭应用后删除：
+
+```text
+stock_cache.db
+```
+
+然后重新启动应用。
+
+### 是否支持美股以外的市场
+
+支持 Yahoo Finance 可识别的 ticker，例如 A 股 ETF、港股、外汇、商品、加密货币等。但基本面数据抓取主要面向普通股票，部分跨市场 ticker 会跳过 StockAnalysis.com 查询。
+
+## 开发注意事项
+
+- 两个前端的分组配置是重复维护的；修改 watch list 时建议同步修改。
+- `requests_cache.uninstall_cache()` 当前会禁用 requests_cache 的全局缓存；主缓存逻辑以 SQLite 为准。
+- `stockanalysis_scraper.py` 使用正则从 StockAnalysis.com 页面提取字段，页面结构变化时可能需要更新解析规则。
+- `stock_cache.db` 是运行期数据，不建议作为代码变更提交。
+- 源码中部分历史中文注释存在编码乱码，但运行逻辑以 Python 代码为准。
+
+## License
 
 MIT License
 
-## 作者
+## Author
 
 cyp9313
 
@@ -384,137 +612,262 @@ cyp9313
 
 # Stock Watch List
 
-A powerful US stock watchlist application providing real-time stock data display, technical analysis charts, and market breadth indicators. Supports both Tkinter desktop version and Streamlit web version.
+A local stock watchlist and market dashboard for US equities and cross-market monitoring. The project provides two frontends:
+
+- `app_tkinter.py`: desktop app built with Tkinter, tksheet, and Matplotlib.
+- `app_streamlit.py`: web dashboard built with Streamlit and Plotly.
+
+Both frontends automatically start the same local Flask backend thread. The backend fetches data from Yahoo Finance, StockAnalysis.com, CNN Fear & Greed, and Alternative.me, and caches selected fundamental and Beta data in SQLite.
+
+> This project is intended for personal market research and data observation only. It is not investment advice. External data sources may be rate-limited, delayed, structurally changed, or return missing values.
 
 ## Features
 
-### 📊 Core Features
+### 1. Stock Watchlist
 
-- **Real-time Stock Data Display**
-  - Real-time prices, price changes (1D, 5D, 1M, YTD)
-  - Relative momentum indicator
-  - Deviation from various EMAs (EMA5/10/20/50/100/200)
-  - Bollinger Bands position (upper/lower band deviation)
-  - Volume ratio
-  - Next earnings date
-  - Valuation metrics: PE (Trailing/Forward), PEG, P/S, P/B
-  - Analyst ratings and target prices
-  - Market cap information
+Default stock groups:
 
-- **Interactive Candlestick Chart Analysis**
-  - Plotly-based interactive candlestick charts with zoom and pan support
-  - Moving averages display (MA20, MA50, MA200)
-  - Volume bar chart
-  - RSI indicator
-  - MACD indicator
-  - Stochastics indicator
-  - TD Sequential indicator (main chart + subplot)
-  - Custom Fibonacci retracement drawing
-  - Quick StockAnalysis link
+- `Mag7`
+- `Chips/AI`
+- `Fin/Crypto`
+- `Health`
+- `Energy`
+- `Defense`
+- `Consumer`
+- `China`
+- `Themes`
 
-- **Market Breadth Indicators**
-  - McClellan Oscillator
-  - McClellan Summation Index
-  - Advance-Decline Line (AD Line)
-  - Advance/Decline bar chart
-  - 52-week new highs/lows statistics
-  - S&P 500, Nasdaq, Dow Jones performance
-  - Percentage of stocks above 20/50/200-day MAs
+Displayed table columns:
 
-- **Group Management**
-  - Stock list grouped by sector/theme (Mag7, Chips/AI, Fin/Crypto, Health, etc.)
-  - Broad market indicator groups (market direction, breadth, rates/FX, volatility, etc.)
-  - Fixed header when scrolling for easy viewing
-  - Color-coded price change highlighting
+- `Ticker`
+- `Price`
+- `1D%`
+- `5D%`
+- `1M%`
+- `YTD%`
+- `Rel. Momentum`
+- `Diff_EMA5%`
+- `Diff_EMA10%`
+- `Diff_EMA20%`
+- `Diff_EMA50%`
+- `Diff_EMA100%`
+- `Diff_EMA200%`
+- `Diff_BB_Up%`
+- `Diff_BB_Low%`
+- `Volume_Ratio`
+- `Next Earnings`
+- `Trailing PE`
+- `Forward PE`
+- `PEG Ratio`
+- `Analysts`
+- `Price Target`
+- `Market Cap`
 
-### 🔧 Technical Features
+The table inserts group header rows and applies color highlights to price changes, EMA deviations, Bollinger Band position, volume ratio, earnings date, analyst rating, price target, and related fields. The backend also returns `Beta`; it is not displayed as a standalone column, but is used to color the `Ticker` cell: Beta above 1 leans red, and Beta below 1 leans green.
 
-- **Dual Interface Support**: Tkinter desktop + Streamlit web versions with identical functionality
-- **Local Caching**: SQLite database for stock data caching to reduce network requests
-- **Automatic Updates**: Periodic data refresh
-- **Unified Data Source**: Flask backend provides data for both frontends
-- **Smart Caching**: requests_cache for HTTP request caching
+### 2. Broad Market Dashboard
 
-## Project Structure Details
+Default broad-market groups:
 
+- `Dashboard`: core market overview.
+- `US Mkt Dir`: S&P 500, Nasdaq 100, Dow Jones, and Russell 2000.
+- `Breadth`: equal-weight market proxies.
+- `AI/Tech Risk`: technology risk-appetite tickers.
+- `China Beta`: China-related ETFs and market proxies.
+- `Rates/FX`: yields and foreign exchange.
+- `Fear/Vol`: volatility indexes.
+- `Safe Haven`: gold and silver.
+- `Oil/Geopol`: Brent crude oil.
+- `Crypto`: BTC and ETH.
+- `Strat Resources`: strategic-resource-related tickers.
+
+### 3. Market Breadth
+
+The market breadth module fetches the latest S&P 500 constituents from Wikipedia, downloads one year of daily data from Yahoo Finance, and calculates:
+
+- `20MA_Ratio`: percentage of constituents closing above their 20-day moving average.
+- `50MA_Ratio`: percentage of constituents closing above their 50-day moving average.
+- `200MA_Ratio`: percentage of constituents closing above their 200-day moving average.
+
+Results are displayed as both a table and a line chart.
+
+### 4. Candlestick And Technical Analysis
+
+You can input any ticker recognized by Yahoo Finance and plot a candlestick chart.
+
+Supported periods (unit: days; controls how far back the K-line chart fetches data): in both the Tkinter and Streamlit versions, `Period (days)` is an input field where you can enter a custom integer day count. The Streamlit version currently limits the value to `1` through `3650` days, for example `30`, `365`, or `730`.
+
+Note: for intraday intervals such as `5m`, `15m`, `1h`, and `4h`, the backend also uses the entered day count, but caps it at the most recent `60` days because of Yahoo Finance availability. For example, period `10` with interval `15m` plots about 10 days of 15-minute candles; period `120` is capped to 60 days.
+
+Supported intervals:
+
+- `1d`
+- `1wk`
+- `1h`
+- `4h`
+- `15m`
+- `5m`
+
+The chart includes:
+
+- Candlesticks.
+- Volume.
+- MA5, MA10, MA20, MA50, MA100, MA200.
+- Bollinger Upper / Lower.
+- MACD, Signal, Histogram.
+- KDJ.
+- RSI.
+- Simplified TD Sequential, also known in Chinese trading contexts as Shenqi Jiuzhuan / 神奇九转.
+- Chip distribution and chip peak estimated from recent 30-day, 4-hour data.
+- StockAnalysis.com quick link.
+
+The Streamlit version also provides a Fibonacci Retracement / Extension form where you can enter A, B, and C price points and draw common retracement and extension levels on the main chart.
+
+The Tkinter version uses the Matplotlib toolbar in the K-line window and supports interactive Fibonacci point selection on the chart.
+
+### 5. Fear And Greed Indexes
+
+The top area displays:
+
+- CNN Fear & Greed Index.
+- Crypto Fear & Greed Index from Alternative.me.
+
+### 6. Fundamentals And Analyst Data
+
+The backend first attempts to scrape the following fields from StockAnalysis.com, and falls back to yfinance when possible:
+
+- Forward PE
+- PEG Ratio
+- Trailing PE
+- Market Cap
+- Earnings Date
+- P/S Ratio
+- P/B Ratio
+- Analyst Consensus
+- Price Target
+
+Note: P/S and P/B are currently used mainly in the K-line chart title and are not displayed as main table columns.
+
+### 7. Relative Momentum And Beta
+
+`Rel. Momentum` uses the S&P 500 as the benchmark. The backend downloads two years of daily `^GSPC` data, picks reference trading dates for approximately 3 months, 6 months, and 12 months, and aligns each ticker to those dates to calculate relative return differences:
+
+```text
+Rel. Momentum = 0.2 * M3M + 0.3 * M6M + 0.5 * M12M
 ```
+
+`M3M`, `M6M`, and `M12M` are the ticker's return differences relative to the S&P 500 over the 3-month, 6-month, and 12-month windows.
+
+Beta is calculated from common trading-day returns between the ticker and `^GSPC`, using up to the most recent 252 trading days, and is cached in SQLite by US Eastern date.
+
+## Project Structure
+
+```text
 Stock_watch_list/
-├── app_tkinter.py              # Tkinter desktop frontend
-│   ├── High-performance table using tksheet
-│   ├── Matplotlib for technical analysis charts
-│   ├── Mouse interaction and zoom support
-│   └── Right-click menu functionality
-│
-├── app_streamlit.py            # Streamlit web frontend
-│   ├── Plotly for interactive charts
-│   ├── Responsive layout with wide-screen support
-│   ├── Sidebar navigation
-│   └── Scrollable table with fixed header
-│
-├── stock_watch_list_back_end.py # Backend API service
-│   ├── Flask web server
-│   ├── SQLite data cache layer
-│   ├── yfinance data fetching
-│   ├── StockAnalysis data scraping
-│   └── Technical indicator calculation
-│
-├── stockanalysis_scraper.py    # StockAnalysis website scraper
-│   ├── Batch fetch Forward PE, PEG and more
-│   ├── Analyst ratings and target prices
-│   └── Earnings date fetching
-│
-├── qwen_forward_pe.py          # Forward PE data processing (backup)
-│
-├── launch_tkinter.bat          # Windows one-click Tkinter launcher
-├── launch_streamlit.bat        # Windows one-click Streamlit launcher
-│
-├── requirements.txt            # Python dependencies
-├── .gitignore                  # Git ignore file configuration
-└── README.md                   # Project documentation
+|-- app_tkinter.py
+|   |-- Tkinter desktop frontend
+|   |-- Automatically starts the local Flask backend thread
+|   |-- Three tksheet tabs: Stocks, Broad Market, Market Breadth
+|   |-- Matplotlib / mplfinance K-line chart
+|   |-- K-line window with volume, MACD, KDJ, RSI, simplified TD Sequential / Shenqi Jiuzhuan, chip distribution, Fibonacci
+|
+|-- app_streamlit.py
+|   |-- Streamlit web frontend
+|   |-- Automatically starts the local Flask backend thread
+|   |-- Three main tabs: Stocks, Broad Market, Market Breadth
+|   |-- Plotly K-line chart and market breadth chart
+|   |-- Uses st.cache_data for frontend API caching
+|
+|-- stock_watch_list_back_end.py
+|   |-- Flask API backend
+|   |-- yfinance data download
+|   |-- StockAnalysis.com data cache and fallback logic
+|   |-- SQLite tables: stock_analysis_data, beta_cache
+|   |-- Market breadth, relative momentum, Beta, K-line indicators, and Fear & Greed APIs
+|
+|-- stockanalysis_scraper.py
+|   |-- StockAnalysis.com scraper
+|   |-- Concurrently fetches Forward PE, PEG, Trailing PE, Market Cap, Earnings Date, P/S, P/B, Analyst, Price Target
+|   |-- Scraping only; caching is handled by the backend
+|
+|-- qwen_forward_pe.py
+|   |-- Legacy / backup Forward PE scraper and cache script
+|   |-- Uses forward_pe_cache.db
+|   |-- Current main flow is handled by stockanalysis_scraper.py + stock_watch_list_back_end.py
+|
+|-- launch_tkinter.bat
+|   |-- Windows one-click Tkinter launcher
+|
+|-- launch_streamlit.bat
+|   |-- Windows one-click Streamlit launcher
+|
+|-- requirements.txt
+|   |-- Python dependencies
+|
+|-- stock_cache.db
+|   |-- Runtime SQLite cache file, generated or updated after launch
+|
+|-- .env
+|   |-- Optional environment variable file
+|
+|-- .gitignore
+|-- README.md
 ```
 
-## Technical Architecture
+## Architecture
 
+```text
+Tkinter UI              Streamlit UI
+app_tkinter.py          app_streamlit.py
+     |                       |
+     | local HTTP API        | local HTTP API
+     +-----------+-----------+
+                 |
+                 v
+      Flask Backend: stock_watch_list_back_end.py
+                 |
+     +-----------+-----------+----------------+
+     |                       |                |
+     v                       v                v
+Yahoo Finance       StockAnalysis.com       External APIs
+yfinance            scraper + SQLite        CNN F&G / Alternative.me
+     |
+     v
+Price, volume, K-line, market breadth, technical indicators
 ```
-┌─────────────────┐         ┌─────────────────┐
-│  app_tkinter.py │         │ app_streamlit.py│
-│   (Tkinter UI)  │         │  (Streamlit UI) │
-└────────┬────────┘         └────────┬────────┘
-         │                           │
-         └────────────┬──────────────┘
-                      │ HTTP API
-                      ▼
-         ┌──────────────────────────┐
-         │stock_watch_list_back_end.py│
-         │    (Flask Backend)        │
-         └────────────┬─────────────┘
-                      │
-        ┌─────────────┼─────────────┐
-        ▼             ▼             ▼
-   ┌──────────┐  ┌─────────┐  ┌───────────┐
-   │  SQLite  │  │yfinance │  │StockAnalysis│
-   │  Cache   │  │  (API)  │  │ (Scraper)  │
-   └──────────┘  └─────────┘  └───────────┘
+
+Both frontends access the backend at:
+
+```text
+http://127.0.0.1:5000
+```
+
+Streamlit runs at:
+
+```text
+http://localhost:8501
 ```
 
 ## Installation
 
-### 1. Clone the Project
+### 1. Clone The Project
 
 ```bash
 git clone https://github.com/cyp9313/Stock_watch_list.git
 cd Stock_watch_list
 ```
 
-### 2. Create Virtual Environment (Recommended)
+### 2. Create A Virtual Environment
 
 Windows:
+
 ```bash
 python -m venv .venv
 .venv\Scripts\activate
 ```
 
-Linux/Mac:
+macOS / Linux:
+
 ```bash
 python -m venv .venv
 source .venv/bin/activate
@@ -526,233 +879,336 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Usage
+Dependencies include:
 
-### Windows Users (Recommended)
+- `fear_and_greed`
+- `Flask`
+- `matplotlib`
+- `mplfinance`
+- `numpy`
+- `pandas`
+- `plotly`
+- `python-dotenv`
+- `pytz`
+- `Requests`
+- `requests_cache`
+- `streamlit`
+- `tksheet`
+- `yfinance`
+- `lxml`
 
-#### Launch Tkinter Desktop Version
-Double-click `launch_tkinter.bat` to automatically launch the Tkinter version.
+## Launch
 
-#### Launch Streamlit Web Version
-Double-click `launch_streamlit.bat` to automatically launch the Streamlit version. Browser will open to http://localhost:8501 automatically.
+### Windows One-Click Launch
 
-### Manual Launch
+Launch the Tkinter desktop version:
 
-#### Tkinter Version
+```text
+Double-click launch_tkinter.bat
+```
+
+Launch the Streamlit web version:
+
+```text
+Double-click launch_streamlit.bat
+```
+
+`launch_streamlit.bat` creates `.venv`, upgrades pip, installs `requirements.txt`, and starts Streamlit when the virtual environment is missing.
+
+`launch_tkinter.bat` creates `.venv`, installs dependencies, and starts the desktop app when the virtual environment is missing.
+
+### Manual Tkinter Launch
+
 ```bash
 python app_tkinter.py
 ```
 
-#### Streamlit Version
+### Manual Streamlit Launch
+
 ```bash
-python -m streamlit run app_streamlit.py --server.port 8501 --server.address localhost
+python -m streamlit run app_streamlit.py --server.port 8501 --server.address localhost --browser.gatherUsageStats false
 ```
 
-#### Backend Service (Optional)
-If you need to use the API service separately:
+### Start Backend Separately
+
+Usually this is not needed because both frontends automatically start the Flask backend thread. For API debugging only, run:
+
 ```bash
 python stock_watch_list_back_end.py
 ```
 
-## How to Customize the Watch List
+If Tkinter or Streamlit is already running, `127.0.0.1:5000` may already be occupied.
 
-This project supports full customization of your stock watchlist. Simply modify the group configuration in the corresponding file.
+## Usage
 
-### Modify Tkinter Version Stock List
+### Tkinter Desktop Version
 
-Edit the `stock_groups` dictionary in [`app_tkinter.py`](file:///c:/Users/Administrator/Desktop/development/Stock_watch_list/app_tkinter.py):
+After launch, the app automatically loads:
+
+- Stock watchlist.
+- Broad market indicators.
+- Market breadth.
+- CNN Fear & Greed Index.
+- Crypto Fear & Greed Index.
+
+Bottom buttons:
+
+- `Refresh Stocks`: refresh stock and broad-market data.
+- `Refresh Breadth`: refresh market breadth data.
+
+K-line input area:
+
+- Ticker: for example `AAPL`.
+- Period: for example `365`.
+- Interval: for example `1d`, `1wk`, `1h`, `4h`, `15m`, `5m`.
+- Click the chart button to open the K-line window.
+
+### Streamlit Web Version
+
+Sidebar:
+
+- `Refresh All`: clear Streamlit frontend cache and reload.
+- Shows current page refresh time.
+
+Main page:
+
+- Top area shows CNN and Crypto Fear & Greed.
+- `Stocks` tab shows the stock watchlist.
+- `Broad Market` tab shows broad-market and cross-market indicators.
+- `Market Breadth` tab shows the breadth table and chart.
+- The `K-Line Chart` section at the bottom plots a single ticker.
+
+Fibonacci:
+
+1. Enter ticker, period, interval, and click `Plot`.
+2. Enter A, B, and C price points in `Fibonacci Retracement / Extension`.
+3. Click `Calculate Fibonacci` to draw retracement and extension levels.
+4. Click `Clear Fibonacci` to remove them.
+
+## Customize Watch List
+
+There is no separate configuration file at the moment. Stock groups and broad-market groups are defined in both frontend files. To keep both versions consistent, update both files.
+
+### Tkinter Version
+
+Edit `app_tkinter.py`:
 
 ```python
 stock_groups = {
     "Mag7": ["AAPL", "MSFT", "GOOG", "AMZN", "META", "TSLA", "NVDA", "SPCX"],
     "Chips/AI": ["MU", "ORCL", "AMD", "INTC", "AVGO", "SMCI", "PLTR", "RGTI", "DXYZ", "SNPS", "APP"],
-    "Fin/Crypto": ["V", "JPM", "BRK-B", "COIN", "HOOD", "MSTR", "CRCL", "SOFI", "OSCR"],
-    "Health": ["LLY", "NVO", "ABBV", "UNH"],
-    "Energy": ["SMR", "VST", "OKLO", "NEE", "ENPH", "GE", "GEV"],
-    "Defense": ["LMT", "BA", "ACHR", "AXON"],
-    "Consumer": ["LULU", "NKE", "CMG", "COST"],
-    "China": ["BYDDY", "XIACY", "PDD", "BABA", "TCEHY", "BIDU"],
-    "Themes": ["ASTS", "CRWV", "NBIS", "MP", "RKLB"],
 }
 ```
 
-#### How to Modify:
+Broad-market groups:
 
-1. **Add new group**: Add a new key-value pair to the dictionary, where the key is the group name and the value is a list of stock tickers
-   ```python
-   "My Favorites": ["AAPL", "MSFT", "GOOGL"],
-   ```
+```python
+broad_market_groups = {
+    "Dashboard": ["^GSPC", "^NDX", "RSP", "QQQE", "^TNX", "EURUSD=X", "^VIX", "GC=F", "BZ=F", "BTC-USD", "510300.SS"],
+}
+```
 
-2. **Modify existing group**: Directly edit the stock ticker list within a group
-   ```python
-   "Mag7": ["AAPL", "MSFT", "TSLA"],  # Keep only these three
-   ```
+### Streamlit Version
 
-3. **Delete group**: Remove the corresponding key-value pair
-
-4. **Add single stock**: Add the stock ticker to the corresponding group list
-   ```python
-   "Chips/AI": ["MU", "ORCL", "AMD", "YOUR_TICKER"],
-   ```
-
-### Modify Streamlit Version Stock List
-
-Edit the `STOCK_GROUPS` dictionary in [`app_streamlit.py`](file:///c:/Users/Administrator/Desktop/development/Stock_watch_list/app_streamlit.py):
+Edit `app_streamlit.py`:
 
 ```python
 STOCK_GROUPS = {
     "Mag7": ["AAPL", "MSFT", "GOOG", "AMZN", "META", "TSLA", "NVDA", "SPCX"],
-    "Chips/AI": ["MU","ORCL", "AMD", "INTC", "AVGO", "SMCI", "PLTR", "RGTI", "DXYZ", "SNPS", "APP"],
-    "Fin/Crypto": ["V", "JPM", "BRK-B", "COIN", "HOOD", "MSTR", "CRCL", "SOFI", "OSCR"],
-    "Health": ["LLY", "NVO", "ABBV", "UNH"],
-    "Energy": ["SMR", "VST", "OKLO", "NEE", "ENPH", "GE", "GEV"],
-    "Defense": ["LMT", "BA", "ACHR", "AXON"],
-    "Consumer": ["LULU", "NKE", "CMG", "COST"],
-    "China": ["BYDDY", "XIACY", "PDD", "BABA", "TCEHY", "BIDU"],
-    "Themes": ["ASTS", "CRWV", "NBIS", "MP", "RKLB"],
+    "Chips/AI": ["MU", "ORCL", "AMD", "INTC", "AVGO", "SMCI", "PLTR", "RGTI", "DXYZ", "SNPS", "APP"],
 }
 ```
 
-The modification method is identical to the Tkinter version. **It's recommended to keep both files consistent for easy switching.**
-
-### Modify Broad Market Indicator List
-
-You can also customize broad market indicators (indices, forex, commodities, cryptocurrencies, etc.):
-
-#### Tkinter Version
-Edit the `broad_market_groups` dictionary in [`app_tkinter.py`](file:///c:/Users/Administrator/Desktop/development/Stock_watch_list/app_tkinter.py).
-
-#### Streamlit Version
-Edit the `BROAD_MARKET_GROUPS` dictionary in [`app_streamlit.py`](file:///c:/Users/Administrator/Desktop/development/Stock_watch_list/app_streamlit.py).
+Broad-market groups:
 
 ```python
 BROAD_MARKET_GROUPS = {
-    "Dashboard": [
-        "^GSPC", "^NDX", "RSP", "QQQE", "^TNX",
-        "EURUSD=X", "^VIX", "GC=F", "BZ=F", "BTC-USD", "510300.SS"
-    ],
-    "US Mkt Dir": ["^GSPC", "^NDX", "^DJI", "^RUT"],
-    "Breadth": ["RSP", "QQQE"],
-    "AI/Tech Risk": ["TQQQ", "^SOX"],
-    "China Beta": ["510300.SS", "510050.SS", "159915.SZ", "588000.SS", "3033.HK"],
-    "Rates/FX": ["^TNX", "EURUSD=X", "EURCNY=X"],
-    "Fear/Vol": ["^VIX", "^VXN"],
-    "Safe Haven": ["GC=F", "SI=F"],
-    "Oil/Geopol": ["BZ=F"],
-    "Crypto": ["BTC-USD", "ETH-USD"],
-    "Strat Resources": ["WNUC.DE", "REMX"],
+    "Dashboard": ["^GSPC", "^NDX", "RSP", "QQQE", "^TNX", "EURUSD=X", "^VIX", "GC=F", "BZ=F", "BTC-USD", "510300.SS"],
 }
 ```
 
-### Stock Ticker Format Guide
+### Example
 
-- **US Stocks**: Use the ticker directly, e.g., `AAPL`, `MSFT`
-- **Indices**: Use Yahoo Finance format, e.g., `^GSPC` (S&P 500), `^NDX` (Nasdaq 100)
-- **Forex**: Format as `XXXYYY=X`, e.g., `EURUSD=X` (EUR/USD)
-- **Commodity Futures**: Format as `XXX=F`, e.g., `GC=F` (Gold), `BZ=F` (Brent Crude)
-- **Cryptocurrencies**: Format as `XXX-USD`, e.g., `BTC-USD` (Bitcoin)
-- **A-Share/Hong Kong Stocks**: Use appropriate suffixes, e.g., `510300.SS` (CSI 300), `3033.HK` (HK)
-
-### Configuration Example
-
-Suppose you want to add a "New Energy" group containing Tesla, NIO, Li Auto, XPeng:
+Add a new energy group:
 
 ```python
 "New Energy": ["TSLA", "NIO", "LI", "XPEV"],
 ```
 
-Add this line to the `stock_groups` or `STOCK_GROUPS` dictionary.
+Restart the app after editing groups.
 
-## Main Features Explained
+## Ticker Format
 
-### 1. Stock Watchlist
-- Display real-time prices, price changes, volume, and more
-- Grouped by sector for easy management
-- Color-coded price change highlighting (green for up, red for down)
-- Fixed header when scrolling for easy viewing
-- 20+ data columns covering technical and fundamental metrics
+The project uses Yahoo Finance ticker format.
 
-### 2. Candlestick Chart Analysis
-- Interactive Plotly/Matplotlib candlestick charts
-- Display moving averages (MA20, MA50, MA200)
-- TD Sequential indicator (numbered annotations, 9th bolded)
-- Volume bar chart
-- RSI, MACD, Stochastics and other technical indicators
-- Dedicated TD Seq subplot with bars + number labels
-- Custom Fibonacci retracement with support for price point input
-- Quick StockAnalysis link
+Common examples:
 
-### 3. Market Breadth Indicators
-- McClellan Oscillator: Measures internal market momentum
-- McClellan Summation Index: Long-term market breadth indicator
-- Advance-Decline Line (AD Line): Trend line of advances vs declines
-- Advance/Decline bar chart: Visual display of market breadth
-- 52-week new highs/lows statistics: Identify extreme sentiment
-- S&P 500, Nasdaq, Dow Jones performance: Market bellwethers
-- MA ratio indicators: Percentage of stocks above 20/50/200-day MAs
+- US stocks: `AAPL`, `MSFT`, `NVDA`
+- Special US tickers: `BRK-B`
+- Indexes: `^GSPC`, `^NDX`, `^DJI`, `^RUT`
+- FX: `EURUSD=X`, `EURCNY=X`
+- Commodity futures: `GC=F`, `SI=F`, `BZ=F`
+- Crypto: `BTC-USD`, `ETH-USD`
+- China A-share / ETF: `510300.SS`, `159915.SZ`
+- Hong Kong stocks: `3033.HK`
+- European market: `WNUC.DE`
 
-## Technology Stack
+StockAnalysis.com scraping is mainly suitable for ordinary stock tickers. The backend skips indexes, cryptocurrencies, commodities, FX, and market-breadth pseudo tickers.
 
-- **Frontend Interface**: Tkinter + tksheet / Streamlit + Plotly
-- **Data Fetching**: yfinance, requests, requests_cache
-- **Data Processing**: pandas, numpy
-- **Visualization**: matplotlib, mplfinance, plotly
-- **Backend**: Flask
-- **Database**: SQLite
+## Backend API
 
-## Dependencies
+The backend listens at:
 
-Main packages:
-- streamlit - Web application framework
-- plotly - Interactive charts
-- pandas - Data processing
-- numpy - Numerical computing
-- matplotlib - Data visualization
-- mplfinance - Financial charting library
-- yfinance - Yahoo Finance data interface
-- Flask - Backend web framework
-- tksheet - Tkinter table component
-- requests_cache - HTTP request caching
-- python-dotenv - Environment variable management
-- fear_and_greed - Fear & Greed Index
-
-See [requirements.txt](requirements.txt) for complete list.
-
-## Configuration
-
-To configure environment variables, create a `.env` file:
-
-```env
-# Optional configuration
-FLASK_ENV=development
-FLASK_PORT=5000
+```text
+http://127.0.0.1:5000
 ```
 
-## Notes
+### GET `/api/stock_data`
 
-- First run will download stock data and may take several minutes
-- Data is cached in `stock_cache.db`, subsequent launches will be faster
-- Stable internet connection recommended for real-time data
-- Restart application after modifying stock groups for changes to take effect
-- Recommended to keep both frontend files in sync
+Fetch stock, broad-market, and cross-market table data.
+
+Query parameters:
+
+- `groups`: JSON string in `{group_name: [ticker, ...]}` format.
+- `broad_market_tickers`: JSON string used to tell the backend which tickers belong to broad-market / cross-market groups, so it can skip StockAnalysis fundamental scraping for them.
+
+Returns:
+
+- `success`
+- `data`
+
+### POST `/api/breadth_data`
+
+Fetch market breadth data.
+
+Form parameter:
+
+- `sp500_symbols`: JSON string containing S&P 500 constituent tickers.
+
+Returns:
+
+- `success`
+- `data`
+- `breadth_chart_data`
+
+### GET `/api/kline_data`
+
+Fetch candlestick data, technical indicators, chip distribution, and financial information for one ticker.
+
+Query parameters:
+
+- `ticker`
+- `period`
+- `interval`
+
+Returns:
+
+- `success`
+- `ticker`
+- `dates`
+- `ohlc`
+- `indicators`
+- `financials`
+
+### GET `/api/fear_greed`
+
+Fetch CNN Fear & Greed Index.
+
+Returns:
+
+- `success`
+- `value`
+- `description`
+
+### GET `/api/fear_greed_crypto`
+
+Fetch Crypto Fear & Greed Index.
+
+Returns:
+
+- `success`
+- `value`
+- `description`
+
+### POST `/api/sp500_symbols`
+
+An experimental / auxiliary endpoint retained in the current code. It reads `sp500_symbols` JSON from the form body. The main market breadth flow uses `/api/breadth_data`.
+
+## Cache And Generated Files
+
+### `stock_cache.db`
+
+Main SQLite cache used by the backend. It contains:
+
+- `stock_analysis_data`: caches StockAnalysis.com fundamentals and analyst data by ticker and US Eastern date.
+- `beta_cache`: caches Beta by ticker and US Eastern date.
+
+Delete `stock_cache.db` and restart the app to refetch and recalculate cached data.
+
+### Streamlit Frontend Cache
+
+`app_streamlit.py` uses `st.cache_data`:
+
+- Stock data: about 300 seconds.
+- Fear & Greed: about 600 seconds.
+- Market breadth: about 600 seconds.
+- K-line data: about 60 seconds.
+- S&P 500 constituent list: about 3600 seconds.
+
+Click `Refresh All` in the sidebar to clear Streamlit cache.
+
+### `forward_pe_cache.db`
+
+This is the cache file used by the legacy / backup `qwen_forward_pe.py` script. The current main application flow does not depend on it.
+
+## Environment Variables
+
+The project loads `.env`, but the current main flow does not require environment variables. The previously mentioned `FLASK_ENV` and `FLASK_PORT` do not automatically change the frontend's built-in backend port. Both frontends currently access `127.0.0.1:5000` directly in code.
+
+To change the port, update both:
+
+- Flask startup port and `API_BASE_URL` in `app_tkinter.py`.
+- Flask startup port and `API_BASE` in `app_streamlit.py`.
 
 ## FAQ
 
-**Q: How to use both versions simultaneously?**
-A: Both versions share the backend, you can launch one or both frontends simultaneously.
+### First Launch Is Slow
 
-**Q: How often is data updated?**
-A: Data is refreshed on application launch and updated periodically thereafter.
+The first launch downloads stock prices, S&P 500 data, market breadth data, and StockAnalysis.com fundamental fields. Waiting time depends on network quality and external data-source response speed.
 
-**Q: Can I add stocks outside the US market?**
-A: Yes, as long as Yahoo Finance supports the ticker symbol.
+### Streamlit Or Tkinter Cannot Connect To Backend
 
-**Q: How to clear the cache and refetch data?**
-A: Delete the `stock_cache.db` file and restart the application.
+Check whether `127.0.0.1:5000` is occupied by another process. Both frontends automatically start the Flask backend, so launching multiple instances at the same time can cause port conflicts.
 
-## Contributing
+### Market Breadth Fails To Load
 
-Issues and Pull Requests welcome!
+Market breadth depends on the Wikipedia S&P 500 constituents table and Yahoo Finance batch download. If either source is unavailable, the module may return empty data or fail.
+
+### Some Tickers Have No Fundamental Data
+
+StockAnalysis.com does not support every ticker. The backend tries to fall back to yfinance. If both sources are missing data, the corresponding fields remain empty.
+
+### Clear Cache
+
+Close the app and delete:
+
+```text
+stock_cache.db
+```
+
+Then restart the app.
+
+### Markets Outside US Stocks
+
+The app supports tickers recognized by Yahoo Finance, such as China A-share ETFs, Hong Kong stocks, FX, commodities, and cryptocurrencies. Fundamental scraping is mainly designed for ordinary stocks, so some cross-market tickers are skipped for StockAnalysis.com queries.
+
+## Development Notes
+
+- Group configuration is duplicated across the two frontends; update both when changing the watch list.
+- `requests_cache.uninstall_cache()` currently disables global requests_cache behavior; the main cache logic is SQLite-based.
+- `stockanalysis_scraper.py` extracts fields from StockAnalysis.com pages with regular expressions; parsing rules may need updates if the page structure changes.
+- `stock_cache.db` is runtime data and should not be committed as a code change.
+- Some historical Chinese comments in source files may show encoding artifacts, but runtime behavior follows the Python code.
 
 ## License
 

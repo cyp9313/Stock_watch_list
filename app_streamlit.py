@@ -919,7 +919,7 @@ col_kl1, col_kl2, col_kl3, col_kl4 = st.columns([2, 1, 1, 1])
 with col_kl1:
     ticker = st.text_input("Ticker", "AAPL", key="kline_ticker").upper()
 with col_kl2:
-    period = st.selectbox("Period (days)", [30, 60, 90, 180, 365, 730, 1095], index=4, key="kline_period")
+    period = int(st.number_input("Period (days)", min_value=1, max_value=3650, value=365, step=1, key="kline_period"))
 with col_kl3:
     interval = st.selectbox("Interval", ["1d", "1wk", "1h", "4h", "15m", "5m"], index=0, key="kline_interval")
 with col_kl4:
