@@ -1,0 +1,4 @@
+.env
+__pycache__/
+*.pyc
+stock_cache.db
