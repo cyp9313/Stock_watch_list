@@ -1,4 +1,5 @@
 import tkinter as tk
+from tkinter import ttk
 import pandas as pd
 import numpy as np
 import tksheet
@@ -59,10 +60,10 @@ t.start()
 # API配置
 # API_BASE_URL = "http://43.157.122.165:6000"  # 修改为你的服务器地址
 API_BASE_URL = "http://127.0.0.1:5000"  # 修改为你的服务器地址
-# 分组配置
-groups = {
+# 分组配置 — 按分页拆分
+stock_groups = {
     "Mag7": ["AAPL", "MSFT", "GOOG", "AMZN", "META", "TSLA", "NVDA","SPCX"],
-    "Chips/AI": ["ORCL","AMD","INTC","AVGO","SMCI","PLTR","RGTI","DXYZ","SNPS","APP"],
+    "Chips/AI": ["MU","ORCL","AMD","INTC","AVGO","SMCI","PLTR","RGTI","DXYZ","SNPS","APP"],
     "Fin/Crypto": ["V","JPM","BRK-B","COIN","HOOD","MSTR","CRCL","SOFI","OSCR"],
     "Health": ["LLY","NVO","ABBV","UNH"],
     "Energy": ["SMR","VST","OKLO","NEE","ENPH","GE","GEV"],
@@ -70,14 +71,32 @@ groups = {
     "Consumer": ["LULU","NKE","CMG","COST"],
     "China": ["BYDDY","XIACY","PDD","BABA","TCEHY","BIDU"],
     "Themes": ["ASTS","CRWV","NBIS","MP","RKLB"],
-    "Broad Market": [
-        "^GSPC","^NDX","^DJI","^RUT","510300.SS",
-        "RSP","QQQE","TQQQ","WNUC.DE","REMX","^TNX",
-        "EURUSD=X","GC=F","SI=F","BZ=F",
-        "BTC-USD","ETH-USD","^VIX","^VXN"
+}
+broad_market_groups = {
+    "Dashboard": [
+        "^GSPC", "^NDX", "RSP", "QQQE", "^TNX",
+        "EURUSD=X", "^VIX", "GC=F", "BZ=F", "BTC-USD", "510300.SS"
     ],
+    "US Mkt Dir": ["^GSPC", "^NDX", "^DJI", "^RUT"],
+    "Breadth": ["RSP", "QQQE"],
+    "AI/Tech Risk": ["TQQQ", "^SOX"],
+    "China Beta": ["510300.SS", "510050.SS", "159915.SZ", "588000.SS", "3033.HK"],
+    "Rates/FX": ["^TNX", "EURUSD=X", "EURCNY=X"],
+    "Fear/Vol": ["^VIX", "^VXN"],
+    "Safe Haven": ["GC=F", "SI=F"],
+    "Oil/Geopol": ["BZ=F"],
+    "Crypto": ["BTC-USD", "ETH-USD"],
+    "Strat Resources": ["WNUC.DE", "REMX"],
+}
+# 去重后的 broad market tickers 列表（Dashboard 与 story groups 有大量重复）
+broad_market_tickers = list(dict.fromkeys(
+    [t for tickers in broad_market_groups.values() for t in tickers]
+))
+breadth_groups = {
     "Market Breadth": ["20MA_Ratio", "50MA_Ratio", "200MA_Ratio"]
 }
+# 合并字典，用于 API 调用（后端需要完整 groups）
+groups = {**stock_groups, **broad_market_groups, **breadth_groups}
 
 # ===== 从wikipedia上爬取最新标普500股票代码列表 =====
 def get_sp500_symbols():
@@ -208,13 +227,18 @@ COLUMNS = (
 )
 
 # ===== 渲染表格 =====
-def render_table(df: pd.DataFrame):
+def render_table(df: pd.DataFrame, target_sheet=None, target_groups=None):
+    if target_sheet is None:
+        target_sheet = sheet_stocks
+    if target_groups is None:
+        target_groups = stock_groups
+
     current_date = pd.Timestamp.now(tz='America/New_York').date()
     table_data = []
     cell_bg = {}
     r = 0
 
-    for grp_name, tickers in groups.items():
+    for grp_name, tickers in target_groups.items():
         title_row = [grp_name] + [""] * (len(COLUMNS) - 1)
         table_data.append(title_row)
         for c in range(len(COLUMNS)):
@@ -295,16 +319,35 @@ def render_table(df: pd.DataFrame):
             table_data.append(row_vals)
             r += 1
 
-    sheet.set_sheet_data(table_data)
+    target_sheet.set_sheet_data(table_data)
     for (ri, ci), color in cell_bg.items():
-        sheet.highlight_cells(row=ri, column=ci, bg=color)
-    sheet.set_column_widths([120]+[100] * (len(COLUMNS)-1))
+        target_sheet.highlight_cells(row=ri, column=ci, bg=color)
+    target_sheet.set_column_widths([120]+[100] * (len(COLUMNS)-1))
 
 # ===== 数据刷新函数 =====
+def render_all_tabs():
+    """将最新数据分发到三个分页渲染"""
+    combined = pd.concat([latest_stock_df, latest_breadth_df], ignore_index=True)
+
+    stock_tickers = [t for tickers in stock_groups.values() for t in tickers]
+    # broad_market_tickers 已在全局去重（Dashboard 与 story groups 有大量重复）
+    broad_tickers = broad_market_tickers
+
+    stock_df = combined[combined["Ticker"].isin(stock_tickers)] if not combined.empty else pd.DataFrame(columns=COLUMNS)
+    broad_df = combined[combined["Ticker"].isin(broad_tickers)] if not combined.empty else pd.DataFrame(columns=COLUMNS)
+    breadth_df = latest_breadth_df.copy() if not latest_breadth_df.empty else pd.DataFrame(columns=COLUMNS)
+
+    render_table(stock_df, sheet_stocks, stock_groups)
+    render_table(broad_df, sheet_broad, broad_market_groups)
+    render_table(breadth_df, sheet_breadth, breadth_groups)
+
 def refresh_stock_data():
     global latest_stock_df
     try:
-        result = fetch_from_api('/api/stock_data',{'groups': json.dumps(groups)})   
+        result = fetch_from_api('/api/stock_data', {
+            'groups': json.dumps(groups),
+            'broad_market_tickers': json.dumps(broad_market_tickers)
+        })
         if result.get('success'):
             latest_stock_df = pd.DataFrame(result['data'])
             title_var.set("US Stock Watchlist - Stocks Updated")
@@ -314,8 +357,7 @@ def refresh_stock_data():
         latest_stock_df = pd.DataFrame(columns=COLUMNS)
         title_var.set(f"Stock Data ⚠⚠⚠️ {e}")
     
-    combined = pd.concat([latest_stock_df, latest_breadth_df], ignore_index=True)
-    render_table(combined)
+    render_all_tabs()
     refresh_label.config(text=f"Last Stock Refresh: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     update_fear_greed_index()
     update_crypto_fear_greed_index()
@@ -343,8 +385,7 @@ def refresh_breadth_data():
         latest_breadth_df = pd.DataFrame(columns=COLUMNS)
         title_var.set(f"Breadth Data ⚠⚠⚠️ {e}")
     
-    combined = pd.concat([latest_stock_df, latest_breadth_df], ignore_index=True)
-    render_table(combined)
+    render_all_tabs()
     refresh_label.config(text=f"Last Breadth Refresh: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 def update_fear_greed_index():
@@ -860,9 +901,27 @@ ticker_entry3.pack(side="left", padx=(0, 5))
 ticker_entry3.insert(0, "1d")
 tk.Button(input_frame, text="绘制K线图", command=plot_kline).pack(side="left")
 
-# 表格
-sheet = tksheet.Sheet(root, data=[], headers=COLUMNS, show_row_index=False)
-sheet.pack(fill="both", expand=True, padx=6, pady=6)
+# 表格 — 三分页 Notebook
+notebook = ttk.Notebook(root)
+notebook.pack(fill="both", expand=True, padx=6, pady=6)
+
+# Tab 1: Stocks
+stocks_frame = tk.Frame(notebook)
+notebook.add(stocks_frame, text="Stocks")
+sheet_stocks = tksheet.Sheet(stocks_frame, data=[], headers=COLUMNS, show_row_index=False)
+sheet_stocks.pack(fill="both", expand=True)
+
+# Tab 2: Broad Market
+broad_frame = tk.Frame(notebook)
+notebook.add(broad_frame, text="Broad Market")
+sheet_broad = tksheet.Sheet(broad_frame, data=[], headers=COLUMNS, show_row_index=False)
+sheet_broad.pack(fill="both", expand=True)
+
+# Tab 3: Market Breadth
+breadth_frame = tk.Frame(notebook)
+notebook.add(breadth_frame, text="Market Breadth")
+sheet_breadth = tksheet.Sheet(breadth_frame, data=[], headers=COLUMNS, show_row_index=False)
+sheet_breadth.pack(fill="both", expand=True)
 
 # 底部按钮
 bottom = tk.Frame(root)

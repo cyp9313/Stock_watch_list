@@ -6,4 +6,10 @@ cd Stock_watch_list
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
-python Market_Watchlist_front_end_local.py
+```
+
+## Windows Usage
+
+后续使用，双击：
+```text
+launch.bat

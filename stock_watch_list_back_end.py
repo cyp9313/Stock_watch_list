@@ -392,8 +392,20 @@ def get_stock_data():
                 "success": False, 
                 "error": "股票代码分组数据为空，请提供有效的JSON格式股票代码分组"
             })
+        
+        # 获取 broad_market_tickers 列表（指数/商品/加密货币等，不需要爬取 SA 财务数据）
+        broad_market_json = request.args.get('broad_market_tickers', '[]')
+        try:
+            broad_market_set = set(json.loads(broad_market_json))
+        except json.JSONDecodeError:
+            broad_market_set = set()
+        
         base_date = datetime.date(datetime.date.today().year - 1, 12, 31).strftime('%Y-%m-%d')
-        all_tickers = [t for group in groups.values() for t in group if t not in ["20MA_Ratio", "50MA_Ratio", "200MA_Ratio"]]
+        # 去重：Dashboard 与 story groups 有大量重复标的，后端只需处理一次
+        all_tickers = list(dict.fromkeys(
+            [t for group in groups.values() for t in group
+             if t not in ["20MA_Ratio", "50MA_Ratio", "200MA_Ratio"]]
+        ))
         
         ny_tz = pytz.timezone('America/New_York')
         current_date_ny = datetime.datetime.now(ny_tz).date()
@@ -405,7 +417,7 @@ def get_stock_data():
         # ===== 批量获取 StockAnalysis 数据（带 SQLite 缓存）=====
         # 在循环之前一次性查询，避免循环内逐只调用
         sa_query_tickers = [t for t in all_tickers
-                           if t not in groups.get("Broad Market", [])
+                           if t not in broad_market_set
                            and t not in groups.get("Market Breadth", [])
                            and should_query_forward_pe(t)]
         print(f"[StockAnalysis] 开始批量查询 {len(sa_query_tickers)} 只股票...")
@@ -413,7 +425,7 @@ def get_stock_data():
         print(f"[StockAnalysis] 查询完成，获取到 {sum(1 for v in sa_data_dict.values() if v and v.get('forward_pe') is not None)}/{len(sa_query_tickers)} 个有效 Forward PE")
 
         for ticker_symbol in all_tickers:
-            if ticker_symbol in groups.get("Broad Market", []) or ticker_symbol in groups.get("Market Breadth", []):
+            if ticker_symbol in broad_market_set or ticker_symbol in groups.get("Market Breadth", []):
                 continue
                 
             try:
