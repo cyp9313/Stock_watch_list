@@ -21,7 +21,7 @@ import threading
 import os
 import sys
 import ctypes
-
+#fafasdf
 # ===== 屏蔽 C 层 stderr（消除 libpng iCCP warning）=====
 # 必须在 import stock_watch_list_back_end 之前执行：
 # 1) C 层 freopen 把 C FILE* stderr → NUL，压制 libpng 的 C 层 fprintf(stderr,...)
