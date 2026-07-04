@@ -48,7 +48,7 @@ API_BASE = "http://127.0.0.1:5000"
 # ── Group definitions (EXACTLY matching tkinter version) ──────
 STOCK_GROUPS = {
     "Mag7": ["AAPL", "MSFT", "GOOG", "AMZN", "META", "TSLA", "NVDA", "SPCX"],
-    "Chips/AI": ["ORCL", "AMD", "INTC", "AVGO", "SMCI", "PLTR", "RGTI", "DXYZ", "SNPS", "APP"],
+    "Chips/AI": ["MU","ORCL", "AMD", "INTC", "AVGO", "SMCI", "PLTR", "RGTI", "DXYZ", "SNPS", "APP"],
     "Fin/Crypto": ["V", "JPM", "BRK-B", "COIN", "HOOD", "MSTR", "CRCL", "SOFI", "OSCR"],
     "Health": ["LLY", "NVO", "ABBV", "UNH"],
     "Energy": ["SMR", "VST", "OKLO", "NEE", "ENPH", "GE", "GEV"],
