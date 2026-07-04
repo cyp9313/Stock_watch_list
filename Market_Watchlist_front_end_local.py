@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import tksheet
 import datetime
+import traceback
 import matplotlib
 import matplotlib.gridspec as gridspec
 import matplotlib.dates as mdates
@@ -526,7 +527,7 @@ def plot_kline():
             ax1.plot(dates, data['indicators']['bollinger_upper'], label='BB Upper', linewidth=1)
             ax1.plot(dates, data['indicators']['bollinger_lower'], label='BB Lower', linewidth=1)
             ax1.axhline(data['indicators']['chip_peak_price'], color='gray', linestyle='--', linewidth=1,label=f"Peak of Chip:{data['indicators']['chip_peak_price']:.2f}")
-            ax1.plot(ohlc_data.index[-1], ohlc_data['Close'][-1], 'rx', markersize=5, label=f"Latest ({ohlc_data.index[-1].date()}:{ohlc_data['Close'][-1]:.2f})")
+            ax1.plot(ohlc_data.index[-1], ohlc_data['Close'].iloc[-1], 'rx', markersize=5, label=f"Latest ({ohlc_data.index[-1].date()}:{ohlc_data['Close'].iloc[-1]:.2f})")
             # 交互功能
             class FibonacciSelector:
                 def __init__(self, ax, dates):
@@ -805,6 +806,18 @@ def plot_kline():
         tk.Button(kline_window, text="关闭", command=kline_window.destroy).pack(pady=10)
 
     except Exception as e:
+        import traceback
+        err_msg = traceback.format_exc()
+        print(err_msg)
+        # 写错误日志到文件
+        try:
+            with open("error_log.txt", "a", encoding="utf-8") as f:
+                f.write(f"\n{'='*60}\n")
+                f.write(f"Time: {datetime.datetime.now()}\n")
+                f.write(f"Error: {str(e)}\n")
+                f.write(f"Traceback:\n{err_msg}\n")
+        except Exception:
+            pass
         messagebox.showerror("错误", f"绘制K线图时出错: {str(e)}")
 
 # ===== GUI初始化 =====
