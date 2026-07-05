@@ -430,7 +430,7 @@ BROAD_MARKET_GROUPS = {
 
 ## Ticker 格式
 
-项目使用 Yahoo Finance ticker 格式。
+项目内部使用 Yahoo Finance ticker 格式，并会在访问 StockAnalysis.com 时自动转换为对应的 StockAnalysis URL 格式。
 
 常见示例：
 
@@ -444,7 +444,16 @@ BROAD_MARKET_GROUPS = {
 - 港股：`3033.HK`
 - 欧洲市场：`WNUC.DE`
 
-StockAnalysis.com 抓取只适合普通股票类 ticker。后端会跳过指数、加密货币、商品、外汇和市场宽度伪 ticker。
+StockAnalysis.com 的代码格式与 yfinance 不同，后端会自动转换常见市场：
+
+- `600519.SS` → `https://stockanalysis.com/quote/sha/600519/`
+- `300750.SZ` → `https://stockanalysis.com/quote/she/300750/`
+- `0700.HK` / `700.HK` → `https://stockanalysis.com/quote/hkg/0700/`
+- `SAP.DE` → `https://stockanalysis.com/quote/etr/SAP/`
+
+K 线输入也支持部分 StockAnalysis 风格代码，例如 `HKG:0700`、`SHA:600519`、`SHE:300750`、`ETR:SAP`，后端会先转换为 yfinance 代码再取价。
+
+StockAnalysis.com 抓取会优先使用普通股票的 `statistics` 页；ETF 或没有 `statistics` 页的标的会回退到 Overview 页读取 `PE Ratio` 等字段。后端会跳过指数、加密货币、商品、外汇和市场宽度伪 ticker。
 
 ## 后端 API
 
@@ -1073,7 +1082,7 @@ Restart the app after editing groups.
 
 ## Ticker Format
 
-The project uses Yahoo Finance ticker format.
+The project uses Yahoo Finance ticker format internally, and automatically converts tickers to the corresponding StockAnalysis.com URL format when scraping fundamentals.
 
 Common examples:
 
@@ -1086,6 +1095,15 @@ Common examples:
 - China A-share / ETF: `510300.SS`, `159915.SZ`
 - Hong Kong stocks: `3033.HK`
 - European market: `WNUC.DE`
+
+Common StockAnalysis.com conversions:
+
+- `600519.SS` → `https://stockanalysis.com/quote/sha/600519/`
+- `300750.SZ` → `https://stockanalysis.com/quote/she/300750/`
+- `0700.HK` / `700.HK` → `https://stockanalysis.com/quote/hkg/0700/`
+- `SAP.DE` → `https://stockanalysis.com/quote/etr/SAP/`
+
+The K-line input also accepts some StockAnalysis-style tickers, such as `HKG:0700`, `SHA:600519`, `SHE:300750`, and `ETR:SAP`; the backend converts them to yfinance format before fetching prices.
 
 StockAnalysis.com scraping is mainly suitable for ordinary stock tickers. The backend skips indexes, cryptocurrencies, commodities, FX, and market-breadth pseudo tickers.
 
@@ -1261,7 +1279,7 @@ Then restart the app. This clears all price cache, fundamental cache, and Beta c
 
 ### Markets Outside US Stocks
 
-The app supports tickers recognized by Yahoo Finance, such as China A-share ETFs, Hong Kong stocks, FX, commodities, and cryptocurrencies. Fundamental scraping is mainly designed for ordinary stocks, so some cross-market tickers are skipped for StockAnalysis.com queries.
+The app supports tickers recognized by Yahoo Finance, such as China A-share ETFs, Hong Kong stocks, FX, commodities, and cryptocurrencies. Fundamental scraping tries the StockAnalysis `statistics` page first for ordinary stocks; ETFs or tickers without a `statistics` page fall back to the Overview page for fields such as `PE Ratio`. Some cross-market tickers are skipped for StockAnalysis.com queries.
 
 ## Development Notes
 

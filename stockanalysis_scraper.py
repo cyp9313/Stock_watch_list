@@ -1,204 +1,222 @@
-"""
-StockAnalysis.com 数据爬取模块（纯爬取，无缓存）
-- 直接爬取 StockAnalysis.com statistics 页面提取 Forward PE、PEG Ratio、Trailing PE、Market Cap、Earnings Date、P/S Ratio、P/B Ratio、分析师评级、Price Target
-- 并发请求（ThreadPoolExecutor）提高速度
-- 缓存逻辑已移至 stock_watch_list_back_end.py
-"""
+"""StockAnalysis.com scraper used by the app-level fundamentals cache."""
 
+import html
 import re
-import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ===== 配置 =====
+import requests
+
+from ticker_mapping import (
+    normalize_yfinance_ticker,
+    should_query_stockanalysis,
+    stockanalysis_candidate_urls,
+)
+
+
 MAX_WORKERS = 5
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/116.0 Safari/537.36"
 }
 
-# 不需要查询的标的（指数、商品、加密货币、汇率等）
-SKIP_PREFIXES = ('^', 'BTC', 'ETH', 'GC=', 'SI=', 'BZ=', 'EUR', 'CL=')
-SKIP_TICKERS = {'20MA_Ratio', '50MA_Ratio', '200MA_Ratio'}
+RESULT_KEYS = (
+    "forward_pe",
+    "peg_ratio",
+    "trailing_pe",
+    "market_cap",
+    "earnings_date",
+    "ps_ratio",
+    "pb_ratio",
+    "analyst_rating",
+    "price_target",
+)
 
 
 def should_query_forward_pe(ticker):
-    """判断该 ticker 是否需要查询"""
-    if ticker in SKIP_TICKERS:
-        return False
-    if any(ticker.startswith(p) for p in SKIP_PREFIXES):
-        return False
-    return True
+    """Return True when StockAnalysis is a suitable source for this ticker."""
+    return should_query_stockanalysis(ticker)
+
+
+def empty_result(raw):
+    return {
+        "forward_pe": None,
+        "peg_ratio": None,
+        "trailing_pe": None,
+        "market_cap": None,
+        "earnings_date": None,
+        "ps_ratio": None,
+        "pb_ratio": None,
+        "analyst_rating": None,
+        "price_target": None,
+        "raw": raw,
+    }
+
+
+def clean_text(value):
+    if value is None:
+        return ""
+    value = re.sub(r"<[^>]+>", "", str(value))
+    value = html.unescape(value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def parse_float(value_str):
+    value_str = clean_text(value_str)
+    if not value_str or value_str.lower() == "n/a":
+        return None
+    match = re.search(r"[-+]?\d+(?:,\d{3})*(?:\.\d+)?|[-+]?\d+(?:\.\d+)?", value_str)
+    if not match:
+        return None
+    try:
+        return float(match.group(0).replace(",", ""))
+    except ValueError:
+        return None
 
 
 def parse_market_cap(value_str):
-    """解析 Market Cap 字符串如 '4.53T', '109.90B', '493.75M' 为浮点数"""
-    if not value_str or value_str in ("n/a", "", "N/A"):
+    value_str = clean_text(value_str)
+    if not value_str or value_str.lower() == "n/a":
         return None
     try:
-        value_str = value_str.strip()
-        if value_str.endswith('T'):
-            return float(value_str[:-1]) * 1e12
-        elif value_str.endswith('B'):
-            return float(value_str[:-1]) * 1e9
-        elif value_str.endswith('M'):
-            return float(value_str[:-1]) * 1e6
-        else:
-            return float(value_str.replace(",", ""))
+        match = re.search(r"([-+]?\d+(?:\.\d+)?)\s*([TtBbMmKk]?)", value_str.replace(",", ""))
+        if not match:
+            return None
+        value = float(match.group(1))
+        suffix = match.group(2).upper()
+        if suffix == "T":
+            return value * 1e12
+        if suffix == "B":
+            return value * 1e9
+        if suffix == "M":
+            return value * 1e6
+        if suffix == "K":
+            return value * 1e3
+        return value
     except (ValueError, TypeError):
         return None
 
 
+def extract_js_value(text, title):
+    match = re.search(rf'{re.escape(title)}",value:"([^"]+)"', text)
+    return match.group(1) if match else None
+
+
+def extract_table_value(text, label):
+    pattern = (
+        rf'<(?:td|th)[^>]*>\s*{re.escape(label)}\s*</(?:td|th)>\s*'
+        rf'<td[^>]*>(.*?)</td>'
+    )
+    match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+    return clean_text(match.group(1)) if match else None
+
+
+def has_useful_data(data):
+    return any(data.get(key) is not None for key in RESULT_KEYS)
+
+
+def parse_stockanalysis_page(text, source_url):
+    result = empty_result("")
+    raw_parts = [f"source={source_url}"]
+
+    # Stock statistics pages use embedded JS data. ETF and many non-US overview
+    # pages expose the relevant data in the visible two-column overview table.
+    forward_pe_raw = extract_js_value(text, "Forward PE") or extract_table_value(text, "Forward PE")
+    if forward_pe_raw:
+        raw_parts.append(f"pe={forward_pe_raw}")
+        result["forward_pe"] = parse_float(forward_pe_raw)
+
+    peg_raw = extract_js_value(text, "PEG Ratio") or extract_table_value(text, "PEG Ratio")
+    if peg_raw:
+        raw_parts.append(f"peg={peg_raw}")
+        result["peg_ratio"] = parse_float(peg_raw)
+
+    trailing_pe_raw = extract_js_value(text, "PE Ratio") or extract_table_value(text, "PE Ratio")
+    if trailing_pe_raw:
+        raw_parts.append(f"trail_pe={trailing_pe_raw}")
+        result["trailing_pe"] = parse_float(trailing_pe_raw)
+
+    market_cap_raw = (
+        extract_js_value(text, "Market Cap")
+        or extract_table_value(text, "Market Cap")
+        or extract_table_value(text, "Assets")
+    )
+    if market_cap_raw:
+        raw_parts.append(f"mcap={market_cap_raw}")
+        result["market_cap"] = parse_market_cap(market_cap_raw)
+
+    earnings_raw = extract_js_value(text, "Earnings Date") or extract_table_value(text, "Earnings Date")
+    if earnings_raw:
+        raw_parts.append(f"earnings={earnings_raw}")
+        if earnings_raw.lower() != "n/a":
+            result["earnings_date"] = earnings_raw
+
+    ps_raw = extract_js_value(text, "PS Ratio") or extract_table_value(text, "PS Ratio")
+    if ps_raw:
+        raw_parts.append(f"ps={ps_raw}")
+        result["ps_ratio"] = parse_float(ps_raw)
+
+    pb_raw = extract_js_value(text, "PB Ratio") or extract_table_value(text, "PB Ratio")
+    if pb_raw:
+        raw_parts.append(f"pb={pb_raw}")
+        result["pb_ratio"] = parse_float(pb_raw)
+
+    rating_raw = extract_js_value(text, "Analyst Consensus") or extract_table_value(text, "Analyst Consensus")
+    if rating_raw:
+        raw_parts.append(f"rating={rating_raw}")
+        if rating_raw.lower() != "n/a":
+            result["analyst_rating"] = rating_raw
+
+    target_raw = extract_js_value(text, "Price Target") or extract_table_value(text, "Price Target")
+    if target_raw:
+        raw_parts.append(f"target={target_raw}")
+        result["price_target"] = parse_float(target_raw)
+
+    result["raw"] = ", ".join(raw_parts) if has_useful_data(result) else f"source={source_url}, not_found"
+    return result
+
+
 def scrape_stock_analysis(ticker):
     """
-    从 StockAnalysis.com 抓取单只股票的 Forward PE、PEG Ratio、Trailing PE、Market Cap、Earnings Date、P/S Ratio、P/B Ratio、分析师评级、Price Target
-    返回: dict {
-        "forward_pe": float or None,
-        "peg_ratio": float or None,
-        "trailing_pe": float or None,
-        "market_cap": float or None,
-        "earnings_date": str or None,
-        "ps_ratio": float or None,
-        "pb_ratio": float or None,
-        "analyst_rating": str or None,
-        "price_target": float or None,
-        "raw": str  (用于调试的原始值摘要)
-    }
+    Fetch one ticker's StockAnalysis fundamentals.
+
+    Stocks try the statistics page first. ETF and instruments without a
+    statistics page fall back to overview pages, where PE Ratio is the trailing
+    PE used by the chart title and watch-list table.
     """
-    sa_ticker = ticker.replace('-', '.')
-    url = f"https://stockanalysis.com/stocks/{sa_ticker}/statistics/"
+    urls = stockanalysis_candidate_urls(ticker)
+    if not urls:
+        return empty_result("unsupported_ticker")
 
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-    except Exception as e:
-        return {"forward_pe": None, "peg_ratio": None, "trailing_pe": None, "market_cap": None,
-                "earnings_date": None, "ps_ratio": None, "pb_ratio": None,
-                "analyst_rating": None, "price_target": None,
-                "raw": f"request_error: {e}"}
+    failures = []
+    for url in urls:
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=15)
+        except Exception as e:
+            failures.append(f"{url}: request_error: {e}")
+            continue
 
-    if resp.status_code != 200:
-        return {"forward_pe": None, "peg_ratio": None, "trailing_pe": None, "market_cap": None,
-                "earnings_date": None, "ps_ratio": None, "pb_ratio": None,
-                "analyst_rating": None, "price_target": None,
-                "raw": f"http_{resp.status_code}"}
+        if resp.status_code != 200:
+            failures.append(f"{url}: http_{resp.status_code}")
+            continue
 
-    text = resp.text
-    result = {"forward_pe": None, "peg_ratio": None, "trailing_pe": None, "market_cap": None,
-              "earnings_date": None, "ps_ratio": None, "pb_ratio": None,
-              "analyst_rating": None, "price_target": None, "raw": ""}
-    raw_parts = []
+        result = parse_stockanalysis_page(resp.text, url)
+        if has_useful_data(result):
+            return result
+        failures.append(result["raw"])
 
-    # --- Forward PE ---
-    # 格式: Forward PE",value:"33.88" 或 Forward PE",value:"n/a"
-    pe_match = re.search(r'Forward PE",value:"([^"]+)"', text)
-    if pe_match:
-        raw_pe = pe_match.group(1)
-        raw_parts.append(f"pe={raw_pe}")
-        if raw_pe not in ("n/a", "", "N/A"):
-            try:
-                result["forward_pe"] = float(raw_pe)
-            except ValueError:
-                pass
-
-    # --- PEG Ratio ---
-    # 格式: pegRatio",title:"PEG Ratio",value:"2.95" 或 value:"n/a"
-    peg_match = re.search(r'pegRatio",title:"PEG Ratio",value:"([^"]+)"', text)
-    if peg_match:
-        raw_peg = peg_match.group(1)
-        raw_parts.append(f"peg={raw_peg}")
-        if raw_peg not in ("n/a", "", "N/A"):
-            try:
-                result["peg_ratio"] = float(raw_peg)
-            except ValueError:
-                pass
-
-    # --- Trailing PE (PE Ratio) ---
-    # 格式: pe",title:"PE Ratio",value:"37.41" 或 value:"n/a"
-    # 注意：只用 id:"pe" (不含 Forward)，区别于 id:"peForward"
-    trail_pe_match = re.search(r'pe",title:"PE Ratio",value:"([^"]+)"', text)
-    if trail_pe_match:
-        raw_trail_pe = trail_pe_match.group(1)
-        raw_parts.append(f"trail_pe={raw_trail_pe}")
-        if raw_trail_pe not in ("n/a", "", "N/A"):
-            try:
-                result["trailing_pe"] = float(raw_trail_pe)
-            except ValueError:
-                pass
-
-    # --- Market Cap ---
-    # 格式: marketcap",title:"Market Cap",value:"4.53T" 或 value:"n/a"
-    mcap_match = re.search(r'marketcap",title:"Market Cap",value:"([^"]+)"', text)
-    if mcap_match:
-        raw_mcap = mcap_match.group(1)
-        raw_parts.append(f"mcap={raw_mcap}")
-        if raw_mcap not in ("n/a", "", "N/A"):
-            result["market_cap"] = parse_market_cap(raw_mcap)
-
-    # --- Earnings Date ---
-    # 格式: earningsdate",title:"Earnings Date",value:"Jul 30, 2026" 或 value:"n/a"
-    ed_match = re.search(r'earningsdate",title:"Earnings Date",value:"([^"]+)"', text)
-    if ed_match:
-        raw_ed = ed_match.group(1)
-        raw_parts.append(f"earnings={raw_ed}")
-        if raw_ed not in ("n/a", "", "N/A"):
-            result["earnings_date"] = raw_ed
-
-    # --- P/S Ratio ---
-    # 格式: ps",title:"PS Ratio",value:"10.04" 或 value:"n/a"
-    ps_match = re.search(r'ps",title:"PS Ratio",value:"([^"]+)"', text)
-    if ps_match:
-        raw_ps = ps_match.group(1)
-        raw_parts.append(f"ps={raw_ps}")
-        if raw_ps not in ("n/a", "", "N/A"):
-            try:
-                result["ps_ratio"] = float(raw_ps)
-            except ValueError:
-                pass
-
-    # --- P/B Ratio ---
-    # 格式: pb",title:"PB Ratio",value:"42.51" 或 value:"n/a"
-    pb_match = re.search(r'pb",title:"PB Ratio",value:"([^"]+)"', text)
-    if pb_match:
-        raw_pb = pb_match.group(1)
-        raw_parts.append(f"pb={raw_pb}")
-        if raw_pb not in ("n/a", "", "N/A"):
-            try:
-                result["pb_ratio"] = float(raw_pb)
-            except ValueError:
-                pass
-
-    # --- Analyst Consensus Rating ---
-    # 格式: analystRatings",title:"Analyst Consensus",value:"Strong Buy"
-    rating_match = re.search(r'analystRatings",title:"Analyst Consensus",value:"([^"]+)"', text)
-    if rating_match:
-        rating = rating_match.group(1)
-        raw_parts.append(f"rating={rating}")
-        if rating not in ("n/a", "", "N/A"):
-            result["analyst_rating"] = rating
-
-    # --- Price Target ---
-    # 格式: priceTarget",title:"Price Target",value:"$315.09"
-    target_match = re.search(r'priceTarget",title:"Price Target",value:"([^"]+)"', text)
-    if target_match:
-        target_str = target_match.group(1)
-        raw_parts.append(f"target={target_str}")
-        if target_str not in ("n/a", "", "N/A"):
-            # 去掉 $ 符号
-            target_clean = target_str.replace("$", "").replace(",", "")
-            try:
-                result["price_target"] = float(target_clean)
-            except ValueError:
-                pass
-
-    result["raw"] = ", ".join(raw_parts) if raw_parts else "not_found"
-    return result
+    return empty_result("; ".join(failures) if failures else "not_found")
 
 
 def scrape_batch(tickers):
     """
-    并发爬取多只股票的 StockAnalysis 数据（无缓存，纯爬取）
-    返回: dict {ticker: {"forward_pe": float/None, "peg_ratio": float/None, "trailing_pe": float/None, "market_cap": float/None, "earnings_date": str/None, "ps_ratio": float/None, "pb_ratio": float/None, "analyst_rating": str/None, "price_target": float/None, "raw": str}}
+    Concurrently fetch StockAnalysis data.
+
+    Returns {ticker: data} using normalized yfinance tickers as keys.
     """
-    query_tickers = [t for t in tickers if should_query_forward_pe(t)]
+    query_tickers = [
+        t for t in list(dict.fromkeys(normalize_yfinance_ticker(t) for t in tickers))
+        if should_query_forward_pe(t)
+    ]
     if not query_tickers:
         return {}
 
@@ -222,26 +240,27 @@ def scrape_batch(tickers):
             pb_str = f"{data['pb_ratio']}" if data["pb_ratio"] is not None else "N/A"
             rating_str = data["analyst_rating"] or "N/A"
             target_str = f"${data['price_target']}" if data["price_target"] is not None else "N/A"
-            print(f"[StockAnalysis] {ticker}: PE={pe_str}, PEG={peg_str}, TrailPE={trail_str}, MCap={mcap_str}, Earnings={ed_str}, PS={ps_str}, PB={pb_str}, Rating={rating_str}, Target={target_str} (raw: {data['raw']})")
+            print(
+                f"[StockAnalysis] {ticker}: PE={pe_str}, PEG={peg_str}, "
+                f"TrailPE={trail_str}, MCap={mcap_str}, Earnings={ed_str}, "
+                f"PS={ps_str}, PB={pb_str}, Rating={rating_str}, Target={target_str} "
+                f"(raw: {data['raw']})"
+            )
 
     return results
 
 
 if __name__ == "__main__":
-    # 测试
-    test_tickers = ["AAPL", "MSFT", "GOOG", "AMZN", "META", "TSLA", "NVDA",
-                    "AMD", "INTC", "BRK-B", "BYDDY", "SPCX"]
+    test_tickers = ["AAPL", "MSFT", "QQQ", "SPY", "2800.HK", "510300.SS", "BRK-B"]
     result = scrape_batch(test_tickers)
-    print("\n=== 测试结果 ===")
+    print("\n=== Test result ===")
     for t, data in result.items():
-        pe = data["forward_pe"]
-        peg = data["peg_ratio"]
-        trail = data["trailing_pe"]
         mcap = data["market_cap"]
-        ed = data["earnings_date"]
-        ps = data["ps_ratio"]
-        pb = data["pb_ratio"]
-        rating = data["analyst_rating"]
-        target = data["price_target"]
         mcap_display = f"{mcap:,.0f}" if mcap else "N/A"
-        print(f"  {t}: Forward PE={pe}, PEG Ratio={peg}, Trailing PE={trail}, MCap={mcap_display}, Earnings={ed}, PS={ps}, PB={pb}, Analysts={rating}, Price Target={target}")
+        print(
+            f"  {t}: Forward PE={data['forward_pe']}, PEG Ratio={data['peg_ratio']}, "
+            f"Trailing PE={data['trailing_pe']}, MCap={mcap_display}, "
+            f"Earnings={data['earnings_date']}, PS={data['ps_ratio']}, "
+            f"PB={data['pb_ratio']}, Analysts={data['analyst_rating']}, "
+            f"Price Target={data['price_target']}"
+        )

@@ -15,6 +15,7 @@ import datetime
 import time
 import threading
 import colorsys
+from ticker_mapping import normalize_yfinance_ticker, stockanalysis_overview_url
 
 # ── Page config ──────────────────────────────────────────────
 st.set_page_config(
@@ -78,6 +79,18 @@ BROAD_MARKET_GROUPS = {
 BREADTH_GROUPS = {
     "Market Breadth": ["20MA_Ratio", "50MA_Ratio", "200MA_Ratio"]
 }
+
+
+def normalize_group_tickers(group_map):
+    return {
+        group_name: [normalize_yfinance_ticker(ticker) for ticker in tickers]
+        for group_name, tickers in group_map.items()
+    }
+
+
+STOCK_GROUPS = normalize_group_tickers(STOCK_GROUPS)
+BROAD_MARKET_GROUPS = normalize_group_tickers(BROAD_MARKET_GROUPS)
+BREADTH_GROUPS = normalize_group_tickers(BREADTH_GROUPS)
 
 # Merge all groups (for API call)
 ALL_GROUPS = {**STOCK_GROUPS, **BROAD_MARKET_GROUPS, **BREADTH_GROUPS}
@@ -501,7 +514,7 @@ def build_kline_chart(kline_data, ticker, fib_levels=None):
                 return str(v)
         return str(v)
 
-    sa_url = f"https://stockanalysis.com/stocks/{ticker.lower().replace('-', '.')}/"
+    sa_url = stockanalysis_overview_url(ticker)
     title = (
         f"<b>K-Curve {ticker}</b> | "
         f"Market Cap: {_fmt(fin.get('market_cap'))}, "
@@ -746,13 +759,14 @@ def build_kline_chart(kline_data, ticker, fib_levels=None):
     )
 
     # StockAnalysis clickable link (top-right, matching tkinter version)
-    fig.add_annotation(
-        text=f"<a href='{sa_url}' style='color:blue; font-style:italic; font-size:12px;'>{sa_url}</a>",
-        xref="paper", yref="paper",
-        x=0.99, y=1.10,
-        xanchor="right", yanchor="top",
-        showarrow=False,
-    )
+    if sa_url:
+        fig.add_annotation(
+            text=f"<a href='{sa_url}' style='color:blue; font-style:italic; font-size:12px;'>{sa_url}</a>",
+            xref="paper", yref="paper",
+            x=0.99, y=1.10,
+            xanchor="right", yanchor="top",
+            showarrow=False,
+        )
 
     # Hide x-axis labels on all but the bottom subplot
     for r in range(1, 6):

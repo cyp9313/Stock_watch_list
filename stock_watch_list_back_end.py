@@ -18,6 +18,7 @@ import warnings
 warnings.filterwarnings('ignore')
 import requests_cache
 from stockanalysis_scraper import scrape_batch, should_query_forward_pe
+from ticker_mapping import normalize_yfinance_ticker
 
 # 加载 .env 文件中的环境变量
 load_dotenv()
@@ -152,6 +153,7 @@ def get_cached_stock_analysis(all_tickers):
     3. 查到后写入缓存
     返回: dict {ticker: {"forward_pe": float/None, "peg_ratio": float/None, "trailing_pe": float/None, "market_cap": float/None, "earnings_date": str/None, "ps_ratio": float/None, "pb_ratio": float/None, "analyst_rating": str/None, "price_target": float/None}}
     """
+    all_tickers = list(dict.fromkeys(normalize_yfinance_ticker(t) for t in all_tickers))
     query_tickers = [t for t in all_tickers if should_query_forward_pe(t)]
     if not query_tickers:
         return {}
@@ -164,11 +166,11 @@ def get_cached_stock_analysis(all_tickers):
     # 1. 查缓存
     for t in query_tickers:
         row = conn.execute(
-            "SELECT forward_pe, peg_ratio, trailing_pe, market_cap, earnings_date, ps_ratio, pb_ratio, analyst_rating, price_target FROM stock_analysis_data WHERE ticker=? AND date=?",
+            "SELECT forward_pe, peg_ratio, trailing_pe, market_cap, earnings_date, ps_ratio, pb_ratio, analyst_rating, price_target, raw_answer FROM stock_analysis_data WHERE ticker=? AND date=?",
             (t, today),
         ).fetchone()
         if row:
-            results[t] = {
+            cached_data = {
                 "forward_pe": row[0],
                 "peg_ratio": row[1],
                 "trailing_pe": row[2],
@@ -179,6 +181,16 @@ def get_cached_stock_analysis(all_tickers):
                 "analyst_rating": row[7],
                 "price_target": row[8],
             }
+            raw_answer = row[9] or ""
+            old_empty_failure = (
+                not any(cached_data.values())
+                and not raw_answer.startswith("source=")
+                and any(token in raw_answer for token in ("http_404", "not_found", "request_error"))
+            )
+            if old_empty_failure:
+                missing.append(t)
+            else:
+                results[t] = cached_data
         else:
             missing.append(t)
 
@@ -529,6 +541,13 @@ def get_financial_info(ticker, attr_name, default_value=None):
     except Exception:
         return default_value
 
+
+def normalize_groups_for_yfinance(groups):
+    return {
+        group_name: [normalize_yfinance_ticker(ticker) for ticker in tickers]
+        for group_name, tickers in groups.items()
+    }
+
 def get_sp500_symbols():
     """获取标普500成分股"""
     try:
@@ -685,6 +704,7 @@ def get_stock_data():
                 "success": False, 
                 "error": "股票代码分组数据格式错误，请提供有效的JSON格式"
             })
+        groups = normalize_groups_for_yfinance(groups)
         
         # 如果客户端没有提供分组，使用默认分组（可选）
         if not groups:
@@ -696,7 +716,7 @@ def get_stock_data():
         # 获取 broad_market_tickers 列表（指数/商品/加密货币等，不需要爬取 SA 财务数据）
         broad_market_json = request.args.get('broad_market_tickers', '[]')
         try:
-            broad_market_set = set(json.loads(broad_market_json))
+            broad_market_set = set(normalize_yfinance_ticker(t) for t in json.loads(broad_market_json))
         except json.JSONDecodeError:
             broad_market_set = set()
         
@@ -1220,7 +1240,7 @@ def get_breadth_data():
 def get_kline_data():
     """获取K线图数据"""
     try:
-        ticker = request.args.get('ticker', '').upper()
+        ticker = normalize_yfinance_ticker(request.args.get('ticker', ''))
         time_span = max(1, int(request.args.get('period', 365)))
         interval = request.args.get('interval', '1d')
         

@@ -24,6 +24,7 @@ import os
 import sys
 import ctypes
 import time
+from ticker_mapping import normalize_yfinance_ticker, stockanalysis_overview_url
 
 # ===== 屏蔽 C 层 stderr（消除 libpng iCCP warning）=====
 # 必须在 import stock_watch_list_back_end 之前执行：
@@ -89,13 +90,24 @@ broad_market_groups = {
     "Crypto": ["BTC-USD", "ETH-USD"],
     "Strat Resources": ["WNUC.DE", "REMX"],
 }
+breadth_groups = {
+    "Market Breadth": ["20MA_Ratio", "50MA_Ratio", "200MA_Ratio"]
+}
+
+def normalize_group_tickers(group_map):
+    return {
+        group_name: [normalize_yfinance_ticker(ticker) for ticker in tickers]
+        for group_name, tickers in group_map.items()
+    }
+
+stock_groups = normalize_group_tickers(stock_groups)
+broad_market_groups = normalize_group_tickers(broad_market_groups)
+breadth_groups = normalize_group_tickers(breadth_groups)
+
 # 去重后的 broad market tickers 列表（Dashboard 与 story groups 有大量重复）
 broad_market_tickers = list(dict.fromkeys(
     [t for tickers in broad_market_groups.values() for t in tickers]
 ))
-breadth_groups = {
-    "Market Breadth": ["20MA_Ratio", "50MA_Ratio", "200MA_Ratio"]
-}
 # 合并字典，用于 API 调用（后端需要完整 groups）
 groups = {**stock_groups, **broad_market_groups, **breadth_groups}
 
@@ -818,24 +830,25 @@ def plot_kline():
             ax1.set_title(f"K-Curve {ticker} | Market Cap: {data['financials']['market_cap']}, PE: {data['financials']['trailing_pe']}/{data['financials']['forward_pe']}, P/S: {data['financials']['price_to_sales']}, P/B: {data['financials']['price_to_book']}, PEG: {data['financials']['peg_ratio']}, Next Earnings: {data['financials']['next_earnings']}, Analysts: {data['financials'].get('analyst_rating', 'N/A')}, Target: {data['financials'].get('price_target', 'N/A')}")
 
             # StockAnalysis 链接（可点击跳转浏览器）
-            sa_url = f"https://stockanalysis.com/stocks/{ticker.replace('-', '.')}/"
-            link_text = fig.text(0.99, 0.985, sa_url,
-                                 ha='right', va='top',
-                                 fontsize=7, color='blue', style='italic')
+            sa_url = stockanalysis_overview_url(ticker)
+            if sa_url:
+                link_text = fig.text(0.99, 0.985, sa_url,
+                                     ha='right', va='top',
+                                     fontsize=7, color='blue', style='italic')
 
-            def _on_sa_link_click(event, _url=sa_url, _txt=link_text):
-                # 只处理 axes 外的点击（标题/边缘区域）
-                if event.inaxes is not None:
-                    return
-                try:
-                    renderer = fig.canvas.get_renderer()
-                except Exception:
-                    return
-                bbox = _txt.get_window_extent(renderer=renderer)
-                if bbox.contains(event.x, event.y):
-                    webbrowser.open(_url)
+                def _on_sa_link_click(event, _url=sa_url, _txt=link_text):
+                    # 只处理 axes 外的点击（标题/边缘区域）
+                    if event.inaxes is not None:
+                        return
+                    try:
+                        renderer = fig.canvas.get_renderer()
+                    except Exception:
+                        return
+                    bbox = _txt.get_window_extent(renderer=renderer)
+                    if bbox.contains(event.x, event.y):
+                        webbrowser.open(_url)
 
-            fig.canvas.mpl_connect('button_press_event', _on_sa_link_click)
+                fig.canvas.mpl_connect('button_press_event', _on_sa_link_click)
             ax1.legend()
             ax1.grid(True)
             ax2.tick_params(axis='x', labelbottom=False) 
