@@ -9,7 +9,7 @@ import os
 import requests
 from io import StringIO
 from dotenv import load_dotenv
-# import time
+import concurrent.futures
 # import random
 import pytz
 import fear_and_greed 
@@ -669,105 +669,149 @@ def get_stock_data():
         current_date_ny = datetime.datetime.now(ny_tz).date()
         earnings_df = pd.DataFrame(columns=["Next Earnings","Trailing PE","Forward PE","PEG Ratio","Market Cap","Analysts","Price Target"])
         
-        # 获取财务数据
-        tickers_obj = yf.Tickers(" ".join(all_tickers))
-
         # ===== 批量获取 StockAnalysis 数据（带 SQLite 缓存）=====
         # 在循环之前一次性查询，避免循环内逐只调用
         sa_query_tickers = [t for t in all_tickers
                            if t not in broad_market_set
                            and t not in groups.get("Market Breadth", [])
                            and should_query_forward_pe(t)]
-        print(f"[StockAnalysis] 开始批量查询 {len(sa_query_tickers)} 只股票...")
         sa_data_dict = get_cached_stock_analysis(sa_query_tickers)
-        print(f"[StockAnalysis] 查询完成，获取到 {sum(1 for v in sa_data_dict.values() if v and v.get('forward_pe') is not None)}/{len(sa_query_tickers)} 个有效 Forward PE")
+
+        # ===== Phase 1: 确定哪些标的需要 yfinance 调用 =====
+        # SA 已有 earnings_date → 不需要 yfinance calendar
+        # SA 已有 trailing_pe/peg_ratio/market_cap → 不需要 yfinance .info
+        tickers_need_earnings_yf = set()
+        tickers_need_info_yf = set()
 
         for ticker_symbol in all_tickers:
             if ticker_symbol in broad_market_set or ticker_symbol in groups.get("Market Breadth", []):
                 continue
-                
+
+            sa_data = sa_data_dict.get(ticker_symbol)
+
+            # SA 没有 earnings_date → 需要 yfinance calendar/earnings_dates
+            if sa_data is None or not sa_data.get("earnings_date"):
+                tickers_need_earnings_yf.add(ticker_symbol)
+
+            # SA 缺少 trailing_pe / peg_ratio / market_cap → 需要 yfinance .info
+            if sa_data is None:
+                tickers_need_info_yf.add(ticker_symbol)
+            else:
+                if (sa_data.get("trailing_pe") is None or
+                        sa_data.get("peg_ratio") is None or
+                        sa_data.get("market_cap") is None):
+                    tickers_need_info_yf.add(ticker_symbol)
+
+        # ===== Phase 2: 并行获取 yfinance 数据 =====
+        need_yf = tickers_need_earnings_yf | tickers_need_info_yf
+
+        def _fetch_yf_data(ticker_symbol):
+            """并行获取单个标的的 yfinance 财报日期和 .info"""
+            result = {'earnings_date': None, 'info': {}}
             try:
-                ticker = tickers_obj.tickers[ticker_symbol]
-                next_earnings_date = None
-                
-                # 获取财报日期
-                calendar = ticker.calendar
-                if calendar and 'Earnings Date' in calendar and calendar['Earnings Date']:
-                    next_earnings_date = calendar['Earnings Date'][0]
-                
-                if next_earnings_date is None:
-                    earnings_data = ticker.get_earnings_dates()
-                    if earnings_data is not None and not earnings_data.empty:
-                        unreported = earnings_data[earnings_data['Reported EPS'].isna()]
-                        if not unreported.empty:
-                            next_earnings_date = unreported.index[0]
-                
+                ticker = yf.Ticker(ticker_symbol)
+
+                if ticker_symbol in tickers_need_earnings_yf:
+                    calendar = ticker.calendar
+                    if calendar and 'Earnings Date' in calendar and calendar['Earnings Date']:
+                        result['earnings_date'] = calendar['Earnings Date'][0]
+
+                    if result['earnings_date'] is None:
+                        earnings_data = ticker.get_earnings_dates()
+                        if earnings_data is not None and not earnings_data.empty:
+                            unreported = earnings_data[earnings_data['Reported EPS'].isna()]
+                            if not unreported.empty:
+                                result['earnings_date'] = unreported.index[0]
+
+                if ticker_symbol in tickers_need_info_yf:
+                    result['info'] = ticker.info  # 一次性获取整个 dict
+            except Exception as e:
+                print(f"获取{ticker_symbol}财报数据失败: {e}")
+
+            return ticker_symbol, result
+
+        yf_data = {}
+        if need_yf:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                futures = [executor.submit(_fetch_yf_data, t) for t in need_yf]
+                for future in concurrent.futures.as_completed(futures):
+                    ticker_symbol, result = future.result()
+                    yf_data[ticker_symbol] = result
+
+        # ===== Phase 3: 构建 earnings_df（无 API 调用，纯内存操作）=====
+        for ticker_symbol in all_tickers:
+            if ticker_symbol in broad_market_set or ticker_symbol in groups.get("Market Breadth", []):
+                continue
+
+            try:
                 sa_data = sa_data_dict.get(ticker_symbol)
+                yf_result = yf_data.get(ticker_symbol, {'earnings_date': None, 'info': {}})
+                yf_earnings = yf_result.get('earnings_date')
+                yf_info = yf_result.get('info', {})
 
                 # ===== Next Earnings：优先 StockAnalysis，缺省 fallback yfinance =====
                 if sa_data is not None and sa_data.get("earnings_date"):
                     try:
                         ed_date = datetime.datetime.strptime(sa_data["earnings_date"], "%b %d, %Y").date()
                         if ed_date and ed_date >= current_date_ny:
-                            earnings_df.loc[ticker_symbol,"Next Earnings"] = ed_date
+                            earnings_df.loc[ticker_symbol, "Next Earnings"] = ed_date
                         else:
-                            earnings_df.loc[ticker_symbol,"Next Earnings"] = None
+                            earnings_df.loc[ticker_symbol, "Next Earnings"] = None
                     except (ValueError, TypeError):
-                        earnings_df.loc[ticker_symbol,"Next Earnings"] = None
+                        earnings_df.loc[ticker_symbol, "Next Earnings"] = None
                 else:
-                    # Fallback: yfinance
-                    if next_earnings_date is not None:
-                        if isinstance(next_earnings_date, pd.Timestamp):
-                            earnings_date = next_earnings_date.date()
-                        elif isinstance(next_earnings_date, datetime.datetime):
-                            earnings_date = next_earnings_date.date()
-                        elif isinstance(next_earnings_date, datetime.date):
-                            earnings_date = next_earnings_date
+                    # Fallback: yfinance（使用预取数据，无 API 调用）
+                    if yf_earnings is not None:
+                        if isinstance(yf_earnings, pd.Timestamp):
+                            earnings_date = yf_earnings.date()
+                        elif isinstance(yf_earnings, datetime.datetime):
+                            earnings_date = yf_earnings.date()
+                        elif isinstance(yf_earnings, datetime.date):
+                            earnings_date = yf_earnings
                         else:
                             earnings_date = None
                         if earnings_date and earnings_date < current_date_ny:
-                            earnings_df.loc[ticker_symbol,"Next Earnings"] = None
+                            earnings_df.loc[ticker_symbol, "Next Earnings"] = None
                         else:
-                            earnings_df.loc[ticker_symbol,"Next Earnings"] = earnings_date
+                            earnings_df.loc[ticker_symbol, "Next Earnings"] = earnings_date
                     else:
-                        earnings_df.loc[ticker_symbol,"Next Earnings"] = None
+                        earnings_df.loc[ticker_symbol, "Next Earnings"] = None
 
                 # ===== Trailing PE：优先 StockAnalysis，缺省 fallback yfinance =====
                 if sa_data is not None:
                     trail_pe = sa_data.get("trailing_pe")
                     if trail_pe is None:
-                        trail_pe = ticker.info.get('trailingPE', None)
-                    earnings_df.loc[ticker_symbol,"Trailing PE"] = trail_pe
+                        trail_pe = yf_info.get('trailingPE', None)
+                    earnings_df.loc[ticker_symbol, "Trailing PE"] = trail_pe
                 else:
-                    earnings_df.loc[ticker_symbol,"Trailing PE"] = ticker.info.get('trailingPE', None)
+                    earnings_df.loc[ticker_symbol, "Trailing PE"] = yf_info.get('trailingPE', None)
 
                 # ===== Forward PE、PEG Ratio、Analysts、Price Target =====
                 if sa_data is not None:
-                    earnings_df.loc[ticker_symbol,"Forward PE"] = sa_data.get("forward_pe")
-                    # PEG Ratio：StockAnalysis 缺省时 fallback 到 yfinance
+                    earnings_df.loc[ticker_symbol, "Forward PE"] = sa_data.get("forward_pe")
                     peg_val = sa_data.get("peg_ratio")
                     if peg_val is None:
-                        peg_val = ticker.info.get('trailingPegRatio', None)
-                    earnings_df.loc[ticker_symbol,"PEG Ratio"] = peg_val
-                    earnings_df.loc[ticker_symbol,"Analysts"] = sa_data.get("analyst_rating")
-                    earnings_df.loc[ticker_symbol,"Price Target"] = sa_data.get("price_target")
+                        peg_val = yf_info.get('trailingPegRatio', None)
+                    earnings_df.loc[ticker_symbol, "PEG Ratio"] = peg_val
+                    earnings_df.loc[ticker_symbol, "Analysts"] = sa_data.get("analyst_rating")
+                    earnings_df.loc[ticker_symbol, "Price Target"] = sa_data.get("price_target")
                 else:
-                    earnings_df.loc[ticker_symbol,"Forward PE"] = ticker.info.get('forwardPE', None)
-                    earnings_df.loc[ticker_symbol,"PEG Ratio"] = ticker.info.get('trailingPegRatio', None)
-                    earnings_df.loc[ticker_symbol,"Analysts"] = None
-                    earnings_df.loc[ticker_symbol,"Price Target"] = None
+                    earnings_df.loc[ticker_symbol, "Forward PE"] = yf_info.get('forwardPE', None)
+                    earnings_df.loc[ticker_symbol, "PEG Ratio"] = yf_info.get('trailingPegRatio', None)
+                    earnings_df.loc[ticker_symbol, "Analysts"] = None
+                    earnings_df.loc[ticker_symbol, "Price Target"] = None
 
                 # ===== Market Cap：优先 StockAnalysis，缺省 fallback yfinance =====
                 if sa_data is not None:
                     mcap = sa_data.get("market_cap")
                     if mcap is None:
-                        mcap = ticker.info.get('marketCap', None)
-                    earnings_df.loc[ticker_symbol,"Market Cap"] = mcap
+                        mcap = yf_info.get('marketCap', None)
+                    earnings_df.loc[ticker_symbol, "Market Cap"] = mcap
                 else:
-                    earnings_df.loc[ticker_symbol,"Market Cap"] = ticker.info.get('marketCap', None)
-                    
+                    earnings_df.loc[ticker_symbol, "Market Cap"] = yf_info.get('marketCap', None)
+
             except Exception as e:
-                print(f"获取{ticker_symbol}财报日期失败: {e}")
+                print(f"构建{ticker_symbol}财报数据失败: {e}")
                 earnings_df.loc[ticker_symbol] = None
 
         # 获取价格数据（增量更新：已有标的只下载最近几天，新标的全量下载）
