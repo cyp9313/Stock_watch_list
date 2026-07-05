@@ -24,6 +24,75 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+THEMES = {
+    "light": {
+        "page_bg": "#ffffff",
+        "panel_bg": "#f8fafc",
+        "text": "#263238",
+        "muted": "#607d8b",
+        "table_bg": "#ffffff",
+        "table_header_bg": "#f0f0f0",
+        "table_group_bg": "#cccccc",
+        "table_border": "#cccccc",
+        "plot_template": "plotly_white",
+        "plot_bg": "#ffffff",
+        "grid": "#e5e7eb",
+        "link": "blue",
+    },
+    "dark": {
+        "page_bg": "#0b1020",
+        "panel_bg": "#111827",
+        "text": "#e5e7eb",
+        "muted": "#9ca3af",
+        "table_bg": "#111827",
+        "table_header_bg": "#1f2937",
+        "table_group_bg": "#374151",
+        "table_border": "#374151",
+        "plot_template": "plotly_dark",
+        "plot_bg": "#111827",
+        "grid": "#374151",
+        "link": "#93c5fd",
+    },
+}
+
+
+def get_theme(dark_mode=False):
+    return THEMES["dark" if dark_mode else "light"]
+
+
+def inject_theme_css(dark_mode=False):
+    theme = get_theme(dark_mode)
+    st.markdown(
+        f"""
+        <style>
+        .stApp {{
+            background-color: {theme["page_bg"]};
+            color: {theme["text"]};
+        }}
+        [data-testid="stSidebar"] {{
+            background-color: {theme["panel_bg"]};
+        }}
+        [data-testid="stSidebar"], [data-testid="stSidebar"] * {{
+            color: {theme["text"]};
+        }}
+        h1, h2, h3, h4, h5, h6, p, label, span {{
+            color: inherit;
+        }}
+        [data-testid="stMetric"], [data-testid="stDataFrame"] {{
+            background-color: {theme["panel_bg"]};
+        }}
+        div[data-testid="stExpander"] {{
+            background-color: {theme["panel_bg"]};
+            border-color: {theme["table_border"]};
+        }}
+        div[data-testid="stTabs"] button {{
+            color: {theme["text"]};
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
 # ── Start Flask backend in daemon thread ─────────────────────
 import stock_watch_list_back_end
 
@@ -199,6 +268,19 @@ def beta_color(beta):
         g = 255
         b = int(255 - 100 * t)
     return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def readable_text_color(bg_color, default="#111827"):
+    if not isinstance(bg_color, str) or not bg_color.startswith("#") or len(bg_color) != 7:
+        return default
+    try:
+        r = int(bg_color[1:3], 16)
+        g = int(bg_color[3:5], 16)
+        b = int(bg_color[5:7], 16)
+    except ValueError:
+        return default
+    luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255
+    return "#f9fafb" if luminance < 0.45 else "#111827"
 
 
 # ── API helpers with caching ─────────────────────────────────
@@ -418,7 +500,7 @@ def apply_cell_colors(df_display, df_raw, groups):
 
 
 # ── Helper: render grouped table with colors ──────────────────
-def render_grouped_table(df, groups, key_prefix=""):
+def render_grouped_table(df, groups, key_prefix="", dark_mode=False):
     """
     Render a table with group headers AND cell colors (matching tkinter), with fixed header.
     """
@@ -433,17 +515,18 @@ def render_grouped_table(df, groups, key_prefix=""):
         st.info("No data available")
         return
     
+    theme = get_theme(dark_mode)
     # Display using HTML table with fixed header using CSS
-    html_table = """
-    <div style="width:100%; max-height:600px; overflow:auto;">
-        <table style="width:100%; border-collapse:collapse; font-family:Arial; font-size:12px;">
-            <thead style="position:sticky; top:0; z-index:10; background-color:white;">
-                <tr style="background-color:#f0f0f0;">
+    html_table = f"""
+    <div style="width:100%; max-height:600px; overflow:auto; border:1px solid {theme['table_border']};">
+        <table style="width:100%; border-collapse:collapse; font-family:Arial; font-size:12px; background-color:{theme['table_bg']}; color:{theme['text']};">
+            <thead style="position:sticky; top:0; z-index:10; background-color:{theme['table_header_bg']};">
+                <tr style="background-color:{theme['table_header_bg']};">
     """
     
     # Header
     for col in COLUMNS:
-        html_table += f"<th style='padding:4px; text-align:left; border:1px solid #ccc;'>{col}</th>"
+        html_table += f"<th style='padding:4px; text-align:left; color:{theme['text']}; border:1px solid {theme['table_border']};'>{col}</th>"
     html_table += "</tr></thead><tbody>"
     
     # Apply colors
@@ -458,18 +541,21 @@ def render_grouped_table(df, groups, key_prefix=""):
         html_table += "<tr>"
         for j, col in enumerate(COLUMNS):
             val = row[col]
-            bg_color = cell_colors.get((r, j), "#ffffff" if not is_header else "#cccccc")
+            bg_color = cell_colors.get((r, j), theme["table_bg"] if not is_header else theme["table_group_bg"])
+            if dark_mode and bg_color.lower() in ("#ffffff", "white", "#cccccc"):
+                bg_color = theme["table_group_bg"] if is_header else theme["table_bg"]
+            text_color = theme["text"] if bg_color == theme["table_bg"] else readable_text_color(bg_color)
             
             # Header row styling
             if is_header and j == 0:
-                html_table += f"<td colspan='{len(COLUMNS)}' style='padding:4px; background-color:{bg_color}; font-weight:bold; border:1px solid #ccc;'>{val}</td>"
+                html_table += f"<td colspan='{len(COLUMNS)}' style='padding:4px; color:{theme['text']}; background-color:{bg_color}; font-weight:bold; border:1px solid {theme['table_border']};'>{val}</td>"
                 break
             elif is_header:
                 continue
             
             # Data row styling
             align = "right" if isinstance(val, (int, float)) or (isinstance(val, str) and val and val[0] in "+-$0123456789") else "left"
-            html_table += f"<td style='padding:4px; text-align:{align}; background-color:{bg_color}; border:1px solid #ccc;'>{val}</td>"
+            html_table += f"<td style='padding:4px; text-align:{align}; color:{text_color}; background-color:{bg_color}; border:1px solid {theme['table_border']};'>{val}</td>"
         
         html_table += "</tr>"
     
@@ -483,7 +569,7 @@ def render_grouped_table(df, groups, key_prefix=""):
 
 
 # ── K-line chart builder ─────────────────────────────────────
-def build_kline_chart(kline_data, ticker, fib_levels=None):
+def build_kline_chart(kline_data, ticker, fib_levels=None, dark_mode=False):
     """Build a Plotly candlestick chart with all indicators.
     fib_levels: optional list of (price, label, color) tuples for Fibonacci lines.
     """
@@ -491,6 +577,7 @@ def build_kline_chart(kline_data, ticker, fib_levels=None):
         st.warning("K-line data not available")
         return None
 
+    theme = get_theme(dark_mode)
     ohlc = kline_data["ohlc"]
     ind = kline_data["indicators"]
     fin = kline_data.get("financials", {})
@@ -753,15 +840,20 @@ def build_kline_chart(kline_data, ticker, fib_levels=None):
         legend=dict(orientation="h", yanchor="bottom", y=1.15, xanchor="left", x=0),
         xaxis_rangeslider_visible=False,
         hovermode="x unified",
-        template="plotly_white",
+        template=theme["plot_template"],
+        paper_bgcolor=theme["page_bg"],
+        plot_bgcolor=theme["plot_bg"],
+        font=dict(color=theme["text"]),
         margin=dict(l=40, r=40, t=140, b=30),
         annotations=annotations,
     )
+    fig.update_xaxes(gridcolor=theme["grid"], zerolinecolor=theme["grid"])
+    fig.update_yaxes(gridcolor=theme["grid"], zerolinecolor=theme["grid"])
 
     # StockAnalysis clickable link (top-right, matching tkinter version)
     if sa_url:
         fig.add_annotation(
-            text=f"<a href='{sa_url}' style='color:blue; font-style:italic; font-size:12px;'>{sa_url}</a>",
+            text=f"<a href='{sa_url}' style='color:{theme['link']}; font-style:italic; font-size:12px;'>{sa_url}</a>",
             xref="paper", yref="paper",
             x=0.99, y=1.10,
             xanchor="right", yanchor="top",
@@ -776,9 +868,10 @@ def build_kline_chart(kline_data, ticker, fib_levels=None):
 
 
 # ── Market breadth chart ─────────────────────────────────────
-def build_breadth_chart(breadth_data):
+def build_breadth_chart(breadth_data, dark_mode=False):
     if not breadth_data or not breadth_data.get("breadth_chart_data"):
         return None
+    theme = get_theme(dark_mode)
     cd = breadth_data["breadth_chart_data"]
     idx = cd["index"]
 
@@ -793,11 +886,16 @@ def build_breadth_chart(breadth_data):
     fig.update_layout(
         title="Market Breadth (S&P 500)",
         height=400,
-        template="plotly_white",
+        template=theme["plot_template"],
+        paper_bgcolor=theme["page_bg"],
+        plot_bgcolor=theme["plot_bg"],
+        font=dict(color=theme["text"]),
         hovermode="x unified",
         yaxis=dict(range=[0, 100], title="% Above MA", showgrid=True),
         xaxis=dict(showgrid=True),
     )
+    fig.update_xaxes(gridcolor=theme["grid"], zerolinecolor=theme["grid"])
+    fig.update_yaxes(gridcolor=theme["grid"], zerolinecolor=theme["grid"])
     return fig
 
 
@@ -814,7 +912,8 @@ def fear_greed_color(value):
     return "#2e7d32"
 
 
-def build_fear_greed_gauge(value, description, title):
+def build_fear_greed_gauge(value, description, title, dark_mode=False):
+    theme = get_theme(dark_mode)
     color = fear_greed_color(value)
     fig = go.Figure(
         go.Indicator(
@@ -832,14 +931,14 @@ def build_fear_greed_gauge(value, description, title):
                 "axis": {
                     "range": [0, 100],
                     "tickwidth": 1,
-                    "tickcolor": "#90a4ae",
+                    "tickcolor": theme["muted"],
                     "tickmode": "array",
                     "tickvals": [0, 25, 50, 75, 100],
                 },
                 "bar": {"color": color, "thickness": 0.22},
-                "bgcolor": "white",
+                "bgcolor": theme["plot_bg"],
                 "borderwidth": 1,
-                "bordercolor": "#cfd8dc",
+                "bordercolor": theme["table_border"],
                 "steps": [
                     {"range": [0, 25], "color": "#ffcdd2"},
                     {"range": [25, 45], "color": "#ffe0b2"},
@@ -860,7 +959,7 @@ def build_fear_greed_gauge(value, description, title):
         margin=dict(l=16, r=16, t=42, b=8),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(family="Arial, sans-serif", color="#263238"),
+        font=dict(family="Arial, sans-serif", color=theme["text"]),
         annotations=[
             dict(
                 text=f"<b>{description}</b>",
@@ -876,7 +975,7 @@ def build_fear_greed_gauge(value, description, title):
     return fig
 
 
-def display_fear_greed(fg_data, title, prefix=""):
+def display_fear_greed(fg_data, title, prefix="", dark_mode=False):
     if not fg_data or not fg_data.get("success"):
         st.metric(title, "N/A")
         return
@@ -887,7 +986,7 @@ def display_fear_greed(fg_data, title, prefix=""):
         return
     val = max(0, min(100, val))
     desc = fg_data.get("description", "") or "N/A"
-    st.plotly_chart(build_fear_greed_gauge(val, desc, title), use_container_width=True)
+    st.plotly_chart(build_fear_greed_gauge(val, desc, title, dark_mode=dark_mode), use_container_width=True)
 
 
 # ════════════════════════════════════════════════════════════
@@ -895,11 +994,11 @@ def display_fear_greed(fg_data, title, prefix=""):
 # ════════════════════════════════════════════════════════════
 
 ensure_flask()
-st.title("📈 US Stock Watchlist")
 
 # ── Sidebar ──────────────────────────────────────────────────
 with st.sidebar:
     st.header("Controls")
+    dark_mode = st.toggle("Dark mode", value=False, key="dark_mode")
 
     col_r1, col_r2 = st.columns(2)
     with col_r1:
@@ -915,16 +1014,19 @@ with st.sidebar:
 
     st.caption(f"Last update: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
+inject_theme_css(dark_mode)
+st.title("📈 US Stock Watchlist")
+
 # ── Fear & Greed Row ─────────────────────────────────────────
 fg = fetch_fear_greed()
 cfg = fetch_crypto_fear_greed()
 col_fg1, col_fg2 = st.columns(2)
 with col_fg1:
     st.caption("CNN Fear & Greed Index")
-    display_fear_greed(fg, "CNN")
+    display_fear_greed(fg, "CNN", dark_mode=dark_mode)
 with col_fg2:
     st.caption("Crypto Fear & Greed Index")
-    display_fear_greed(cfg, "Crypto")
+    display_fear_greed(cfg, "Crypto", dark_mode=dark_mode)
 
 st.divider()
 
@@ -948,7 +1050,7 @@ with tab1:
         stocks_df = df[~df["Ticker"].isin(broad_and_breadth_tickers)].copy()
         
         if not stocks_df.empty:
-            render_grouped_table(stocks_df, STOCK_GROUPS)
+            render_grouped_table(stocks_df, STOCK_GROUPS, dark_mode=dark_mode)
         else:
             st.info("No stock data available")
     else:
@@ -961,7 +1063,7 @@ with tab2:
         broad_df = df[df["Ticker"].isin(BROAD_MARKET_TICKERS)].copy()
         
         if not broad_df.empty:
-            render_grouped_table(broad_df, BROAD_MARKET_GROUPS)
+            render_grouped_table(broad_df, BROAD_MARKET_GROUPS, dark_mode=dark_mode)
         else:
             st.info("No broad market data available")
     else:
@@ -981,11 +1083,11 @@ with tab3:
         
         if not breadth_df.empty:
             # Display breadth table with grouped headers and colors (matching tkinter)
-            render_grouped_table(breadth_df, BREADTH_GROUPS)
+            render_grouped_table(breadth_df, BREADTH_GROUPS, dark_mode=dark_mode)
             
             # Display breadth chart
             st.divider()
-            fig = build_breadth_chart(breadth_data)
+            fig = build_breadth_chart(breadth_data, dark_mode=dark_mode)
             if fig:
                 st.plotly_chart(fig, width="stretch", key="breadth_chart")
         else:
@@ -1094,7 +1196,7 @@ if kd and kd.get("success"):
             st.dataframe(pd.DataFrame(rows_data), width="stretch", hide_index=True)
     
     # Now render the chart with potentially updated fib_levels
-    fig = build_kline_chart(kd, ticker, fib_levels=fib_levels)
+    fig = build_kline_chart(kd, ticker, fib_levels=fib_levels, dark_mode=dark_mode)
     if fig:
         st.plotly_chart(fig, width="stretch", key="kline_main_chart")
     else:
