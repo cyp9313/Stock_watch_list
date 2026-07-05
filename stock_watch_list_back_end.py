@@ -32,6 +32,8 @@ requests_cache.uninstall_cache()
 # ===== SQLite 缓存层 =====
 DB_PATH = "stock_cache.db"
 YF_DOWNLOAD_BATCH_SIZE = 100
+SP500_SYMBOLS_CACHE_PATH = os.path.join(os.path.dirname(__file__), "sp500_symbols_cache.json")
+SP500_SYMBOLS_CACHE_MAX_AGE_DAYS = 7
 
 
 def init_db():
@@ -548,27 +550,96 @@ def normalize_groups_for_yfinance(groups):
         for group_name, tickers in groups.items()
     }
 
-def get_sp500_symbols():
-    """获取标普500成分股"""
+def _normalize_sp500_symbols(symbols):
+    return [
+        str(symbol).strip().replace(".", "-")
+        for symbol in symbols
+        if str(symbol).strip() and str(symbol).strip().lower() != "nan"
+    ]
+
+
+def _read_sp500_symbols_cache(max_age_days=SP500_SYMBOLS_CACHE_MAX_AGE_DAYS):
     try:
-        url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0 Safari/537.36"
-        }
-        response = requests.get(url, headers=headers, timeout=15)
-        response.raise_for_status()
-
-        html = response.text
-
-        # ✅ 用 StringIO 包装
-        df = pd.read_html(StringIO(html), attrs={"id": "constituents"})[0]
-
-        sp500_symbols = df["Symbol"].tolist()
-        return [symbol.replace(".", "-") for symbol in sp500_symbols]
-
+        if not os.path.exists(SP500_SYMBOLS_CACHE_PATH):
+            return []
+        with open(SP500_SYMBOLS_CACHE_PATH, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        symbols = payload.get("symbols", payload if isinstance(payload, list) else [])
+        symbols = _normalize_sp500_symbols(symbols)
+        if not symbols:
+            return []
+        if max_age_days is not None:
+            mtime = datetime.datetime.fromtimestamp(os.path.getmtime(SP500_SYMBOLS_CACHE_PATH))
+            if datetime.datetime.now() - mtime > datetime.timedelta(days=max_age_days):
+                return []
+        return symbols
     except Exception as e:
-        print(f"获取标普500成分股失败: {e}")
+        print(f"S&P 500 symbols cache read failed: {e}")
         return []
+
+
+def _write_sp500_symbols_cache(symbols, source):
+    try:
+        payload = {
+            "source": source,
+            "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "symbols": _normalize_sp500_symbols(symbols),
+        }
+        with open(SP500_SYMBOLS_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"S&P 500 symbols cache write failed: {e}")
+
+
+def get_sp500_symbols():
+    """Fetch S&P 500 constituents with a local cache and non-Wikipedia fallback."""
+    cached_symbols = _read_sp500_symbols_cache()
+    if cached_symbols:
+        return cached_symbols
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/116.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    sources = [
+        (
+            "Wikipedia",
+            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+            "html",
+        ),
+        (
+            "DataHub GitHub CSV",
+            "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv",
+            "csv",
+        ),
+    ]
+
+    for source_name, url, source_type in sources:
+        try:
+            response = requests.get(url, headers=headers, timeout=20)
+            response.raise_for_status()
+            if source_type == "html":
+                df = pd.read_html(StringIO(response.text), attrs={"id": "constituents"})[0]
+            else:
+                df = pd.read_csv(StringIO(response.text))
+            symbols = _normalize_sp500_symbols(df["Symbol"].tolist())
+            if symbols:
+                _write_sp500_symbols_cache(symbols, source_name)
+                print(f"S&P 500 symbols loaded from {source_name}: {len(symbols)}")
+                return symbols
+        except Exception as e:
+            print(f"S&P 500 symbols source failed ({source_name}): {e}")
+
+    stale_symbols = _read_sp500_symbols_cache(max_age_days=None)
+    if stale_symbols:
+        print(f"S&P 500 symbols using stale local cache: {len(stale_symbols)}")
+        return stale_symbols
+
+    print("S&P 500 symbols unavailable from all sources")
+    return []
 
 # 计算股票的筹码分布(最近30个交易日)
 def calculate_chip_distribution(stock_ticker,days="30d",num_bins=20):

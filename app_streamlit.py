@@ -15,6 +15,7 @@ import datetime
 import time
 import threading
 import colorsys
+import socket
 from ticker_mapping import normalize_yfinance_ticker, stockanalysis_overview_url
 
 # ── Page config ──────────────────────────────────────────────
@@ -99,18 +100,30 @@ import stock_watch_list_back_end
 _flask_started = False
 
 
+def is_port_open(host, port, timeout=0.5):
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def ensure_flask():
     global _flask_started
-    if not _flask_started:
-        t = threading.Thread(
-            target=lambda: stock_watch_list_back_end.app.run(
-                host="127.0.0.1", port=5000, debug=False, use_reloader=False, threaded=True
-            ),
-            daemon=True,
-        )
-        t.start()
+    if _flask_started:
+        return
+    if is_port_open("127.0.0.1", 5000):
         _flask_started = True
-        time.sleep(2)  # wait for Flask to boot
+        return
+    t = threading.Thread(
+        target=lambda: stock_watch_list_back_end.app.run(
+            host="127.0.0.1", port=5000, debug=False, use_reloader=False, threaded=True
+        ),
+        daemon=True,
+    )
+    t.start()
+    _flask_started = True
+    time.sleep(2)  # wait for Flask to boot
 
 
 API_BASE = "http://127.0.0.1:5000"
@@ -330,16 +343,16 @@ def fetch_crypto_fear_greed():
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_breadth_data(sp500_list):
     """Fetch market breadth data. Use data= for form-encoded POST."""
+    if not sp500_list:
+        return {"success": False, "error": "S&P 500 symbol list is empty. The server may not be able to reach Wikipedia."}
     payload = {"sp500_symbols": json.dumps(sp500_list)}
     try:
-        resp = requests.post(f"{API_BASE}/api/breadth_data", data=payload, timeout=120)
+        resp = requests.post(f"{API_BASE}/api/breadth_data", data=payload, timeout=300)
         if resp.status_code != 200:
-            st.error(f"Breadth API error: {resp.status_code} - {resp.text}")
-            return None
+            return {"success": False, "error": f"Breadth API HTTP {resp.status_code}: {resp.text}"}
         return resp.json()
     except Exception as e:
-        st.error(f"Breadth API exception: {e}")
-        return None
+        return {"success": False, "error": f"Breadth API exception: {e}"}
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -1093,7 +1106,8 @@ with tab3:
         else:
             st.warning("Market breadth data is empty")
     else:
-        st.warning("Failed to load market breadth data. Try refreshing.")
+        error_msg = breadth_data.get("error") if isinstance(breadth_data, dict) else None
+        st.warning(f"Failed to load market breadth data. {error_msg or 'Try refreshing.'}")
 
 st.divider()
 
