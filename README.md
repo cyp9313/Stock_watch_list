@@ -355,7 +355,8 @@ K 线输入区：
 
 侧边栏：
 
-- `Refresh All`：清空 Streamlit 前端缓存并重新加载。
+- `Refresh Stocks`：刷新股票与大盘数据。
+- `Refresh Breadth`：刷新市场宽度数据。
 - 显示当前页面刷新时间。
 
 主页面：
@@ -541,10 +542,11 @@ http://127.0.0.1:5000
    - `new`（请求 - DB）→ 全量下载 2 年数据
    - `stale`（DB - 请求）→ 默认不删除（避免 `/api/stock_data` 和 `/api/breadth_data` 互删对方数据）；旧数据由 750 天滚动窗口自动清理
 
-2. **增量下载周期由 gap 决定**：
-   - gap ≤ 7 天 → 下载 `5d`
-   - 8~30 天 → 下载 `{gap+2}d`
+2. **增量下载周期由 gap 决定**（均为自然日，用 `gap+2` 留 2 天缓冲，防止周末缺口）：
+   - gap ≤ 30 天 → 下载 `{gap+2}d`（例：gap=1→3d，gap=6→8d，确保覆盖最新交易日）
    - > 30 天 → 全量重新下载 `2y`
+
+   **注意**：早期版本对 `gap ≤ 7` 天固定用 `5d`，但当 gap=6（今天周四，缓存最新上周五）时，`5d` 只取最近 5 个自然日（周日~周四），上周五的数据（距今天 6 天）会被遗漏。现统一为 `{gap+2}d` 修复此问题。
 
 3. **滚动窗口清理**：每次 `init_db()` 时自动执行：
    - `price_cache`：保留最近 750 个自然日（≈517 交易日）。MA200 需 200 交易日 warmup + 1 年图表 252 交易日 = 452 交易日最低需求；750 自然日 ≈ 517 交易日，留有 ~65 交易日余量
@@ -564,7 +566,7 @@ http://127.0.0.1:5000
 - K 线数据缓存约 60 秒。
 - S&P 500 成分股列表缓存约 3600 秒。
 
-点击侧边栏 `Refresh All` 可清空 Streamlit 缓存。
+点击侧边栏 `Refresh Stocks` 可清空股票数据缓存，点击 `Refresh Breadth` 可清空市场宽度数据缓存。
 
 ### `forward_pe_cache.db`
 
@@ -991,7 +993,8 @@ K-line input area:
 
 Sidebar:
 
-- `Refresh All`: clear Streamlit frontend cache and reload.
+- `Refresh Stocks`: refresh stock and broad-market data.
+- `Refresh Breadth`: refresh market breadth data.
 - Shows current page refresh time.
 
 Main page:
@@ -1177,10 +1180,11 @@ Price data uses an incremental update strategy to avoid re-downloading 2 years o
    - `new` (request - DB) → full 2-year download
    - `stale` (DB - request) → not deleted by default (avoids `/api/stock_data` and `/api/breadth_data` deleting each other's data); old data is cleaned up by the 750-day rolling window
 
-2. **Incremental download period is determined by the gap**:
-   - gap ≤ 7 days → download `5d`
-   - 8-30 days → download `{gap+2}d`
+2. **Incremental download period is determined by the gap** (both are calendar days, using `gap+2` to add a 2-day buffer to prevent weekend gaps):
+   - gap ≤ 30 days → download `{gap+2}d` (e.g., gap=1→3d, gap=6→8d, ensuring the latest trading day is covered)
    - > 30 days → full re-download with `2y`
+
+   **Note**: An earlier version used a fixed `5d` for `gap ≤ 7 days`. When gap=6 (today is Thursday, cache latest is last Friday), `5d` only fetches the last 5 calendar days (Sunday~Thursday), and last Friday's data (6 days ago) would be missed. Now unified to `{gap+2}d` to fix this issue.
 
 3. **Rolling window cleanup**: Executed automatically on each `init_db()` call:
    - `price_cache`: retains the most recent 750 calendar days (≈517 trading days). MA200 requires 200 trading days warmup + 1-year chart needs 252 trading days = 452 trading days minimum; 750 calendar days ≈ 517 trading days, providing ~65 trading days of buffer
@@ -1200,7 +1204,7 @@ Delete `stock_cache.db` and restart the app to refetch and recalculate cached da
 - K-line data: about 60 seconds.
 - S&P 500 constituent list: about 3600 seconds.
 
-Click `Refresh All` in the sidebar to clear Streamlit cache.
+Click `Refresh Stocks` in the sidebar to clear stock data cache, or `Refresh Breadth` to clear market breadth data cache.
 
 ### `forward_pe_cache.db`
 

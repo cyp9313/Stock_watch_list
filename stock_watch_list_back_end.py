@@ -358,12 +358,13 @@ def get_prices_with_cache(tickers, period="2y", delete_stale=False):
     请求的标的集不同，开启 stale 删除会导致两个端点互删对方数据。
     旧数据由 init_db() 的 750 天滚动窗口自动清理。
 
-    增量下载的 period 由 gap 决定：
-      - gap ≤ 7 天  → "5d"
+    增量下载的 period 由 gap 决定（均为自然日，用 gap+2 留 2 天缓冲）：
+      - gap ≤ 7 天  → "{gap+2}d"（例: gap=1→3d, gap=6→8d，确保覆盖最新交易日）
       - 8~30 天     → "{gap+2}d"
       - > 30 天     → 全量重新下载 period
 
-    返回: MultiIndex DataFrame（与 yf.download group_by='column' auto_adjust=False 一致）
+    注意: "5d" 不够用——若今天是周四(gap=6)，"5d" 只取最近 5 个自然日（周日~周四），
+    上周五的数据（距今天 6 天）会被遗漏。
     """
     if not tickers:
         return pd.DataFrame()
@@ -430,8 +431,6 @@ def get_prices_with_cache(tickers, period="2y", delete_stale=False):
             if gap_days <= 0:
                 # 已是最新，跳过
                 continue
-            elif gap_days <= 7:
-                dl_period = "5d"
             elif gap_days <= 30:
                 dl_period = f"{gap_days + 2}d"
             else:
