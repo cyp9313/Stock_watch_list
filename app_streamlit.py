@@ -802,27 +802,92 @@ def build_breadth_chart(breadth_data):
 
 
 # ── Fear & greed display ─────────────────────────────────────
+def fear_greed_color(value):
+    if value <= 25:
+        return "#d32f2f"
+    if value <= 45:
+        return "#f57c00"
+    if value <= 55:
+        return "#fbc02d"
+    if value <= 75:
+        return "#7cb342"
+    return "#2e7d32"
+
+
+def build_fear_greed_gauge(value, description, title):
+    color = fear_greed_color(value)
+    fig = go.Figure(
+        go.Indicator(
+            mode="gauge+number",
+            value=value,
+            number={
+                "font": {"size": 42, "color": color},
+                "valueformat": ".0f",
+            },
+            title={
+                "text": f"<b>{title}</b>",
+                "font": {"size": 17},
+            },
+            gauge={
+                "axis": {
+                    "range": [0, 100],
+                    "tickwidth": 1,
+                    "tickcolor": "#90a4ae",
+                    "tickmode": "array",
+                    "tickvals": [0, 25, 50, 75, 100],
+                },
+                "bar": {"color": color, "thickness": 0.22},
+                "bgcolor": "white",
+                "borderwidth": 1,
+                "bordercolor": "#cfd8dc",
+                "steps": [
+                    {"range": [0, 25], "color": "#ffcdd2"},
+                    {"range": [25, 45], "color": "#ffe0b2"},
+                    {"range": [45, 55], "color": "#fff9c4"},
+                    {"range": [55, 75], "color": "#dcedc8"},
+                    {"range": [75, 100], "color": "#c8e6c9"},
+                ],
+                "threshold": {
+                    "line": {"color": color, "width": 5},
+                    "thickness": 0.85,
+                    "value": value,
+                },
+            },
+        )
+    )
+    fig.update_layout(
+        height=230,
+        margin=dict(l=16, r=16, t=42, b=8),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="Arial, sans-serif", color="#263238"),
+        annotations=[
+            dict(
+                text=f"<b>{description}</b>",
+                x=0.5,
+                y=0.46,
+                xref="paper",
+                yref="paper",
+                showarrow=False,
+                font=dict(size=18, color=color),
+            )
+        ],
+    )
+    return fig
+
+
 def display_fear_greed(fg_data, title, prefix=""):
     if not fg_data or not fg_data.get("success"):
         st.metric(title, "N/A")
         return
-    val = fg_data.get("value", 50)
-    desc = fg_data.get("description", "")
-    if val <= 25:
-        color = "#1565C0"  # deep blue
-    elif val <= 45:
-        color = "#00BCD4"  # cyan
-    elif val <= 55:
-        color = "#4CAF50"  # green
-    elif val <= 75:
-        color = "#FF9800"  # orange
-    else:
-        color = "#F44336"  # red
-    st.markdown(
-        f"<span style='font-size:1.5em;font-weight:bold;color:{color}'>{prefix}{val:.0f}</span>"
-        f"&nbsp;&nbsp;<span style='color:gray'>{desc}</span>",
-        unsafe_allow_html=True,
-    )
+    try:
+        val = float(fg_data.get("value", 50))
+    except (TypeError, ValueError):
+        st.metric(title, "N/A")
+        return
+    val = max(0, min(100, val))
+    desc = fg_data.get("description", "") or "N/A"
+    st.plotly_chart(build_fear_greed_gauge(val, desc, title), use_container_width=True)
 
 
 # ════════════════════════════════════════════════════════════
