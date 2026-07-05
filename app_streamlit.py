@@ -34,7 +34,7 @@ def ensure_flask():
     if not _flask_started:
         t = threading.Thread(
             target=lambda: stock_watch_list_back_end.app.run(
-                host="127.0.0.1", port=5000, debug=False, use_reloader=False
+                host="127.0.0.1", port=5000, debug=False, use_reloader=False, threaded=True
             ),
             daemon=True,
         )

@@ -23,6 +23,7 @@ import threading
 import os
 import sys
 import ctypes
+import time
 
 # ===== 屏蔽 C 层 stderr（消除 libpng iCCP warning）=====
 # 必须在 import stock_watch_list_back_end 之前执行：
@@ -52,7 +53,7 @@ if sys.platform == 'win32':
 import stock_watch_list_back_end
 
 def run_flask():
-    stock_watch_list_back_end.app.run(host="127.0.0.1", port=5000, debug=False, use_reloader=False)
+    stock_watch_list_back_end.app.run(host="127.0.0.1", port=5000, debug=False, use_reloader=False, threaded=True)
 
 t = threading.Thread(target=run_flask, daemon=True)
 t.start()
@@ -342,75 +343,178 @@ def render_all_tabs():
     render_table(breadth_df, sheet_breadth, breadth_groups)
 
 def refresh_stock_data():
-    global latest_stock_df
+    global stock_refresh_running
+    if stock_refresh_running:
+        return
+
+    stock_refresh_running = True
+    title_var.set("US Stock Watchlist - Refreshing Stocks...")
+    refresh_label.config(text="Refreshing Stocks...")
+    if "refresh_stock_button" in globals():
+        refresh_stock_button.config(state="disabled")
+
+    threading.Thread(target=_refresh_stock_data_worker, daemon=True).start()
+
+def _refresh_stock_data_worker():
     try:
         result = fetch_from_api('/api/stock_data', {
             'groups': json.dumps(groups),
             'broad_market_tickers': json.dumps(broad_market_tickers)
         })
         if result.get('success'):
-            latest_stock_df = pd.DataFrame(result['data'])
+            stock_df = pd.DataFrame(result['data'])
+            error = None
+        else:
+            stock_df = pd.DataFrame(columns=COLUMNS)
+            error = result.get('error', 'Unknown error')
+    except Exception as e:
+        stock_df = pd.DataFrame(columns=COLUMNS)
+        error = str(e)
+
+    try:
+        root.after(0, lambda: _finish_stock_refresh(stock_df, error))
+    except tk.TclError:
+        pass
+
+def _finish_stock_refresh(stock_df, error=None):
+    global latest_stock_df, stock_refresh_running, startup_breadth_pending
+    try:
+        latest_stock_df = stock_df
+        if error is None:
             title_var.set("US Stock Watchlist - Stocks Updated")
         else:
-            raise Exception(result.get('error', 'Unknown error'))
-    except Exception as e:
-        latest_stock_df = pd.DataFrame(columns=COLUMNS)
-        title_var.set(f"Stock Data ⚠⚠⚠️ {e}")
-    
-    render_all_tabs()
-    refresh_label.config(text=f"Last Stock Refresh: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    update_fear_greed_index()
-    update_crypto_fear_greed_index()
+            title_var.set(f"Stock Data ⚠⚠⚠️ {error}")
+        render_all_tabs()
+        refresh_label.config(text=f"Last Stock Refresh: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        refresh_fear_greed_async()
+        if startup_breadth_pending:
+            startup_breadth_pending = False
+            root.after(100, refresh_breadth_data)
+    finally:
+        stock_refresh_running = False
+        if "refresh_stock_button" in globals():
+            refresh_stock_button.config(state="normal")
 
 def refresh_breadth_data():
-    global latest_breadth_df, breadth_chart_data
+    global breadth_refresh_running
+    if breadth_refresh_running:
+        return
+
+    breadth_refresh_running = True
+    title_var.set("US Stock Watchlist - Refreshing Breadth...")
+    refresh_label.config(text="Refreshing Breadth...")
+    if "refresh_breadth_button" in globals():
+        refresh_breadth_button.config(state="disabled")
+
+    threading.Thread(target=_refresh_breadth_data_worker, daemon=True).start()
+
+def _refresh_breadth_data_worker():
+    start = time.perf_counter()
+    print("[Tkinter] Breadth refresh request started")
     try:
-        # result = fetch_from_api('/api/breadth_data')
-        # result = fetch_from_api('/api/breadth_data',{'sp500_symbols': json.dumps(sp500_symbols)})   
-        """调用API获取数据"""
-        try:
-            endpoint = '/api/breadth_data'
-            response = requests.post(f"{API_BASE_URL}{endpoint}", data={'sp500_symbols': json.dumps(sp500_symbols)}, timeout=120)
-            result = response.json()
-        except Exception as e:
-            print(f"API调用失败: {e}")
-            result = {"success": False, "error": str(e)}
+        endpoint = '/api/breadth_data'
+        response = requests.post(
+            f"{API_BASE_URL}{endpoint}",
+            data={'sp500_symbols': json.dumps(sp500_symbols)},
+            timeout=120
+        )
+        result = response.json()
         if result.get('success'):
-            latest_breadth_df = pd.DataFrame(result['data'])
-            breadth_chart_data = result.get('breadth_chart_data', {})
+            breadth_df = pd.DataFrame(result['data'])
+            chart_data = result.get('breadth_chart_data', {})
+            error = None
+        else:
+            breadth_df = pd.DataFrame(columns=COLUMNS)
+            chart_data = {}
+            error = result.get('error', 'Unknown error')
+    except Exception as e:
+        print(f"API调用失败: {e}")
+        breadth_df = pd.DataFrame(columns=COLUMNS)
+        chart_data = {}
+        error = str(e)
+    finally:
+        print(f"[Tkinter] Breadth refresh request finished in {time.perf_counter() - start:.1f}s")
+
+    try:
+        root.after(0, lambda: _finish_breadth_refresh(breadth_df, chart_data, error))
+    except tk.TclError:
+        pass
+
+def _finish_breadth_refresh(breadth_df, chart_data, error=None):
+    global latest_breadth_df, breadth_chart_data, breadth_refresh_running
+    try:
+        latest_breadth_df = breadth_df
+        breadth_chart_data = chart_data
+        if error is None:
             title_var.set("US Stock Watchlist - Breadth Updated")
         else:
-            raise Exception(result.get('error', 'Unknown error'))
-    except Exception as e:
-        latest_breadth_df = pd.DataFrame(columns=COLUMNS)
-        title_var.set(f"Breadth Data ⚠⚠⚠️ {e}")
-    
-    render_all_tabs()
-    refresh_label.config(text=f"Last Breadth Refresh: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            title_var.set(f"Breadth Data ⚠⚠⚠️ {error}")
+        render_all_tabs()
+        refresh_label.config(text=f"Last Breadth Refresh: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    finally:
+        breadth_refresh_running = False
+        if "refresh_breadth_button" in globals():
+            refresh_breadth_button.config(state="normal")
+
+def fear_greed_color(index_value):
+    if index_value <= 25:
+        return "blue"
+    if index_value <= 45:
+        return "cyan"
+    if index_value <= 55:
+        return "green"
+    if index_value <= 75:
+        return "orange"
+    return "red"
+
+def refresh_fear_greed_async():
+    global fear_greed_refresh_running
+    if fear_greed_refresh_running:
+        return
+
+    fear_greed_refresh_running = True
+    threading.Thread(target=_refresh_fear_greed_worker, daemon=True).start()
+
+def _refresh_fear_greed_worker():
+    cnn_result = fetch_from_api('/api/fear_greed')
+    crypto_result = fetch_from_api('/api/fear_greed_crypto')
+    try:
+        root.after(0, lambda: _finish_fear_greed_refresh(cnn_result, crypto_result))
+    except tk.TclError:
+        pass
+
+def _finish_fear_greed_refresh(cnn_result, crypto_result):
+    global fear_greed_refresh_running
+    try:
+        apply_fear_greed_result(cnn_result)
+        apply_crypto_fear_greed_result(crypto_result)
+    finally:
+        fear_greed_refresh_running = False
+
+def apply_fear_greed_result(result):
+    if result.get('success'):
+        index_value = result['value']
+        description = result['description']
+        fear_greed_var.set(f"CNN股票恐惧贪婪指数: {index_value:.2f} ({description})")
+        fear_greed_label.config(fg=fear_greed_color(index_value))
+    else:
+        fear_greed_var.set(f"CNN股票恐惧贪婪指数: 获取失败")
+        fear_greed_label.config(fg="black")
+
+def apply_crypto_fear_greed_result(result):
+    if result.get('success'):
+        index_value = result['value']
+        description = result['description']
+        fear_greed_crypto_var.set(f"Crypto恐惧贪婪指数: {index_value:.2f} ({description})")
+        fear_greed_crypto_label.config(fg=fear_greed_color(index_value))
+    else:
+        fear_greed_crypto_var.set(f"Crypto恐惧贪婪指数: 获取失败")
+        fear_greed_crypto_label.config(fg="black")
 
 def update_fear_greed_index():
     try:
         result = fetch_from_api('/api/fear_greed')
-        if result.get('success'):
-            index_value = result['value']
-            description = result['description']
-            
-            if index_value <= 25:
-                color = "blue"
-            elif index_value <= 45:
-                color = "cyan"
-            elif index_value <= 55:
-                color = "green"
-            elif index_value <= 75:
-                color = "orange"
-            else:
-                color = "red"
-                
-            fear_greed_var.set(f"CNN股票恐惧贪婪指数: {index_value:.2f} ({description})")
-            fear_greed_label.config(fg=color)
-        else:
-            fear_greed_var.set(f"CNN股票恐惧贪婪指数: 获取失败")
-            fear_greed_label.config(fg="black")
+        apply_fear_greed_result(result)
     except Exception as e:
         fear_greed_var.set(f"CNN股票恐惧贪婪指数: 获取失败 ({str(e)})")
         fear_greed_label.config(fg="black")
@@ -418,26 +522,7 @@ def update_fear_greed_index():
 def update_crypto_fear_greed_index():
     try:
         result = fetch_from_api('/api/fear_greed_crypto')
-        if result.get('success'):
-            index_value = result['value']
-            description = result['description']
-            
-            if index_value <= 25:
-                color = "blue"
-            elif index_value <= 45:
-                color = "cyan"
-            elif index_value <= 55:
-                color = "green"
-            elif index_value <= 75:
-                color = "orange"
-            else:
-                color = "red"
-                
-            fear_greed_crypto_var.set(f"Crypto恐惧贪婪指数: {index_value:.2f} ({description})")
-            fear_greed_crypto_label.config(fg=color)
-        else:
-            fear_greed_crypto_var.set(f"Crypto恐惧贪婪指数: 获取失败")
-            fear_greed_crypto_label.config(fg="black")
+        apply_crypto_fear_greed_result(result)
     except Exception as e:
         fear_greed_crypto_var.set(f"Crypto恐惧贪婪指数: 获取失败 ({str(e)})")
         fear_greed_crypto_label.config(fg="black")
@@ -930,8 +1015,10 @@ sheet_breadth.pack(fill="both", expand=True)
 # 底部按钮
 bottom = tk.Frame(root)
 bottom.pack(fill="x", padx=6, pady=(0, 8))
-tk.Button(bottom, text="Refresh Stocks", command=refresh_stock_data, width=15).pack(side="left", padx=4)
-tk.Button(bottom, text="Refresh Breadth", command=refresh_breadth_data, width=15).pack(side="left", padx=4)
+refresh_stock_button = tk.Button(bottom, text="Refresh Stocks", command=refresh_stock_data, width=15)
+refresh_stock_button.pack(side="left", padx=4)
+refresh_breadth_button = tk.Button(bottom, text="Refresh Breadth", command=refresh_breadth_data, width=15)
+refresh_breadth_button.pack(side="left", padx=4)
 refresh_label = tk.Label(bottom, text="Last Refresh: Not yet", anchor="e")
 refresh_label.pack(side="right")
 
@@ -939,9 +1026,12 @@ refresh_label.pack(side="right")
 latest_stock_df = pd.DataFrame()
 latest_breadth_df = pd.DataFrame()
 breadth_chart_data = {}
+stock_refresh_running = False
+breadth_refresh_running = False
+fear_greed_refresh_running = False
+startup_breadth_pending = True
 
 # 启动时加载数据
-refresh_stock_data()
-refresh_breadth_data()
+root.after(100, refresh_stock_data)
 
 root.mainloop()

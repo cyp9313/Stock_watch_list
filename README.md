@@ -146,7 +146,7 @@ Rel. Momentum = 0.2 * M3M + 0.3 * M6M + 0.5 * M12M
 
 其中 `M3M`、`M6M`、`M12M` 分别是标的相对 S&P 500 的 3 个月、6 个月、12 个月收益差。
 
-Beta 使用标的与 `^GSPC` 的共同交易日收益率计算，窗口最多取最近 252 个交易日，并按美东日期缓存到 SQLite。标的与基准的价格数据均来自 `price_cache` 表。
+Beta 使用标的与 `^GSPC` 的共同交易日收益率计算，窗口最多取最近 252 个交易日，并按美东日期缓存到 SQLite。标的与基准的价格数据均来自 `price_cache` 表；刷新时会批量读取和写入 Beta 缓存，避免逐 ticker 重复初始化 SQLite。
 
 ## 项目结构
 
@@ -343,6 +343,8 @@ python stock_watch_list_back_end.py
 
 - `Refresh Stocks`：刷新股票与大盘数据。
 - `Refresh Breadth`：刷新市场宽度数据。
+
+Tkinter 版刷新会在后台线程中执行，按钮会在对应刷新任务运行期间临时禁用，数据返回后再回到主线程更新表格；启动时会先刷新股票与大盘数据，完成后自动触发市场宽度刷新。
 
 K 线输入区：
 
@@ -543,10 +545,13 @@ http://127.0.0.1:5000
    - `stale`（DB - 请求）→ 默认不删除（避免 `/api/stock_data` 和 `/api/breadth_data` 互删对方数据）；旧数据由 750 天滚动窗口自动清理
 
 2. **增量下载周期由 gap 决定**（均为自然日，用 `gap+2` 留 2 天缓冲，防止周末缺口）：
-   - gap ≤ 30 天 → 下载 `{gap+2}d`（例：gap=1→3d，gap=6→8d，确保覆盖最新交易日）
+   - gap ≤ 0 天 → 下载 `2d`，用于同一交易日内再次刷新时获取盘中最新价
+   - 1 ≤ gap ≤ 30 天 → 下载 `{gap+2}d`（例：gap=1→3d，gap=6→8d，确保覆盖最新交易日）
    - > 30 天 → 全量重新下载 `2y`
 
    **注意**：早期版本对 `gap ≤ 7` 天固定用 `5d`，但当 gap=6（今天周四，缓存最新上周五）时，`5d` 只取最近 5 个自然日（周日~周四），上周五的数据（距今天 6 天）会被遗漏。现统一为 `{gap+2}d` 修复此问题。
+
+   对大量标的（例如 S&P 500 市场宽度）进行增量更新时，后端会将 yfinance 下载拆成批次执行并逐批写入缓存，避免一次性请求过多 ticker 导致响应长时间卡住。
 
 3. **滚动窗口清理**：每次 `init_db()` 时自动执行：
    - `price_cache`：保留最近 750 个自然日（≈517 交易日）。MA200 需 200 交易日 warmup + 1 年图表 252 交易日 = 452 交易日最低需求；750 自然日 ≈ 517 交易日，留有 ~65 交易日余量
@@ -784,7 +789,7 @@ Rel. Momentum = 0.2 * M3M + 0.3 * M6M + 0.5 * M12M
 
 `M3M`, `M6M`, and `M12M` are the ticker's return differences relative to the S&P 500 over the 3-month, 6-month, and 12-month windows.
 
-Beta is calculated from common trading-day returns between the ticker and `^GSPC`, using up to the most recent 252 trading days, and is cached in SQLite by US Eastern date. Both ticker and benchmark price data come from the `price_cache` table.
+Beta is calculated from common trading-day returns between the ticker and `^GSPC`, using up to the most recent 252 trading days, and is cached in SQLite by US Eastern date. Both ticker and benchmark price data come from the `price_cache` table; refreshes batch-read and batch-write the Beta cache to avoid repeated SQLite initialization per ticker.
 
 ## Project Structure
 
@@ -981,6 +986,8 @@ Bottom buttons:
 
 - `Refresh Stocks`: refresh stock and broad-market data.
 - `Refresh Breadth`: refresh market breadth data.
+
+In the Tkinter version, refresh tasks run in background threads. The corresponding button is temporarily disabled while its task is running, and table updates are applied back on the Tkinter main thread. On startup, the app refreshes stock and broad-market data first, then automatically starts the market breadth refresh.
 
 K-line input area:
 
@@ -1181,10 +1188,13 @@ Price data uses an incremental update strategy to avoid re-downloading 2 years o
    - `stale` (DB - request) → not deleted by default (avoids `/api/stock_data` and `/api/breadth_data` deleting each other's data); old data is cleaned up by the 750-day rolling window
 
 2. **Incremental download period is determined by the gap** (both are calendar days, using `gap+2` to add a 2-day buffer to prevent weekend gaps):
-   - gap ≤ 30 days → download `{gap+2}d` (e.g., gap=1→3d, gap=6→8d, ensuring the latest trading day is covered)
+   - gap ≤ 0 days → download `2d`, so same-day refreshes can still capture intraday price updates
+   - 1 ≤ gap ≤ 30 days → download `{gap+2}d` (e.g., gap=1→3d, gap=6→8d, ensuring the latest trading day is covered)
    - > 30 days → full re-download with `2y`
 
    **Note**: An earlier version used a fixed `5d` for `gap ≤ 7 days`. When gap=6 (today is Thursday, cache latest is last Friday), `5d` only fetches the last 5 calendar days (Sunday~Thursday), and last Friday's data (6 days ago) would be missed. Now unified to `{gap+2}d` to fix this issue.
+
+   For large ticker sets such as S&P 500 market breadth, the backend splits yfinance downloads into batches and writes each batch into SQLite, avoiding long stalls from sending too many tickers in one request.
 
 3. **Rolling window cleanup**: Executed automatically on each `init_db()` call:
    - `price_cache`: retains the most recent 750 calendar days (≈517 trading days). MA200 requires 200 trading days warmup + 1-year chart needs 252 trading days = 452 trading days minimum; 750 calendar days ≈ 517 trading days, providing ~65 trading days of buffer

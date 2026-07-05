@@ -10,6 +10,7 @@ import requests
 from io import StringIO
 from dotenv import load_dotenv
 import concurrent.futures
+import time
 # import random
 import pytz
 import fear_and_greed 
@@ -29,6 +30,7 @@ requests_cache.uninstall_cache()
 
 # ===== SQLite 缓存层 =====
 DB_PATH = "stock_cache.db"
+YF_DOWNLOAD_BATCH_SIZE = 100
 
 
 def init_db():
@@ -237,6 +239,36 @@ def save_beta(ticker, date_str, beta, data_points):
     conn.close()
 
 
+def get_cached_betas(tickers, date_str):
+    """批量从缓存读取 Beta，返回 {ticker: beta}"""
+    tickers = list(dict.fromkeys(tickers))
+    if not tickers:
+        return {}
+
+    conn = init_db()
+    placeholders = ','.join('?' * len(tickers))
+    rows = conn.execute(
+        f"SELECT ticker, beta FROM beta_cache WHERE date=? AND ticker IN ({placeholders})",
+        [date_str] + tickers
+    ).fetchall()
+    conn.close()
+    return {ticker: float(beta) for ticker, beta in rows if beta is not None}
+
+
+def save_betas(beta_rows):
+    """批量写入 Beta 缓存。beta_rows: [(ticker, date_str, beta, data_points), ...]"""
+    if not beta_rows:
+        return
+
+    conn = init_db()
+    conn.executemany(
+        "INSERT OR REPLACE INTO beta_cache (ticker, date, beta, data_points) VALUES (?, ?, ?, ?)",
+        beta_rows
+    )
+    conn.commit()
+    conn.close()
+
+
 # ===== 价格缓存层（增量更新核心）=====
 
 def _safe_float(val):
@@ -248,6 +280,11 @@ def _safe_float(val):
         return None if np.isnan(f) else f
     except (ValueError, TypeError):
         return None
+
+
+def _chunks(items, size):
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
 
 
 def _save_to_price_cache(conn, df, tickers):
@@ -401,24 +438,28 @@ def get_prices_with_cache(tickers, period="2y", delete_stale=False):
     if new:
         new_list = sorted(new)
         print(f"[PriceCache] 全量下载 {len(new_list)} 个新标的 (period={period})...")
-        df_new = yf.download(
-            tickers=new_list, period=period, interval="1d",
-            auto_adjust=False, group_by="column", threads=True, progress=False
-        )
-        if df_new is not None and not df_new.empty:
-            _save_to_price_cache(conn, df_new, new_list)
+        for batch in _chunks(new_list, YF_DOWNLOAD_BATCH_SIZE):
+            print(f"[PriceCache] 全量下载批次 {len(batch)} 个标的 (period={period})...")
+            df_new = yf.download(
+                tickers=batch, period=period, interval="1d",
+                auto_adjust=False, group_by="column", threads=True, progress=False, timeout=20
+            )
+            if df_new is not None and not df_new.empty:
+                _save_to_price_cache(conn, df_new, batch)
 
     # 5. 增量更新已有标的
     if existing:
         existing_list = sorted(existing)
         # 按下载 period 分组，减少 API 调用次数
         download_batches = {}  # period_str -> [tickers]
+        placeholders = ','.join('?' * len(existing_list))
+        max_dates = dict(conn.execute(
+            f"SELECT ticker, MAX(date) FROM price_cache WHERE ticker IN ({placeholders}) GROUP BY ticker",
+            existing_list
+        ).fetchall())
 
         for t in existing_list:
-            row = conn.execute(
-                "SELECT MAX(date) FROM price_cache WHERE ticker=?", (t,)
-            ).fetchone()
-            max_date_str = row[0] if row else None
+            max_date_str = max_dates.get(t)
 
             if max_date_str is None:
                 # DB 中无数据，按全量处理
@@ -429,8 +470,8 @@ def get_prices_with_cache(tickers, period="2y", delete_stale=False):
             gap_days = (today - max_date).days
 
             if gap_days <= 0:
-                # 已是最新，跳过
-                continue
+                # 同一交易日内再次刷新时，仍拉取 2d 以获取盘中最新价
+                dl_period = "2d"
             elif gap_days <= 30:
                 dl_period = f"{gap_days + 2}d"
             else:
@@ -440,12 +481,14 @@ def get_prices_with_cache(tickers, period="2y", delete_stale=False):
 
         for dl_period, batch in download_batches.items():
             print(f"[PriceCache] 增量更新 {len(batch)} 个标的 (period={dl_period})...")
-            df_inc = yf.download(
-                tickers=batch, period=dl_period, interval="1d",
-                auto_adjust=False, group_by="column", threads=True, progress=False
-            )
-            if df_inc is not None and not df_inc.empty:
-                _save_to_price_cache(conn, df_inc, batch)
+            for sub_batch in _chunks(batch, YF_DOWNLOAD_BATCH_SIZE):
+                print(f"[PriceCache] 增量更新批次 {len(sub_batch)} 个标的 (period={dl_period})...")
+                df_inc = yf.download(
+                    tickers=sub_batch, period=dl_period, interval="1d",
+                    auto_adjust=False, group_by="column", threads=True, progress=False, timeout=20
+                )
+                if df_inc is not None and not df_inc.empty:
+                    _save_to_price_cache(conn, df_inc, sub_batch)
 
     conn.commit()
 
@@ -909,6 +952,10 @@ def get_stock_data():
 
             return np.nan, None
 
+        today_str = get_market_date()
+        beta_cache = get_cached_betas(all_tickers, today_str)
+        beta_updates = []
+
         for ticker in all_tickers:
             if adj_close.empty or ticker not in adj_close.columns:
                 continue
@@ -1021,8 +1068,7 @@ def get_stock_data():
 
             # ===== Beta（相对于 ^GSPC，带 SQLite 缓存，统一用过去1年数据）=====
             beta = np.nan
-            today_str = get_market_date()
-            beta_cached = get_cached_beta(ticker, today_str)
+            beta_cached = beta_cache.get(ticker)
             if beta_cached is not None:
                 beta = float(beta_cached)
             elif (sp500_prices is not None and isinstance(sp500_prices, pd.Series) 
@@ -1045,7 +1091,7 @@ def get_stock_data():
                         var_sp500 = cov_matrix[1, 1]
                         if var_sp500 != 0:
                             beta = float(cov_matrix[0, 1] / var_sp500)
-                            save_beta(ticker, today_str, beta, len(common_idx))
+                            beta_updates.append((ticker, today_str, beta, len(common_idx)))
 
             row = {
                 "Ticker": ticker,
@@ -1075,6 +1121,8 @@ def get_stock_data():
 
             results.append(row)
 
+        save_betas(beta_updates)
+
         return jsonify({"success": True, "data": results})
         
     except Exception as e:
@@ -1083,6 +1131,7 @@ def get_stock_data():
 @app.route('/api/breadth_data', methods=['POST'])
 def get_breadth_data():
     """获取市场宽度数据"""
+    endpoint_start = time.perf_counter()
     try:
         
                 # 获取标普500股票代码列表
@@ -1102,8 +1151,9 @@ def get_breadth_data():
         
         # 获取标普500价格数据（增量更新，2y 数据确保 MA200 在 1 年图表范围内有效）
         try:
+            price_start = time.perf_counter()
             sp500_data = get_prices_with_cache(sp500_symbols, period="2y")
-            print(f"标普500数据获取完成，数据形状: {sp500_data.shape}")
+            print(f"标普500数据获取完成，数据形状: {sp500_data.shape}, 耗时 {time.perf_counter() - price_start:.1f}s")
         except Exception as e:
             return jsonify({"success": False, "error": f"获取标普500数据失败: {str(e)}"})
         
@@ -1112,7 +1162,9 @@ def get_breadth_data():
             return jsonify({"success": False, "error": "标普500数据为空"})
         
         # 计算市场宽度
+        calc_start = time.perf_counter()
         breadth_df = calculate_market_breadth(sp500_data, sp500_symbols)
+        print(f"市场宽度计算完成，耗时 {time.perf_counter() - calc_start:.1f}s")
         
         # 检查市场宽度数据是否为空
         if breadth_df.empty:
@@ -1158,6 +1210,7 @@ def get_breadth_data():
             "200MA_Ratio": [round(float(x), 2) if not np.isnan(x) else 0 for x in chart_df["200MA_Ratio"]] if "200MA_Ratio" in chart_df.columns else []
         }
         
+        print(f"/api/breadth_data 完成，总耗时 {time.perf_counter() - endpoint_start:.1f}s")
         return jsonify({"success": True, "data": results, "breadth_chart_data": breadth_data})
         
     except Exception as e:
@@ -1337,7 +1390,7 @@ def get_fear_greed_crypto():
     """获取加密货币恐惧贪婪指数"""
     try:
         url="https://api.alternative.me/fng/"
-        response = requests.get(url)
+        response = requests.get(url, timeout=10)
         data = response.json()
         fear_greed_data = data["data"][0]  # 获取第一个数据点
         value = float(fear_greed_data["value"])  # 指数值
