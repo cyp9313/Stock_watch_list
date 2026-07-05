@@ -757,10 +757,14 @@ def plot_kline():
             ax2.grid(True)
 
             # MACD
-            ax3.plot(dates, data['indicators']['macd'], label='MACD', color='blue')
-            ax3.plot(dates, data['indicators']['signal'], label='Signal', color='red')
+            hist_data = data['indicators']['hist']
+            hist_colors = ['#26a69a' if v >= 0 else '#ef5350' for v in hist_data]
+            ax3.bar(dates, hist_data, width=0.8, color=hist_colors, alpha=0.6, label='Hist')
+            ax3.plot(dates, data['indicators']['macd'], label='MACD', color='blue', linewidth=1)
+            ax3.plot(dates, data['indicators']['signal'], label='Signal', color='red', linewidth=1)
+            ax3.axhline(0, color='gray', linewidth=0.5)
             ax3.set_ylabel('MACD')
-            ax3.tick_params(axis='x', labelbottom=False)  
+            ax3.tick_params(axis='x', labelbottom=False)
             ax3.legend()
             ax3.grid(True)
 

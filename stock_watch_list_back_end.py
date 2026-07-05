@@ -34,6 +34,27 @@ DB_PATH = "stock_cache.db"
 def init_db():
     """初始化 SQLite 数据库，返回连接"""
     conn = sqlite3.connect(DB_PATH)
+    # 性能优化：WAL 模式提升并发读写；增量 auto_vacuum 让被删除的页面可复用
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
+
+    # ===== 价格缓存表（增量更新的核心）=====
+    # 所有标的（watchlist + 宽基指数 + S&P500 breadth）统一存一张表
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS price_cache (
+            ticker      TEXT    NOT NULL,
+            date        TEXT    NOT NULL,
+            adj_close   REAL,
+            volume      REAL,
+            PRIMARY KEY (ticker, date)
+        )
+    """)
+    # 为按 ticker 查询创建索引（MAX(date) 查询走索引）
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_price_cache_ticker
+        ON price_cache(ticker)
+    """)
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS stock_analysis_data (
             ticker          TEXT    NOT NULL,
@@ -98,6 +119,19 @@ def init_db():
     except sqlite3.OperationalError:
         conn.execute("ALTER TABLE stock_analysis_data ADD COLUMN pb_ratio REAL")
         print("[DB] 已添加 pb_ratio 列到 stock_analysis_data 表")
+
+    # ===== 滚动窗口清理 =====
+    # price_cache: 保留 750 个自然日（≈517 交易日）
+    #   MA200 需 200 交易日 warmup + 1 年图表 252 交易日 = 452 交易日最低需求
+    #   750 自然日 ≈ 517 交易日，留有 ~65 交易日余量
+    #   注意：不能用 500 自然日，因为 500 自然日 ≈ 345 交易日 < 452 交易日
+    deleted = conn.execute("DELETE FROM price_cache WHERE date < date('now', '-750 days')").rowcount
+    if deleted > 0:
+        print(f"[DB] price_cache 清理: 删除 {deleted} 条 750 天前的记录")
+    # stock_analysis_data / beta_cache: 保留 90 天（每日一行，90 天足够）
+    conn.execute("DELETE FROM stock_analysis_data WHERE date < date('now', '-90 days')")
+    conn.execute("DELETE FROM beta_cache WHERE date < date('now', '-90 days')")
+
     conn.commit()
     return conn
 
@@ -202,6 +236,225 @@ def save_beta(ticker, date_str, beta, data_points):
     conn.commit()
     conn.close()
 
+
+# ===== 价格缓存层（增量更新核心）=====
+
+def _safe_float(val):
+    """将值安全转换为 float，NaN/None 返回 None"""
+    if val is None:
+        return None
+    try:
+        f = float(val)
+        return None if np.isnan(f) else f
+    except (ValueError, TypeError):
+        return None
+
+
+def _save_to_price_cache(conn, df, tickers):
+    """
+    将 yf.download 的输出写入 price_cache 表（INSERT OR REPLACE）。
+    只保存 adj_close 和 volume，OHL/Close 是冗余数据不保存。
+    支持多标的（MultiIndex 列）和单标的（扁平列）两种格式。
+    """
+    if df is None or df.empty:
+        return
+
+    all_rows = []
+
+    if isinstance(df.columns, pd.MultiIndex):
+        # 多标的格式：列如 ('Adj Close', 'AAPL')
+        for ticker in tickers:
+            rows_data = []
+            if ('Adj Close', ticker) in df.columns:
+                rows_data.append(('adj_close', df[('Adj Close', ticker)]))
+            if ('Volume', ticker) in df.columns:
+                rows_data.append(('volume', df[('Volume', ticker)]))
+
+            if not rows_data:
+                continue
+
+            sub = pd.DataFrame({name: series for name, series in rows_data})
+            sub = sub.dropna(how='all')
+
+            for date_idx, row in sub.iterrows():
+                date_str = pd.Timestamp(date_idx).strftime('%Y-%m-%d')
+                all_rows.append((
+                    ticker, date_str,
+                    _safe_float(row.get('adj_close')),
+                    _safe_float(row.get('volume')),
+                ))
+    elif len(tickers) == 1:
+        # 单标的格式：列如 'Adj Close', 'Volume', ...
+        ticker = tickers[0]
+        col_map = {'Adj Close': 'adj_close', 'Volume': 'volume'}
+        available = {col_map[c]: df[c] for c in df.columns if c in col_map}
+        if not available:
+            return
+        sub = pd.DataFrame(available).dropna(how='all')
+
+        for date_idx, row in sub.iterrows():
+            date_str = pd.Timestamp(date_idx).strftime('%Y-%m-%d')
+            all_rows.append((
+                ticker, date_str,
+                _safe_float(row.get('adj_close')),
+                _safe_float(row.get('volume')),
+            ))
+
+    if all_rows:
+        conn.executemany(
+            "INSERT OR REPLACE INTO price_cache "
+            "(ticker, date, adj_close, volume) "
+            "VALUES (?, ?, ?, ?)",
+            all_rows
+        )
+        print(f"[PriceCache] 写入 {len(all_rows)} 条记录 ({len(tickers)} 个标的)")
+
+
+def _load_from_price_cache(conn, tickers):
+    """
+    从 price_cache 读取数据，返回与 yf.download(group_by='column', auto_adjust=False)
+    格式一致的 MultiIndex DataFrame。
+    只包含 ('Adj Close', ticker) 和 ('Volume', ticker) 列。
+    """
+    if not tickers:
+        return pd.DataFrame()
+
+    placeholders = ','.join('?' * len(tickers))
+    rows = conn.execute(
+        f"SELECT ticker, date, adj_close, volume "
+        f"FROM price_cache WHERE ticker IN ({placeholders}) ORDER BY ticker, date",
+        tickers
+    ).fetchall()
+
+    if not rows:
+        return pd.DataFrame()
+
+    records = []
+    for ticker, date_str, ac, v in rows:
+        records.append({
+            'date': pd.Timestamp(date_str),
+            'ticker': ticker,
+            'Adj Close': ac, 'Volume': v
+        })
+
+    df = pd.DataFrame(records)
+    df = df.pivot(index='date', columns='ticker')
+    # pivot 后列是 MultiIndex: ('Adj Close', 'AAPL'), ('Adj Close', 'MSFT'), ...
+    # 这与 yf.download(group_by='column') 格式一致（仅含 Adj Close 和 Volume）
+    df = df.sort_index(axis=1, level=0)
+    return df
+
+
+def get_prices_with_cache(tickers, period="2y", delete_stale=False):
+    """
+    带增量更新的价格数据获取。
+
+    策略（3-way delta reconciliation）：
+      - existing = DB ∩ 请求 → 增量下载最近几天，与缓存合并
+      - new      = 请求 - DB → 全量下载 period 数据
+      - stale    = DB - 请求 → 从 DB 删除（仅当 delete_stale=True）
+
+    注意: stale 删除默认关闭。因为 /api/stock_data 和 /api/breadth_data
+    请求的标的集不同，开启 stale 删除会导致两个端点互删对方数据。
+    旧数据由 init_db() 的 750 天滚动窗口自动清理。
+
+    增量下载的 period 由 gap 决定：
+      - gap ≤ 7 天  → "5d"
+      - 8~30 天     → "{gap+2}d"
+      - > 30 天     → 全量重新下载 period
+
+    返回: MultiIndex DataFrame（与 yf.download group_by='column' auto_adjust=False 一致）
+    """
+    if not tickers:
+        return pd.DataFrame()
+
+    conn = init_db()
+    today = datetime.date.today()
+
+    # 去重保持顺序
+    tickers = list(dict.fromkeys(tickers))
+    req_set = set(tickers)
+
+    # 1. 查询 DB 中已有的标的
+    db_tickers = set(
+        row[0] for row in conn.execute("SELECT DISTINCT ticker FROM price_cache").fetchall()
+    )
+
+    # 2. 3-way 集合划分
+    existing = req_set & db_tickers    # 增量更新
+    new = req_set - db_tickers         # 全量下载
+    stale = db_tickers - req_set       # 删除
+
+    # 3. 删除过期标的（默认关闭，避免 stock_data 和 breadth_data 互删）
+    if delete_stale and stale:
+        stale_list = sorted(stale)
+        placeholders = ','.join('?' * len(stale_list))
+        conn.execute(
+            f"DELETE FROM price_cache WHERE ticker IN ({placeholders})",
+            stale_list
+        )
+        conn.commit()
+        print(f"[PriceCache] 删除 {len(stale_list)} 个过期标的: {stale_list}")
+
+    # 4. 全量下载新标的
+    if new:
+        new_list = sorted(new)
+        print(f"[PriceCache] 全量下载 {len(new_list)} 个新标的 (period={period})...")
+        df_new = yf.download(
+            tickers=new_list, period=period, interval="1d",
+            auto_adjust=False, group_by="column", threads=True, progress=False
+        )
+        if df_new is not None and not df_new.empty:
+            _save_to_price_cache(conn, df_new, new_list)
+
+    # 5. 增量更新已有标的
+    if existing:
+        existing_list = sorted(existing)
+        # 按下载 period 分组，减少 API 调用次数
+        download_batches = {}  # period_str -> [tickers]
+
+        for t in existing_list:
+            row = conn.execute(
+                "SELECT MAX(date) FROM price_cache WHERE ticker=?", (t,)
+            ).fetchone()
+            max_date_str = row[0] if row else None
+
+            if max_date_str is None:
+                # DB 中无数据，按全量处理
+                download_batches.setdefault(period, []).append(t)
+                continue
+
+            max_date = datetime.datetime.strptime(max_date_str, '%Y-%m-%d').date()
+            gap_days = (today - max_date).days
+
+            if gap_days <= 0:
+                # 已是最新，跳过
+                continue
+            elif gap_days <= 7:
+                dl_period = "5d"
+            elif gap_days <= 30:
+                dl_period = f"{gap_days + 2}d"
+            else:
+                dl_period = period  # gap 过大，全量重新下载
+
+            download_batches.setdefault(dl_period, []).append(t)
+
+        for dl_period, batch in download_batches.items():
+            print(f"[PriceCache] 增量更新 {len(batch)} 个标的 (period={dl_period})...")
+            df_inc = yf.download(
+                tickers=batch, period=dl_period, interval="1d",
+                auto_adjust=False, group_by="column", threads=True, progress=False
+            )
+            if df_inc is not None and not df_inc.empty:
+                _save_to_price_cache(conn, df_inc, batch)
+
+    conn.commit()
+
+    # 6. 从 DB 加载完整数据
+    result_df = _load_from_price_cache(conn, tickers)
+
+    conn.close()
+    return result_df
 
 
 app = Flask(__name__)
@@ -310,27 +563,31 @@ def calculate_market_breadth(data, symbols):
     # 处理不同的数据格式
     try:
         if isinstance(data.columns, pd.MultiIndex):
-            # MultiIndex格式（yf.download返回的格式）
-            try:
-                close_prices = data.xs('Close', axis=1, level=1)
-            except Exception:
+            # MultiIndex格式：price_cache 只存 Adj Close，直接提取
+            close_prices = None
+            for level in [0, 1]:
                 try:
-                    close_prices = data.xs('Adj Close', axis=1, level=1)
-                except Exception:
-                    print("无法提取Close价格数据")
-                    return pd.DataFrame(columns=["20MA_Ratio", "50MA_Ratio", "200MA_Ratio"])
+                    candidate = data.xs('Adj Close', axis=1, level=level)
+                    if not candidate.empty:
+                        close_prices = candidate
+                        break
+                except KeyError:
+                    continue
+            if close_prices is None:
+                print("无法提取 Adj Close 价格数据")
+                return pd.DataFrame(columns=["20MA_Ratio", "50MA_Ratio", "200MA_Ratio"])
         else:
             # 普通DataFrame格式（备用方法返回的格式）
             close_prices = data
             
-        print(f"Close价格数据形状: {close_prices.shape}")
+        print(f"Adj Close价格数据形状: {close_prices.shape}")
         
         # 删除全为NaN的列
         close_prices = close_prices.dropna(axis=1, how='all')
         print(f"删除全NaN列后形状: {close_prices.shape}")
         
         if close_prices.empty:
-            print("Close价格数据为空")
+            print("Adj Close价格数据为空")
             return pd.DataFrame(columns=["20MA_Ratio", "50MA_Ratio", "200MA_Ratio"])
             
         # 确保有足够的数据点
@@ -338,10 +595,11 @@ def calculate_market_breadth(data, symbols):
             print("数据点不足20个，无法计算市场宽度")
             return pd.DataFrame(columns=["20MA_Ratio", "50MA_Ratio", "200MA_Ratio"])
 
-        # 计算移动平均线
-        ma20 = close_prices.rolling(window=20, min_periods=1).mean()
-        ma50 = close_prices.rolling(window=50, min_periods=1).mean()
-        ma200 = close_prices.rolling(window=200, min_periods=1).mean()
+        # 计算移动平均线（不使用 min_periods=1，确保 MA 值在窗口不足时为 NaN）
+        # 2y 数据（500+ 交易日）足以让 MA200 在最近 1 年图表范围内全部有效
+        ma20 = close_prices.rolling(window=20).mean()
+        ma50 = close_prices.rolling(window=50).mean()
+        ma200 = close_prices.rolling(window=200).mean()
 
         # 计算上涨股票数量
         adv_mask_20 = (close_prices > ma20) & (~ma20.isna())
@@ -512,30 +770,19 @@ def get_stock_data():
                 print(f"获取{ticker_symbol}财报日期失败: {e}")
                 earnings_df.loc[ticker_symbol] = None
 
-        # 获取价格数据（改为2y确保12个月计算有足够数据）
-        df = yf.download(
-            tickers=all_tickers,
-            period="2y",
-            interval="1d",
-            auto_adjust=False,
-            group_by="column",
-            threads=True
-        )
+        # 获取价格数据（增量更新：已有标的只下载最近几天，新标的全量下载）
+        df = get_prices_with_cache(all_tickers, period="2y")
 
         if isinstance(df.columns, pd.MultiIndex):
             top_fields = {lvl[0] for lvl in df.columns}
             if 'Adj Close' in top_fields:
                 adj_close = df['Adj Close'].copy()
-            elif 'Close' in top_fields:
-                adj_close = df['Close'].copy()
             else:
                 adj_close = pd.DataFrame()
             volumes = df['Volume'].copy() if 'Volume' in top_fields else pd.DataFrame()
         else:
             if 'Adj Close' in df.columns:
                 price_col = 'Adj Close'
-            elif 'Close' in df.columns:
-                price_col = 'Close'
             else:
                 price_col = df.columns[0]
             only_ticker = all_tickers[0]
@@ -544,29 +791,23 @@ def get_stock_data():
 
         results = []
 
-        # 获取标普500的数据作为基准
+        # 从缓存数据中提取标普500价格（无需单独下载）
         sp500_ticker = "^GSPC"
-
-        # 总是尝试获取标普500的数据
         sp500_prices = None
         sp500_reference_dates = {}  # 存储参考日期：{63: date, 126: date, 252: date}
-        
+
         try:
-            print(f"正在下载 {sp500_ticker} 数据...")
-            sp500_data = yf.download(sp500_ticker, period="2y", interval="1d", auto_adjust=False, progress=False)
-            if not sp500_data.empty:
-                if isinstance(sp500_data.columns, pd.MultiIndex):
-                    if 'Adj Close' in sp500_data.columns:
-                        sp500_prices = sp500_data['Adj Close'][sp500_ticker].dropna()
-                    elif 'Close' in sp500_data.columns:
-                        sp500_prices = sp500_data['Close'][sp500_ticker].dropna()
-                else:
-                    if 'Adj Close' in sp500_data.columns:
-                        sp500_prices = sp500_data['Adj Close'].dropna()
-                    elif 'Close' in sp500_data.columns:
-                        sp500_prices = sp500_data['Close'].dropna()
-                print(f"{sp500_ticker} 数据下载成功，共 {len(sp500_prices)} 个数据点")
-                
+            if not adj_close.empty and sp500_ticker in adj_close.columns:
+                sp500_prices = adj_close[sp500_ticker].dropna()
+                print(f"{sp500_ticker} 从缓存获取成功，共 {len(sp500_prices)} 个数据点")
+            elif not adj_close.empty and 'Adj Close' in df.columns:
+                # 单标的情况
+                sp500_prices = df['Adj Close'].dropna()
+                print(f"{sp500_ticker} 从缓存获取成功，共 {len(sp500_prices)} 个数据点")
+            else:
+                print(f"{sp500_ticker} 不在缓存数据中")
+
+            if sp500_prices is not None and len(sp500_prices) > 0:
                 # 计算标普500的参考日期（日期对齐的关键），统一去掉时区
                 def _normalize_date(ts):
                     ts = pd.Timestamp(ts).normalize()
@@ -578,12 +819,10 @@ def get_stock_data():
                     sp500_reference_dates[126] = _normalize_date(sp500_prices.index[-126])
                 if len(sp500_prices) >= 252:
                     sp500_reference_dates[252] = _normalize_date(sp500_prices.index[-252])
-                
+
                 print(f"标普500参考日期: 3M={sp500_reference_dates.get(63, 'N/A')}, 6M={sp500_reference_dates.get(126, 'N/A')}, 12M={sp500_reference_dates.get(252, 'N/A')}")
-            else:
-                print(f"{sp500_ticker} 数据为空")
         except Exception as e:
-            print(f"下载 {sp500_ticker} 数据失败: {e}")
+            print(f"提取 {sp500_ticker} 缓存数据失败: {e}")
 
         def pct(a, b):
             if pd.isna(a) or pd.isna(b) or b == 0:
@@ -677,12 +916,9 @@ def get_stock_data():
             if (sp500_prices is not None and isinstance(sp500_prices, pd.Series) and 
                 len(sp500_prices) > 0 and len(price_series) > 0 and len(sp500_reference_dates) > 0):
                 
-                print(f"计算 {ticker} 的相对动量分数（日期对齐）...")
-                
                 # 计算3个月（63个交易日）的收益率
                 if 63 in sp500_reference_dates:
                     ref_date_3m = sp500_reference_dates[63]
-                    print(f"  参考日期 3M: {ref_date_3m.strftime('%Y-%m-%d')}")
                     
                     # 获取标普500在参考日期的价格
                     sp500_price_3m, actual_date_3m = get_price_on_date(sp500_prices, ref_date_3m)
@@ -697,14 +933,10 @@ def get_stock_data():
                         sp500_return_3m = (sp500_prices.iloc[-1] / sp500_price_3m - 1) * 100
                         stock_return_3m = (price_series.iloc[-1] / stock_price_3m - 1) * 100
                         m3m = stock_return_3m - sp500_return_3m
-                        print(f"  M3M: 股票收益率={stock_return_3m:.2f}%, 标普500收益率={sp500_return_3m:.2f}%, 相对差={m3m:.2f}%")
-                    else:
-                        print(f"  M3M: 数据不足（sp500_price={sp500_price_3m}, stock_price={stock_price_3m})")
                 
                 # 计算6个月（126个交易日）的收益率
                 if 126 in sp500_reference_dates:
                     ref_date_6m = sp500_reference_dates[126]
-                    print(f"  参考日期 6M: {ref_date_6m.strftime('%Y-%m-%d')}")
                     
                     sp500_price_6m, actual_date_6m = get_price_on_date(sp500_prices, ref_date_6m)
                     
@@ -717,14 +949,10 @@ def get_stock_data():
                         sp500_return_6m = (sp500_prices.iloc[-1] / sp500_price_6m - 1) * 100
                         stock_return_6m = (price_series.iloc[-1] / stock_price_6m - 1) * 100
                         m6m = stock_return_6m - sp500_return_6m
-                        print(f"  M6M: 股票收益率={stock_return_6m:.2f}%, 标普500收益率={sp500_return_6m:.2f}%, 相对差={m6m:.2f}%")
-                    else:
-                        print(f"  M6M: 数据不足")
                 
                 # 计算12个月（252个交易日）的收益率
                 if 252 in sp500_reference_dates:
                     ref_date_12m = sp500_reference_dates[252]
-                    print(f"  参考日期 12M: {ref_date_12m.strftime('%Y-%m-%d')}")
                     
                     sp500_price_12m, actual_date_12m = get_price_on_date(sp500_prices, ref_date_12m)
                     
@@ -737,27 +965,16 @@ def get_stock_data():
                         sp500_return_12m = (sp500_prices.iloc[-1] / sp500_price_12m - 1) * 100
                         stock_return_12m = (price_series.iloc[-1] / stock_price_12m - 1) * 100
                         m12m = stock_return_12m - sp500_return_12m
-                        print(f"  M12M: 股票收益率={stock_return_12m:.2f}%, 标普500收益率={sp500_return_12m:.2f}%, 相对差={m12m:.2f}%")
-                    else:
-                        print(f"  M12M: 数据不足")
                 
                 # 计算相对动量分数
                 if not (pd.isna(m3m) or pd.isna(m6m) or pd.isna(m12m)):
                     relative_momentum = 0.2 * m3m + 0.3 * m6m + 0.5 * m12m
-                    print(f"  相对动量分数: {relative_momentum:.2f}")
                 elif ticker == sp500_ticker:
                     # 标普500本身的相对动量分数应为0
                     relative_momentum = 0.0
                     m3m = 0.0
                     m6m = 0.0
                     m12m = 0.0
-                    print(f"  {ticker} 是标普500，相对动量分数设为 0.0")
-                else:
-                    print(f"  无法计算相对动量分数: M3M={m3m}, M6M={m6m}, M12M={m12m}")
-            else:
-                sp500_status = '有效' if sp500_prices is not None and isinstance(sp500_prices, pd.Series) and len(sp500_prices) > 0 else '无效'
-                ref_dates_status = f'{len(sp500_reference_dates)} 个参考日期' if len(sp500_reference_dates) > 0 else '无参考日期'
-                print(f"跳过 {ticker} 的相对动量计算: sp500_prices={sp500_status}, 参考日期={ref_dates_status}, price_series长度={len(price_series)}")
 
             # ===== Beta（相对于 ^GSPC，带 SQLite 缓存，统一用过去1年数据）=====
             beta = np.nan
@@ -840,19 +1057,12 @@ def get_breadth_data():
         if not sp500_symbols:
             return jsonify({"success": False, "error": "无法获取标普500成分股列表"})
         
-        # 下载标普500数据
+        # 获取标普500价格数据（增量更新，2y 数据确保 MA200 在 1 年图表范围内有效）
         try:
-            sp500_data = yf.download(
-                tickers=sp500_symbols,
-                period="1y",
-                group_by='ticker',
-                auto_adjust=True,
-                progress=False,
-                threads=True
-            )
-            print(f"标普500数据下载完成，数据形状: {sp500_data.shape}")
+            sp500_data = get_prices_with_cache(sp500_symbols, period="2y")
+            print(f"标普500数据获取完成，数据形状: {sp500_data.shape}")
         except Exception as e:
-            return jsonify({"success": False, "error": f"下载标普500数据失败: {str(e)}"})
+            return jsonify({"success": False, "error": f"获取标普500数据失败: {str(e)}"})
         
         # 检查数据是否为空
         if sp500_data is None or sp500_data.empty:
@@ -888,20 +1098,21 @@ def get_breadth_data():
                         "Diff_BB_Low%": np.nan
                     })
 
-        # 准备图表数据
-        if hasattr(breadth_df.index, 'strftime') and callable(getattr(breadth_df.index, 'strftime', None)):
-            index_list = breadth_df.index.strftime('%Y-%m-%d').tolist()
+        # 准备图表数据（只取最近 252 个交易日 = 1 年）
+        chart_df = breadth_df.iloc[-252:] if len(breadth_df) > 252 else breadth_df
+        if hasattr(chart_df.index, 'strftime') and callable(getattr(chart_df.index, 'strftime', None)):
+            index_list = chart_df.index.strftime('%Y-%m-%d').tolist()
         else:
             try:
-                index_list = pd.to_datetime(breadth_df.index).strftime('%Y-%m-%d').tolist()
+                index_list = pd.to_datetime(chart_df.index).strftime('%Y-%m-%d').tolist()
             except:
                 index_list = []
-        
+
         breadth_data = {
             "index": index_list,
-            "20MA_Ratio": [round(float(x), 2) if not np.isnan(x) else 0 for x in breadth_df["20MA_Ratio"]] if "20MA_Ratio" in breadth_df.columns else [],
-            "50MA_Ratio": [round(float(x), 2) if not np.isnan(x) else 0 for x in breadth_df["50MA_Ratio"]] if "50MA_Ratio" in breadth_df.columns else [],
-            "200MA_Ratio": [round(float(x), 2) if not np.isnan(x) else 0 for x in breadth_df["200MA_Ratio"]] if "200MA_Ratio" in breadth_df.columns else []
+            "20MA_Ratio": [round(float(x), 2) if not np.isnan(x) else 0 for x in chart_df["20MA_Ratio"]] if "20MA_Ratio" in chart_df.columns else [],
+            "50MA_Ratio": [round(float(x), 2) if not np.isnan(x) else 0 for x in chart_df["50MA_Ratio"]] if "50MA_Ratio" in chart_df.columns else [],
+            "200MA_Ratio": [round(float(x), 2) if not np.isnan(x) else 0 for x in chart_df["200MA_Ratio"]] if "200MA_Ratio" in chart_df.columns else []
         }
         
         return jsonify({"success": True, "data": results, "breadth_chart_data": breadth_data})
@@ -1122,20 +1333,13 @@ def get_breadth_data_trail():
     if not sp500_symbols:
         return jsonify({"success": False, "error": "无法获取标普500成分股列表"})
     
-    # 下载标普500数据
+    # 预热标普500价格缓存（增量更新，2y 数据确保 MA200 有效）
     try:
-        sp500_data = yf.download(
-            tickers=sp500_symbols,
-            period="1y",
-            group_by='ticker',
-            auto_adjust=True,
-            progress=False,
-            threads=True
-        )
-        print(f"标普500数据下载完成，数据形状: {sp500_data.shape}")
-        return jsonify({"success": True, "error": "下载标普500数据成功"})
+        sp500_data = get_prices_with_cache(sp500_symbols, period="2y")
+        print(f"标普500数据预热完成，数据形状: {sp500_data.shape}")
+        return jsonify({"success": True, "error": "预热标普500数据成功"})
     except Exception as e:
-        return jsonify({"success": False, "error": f"下载标普500数据失败: {str(e)}"})
+        return jsonify({"success": False, "error": f"预热标普500数据失败: {str(e)}"})
     
 # if __name__ == "__main__":
 #     app.run(host="127.0.0.1", port=5000, debug=True, use_reloader=False)

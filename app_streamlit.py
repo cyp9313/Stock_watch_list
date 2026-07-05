@@ -821,15 +821,19 @@ st.title("📈 US Stock Watchlist")
 # ── Sidebar ──────────────────────────────────────────────────
 with st.sidebar:
     st.header("Controls")
-    
+
     col_r1, col_r2 = st.columns(2)
     with col_r1:
-        if st.button("🔄 Refresh All", width="stretch"):
-            st.cache_data.clear()
+        if st.button("📈 Refresh Stocks", width="stretch", key="btn_refresh_stocks"):
+            fetch_stock_data.clear()
             st.rerun()
-    
+    with col_r2:
+        if st.button("📊 Refresh Breadth", width="stretch", key="btn_refresh_breadth"):
+            fetch_breadth_data.clear()
+            st.rerun()
+
     st.divider()
-    
+
     st.caption(f"Last update: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 # ── Fear & Greed Row ─────────────────────────────────────────

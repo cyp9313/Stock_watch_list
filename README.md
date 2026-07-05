@@ -5,7 +5,7 @@
 - `app_tkinter.py`：Windows 桌面版，使用 Tkinter + tksheet + Matplotlib。
 - `app_streamlit.py`：网页看板版，使用 Streamlit + Plotly。
 
-两个前端都会在本地自动启动同一个 Flask 后端线程，后端通过 Yahoo Finance、StockAnalysis.com、CNN Fear & Greed、Alternative.me 等数据源获取数据，并用 SQLite 缓存部分基本面与 Beta 数据。
+两个前端都会在本地自动启动同一个 Flask 后端线程，后端通过 Yahoo Finance、StockAnalysis.com、CNN Fear & Greed、Alternative.me 等数据源获取数据，并用 SQLite 缓存价格数据（增量更新）、基本面数据与 Beta 数据。
 
 > 本项目用于个人投资研究和数据观察，不构成投资建议。外部数据源可能限流、延迟、字段变更或返回空值。
 
@@ -71,11 +71,11 @@
 
 ### 3. 市场宽度
 
-市场宽度模块会从 Wikipedia 获取最新 S&P 500 成分股列表，然后通过 Yahoo Finance 下载一年日线数据，计算：
+市场宽度模块会从 Wikipedia 获取最新 S&P 500 成分股列表，然后通过 Yahoo Finance 下载两年日线数据（确保 MA200 在一年图表范围内有效），计算：
 
-- `20MA_Ratio`：收盘价高于 20 日均线的成分股比例。
-- `50MA_Ratio`：收盘价高于 50 日均线的成分股比例。
-- `200MA_Ratio`：收盘价高于 200 日均线的成分股比例。
+- `20MA_Ratio`：复权收盘价高于 20 日均线的成分股比例。
+- `50MA_Ratio`：复权收盘价高于 50 日均线的成分股比例。
+- `200MA_Ratio`：复权收盘价高于 200 日均线的成分股比例。
 
 结果会以表格和折线图展示，便于观察指数内部强弱。
 
@@ -138,7 +138,7 @@ Tkinter 版在 K 线窗口中使用 Matplotlib 工具栏，并支持在图上交
 
 ### 7. 相对动量与 Beta
 
-`Rel. Momentum` 使用 S&P 500 作为基准。后端先下载 `^GSPC` 过去两年日线数据，取约 3 个月、6 个月、12 个月对应的参考交易日，再将每只标的与这些参考日期对齐计算相对收益差：
+`Rel. Momentum` 使用 S&P 500 作为基准。后端从价格缓存中获取 `^GSPC` 过去两年日线数据，取约 3 个月、6 个月、12 个月对应的参考交易日，再将每只标的与这些参考日期对齐计算相对收益差：
 
 ```text
 Rel. Momentum = 0.2 * M3M + 0.3 * M6M + 0.5 * M12M
@@ -146,7 +146,7 @@ Rel. Momentum = 0.2 * M3M + 0.3 * M6M + 0.5 * M12M
 
 其中 `M3M`、`M6M`、`M12M` 分别是标的相对 S&P 500 的 3 个月、6 个月、12 个月收益差。
 
-Beta 使用标的与 `^GSPC` 的共同交易日收益率计算，窗口最多取最近 252 个交易日，并按美东日期缓存到 SQLite。
+Beta 使用标的与 `^GSPC` 的共同交易日收益率计算，窗口最多取最近 252 个交易日，并按美东日期缓存到 SQLite。标的与基准的价格数据均来自 `price_cache` 表。
 
 ## 项目结构
 
@@ -168,9 +168,9 @@ Stock_watch_list/
 |
 |-- stock_watch_list_back_end.py
 |   |-- Flask API 后端
-|   |-- yfinance 数据下载
+|   |-- yfinance 数据下载（增量更新 + SQLite 缓存）
 |   |-- StockAnalysis.com 数据缓存与回退逻辑
-|   |-- SQLite 表：stock_analysis_data、beta_cache
+|   |-- SQLite 表：price_cache、stock_analysis_data、beta_cache
 |   |-- 市场宽度、相对动量、Beta、K 线指标、恐惧贪婪指数接口
 |
 |-- stockanalysis_scraper.py
@@ -526,10 +526,31 @@ http://127.0.0.1:5000
 
 ### `stock_cache.db`
 
-主后端使用的 SQLite 缓存文件，包含：
+主后端使用的 SQLite 缓存文件，包含三张表：
 
+- `price_cache`：统一存储所有标的（watchlist 股票 + 宽基指数 + S&P 500 breadth 成分股）的日线 **Adj Close 和 Volume** 数据（OHL/Close 为冗余数据不保存）。主键为 `(ticker, date)`，使用 `INSERT OR REPLACE` 合并增量数据。
 - `stock_analysis_data`：按 ticker 和美东日期缓存 StockAnalysis.com 基本面与分析师数据。
 - `beta_cache`：按 ticker 和美东日期缓存 Beta。
+
+#### 增量更新机制
+
+价格数据采用增量更新策略，避免每次刷新都全量下载 2 年历史数据：
+
+1. **3-way delta reconciliation**：每次请求时，将 DB 中已有的标的与当前请求的标的做集合比较：
+   - `existing`（DB ∩ 请求）→ 增量下载最近几天，与缓存合并
+   - `new`（请求 - DB）→ 全量下载 2 年数据
+   - `stale`（DB - 请求）→ 默认不删除（避免 `/api/stock_data` 和 `/api/breadth_data` 互删对方数据）；旧数据由 750 天滚动窗口自动清理
+
+2. **增量下载周期由 gap 决定**：
+   - gap ≤ 7 天 → 下载 `5d`
+   - 8~30 天 → 下载 `{gap+2}d`
+   - > 30 天 → 全量重新下载 `2y`
+
+3. **滚动窗口清理**：每次 `init_db()` 时自动执行：
+   - `price_cache`：保留最近 750 个自然日（≈517 交易日）。MA200 需 200 交易日 warmup + 1 年图表 252 交易日 = 452 交易日最低需求；750 自然日 ≈ 517 交易日，留有 ~65 交易日余量
+   - `stock_analysis_data` / `beta_cache`：保留最近 90 天
+
+4. **SQLite 优化**：启用 WAL 模式提升并发读写；设置 `auto_vacuum = INCREMENTAL` 让被删除的页面可复用。稳态下插入与删除平衡，数据库文件大小保持恒定。
 
 删除 `stock_cache.db` 后重启应用，会重新抓取和计算缓存数据。
 
@@ -562,7 +583,9 @@ http://127.0.0.1:5000
 
 ### 首次启动很慢
 
-首次启动会下载股票价格、S&P 500 数据、市场宽度数据，并抓取 StockAnalysis.com 基本面字段。等待时间取决于网络和外部数据源响应速度。
+首次启动（或 `stock_cache.db` 不存在时）会全量下载所有标的的 2 年价格数据、S&P 500 市场宽度数据，并抓取 StockAnalysis.com 基本面字段。等待时间取决于网络和外部数据源响应速度。
+
+后续启动时，已缓存的标的只需增量下载最近几天数据，响应速度会显著提升。仅当某标的距上次缓存超过 30 天（如长时间未启动程序）时，才会触发该标的的全量重新下载。
 
 ### Streamlit 或 Tkinter 报后端连接失败
 
@@ -584,7 +607,7 @@ StockAnalysis.com 不一定支持所有 ticker。后端会尽量回退到 yfinan
 stock_cache.db
 ```
 
-然后重新启动应用。
+然后重新启动应用。这会清空所有价格缓存、基本面缓存和 Beta 缓存，下次启动时重新全量下载。
 
 ### 是否支持美股以外的市场
 
@@ -597,6 +620,7 @@ stock_cache.db
 - `stockanalysis_scraper.py` 使用正则从 StockAnalysis.com 页面提取字段，页面结构变化时可能需要更新解析规则。
 - `stock_cache.db` 是运行期数据，不建议作为代码变更提交。
 - 源码中部分历史中文注释存在编码乱码，但运行逻辑以 Python 代码为准。
+- 价格数据使用 `price_cache` 表统一缓存并增量更新；新增标的自动全量下载，旧标的由 750 天滚动窗口自动清理，无需手动干预。
 
 ## License
 
@@ -617,7 +641,7 @@ A local stock watchlist and market dashboard for US equities and cross-market mo
 - `app_tkinter.py`: desktop app built with Tkinter, tksheet, and Matplotlib.
 - `app_streamlit.py`: web dashboard built with Streamlit and Plotly.
 
-Both frontends automatically start the same local Flask backend thread. The backend fetches data from Yahoo Finance, StockAnalysis.com, CNN Fear & Greed, and Alternative.me, and caches selected fundamental and Beta data in SQLite.
+Both frontends automatically start the same local Flask backend thread. The backend fetches data from Yahoo Finance, StockAnalysis.com, CNN Fear & Greed, and Alternative.me, and caches price data (with incremental updates), fundamental data, and Beta data in SQLite.
 
 > This project is intended for personal market research and data observation only. It is not investment advice. External data sources may be rate-limited, delayed, structurally changed, or return missing values.
 
@@ -683,11 +707,11 @@ Default broad-market groups:
 
 ### 3. Market Breadth
 
-The market breadth module fetches the latest S&P 500 constituents from Wikipedia, downloads one year of daily data from Yahoo Finance, and calculates:
+The market breadth module fetches the latest S&P 500 constituents from Wikipedia, downloads two years of daily data from Yahoo Finance (ensuring MA200 is valid across the one-year chart range), and calculates:
 
-- `20MA_Ratio`: percentage of constituents closing above their 20-day moving average.
-- `50MA_Ratio`: percentage of constituents closing above their 50-day moving average.
-- `200MA_Ratio`: percentage of constituents closing above their 200-day moving average.
+- `20MA_Ratio`: percentage of constituents with adjusted closing price above their 20-day moving average.
+- `50MA_Ratio`: percentage of constituents with adjusted closing price above their 50-day moving average.
+- `200MA_Ratio`: percentage of constituents with adjusted closing price above their 200-day moving average.
 
 Results are displayed as both a table and a line chart.
 
@@ -750,7 +774,7 @@ Note: P/S and P/B are currently used mainly in the K-line chart title and are no
 
 ### 7. Relative Momentum And Beta
 
-`Rel. Momentum` uses the S&P 500 as the benchmark. The backend downloads two years of daily `^GSPC` data, picks reference trading dates for approximately 3 months, 6 months, and 12 months, and aligns each ticker to those dates to calculate relative return differences:
+`Rel. Momentum` uses the S&P 500 as the benchmark. The backend retrieves two years of daily `^GSPC` data from the price cache, picks reference trading dates for approximately 3 months, 6 months, and 12 months, and aligns each ticker to those dates to calculate relative return differences:
 
 ```text
 Rel. Momentum = 0.2 * M3M + 0.3 * M6M + 0.5 * M12M
@@ -758,7 +782,7 @@ Rel. Momentum = 0.2 * M3M + 0.3 * M6M + 0.5 * M12M
 
 `M3M`, `M6M`, and `M12M` are the ticker's return differences relative to the S&P 500 over the 3-month, 6-month, and 12-month windows.
 
-Beta is calculated from common trading-day returns between the ticker and `^GSPC`, using up to the most recent 252 trading days, and is cached in SQLite by US Eastern date.
+Beta is calculated from common trading-day returns between the ticker and `^GSPC`, using up to the most recent 252 trading days, and is cached in SQLite by US Eastern date. Both ticker and benchmark price data come from the `price_cache` table.
 
 ## Project Structure
 
@@ -780,9 +804,9 @@ Stock_watch_list/
 |
 |-- stock_watch_list_back_end.py
 |   |-- Flask API backend
-|   |-- yfinance data download
+|   |-- yfinance data download (incremental update + SQLite cache)
 |   |-- StockAnalysis.com data cache and fallback logic
-|   |-- SQLite tables: stock_analysis_data, beta_cache
+|   |-- SQLite tables: price_cache, stock_analysis_data, beta_cache
 |   |-- Market breadth, relative momentum, Beta, K-line indicators, and Fear & Greed APIs
 |
 |-- stockanalysis_scraper.py
@@ -1138,10 +1162,31 @@ An experimental / auxiliary endpoint retained in the current code. It reads `sp5
 
 ### `stock_cache.db`
 
-Main SQLite cache used by the backend. It contains:
+Main SQLite cache used by the backend. It contains three tables:
 
+- `price_cache`: unified storage for daily **Adj Close and Volume** data of all tickers (watchlist stocks + broad-market indexes + S&P 500 breadth constituents). OHL/Close are redundant and not stored. Primary key is `(ticker, date)`; uses `INSERT OR REPLACE` to merge incremental data.
 - `stock_analysis_data`: caches StockAnalysis.com fundamentals and analyst data by ticker and US Eastern date.
 - `beta_cache`: caches Beta by ticker and US Eastern date.
+
+#### Incremental Update Mechanism
+
+Price data uses an incremental update strategy to avoid re-downloading 2 years of history on every refresh:
+
+1. **3-way delta reconciliation**: On each request, the backend compares DB tickers with the currently requested tickers:
+   - `existing` (DB ∩ request) → download only the latest few days and merge with cache
+   - `new` (request - DB) → full 2-year download
+   - `stale` (DB - request) → not deleted by default (avoids `/api/stock_data` and `/api/breadth_data` deleting each other's data); old data is cleaned up by the 750-day rolling window
+
+2. **Incremental download period is determined by the gap**:
+   - gap ≤ 7 days → download `5d`
+   - 8-30 days → download `{gap+2}d`
+   - > 30 days → full re-download with `2y`
+
+3. **Rolling window cleanup**: Executed automatically on each `init_db()` call:
+   - `price_cache`: retains the most recent 750 calendar days (≈517 trading days). MA200 requires 200 trading days warmup + 1-year chart needs 252 trading days = 452 trading days minimum; 750 calendar days ≈ 517 trading days, providing ~65 trading days of buffer
+   - `stock_analysis_data` / `beta_cache`: retains the most recent 90 days
+
+4. **SQLite optimization**: WAL mode enabled for concurrent read/write; `auto_vacuum = INCREMENTAL` allows freed pages to be reused. In steady state, insert/delete is balanced and the database file size remains constant.
 
 Delete `stock_cache.db` and restart the app to refetch and recalculate cached data.
 
@@ -1174,7 +1219,9 @@ To change the port, update both:
 
 ### First Launch Is Slow
 
-The first launch downloads stock prices, S&P 500 data, market breadth data, and StockAnalysis.com fundamental fields. Waiting time depends on network quality and external data-source response speed.
+The first launch (or when `stock_cache.db` does not exist) downloads 2 years of price data for all tickers, S&P 500 market breadth data, and StockAnalysis.com fundamental fields. Waiting time depends on network quality and external data-source response speed.
+
+On subsequent launches, cached tickers only need an incremental download of the latest few days, significantly improving response speed. A full re-download for a specific ticker is only triggered when it has been more than 30 days since the last cache update (e.g., after a long period without launching the app).
 
 ### Streamlit Or Tkinter Cannot Connect To Backend
 
@@ -1196,7 +1243,7 @@ Close the app and delete:
 stock_cache.db
 ```
 
-Then restart the app.
+Then restart the app. This clears all price cache, fundamental cache, and Beta cache; the next launch will perform a full re-download.
 
 ### Markets Outside US Stocks
 
@@ -1209,6 +1256,7 @@ The app supports tickers recognized by Yahoo Finance, such as China A-share ETFs
 - `stockanalysis_scraper.py` extracts fields from StockAnalysis.com pages with regular expressions; parsing rules may need updates if the page structure changes.
 - `stock_cache.db` is runtime data and should not be committed as a code change.
 - Some historical Chinese comments in source files may show encoding artifacts, but runtime behavior follows the Python code.
+- Price data is cached and incrementally updated in the `price_cache` table; new tickers are automatically downloaded in full, and old tickers are cleaned up by the 750-day rolling window without manual intervention.
 
 ## License
 
