@@ -619,6 +619,17 @@ def _extended_label_for_timestamp(ts_ny):
     return "Pre-market estimate" if local_time < datetime.time(9, 30) else "After-hours estimate"
 
 
+def _extended_label_for_now(now=None):
+    ny_tz = pytz.timezone('America/New_York')
+    now_ny = now.astimezone(ny_tz) if now is not None else datetime.datetime.now(ny_tz)
+    local_time = now_ny.time()
+    if now_ny.weekday() < 5 and local_time < datetime.time(9, 30):
+        return "Pre-market estimate"
+    if now_ny.weekday() < 5 and local_time >= datetime.time(16, 0):
+        return "After-hours estimate"
+    return "Extended-hours estimate"
+
+
 def _filter_extended_session(series, now=None):
     if series is None or series.empty:
         return pd.Series(dtype=float)
@@ -643,16 +654,35 @@ def _filter_extended_session(series, now=None):
     return s[mask.to_numpy()]
 
 
-def _select_latest_extended_price(series):
-    close_ext = _filter_extended_session(series)
-    if close_ext.empty:
+def _filter_intraday_until_now(series, now=None):
+    if series is None or series.empty:
+        return pd.Series(dtype=float)
+
+    s = series.dropna()
+    if s.empty:
+        return s
+
+    idx = pd.to_datetime(s.index)
+    if idx.tz is None:
+        idx_ny = idx.tz_localize('America/New_York')
+    else:
+        idx_ny = idx.tz_convert('America/New_York')
+
+    ny_tz = pytz.timezone('America/New_York')
+    now_ny = now.astimezone(ny_tz) if now is not None else datetime.datetime.now(ny_tz)
+    return s[np.asarray(idx_ny <= now_ny)]
+
+
+def _select_latest_extended_price(series, now=None):
+    close_latest = _filter_intraday_until_now(series, now=now)
+    if close_latest.empty:
         return None, None, None, None
-    latest_ts = close_ext.index[-1]
-    latest_price = _safe_float(close_ext.iloc[-1])
+    latest_ts = close_latest.index[-1]
+    latest_price = _safe_float(close_latest.iloc[-1])
     if latest_price is None:
         return None, None, None, None
     latest_ts_ny = _timestamp_to_ny(latest_ts)
-    return _extended_label_for_timestamp(latest_ts_ny), latest_ts, latest_ts_ny, latest_price
+    return _extended_label_for_now(now), latest_ts, latest_ts_ny, latest_price
 
 
 def update_extended_hours_price_cache(tickers):
