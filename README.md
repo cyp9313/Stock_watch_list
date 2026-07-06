@@ -1290,6 +1290,30 @@ The app supports tickers recognized by Yahoo Finance, such as China A-share ETFs
 - Some historical Chinese comments in source files may show encoding artifacts, but runtime behavior follows the Python code.
 - Price data is cached and incrementally updated in the `price_cache` table; new tickers are automatically downloaded in full, and old tickers are cleaned up by the 750-day rolling window without manual intervention.
 
+## Multi-user Streamlit Frontend
+
+`app_streamlit_multiuser.py` is an optional multi-user web frontend. It keeps the existing single-user `app_streamlit.py` unchanged.
+
+Create or reset a user account:
+
+```bash
+python multiuser_store.py create-user alice "your-password"
+python multiuser_store.py create-user alice "new-password" --overwrite
+```
+
+Run the multi-user frontend:
+
+```bash
+python -m streamlit run app_streamlit_multiuser.py --server.address 127.0.0.1 --server.port 8502 --server.headless true --browser.gatherUsageStats false
+```
+
+Behavior:
+
+- Logged-in users can edit their own Stocks and Broad Market pages, group names, and ticker lists.
+- Guest users see the default watch list in read-only mode and cannot save changes.
+- Each logged-in user's market-data cache is stored separately under `user_data/<username>_stock_cache.db`.
+- Accounts are created by the administrator with the command line; there is no public self-registration UI.
+
 ## License
 
 MIT License

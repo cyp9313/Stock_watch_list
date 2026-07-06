@@ -11,6 +11,8 @@ from io import StringIO
 from dotenv import load_dotenv
 import concurrent.futures
 import time
+import contextvars
+import re
 # import random
 import pytz
 import fear_and_greed 
@@ -34,11 +36,37 @@ DB_PATH = "stock_cache.db"
 YF_DOWNLOAD_BATCH_SIZE = 100
 SP500_SYMBOLS_CACHE_PATH = os.path.join(os.path.dirname(__file__), "sp500_symbols_cache.json")
 SP500_SYMBOLS_CACHE_MAX_AGE_DAYS = 7
+USER_CACHE_DIR = os.path.join(os.path.dirname(__file__), "user_data")
+CURRENT_DB_PATH = contextvars.ContextVar("CURRENT_DB_PATH", default=None)
+
+
+def _safe_cache_key(cache_key):
+    if not cache_key:
+        return ""
+    key = re.sub(r"[^A-Za-z0-9_-]+", "_", str(cache_key).strip())
+    return key[:64].strip("_")
+
+
+def db_path_for_cache_key(cache_key):
+    safe_key = _safe_cache_key(cache_key)
+    if not safe_key:
+        return DB_PATH
+    os.makedirs(USER_CACHE_DIR, exist_ok=True)
+    return os.path.join(USER_CACHE_DIR, f"{safe_key}_stock_cache.db")
+
+
+def get_active_db_path():
+    return CURRENT_DB_PATH.get() or DB_PATH
+
+
+def set_request_cache_db():
+    cache_key = request.values.get("cache_key", "")
+    return CURRENT_DB_PATH.set(db_path_for_cache_key(cache_key))
 
 
 def init_db():
     """初始化 SQLite 数据库，返回连接"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(get_active_db_path())
     # 性能优化：WAL 模式提升并发读写；增量 auto_vacuum 让被删除的页面可复用
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
@@ -764,6 +792,7 @@ def calculate_market_breadth(data, symbols):
 @app.route('/api/stock_data', methods=['GET'])
 def get_stock_data():
     """获取股票数据"""
+    cache_token = set_request_cache_db()
     try:
         # 从查询参数获取分组数据
         groups_json = request.args.get('groups', '{}')
@@ -1218,10 +1247,13 @@ def get_stock_data():
         
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
+    finally:
+        CURRENT_DB_PATH.reset(cache_token)
 
 @app.route('/api/breadth_data', methods=['POST'])
 def get_breadth_data():
     """获取市场宽度数据"""
+    cache_token = set_request_cache_db()
     endpoint_start = time.perf_counter()
     try:
         
@@ -1306,10 +1338,13 @@ def get_breadth_data():
         
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
+    finally:
+        CURRENT_DB_PATH.reset(cache_token)
 
 @app.route('/api/kline_data', methods=['GET'])
 def get_kline_data():
     """获取K线图数据"""
+    cache_token = set_request_cache_db()
     try:
         ticker = normalize_yfinance_ticker(request.args.get('ticker', ''))
         time_span = max(1, int(request.args.get('period', 365)))
@@ -1443,6 +1478,8 @@ def get_kline_data():
         
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
+    finally:
+        CURRENT_DB_PATH.reset(cache_token)
 
 @app.route('/api/fear_greed', methods=['GET'])
 def get_fear_greed():
