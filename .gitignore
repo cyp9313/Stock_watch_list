@@ -42,6 +42,8 @@ wheels/
 stock_cache.db
 sp500_symbols_cache.json
 sp500_constituents_cache.json
+nasdaq100_symbols_cache.json
+nasdaq100_constituents_cache.json
 watchlist_users.db
 user_data/
 *.db

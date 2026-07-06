@@ -366,7 +366,7 @@ K 线输入区：
 - 顶部显示 CNN 与 Crypto Fear & Greed。
 - `Stocks` 标签页显示股票观察列表。
 - `Broad Market` 标签页显示大盘与跨市场指标。
-- `Market Breadth` 标签页显示市场宽度表格和图表。
+- `Market Breadth` 标签页显示 S&P 500 与 Nasdaq 100 的 6 行宽度表格、两张宽度曲线图，以及两张按市值加权的 treemap。
 - 页面下方 `K-Line Chart` 区域用于绘制单个 ticker 的 K 线图。
 
 Fibonacci：
@@ -484,12 +484,18 @@ http://127.0.0.1:5000
 表单参数：
 
 - `sp500_symbols`：JSON 字符串，S&P 500 成分股 ticker 列表。
+- `nasdaq100_symbols`：JSON 字符串，Nasdaq 100 成分股 ticker 列表。后端会将两组 ticker 合并去重后只下载一次价格数据。
 
 返回：
 
 - `success`
 - `data`
 - `breadth_chart_data`
+- `breadth_treemap_data`
+- `nasdaq100_data`
+- `nasdaq100_breadth_chart_data`
+- `nasdaq100_breadth_treemap_data`
+- `breadth_universe_counts`
 
 ### GET `/api/kline_data`
 
@@ -723,11 +729,13 @@ Default broad-market groups:
 
 ### 3. Market Breadth
 
-The market breadth module fetches the latest S&P 500 constituents from Wikipedia, downloads two years of daily data from Yahoo Finance (ensuring MA200 is valid across the one-year chart range), and calculates:
+The market breadth module fetches the latest S&P 500 and Nasdaq 100 constituents, downloads two years of daily data from Yahoo Finance with a de-duplicated combined ticker universe (ensuring MA200 is valid across the one-year chart range), and calculates:
 
 - `20MA_Ratio`: percentage of constituents with adjusted closing price above their 20-day moving average.
 - `50MA_Ratio`: percentage of constituents with adjusted closing price above their 50-day moving average.
 - `200MA_Ratio`: percentage of constituents with adjusted closing price above their 200-day moving average.
+
+The Streamlit Market Breadth page keeps both universes on one page: a single grouped table with six rows, two side-by-side breadth charts, then S&P 500 and Nasdaq 100 treemaps. Nasdaq 100 constituents use Wikipedia first and a GitHub raw CSV fallback if Wikipedia is unavailable; sector metadata falls back to S&P 500 overlap metadata and yfinance when needed.
 
 Results are displayed as both a table and a line chart.
 
@@ -1018,7 +1026,7 @@ Main page:
 - Top area shows CNN and Crypto Fear & Greed.
 - `Stocks` tab shows the stock watchlist.
 - `Broad Market` tab shows broad-market and cross-market indicators.
-- `Market Breadth` tab shows the breadth table and chart.
+- `Market Breadth` tab shows the S&P 500 and Nasdaq 100 breadth table, two breadth charts, and two market-cap weighted treemaps.
 - The `K-Line Chart` section at the bottom plots a single ticker.
 
 Fibonacci:
@@ -1136,12 +1144,18 @@ Fetch market breadth data.
 Form parameter:
 
 - `sp500_symbols`: JSON string containing S&P 500 constituent tickers.
+- `nasdaq100_symbols`: JSON string containing Nasdaq 100 constituent tickers. The backend merges both universes and downloads each unique ticker only once.
 
 Returns:
 
 - `success`
 - `data`
 - `breadth_chart_data`
+- `breadth_treemap_data`
+- `nasdaq100_data`
+- `nasdaq100_breadth_chart_data`
+- `nasdaq100_breadth_treemap_data`
+- `breadth_universe_counts`
 
 ### GET `/api/kline_data`
 
@@ -1261,7 +1275,7 @@ Check whether `127.0.0.1:5000` is occupied by another process. Both frontends au
 
 ### Market Breadth Fails To Load
 
-Market breadth depends on the Wikipedia S&P 500 constituents table and Yahoo Finance batch download. If either source is unavailable, the module may return empty data or fail.
+Market breadth depends on constituent-list sources and Yahoo Finance batch download. S&P 500 uses Wikipedia with a DataHub GitHub CSV fallback; Nasdaq 100 uses Wikipedia with a GitHub raw CSV fallback. If Yahoo Finance is unavailable, breadth calculation may return empty data or fail.
 
 ### Some Tickers Have No Fundamental Data
 
@@ -1357,7 +1371,7 @@ For K-line charts:
 
 - Tkinter, single-user Streamlit, and guest mode use the shared `stock_cache.db`.
 - Logged-in multi-user Streamlit accounts use separate price caches under `user_data/<username>_stock_cache.db`.
-- S&P 500 market-breadth data and S&P 500 market-cap cache are shared rather than duplicated per user.
+- S&P 500 and Nasdaq 100 market-breadth data and market-cap cache are shared rather than duplicated per user.
 - Ticker display-name cache follows the active price cache: logged-in users keep names in their own `user_data/<username>_stock_cache.db`, while Tkinter, single-user Streamlit, and guest mode use `stock_cache.db`. Existing ticker names are reused permanently; only tickers without a cached name are queried again.
 
 ## License

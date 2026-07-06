@@ -159,7 +159,13 @@ BROAD_MARKET_GROUPS = {
 }
 
 BREADTH_GROUPS = {
-    "Market Breadth": ["20MA_Ratio", "50MA_Ratio", "200MA_Ratio"]
+    "S&P 500 Breadth": ["SP500_20MA_Ratio", "SP500_50MA_Ratio", "SP500_200MA_Ratio"],
+    "Nasdaq 100 Breadth": ["NDX100_20MA_Ratio", "NDX100_50MA_Ratio", "NDX100_200MA_Ratio"],
+}
+NON_PRICE_TICKERS = {
+    "20MA_Ratio", "50MA_Ratio", "200MA_Ratio",
+    "SP500_20MA_Ratio", "SP500_50MA_Ratio", "SP500_200MA_Ratio",
+    "NDX100_20MA_Ratio", "NDX100_50MA_Ratio", "NDX100_200MA_Ratio",
 }
 
 
@@ -345,7 +351,10 @@ def fetch_breadth_data(sp500_list):
     """Fetch market breadth data. Use data= for form-encoded POST."""
     if not sp500_list:
         return {"success": False, "error": "S&P 500 symbol list is empty. The server may not be able to reach Wikipedia."}
-    payload = {"sp500_symbols": json.dumps(sp500_list)}
+    payload = {
+        "sp500_symbols": json.dumps(sp500_list),
+        "nasdaq100_symbols": json.dumps(stock_watch_list_back_end.get_nasdaq100_symbols()),
+    }
     try:
         resp = requests.post(f"{API_BASE}/api/breadth_data", data=payload, timeout=300)
         if resp.status_code != 200:
@@ -410,7 +419,7 @@ def build_grouped_df(df, groups):
                 val = row[col] if col in row else np.nan
                 
                 # Special handling for Market Breadth tickers
-                if tk_ in ["20MA_Ratio", "50MA_Ratio", "200MA_Ratio"]:
+                if tk_ in NON_PRICE_TICKERS:
                     if col in ["Ticker", "Price", "1D%", "5D%", "1M%"]:
                         disp = tk_ if col == "Ticker" else (f"{float(val):.2f}" if pd.notna(val) else "")
                     else:
@@ -887,24 +896,31 @@ def build_kline_chart(kline_data, ticker, fib_levels=None, dark_mode=False):
 
 
 # ── Market breadth chart ─────────────────────────────────────
-def build_breadth_chart(breadth_data, dark_mode=False):
-    if not breadth_data or not breadth_data.get("breadth_chart_data"):
+def build_breadth_chart(
+    breadth_data,
+    dark_mode=False,
+    chart_key="breadth_chart_data",
+    title="Market Breadth (S&P 500)",
+    index_key="GSPC",
+    index_label="^GSPC Adj Close",
+):
+    if not breadth_data or not breadth_data.get(chart_key):
         return None
     theme = get_theme(dark_mode)
-    cd = breadth_data["breadth_chart_data"]
+    cd = breadth_data[chart_key]
     idx = cd["index"]
 
     fig = go.Figure()
     for key, color in [("20MA_Ratio", "red"), ("50MA_Ratio", "orange"), ("200MA_Ratio", "blue")]:
         if key in cd:
             fig.add_trace(go.Scatter(x=idx, y=cd[key], name=key, line=dict(color=color, width=1.5)))
-    if cd.get("GSPC"):
+    if cd.get(index_key):
         gspc_color = "#f9fafb" if dark_mode else "#111827"
         fig.add_trace(
             go.Scatter(
                 x=idx,
-                y=cd["GSPC"],
-                name="^GSPC Adj Close",
+                y=cd[index_key],
+                name=index_label,
                 line=dict(color=gspc_color, width=2.0),
                 yaxis="y2",
             )
@@ -914,7 +930,7 @@ def build_breadth_chart(breadth_data, dark_mode=False):
     fig.add_hline(y=80, line_dash="dash", line_color="gray")
 
     fig.update_layout(
-        title=dict(text="Market Breadth (S&P 500)", font=dict(color=theme["text"], size=18)),
+        title=dict(text=title, font=dict(color=theme["text"], size=18)),
         height=400,
         template=theme["plot_template"],
         paper_bgcolor=theme["page_bg"],
@@ -934,7 +950,7 @@ def build_breadth_chart(breadth_data, dark_mode=False):
             showgrid=True,
         ),
         yaxis2=dict(
-            title=dict(text="^GSPC Adj Close", font=dict(color=theme["text"])),
+            title=dict(text=index_label, font=dict(color=theme["text"])),
             tickfont=dict(color=theme["text"]),
             overlaying="y",
             side="right",
@@ -949,11 +965,17 @@ def build_breadth_chart(breadth_data, dark_mode=False):
 
 
 # ── Fear & greed display ─────────────────────────────────────
-def build_sp500_treemap(breadth_data, dark_mode=False):
-    if not breadth_data or not breadth_data.get("breadth_treemap_data"):
+def build_market_treemap(
+    breadth_data,
+    dark_mode=False,
+    data_key="breadth_treemap_data",
+    root_label="S&P 500",
+    title="S&P 500 Treemap by Sector (1D%)",
+):
+    if not breadth_data or not breadth_data.get(data_key):
         return None
     theme = get_theme(dark_mode)
-    rows = pd.DataFrame(breadth_data["breadth_treemap_data"])
+    rows = pd.DataFrame(breadth_data[data_key])
     if rows.empty or "Ticker" not in rows or "Sector" not in rows or "1D%" not in rows:
         return None
 
@@ -977,7 +999,7 @@ def build_sp500_treemap(breadth_data, dark_mode=False):
             return f"${value / 1e6:.2f}M"
         return f"${value:,.0f}"
 
-    labels = ["S&P 500"]
+    labels = [root_label]
     ids = ["root"]
     parents = [""]
     values = [float(rows["Size"].sum())]
@@ -1056,7 +1078,7 @@ def build_sp500_treemap(breadth_data, dark_mode=False):
         )
     )
     fig.update_layout(
-        title=dict(text="S&P 500 Treemap by Sector (1D%)", font=dict(color=theme["text"], size=18)),
+        title=dict(text=title, font=dict(color=theme["text"], size=18)),
         height=700,
         margin=dict(l=8, r=8, t=44, b=8),
         paper_bgcolor=theme["page_bg"],
@@ -1065,6 +1087,26 @@ def build_sp500_treemap(breadth_data, dark_mode=False):
         uniformtext=dict(minsize=13, mode="hide"),
     )
     return fig
+
+
+def build_sp500_treemap(breadth_data, dark_mode=False):
+    return build_market_treemap(
+        breadth_data,
+        dark_mode=dark_mode,
+        data_key="breadth_treemap_data",
+        root_label="S&P 500",
+        title="S&P 500 Treemap by Sector (1D%)",
+    )
+
+
+def build_nasdaq100_treemap(breadth_data, dark_mode=False):
+    return build_market_treemap(
+        breadth_data,
+        dark_mode=dark_mode,
+        data_key="nasdaq100_breadth_treemap_data",
+        root_label="Nasdaq 100",
+        title="Nasdaq 100 Treemap by Sector (1D%)",
+    )
 
 
 def fear_greed_color(value):
@@ -1231,7 +1273,7 @@ with tab1:
     show_stock_names = st.toggle("Show Name column next to Ticker", value=False, key="single_stocks_show_name_column")
     if not df.empty:
         # Filter stocks (exclude broad market and breadth tickers)
-        broad_and_breadth_tickers = set(BROAD_MARKET_TICKERS) | {"20MA_Ratio", "50MA_Ratio", "200MA_Ratio"}
+        broad_and_breadth_tickers = set(BROAD_MARKET_TICKERS) | NON_PRICE_TICKERS
         stocks_df = df[~df["Ticker"].isin(broad_and_breadth_tickers)].copy()
         
         if not stocks_df.empty:
@@ -1266,21 +1308,41 @@ with tab3:
         breadth_data = fetch_breadth_data(sp500_list)
     
     if breadth_data and breadth_data.get("success"):
+        counts = breadth_data.get("breadth_universe_counts", {})
+        if counts:
+            st.caption(
+                f"Download universe: {counts.get('combined_download', 'N/A')} unique tickers "
+                f"({counts.get('sp500', 'N/A')} S&P 500, {counts.get('nasdaq100', 'N/A')} Nasdaq 100, "
+                f"{counts.get('overlap', 'N/A')} overlap)."
+            )
         breadth_df = pd.DataFrame(breadth_data["data"])
-        
         if not breadth_df.empty:
-            # Display breadth table with grouped headers and colors (matching tkinter)
             render_grouped_table(breadth_df, BREADTH_GROUPS, dark_mode=dark_mode, show_name_column=show_breadth_names)
-            
-            # Display breadth chart
             st.divider()
             fig = build_breadth_chart(breadth_data, dark_mode=dark_mode)
-            if fig:
-                st.plotly_chart(fig, width="stretch", key="breadth_chart")
+            ndx_fig = build_breadth_chart(
+                breadth_data,
+                dark_mode=dark_mode,
+                chart_key="nasdaq100_breadth_chart_data",
+                title="Market Breadth (Nasdaq 100)",
+                index_key="NDX",
+                index_label="^NDX Adj Close",
+            )
+            chart_col1, chart_col2 = st.columns(2)
+            with chart_col1:
+                if fig:
+                    st.plotly_chart(fig, width="stretch", key="breadth_chart")
+            with chart_col2:
+                if ndx_fig:
+                    st.plotly_chart(ndx_fig, width="stretch", key="nasdaq100_breadth_chart")
+            st.divider()
+            st.caption("Treemap tile area is based on cached latest market cap; color is the latest regular 1D% move.")
             treemap_fig = build_sp500_treemap(breadth_data, dark_mode=dark_mode)
+            ndx_treemap_fig = build_nasdaq100_treemap(breadth_data, dark_mode=dark_mode)
             if treemap_fig:
-                st.caption("Treemap tile area is based on cached latest market cap; color is the latest regular 1D% move.")
                 st.plotly_chart(treemap_fig, width="stretch", key="sp500_treemap")
+            if ndx_treemap_fig:
+                st.plotly_chart(ndx_treemap_fig, width="stretch", key="nasdaq100_treemap")
         else:
             st.warning("Market breadth data is empty")
     else:

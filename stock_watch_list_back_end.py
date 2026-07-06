@@ -36,11 +36,18 @@ DB_PATH = "stock_cache.db"
 YF_DOWNLOAD_BATCH_SIZE = 100
 SP500_SYMBOLS_CACHE_PATH = os.path.join(os.path.dirname(__file__), "sp500_symbols_cache.json")
 SP500_CONSTITUENTS_CACHE_PATH = os.path.join(os.path.dirname(__file__), "sp500_constituents_cache.json")
+NASDAQ100_SYMBOLS_CACHE_PATH = os.path.join(os.path.dirname(__file__), "nasdaq100_symbols_cache.json")
+NASDAQ100_CONSTITUENTS_CACHE_PATH = os.path.join(os.path.dirname(__file__), "nasdaq100_constituents_cache.json")
 SP500_SYMBOLS_CACHE_MAX_AGE_DAYS = 7
 USER_CACHE_DIR = os.path.join(os.path.dirname(__file__), "user_data")
 CURRENT_DB_PATH = contextvars.ContextVar("CURRENT_DB_PATH", default=None)
 US_EXTENDED_HOURS_BATCH_SIZE = 80
-NON_EXTENDED_HOURS_TICKERS = {"20MA_Ratio", "50MA_Ratio", "200MA_Ratio"}
+BREADTH_RATIO_TICKERS = {"20MA_Ratio", "50MA_Ratio", "200MA_Ratio"}
+BREADTH_DISPLAY_TICKERS = {
+    "SP500_20MA_Ratio", "SP500_50MA_Ratio", "SP500_200MA_Ratio",
+    "NDX100_20MA_Ratio", "NDX100_50MA_Ratio", "NDX100_200MA_Ratio",
+}
+NON_EXTENDED_HOURS_TICKERS = BREADTH_RATIO_TICKERS | BREADTH_DISPLAY_TICKERS
 SP500_MARKET_CAP_WORKERS = 12
 
 
@@ -1110,6 +1117,39 @@ def _write_sp500_symbols_cache(symbols, source):
         print(f"S&P 500 symbols cache write failed: {e}")
 
 
+def _read_symbol_cache(path, label, max_age_days=SP500_SYMBOLS_CACHE_MAX_AGE_DAYS):
+    try:
+        if not os.path.exists(path):
+            return []
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        symbols = payload.get("symbols", payload if isinstance(payload, list) else [])
+        symbols = _normalize_sp500_symbols(symbols)
+        if not symbols:
+            return []
+        if max_age_days is not None:
+            mtime = datetime.datetime.fromtimestamp(os.path.getmtime(path))
+            if datetime.datetime.now() - mtime > datetime.timedelta(days=max_age_days):
+                return []
+        return symbols
+    except Exception as e:
+        print(f"{label} symbols cache read failed: {e}")
+        return []
+
+
+def _write_symbol_cache(path, symbols, source, label):
+    try:
+        payload = {
+            "source": source,
+            "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "symbols": _normalize_sp500_symbols(symbols),
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"{label} symbols cache write failed: {e}")
+
+
 def _normalize_sp500_constituents_df(df):
     if df is None or df.empty or "Symbol" not in df.columns:
         return []
@@ -1282,6 +1322,230 @@ def get_sp500_symbols():
     return []
 
 # 计算股票的筹码分布(最近30个交易日)
+def get_nasdaq100_symbols():
+    """Fetch Nasdaq 100 constituents with a local cache and stale-cache fallback."""
+    cached_symbols = _read_symbol_cache(NASDAQ100_SYMBOLS_CACHE_PATH, "Nasdaq 100")
+    if cached_symbols:
+        return cached_symbols
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/116.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    sources = [
+        (
+            "Wikipedia",
+            "https://en.wikipedia.org/wiki/Nasdaq-100",
+            "html",
+        ),
+        (
+            "GitHub CSV",
+            "https://raw.githubusercontent.com/eoliveiradc/openai-enrich-stockmarket-data/main/nasdaq100.csv",
+            "csv",
+        ),
+    ]
+
+    for source_name, url, source_type in sources:
+        try:
+            response = requests.get(url, headers=headers, timeout=20)
+            response.raise_for_status()
+            if source_type == "html":
+                symbols = []
+                for df in pd.read_html(StringIO(response.text)):
+                    if "Ticker" in df.columns and "Company" in df.columns:
+                        symbols = _normalize_sp500_symbols(df["Ticker"].tolist())
+                        if len(symbols) >= 90:
+                            break
+            else:
+                df = pd.read_csv(StringIO(response.text))
+                symbol_col = "Ticker" if "Ticker" in df.columns else "Symbol" if "Symbol" in df.columns else "symbol" if "symbol" in df.columns else None
+                symbols = _normalize_sp500_symbols(df[symbol_col].tolist()) if symbol_col else []
+            if symbols:
+                _write_symbol_cache(NASDAQ100_SYMBOLS_CACHE_PATH, symbols, source_name, "Nasdaq 100")
+                print(f"Nasdaq 100 symbols loaded from {source_name}: {len(symbols)}")
+                return symbols
+        except Exception as e:
+            print(f"Nasdaq 100 symbols source failed ({source_name}): {e}")
+
+    stale_symbols = _read_symbol_cache(NASDAQ100_SYMBOLS_CACHE_PATH, "Nasdaq 100", max_age_days=None)
+    if stale_symbols:
+        print(f"Nasdaq 100 symbols using stale local cache: {len(stale_symbols)}")
+        return stale_symbols
+
+    print("Nasdaq 100 symbols unavailable from all sources")
+    return []
+
+
+def _normalize_nasdaq100_constituents_df(df):
+    if df is None or df.empty:
+        return []
+    symbol_col = next((col for col in ["Ticker", "Symbol", "symbol"] if col in df.columns), None)
+    if not symbol_col:
+        return []
+    name_col = next((col for col in ["Company", "Name", "name"] if col in df.columns), None)
+    sector_col = next((col for col in ["ICB Industry[15]", "ICB Industry", "Sector", "sector"] if col in df.columns), None)
+    industry_col = next((col for col in ["ICB Subsector[15]", "ICB Subsector", "Industry", "industry"] if col in df.columns), None)
+
+    records = []
+    for _, row in df.iterrows():
+        symbol = _normalize_sp500_symbols([row.get(symbol_col)])
+        if not symbol:
+            continue
+        ticker = symbol[0]
+        records.append({
+            "ticker": ticker,
+            "name": str(row.get(name_col, ticker)).strip() if name_col else ticker,
+            "sector": str(row.get(sector_col, "Unknown")).strip() if sector_col else "Unknown",
+            "industry": str(row.get(industry_col, "Unknown")).strip() if industry_col else "Unknown",
+        })
+    return records
+
+
+def _read_nasdaq100_constituents_cache(max_age_days=SP500_SYMBOLS_CACHE_MAX_AGE_DAYS):
+    try:
+        if not os.path.exists(NASDAQ100_CONSTITUENTS_CACHE_PATH):
+            return []
+        with open(NASDAQ100_CONSTITUENTS_CACHE_PATH, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        records = payload.get("constituents", payload if isinstance(payload, list) else [])
+        if not records:
+            return []
+        if max_age_days is not None:
+            mtime = datetime.datetime.fromtimestamp(os.path.getmtime(NASDAQ100_CONSTITUENTS_CACHE_PATH))
+            if datetime.datetime.now() - mtime > datetime.timedelta(days=max_age_days):
+                return []
+        normalized = []
+        for item in records:
+            ticker = _normalize_sp500_symbols([item.get("ticker")])
+            if ticker:
+                normalized.append({
+                    "ticker": ticker[0],
+                    "name": str(item.get("name") or ticker[0]),
+                    "sector": str(item.get("sector") or "Unknown"),
+                    "industry": str(item.get("industry") or "Unknown"),
+                })
+        return normalized
+    except Exception as e:
+        print(f"Nasdaq 100 constituents cache read failed: {e}")
+        return []
+
+
+def _write_nasdaq100_constituents_cache(records, source):
+    try:
+        payload = {
+            "source": source,
+            "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "constituents": records,
+        }
+        with open(NASDAQ100_CONSTITUENTS_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Nasdaq 100 constituents cache write failed: {e}")
+
+
+def _fetch_yfinance_sector_metadata(ticker):
+    try:
+        info = yf.Ticker(ticker).info
+        return (
+            _short_ticker_name(info.get("shortName") or info.get("displayName") or info.get("longName")) or ticker,
+            str(info.get("sector") or "Unknown"),
+            str(info.get("industry") or "Unknown"),
+        )
+    except Exception:
+        return (ticker, "Unknown", "Unknown")
+
+
+def get_nasdaq100_constituents_metadata(symbols=None):
+    cached_records = _read_nasdaq100_constituents_cache()
+    if not cached_records:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/116.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        sources = [
+            (
+                "Wikipedia",
+                "https://en.wikipedia.org/wiki/Nasdaq-100",
+                "html",
+            ),
+            (
+                "GitHub CSV",
+                "https://raw.githubusercontent.com/eoliveiradc/openai-enrich-stockmarket-data/main/nasdaq100.csv",
+                "csv",
+            ),
+        ]
+        for source_name, url, source_type in sources:
+            try:
+                response = requests.get(url, headers=headers, timeout=20)
+                response.raise_for_status()
+                if source_type == "html":
+                    records = []
+                    for df in pd.read_html(StringIO(response.text)):
+                        records = _normalize_nasdaq100_constituents_df(df)
+                        if len(records) >= 90:
+                            break
+                else:
+                    records = _normalize_nasdaq100_constituents_df(pd.read_csv(StringIO(response.text)))
+                if records:
+                    _write_nasdaq100_constituents_cache(records, source_name)
+                    cached_records = records
+                    print(f"Nasdaq 100 constituents metadata loaded from {source_name}: {len(records)}")
+                    break
+            except Exception as e:
+                print(f"Nasdaq 100 constituents metadata source failed ({source_name}): {e}")
+
+    if not cached_records:
+        cached_records = _read_nasdaq100_constituents_cache(max_age_days=None)
+
+    metadata = {item["ticker"]: item for item in cached_records}
+    wanted = set(_normalize_sp500_symbols(symbols)) if symbols else set(metadata)
+    missing_or_unknown = [
+        ticker for ticker in wanted
+        if ticker not in metadata or metadata[ticker].get("sector", "Unknown") == "Unknown"
+    ]
+
+    if missing_or_unknown:
+        sp500_meta = get_sp500_constituents_metadata(missing_or_unknown)
+        still_missing = []
+        for ticker in missing_or_unknown:
+            meta = sp500_meta.get(ticker)
+            if meta and meta.get("sector") and meta.get("sector") != "Unknown":
+                current = metadata.get(ticker, {"ticker": ticker, "name": ticker})
+                metadata[ticker] = {
+                    "ticker": ticker,
+                    "name": current.get("name") or meta.get("name") or ticker,
+                    "sector": meta.get("sector") or "Unknown",
+                    "industry": meta.get("industry") or "Unknown",
+                }
+            else:
+                still_missing.append(ticker)
+
+        if still_missing:
+            max_workers = min(8, max(1, len(still_missing)))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(_fetch_yfinance_sector_metadata, ticker): ticker for ticker in still_missing}
+                for future in concurrent.futures.as_completed(futures):
+                    ticker = futures[future]
+                    name, sector, industry = future.result()
+                    current = metadata.get(ticker, {"ticker": ticker})
+                    metadata[ticker] = {
+                        "ticker": ticker,
+                        "name": current.get("name") or name or ticker,
+                        "sector": sector or "Unknown",
+                        "industry": industry or "Unknown",
+                    }
+
+    if symbols:
+        return {ticker: metadata.get(ticker, {"ticker": ticker, "name": ticker, "sector": "Unknown", "industry": "Unknown"}) for ticker in wanted}
+    return metadata
+
+
 def calculate_chip_distribution(stock_ticker,days="30d",num_bins=20):
     data = yf.Ticker(stock_ticker).history(interval="4h", period=days)
     price_min = data['Low'].min()
@@ -1341,12 +1605,11 @@ def extract_adj_close_frame(data):
     return data.dropna(axis=1, how='all')
 
 
-def build_sp500_treemap_data(data, symbols):
+def build_constituent_treemap_data(data, symbols, metadata):
     close_prices = extract_adj_close_frame(data)
     if close_prices.empty:
         return []
 
-    metadata = get_sp500_constituents_metadata(symbols)
     market_caps = get_cached_market_caps(symbols)
     rows = []
     fallback_rows = []
@@ -1377,6 +1640,14 @@ def build_sp500_treemap_data(data, symbols):
         if market_cap and market_cap > 0:
             rows.append(row)
     return rows or fallback_rows
+
+
+def build_sp500_treemap_data(data, symbols):
+    return build_constituent_treemap_data(data, symbols, get_sp500_constituents_metadata(symbols))
+
+
+def build_nasdaq100_treemap_data(data, symbols):
+    return build_constituent_treemap_data(data, symbols, get_nasdaq100_constituents_metadata(symbols))
 
 
 def calculate_market_breadth(data, symbols):
@@ -1411,6 +1682,17 @@ def calculate_market_breadth(data, symbols):
         close_prices = close_prices.dropna(axis=1, how='all')
         print(f"删除全NaN列后形状: {close_prices.shape}")
         
+        requested_symbols = _normalize_sp500_symbols(symbols)
+        available_symbols = [ticker for ticker in requested_symbols if ticker in close_prices.columns]
+        missing_count = len(requested_symbols) - len(available_symbols)
+        if not available_symbols:
+            print("市场宽度 universe 没有可用价格列")
+            return pd.DataFrame(columns=["20MA_Ratio", "50MA_Ratio", "200MA_Ratio"])
+        close_prices = close_prices[available_symbols]
+        if missing_count > 0:
+            print(f"市场宽度 universe 缺失 {missing_count} 个标的价格列")
+        print(f"市场宽度 universe 过滤后形状: {close_prices.shape}")
+
         if close_prices.empty:
             print("Adj Close价格数据为空")
             return pd.DataFrame(columns=["20MA_Ratio", "50MA_Ratio", "200MA_Ratio"])
@@ -1454,6 +1736,70 @@ def calculate_market_breadth(data, symbols):
         return pd.DataFrame(columns=["20MA_Ratio", "50MA_Ratio", "200MA_Ratio"])
 
 # ===== API 路由 =====
+def build_breadth_summary_rows(breadth_df, ticker_prefix="", display_prefix=""):
+    results = []
+    for ratio in ["20MA_Ratio", "50MA_Ratio", "200MA_Ratio"]:
+        if ratio not in breadth_df.columns:
+            continue
+        series = breadth_df[ratio].dropna()
+        if series.empty:
+            continue
+        latest_val = series.iloc[-1]
+        chg_1d = latest_val - series.iloc[-2] if len(series) > 1 else np.nan
+        chg_5d = latest_val - series.iloc[-6] if len(series) > 6 else np.nan
+        chg_20d = latest_val - series.iloc[-21] if len(series) > 21 else np.nan
+        results.append({
+            "Ticker": f"{ticker_prefix}{ratio}",
+            "Name": f"{display_prefix}{ratio}" if display_prefix else ratio,
+            "Price": round(float(latest_val), 2),
+            "1D%": round(float(chg_1d), 2) if not np.isnan(chg_1d) else np.nan,
+            "5D%": round(float(chg_5d), 2) if not np.isnan(chg_5d) else np.nan,
+            "1M%": round(float(chg_20d), 2) if not np.isnan(chg_20d) else np.nan,
+            "YTD%": np.nan,
+            "Volume_Ratio": np.nan,
+            **{f"Diff_EMA{n}%": np.nan for n in [5, 10, 20, 50, 100, 200]},
+            "Diff_BB_Up%": np.nan,
+            "Diff_BB_Low%": np.nan,
+        })
+    return results
+
+
+def build_breadth_chart_payload(breadth_df, all_price_data=None, index_ticker=None, index_key=None):
+    chart_df = breadth_df.iloc[-252:] if len(breadth_df) > 252 else breadth_df
+    if hasattr(chart_df.index, 'strftime') and callable(getattr(chart_df.index, 'strftime', None)):
+        index_list = chart_df.index.strftime('%Y-%m-%d').tolist()
+    else:
+        try:
+            index_list = pd.to_datetime(chart_df.index).strftime('%Y-%m-%d').tolist()
+        except Exception:
+            index_list = []
+
+    payload = {
+        "index": index_list,
+        "20MA_Ratio": [round(float(x), 2) if not np.isnan(x) else 0 for x in chart_df["20MA_Ratio"]] if "20MA_Ratio" in chart_df.columns else [],
+        "50MA_Ratio": [round(float(x), 2) if not np.isnan(x) else 0 for x in chart_df["50MA_Ratio"]] if "50MA_Ratio" in chart_df.columns else [],
+        "200MA_Ratio": [round(float(x), 2) if not np.isnan(x) else 0 for x in chart_df["200MA_Ratio"]] if "200MA_Ratio" in chart_df.columns else [],
+    }
+
+    if index_ticker and index_key:
+        payload[index_key] = []
+        try:
+            close_frame = extract_adj_close_frame(all_price_data)
+            if index_ticker in close_frame.columns:
+                index_series = close_frame[index_ticker].copy()
+                index_series.index = pd.to_datetime(index_series.index).tz_localize(None)
+                chart_index = pd.to_datetime(chart_df.index).tz_localize(None)
+                aligned_index = index_series.reindex(chart_index)
+                payload[index_key] = [
+                    round(float(x), 2) if pd.notna(x) else None
+                    for x in aligned_index
+                ]
+        except Exception as e:
+            print(f"{index_ticker} breadth chart data failed: {e}")
+
+    return payload
+
+
 @app.route('/api/stock_data', methods=['GET'])
 def get_stock_data():
     """获取股票数据"""
@@ -1489,7 +1835,7 @@ def get_stock_data():
         # 去重：Dashboard 与 story groups 有大量重复标的，后端只需处理一次
         all_tickers = list(dict.fromkeys(
             [t for group in groups.values() for t in group
-             if t not in ["20MA_Ratio", "50MA_Ratio", "200MA_Ratio"]]
+             if t not in NON_EXTENDED_HOURS_TICKERS]
         ))
         ticker_names = get_cached_ticker_names(all_tickers)
         
@@ -1938,6 +2284,75 @@ def get_breadth_data():
     cache_token = set_request_cache_db()
     endpoint_start = time.perf_counter()
     try:
+        sp500_symbols_json = request.form.get('sp500_symbols', '[]')
+        nasdaq100_symbols_json = request.form.get('nasdaq100_symbols', '[]')
+
+        try:
+            sp500_symbols = _normalize_sp500_symbols(json.loads(sp500_symbols_json))
+            nasdaq100_symbols = _normalize_sp500_symbols(json.loads(nasdaq100_symbols_json))
+        except json.JSONDecodeError:
+            return jsonify({"success": False, "error": "Breadth symbol list JSON is invalid"})
+
+        if not sp500_symbols:
+            sp500_symbols = get_sp500_symbols()
+        if not nasdaq100_symbols:
+            nasdaq100_symbols = get_nasdaq100_symbols()
+        if not sp500_symbols:
+            return jsonify({"success": False, "error": "Unable to load S&P 500 symbols"})
+        if not nasdaq100_symbols:
+            return jsonify({"success": False, "error": "Unable to load Nasdaq 100 symbols"})
+
+        combined_symbols = list(dict.fromkeys(sp500_symbols + nasdaq100_symbols + ["^GSPC", "^NDX"]))
+        overlap_count = len(set(sp500_symbols).intersection(nasdaq100_symbols))
+
+        try:
+            price_start = time.perf_counter()
+            combined_data = get_prices_with_cache(combined_symbols, period="2y")
+            print(
+                f"Breadth price data fetched once: combined={len(combined_symbols)}, "
+                f"sp500={len(sp500_symbols)}, nasdaq100={len(nasdaq100_symbols)}, "
+                f"overlap={overlap_count}, shape={combined_data.shape}, "
+                f"elapsed={time.perf_counter() - price_start:.1f}s"
+            )
+        except Exception as e:
+            return jsonify({"success": False, "error": f"Failed to fetch breadth price data: {str(e)}"})
+
+        if combined_data is None or combined_data.empty:
+            return jsonify({"success": False, "error": "Breadth price data is empty"})
+
+        calc_start = time.perf_counter()
+        breadth_df = calculate_market_breadth(combined_data, sp500_symbols)
+        nasdaq100_breadth_df = calculate_market_breadth(combined_data, nasdaq100_symbols)
+        print(f"Market breadth calculated for S&P 500 and Nasdaq 100 in {time.perf_counter() - calc_start:.1f}s")
+
+        if breadth_df.empty:
+            return jsonify({"success": False, "error": "S&P 500 breadth calculation failed"})
+
+        sp500_results = build_breadth_summary_rows(breadth_df, "SP500_", "S&P 500 ")
+        nasdaq100_results = build_breadth_summary_rows(nasdaq100_breadth_df, "NDX100_", "Nasdaq 100 ")
+        results = sp500_results + nasdaq100_results
+        breadth_data = build_breadth_chart_payload(breadth_df, combined_data, "^GSPC", "GSPC")
+        nasdaq100_breadth_data = build_breadth_chart_payload(nasdaq100_breadth_df, combined_data, "^NDX", "NDX")
+        treemap_data = build_sp500_treemap_data(combined_data, sp500_symbols)
+        nasdaq100_treemap_data = build_nasdaq100_treemap_data(combined_data, nasdaq100_symbols)
+
+        print(f"/api/breadth_data completed in {time.perf_counter() - endpoint_start:.1f}s")
+        return jsonify({
+            "success": True,
+            "data": results,
+            "sp500_data": sp500_results,
+            "breadth_chart_data": breadth_data,
+            "breadth_treemap_data": treemap_data,
+            "nasdaq100_data": nasdaq100_results,
+            "nasdaq100_breadth_chart_data": nasdaq100_breadth_data,
+            "nasdaq100_breadth_treemap_data": nasdaq100_treemap_data,
+            "breadth_universe_counts": {
+                "sp500": len(sp500_symbols),
+                "nasdaq100": len(nasdaq100_symbols),
+                "overlap": overlap_count,
+                "combined_download": len(combined_symbols),
+            },
+        })
         
                 # 获取标普500股票代码列表
         sp500_symbols_json = request.form.get('sp500_symbols', '{}')

@@ -52,7 +52,10 @@ DEFAULT_BROAD_PAGES = [
     }
 ]
 
-BREADTH_GROUPS = {"Market Breadth": ["20MA_Ratio", "50MA_Ratio", "200MA_Ratio"]}
+BREADTH_GROUPS = {
+    "S&P 500 Breadth": ["SP500_20MA_Ratio", "SP500_50MA_Ratio", "SP500_200MA_Ratio"],
+    "Nasdaq 100 Breadth": ["NDX100_20MA_Ratio", "NDX100_50MA_Ratio", "NDX100_200MA_Ratio"],
+}
 
 
 def default_watchlist_config():
