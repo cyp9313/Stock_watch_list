@@ -897,15 +897,26 @@ def build_breadth_chart(breadth_data, dark_mode=False):
     fig.add_hline(y=80, line_dash="dash", line_color="gray")
 
     fig.update_layout(
-        title="Market Breadth (S&P 500)",
+        title=dict(text="Market Breadth (S&P 500)", font=dict(color=theme["text"], size=18)),
         height=400,
         template=theme["plot_template"],
         paper_bgcolor=theme["page_bg"],
         plot_bgcolor=theme["plot_bg"],
         font=dict(color=theme["text"]),
+        legend=dict(
+            font=dict(color=theme["text"]),
+            bgcolor="rgba(17,24,39,0.82)" if dark_mode else "rgba(255,255,255,0.82)",
+            bordercolor=theme["grid"],
+            borderwidth=1,
+        ),
         hovermode="x unified",
-        yaxis=dict(range=[0, 100], title="% Above MA", showgrid=True),
-        xaxis=dict(showgrid=True),
+        yaxis=dict(
+            range=[0, 100],
+            title=dict(text="% Above MA", font=dict(color=theme["text"])),
+            tickfont=dict(color=theme["text"]),
+            showgrid=True,
+        ),
+        xaxis=dict(tickfont=dict(color=theme["text"]), showgrid=True),
     )
     fig.update_xaxes(gridcolor=theme["grid"], zerolinecolor=theme["grid"])
     fig.update_yaxes(gridcolor=theme["grid"], zerolinecolor=theme["grid"])

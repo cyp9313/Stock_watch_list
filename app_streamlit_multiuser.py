@@ -40,6 +40,11 @@ COLUMNS = (
     + ["Diff_BB_Up%", "Diff_BB_Low%", "Volume_Ratio", "Next Earnings", "Trailing PE", "Forward PE",
        "PEG Ratio", "Analysts", "Price Target", "Market Cap"]
 )
+RIGHT_ALIGNED_COLUMNS = {
+    col
+    for col in COLUMNS
+    if col not in {"Ticker", "Next Earnings"}
+}
 
 SECTION_META = {
     "stocks_pages": {
@@ -78,6 +83,22 @@ TICKER_CURRENCY_SUFFIXES = {
     ".L": "GBX",
     ".TO": "CAD",
     ".T": "JPY",
+}
+CURRENCY_DISPLAY_UNITS = {
+    "USD": ("$", ""),
+    "EUR": ("€", ""),
+    "CNY": ("￥", ""),
+    "CNH": ("￥", ""),
+    "HKD": ("HK$", ""),
+    "CAD": ("CA$", ""),
+    "AUD": ("A$", ""),
+    "GBP": ("£", ""),
+    "GBX": ("", "p"),
+    "JPY": ("¥", ""),
+    "CHF": ("CHF ", ""),
+    "SEK": ("SEK ", ""),
+    "NOK": ("NOK ", ""),
+    "DKK": ("DKK ", ""),
 }
 
 THEMES = {
@@ -478,7 +499,29 @@ def readable_text_color(bg_color, default="#111827"):
     return "#f9fafb" if luminance < 0.45 else "#111827"
 
 
-def build_grouped_df(df, groups, price_symbol="$"):
+def price_unit_for_ticker(ticker, display_currency="Local"):
+    if display_currency == "EUR" and should_convert_price_ticker(ticker):
+        return "EUR"
+    if display_currency == "Local":
+        return get_ticker_currency(ticker)
+    return None
+
+
+def format_money_value(value, ticker, display_currency="Local"):
+    if pd.isna(value):
+        return ""
+    currency = price_unit_for_ticker(ticker, display_currency)
+    try:
+        formatted = f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return ""
+    if not currency:
+        return formatted
+    prefix, suffix = CURRENCY_DISPLAY_UNITS.get(currency, (f"{currency} ", ""))
+    return f"{prefix}{formatted}{suffix}"
+
+
+def build_grouped_df(df, groups, display_currency="Local"):
     if df.empty:
         return pd.DataFrame()
 
@@ -509,14 +552,16 @@ def build_grouped_df(df, groups, price_symbol="$"):
                     disp = ticker
                 elif col == "Rel. Momentum":
                     disp = f"{float(val):.2f}" if pd.notna(val) else ""
-                elif col in ("Price", "Volume_Ratio"):
+                elif col == "Price":
+                    disp = format_money_value(val, ticker, display_currency)
+                elif col == "Volume_Ratio":
                     disp = f"{float(val):.2f}" if pd.notna(val) else ""
                 elif col == "Next Earnings":
                     disp = val if isinstance(val, str) else val.strftime("%Y-%m-%d") if not pd.isna(val) else ""
                 elif col == "Analysts":
                     disp = str(val) if pd.notna(val) and val is not None else ""
                 elif col == "Price Target":
-                    disp = f"{price_symbol}{float(val):.2f}" if pd.notna(val) and val is not None else ""
+                    disp = format_money_value(val, ticker, display_currency) if val is not None else ""
                 elif col == "Market Cap":
                     disp = f"{float(val):.2e}" if pd.notna(val) else ""
                 else:
@@ -550,6 +595,14 @@ def apply_cell_colors(df_display, df_raw, groups):
                 val = row[col] if col in row else np.nan
                 if col == "Ticker":
                     cell_colors[(row_index, col_index)] = beta_color(row.get("Beta", np.nan))
+                elif col == "Price":
+                    source = str(row.get("Price Source", "") or "").lower()
+                    if source.startswith("pre-market"):
+                        cell_colors[(row_index, col_index)] = "#dbeafe"
+                    elif source.startswith("after-hours"):
+                        cell_colors[(row_index, col_index)] = "#fef3c7"
+                    elif pd.notna(val) and df_display.iloc[row_index][col] != "":
+                        cell_colors[(row_index, col_index)] = "#dcfce7"
                 elif pd.notna(val) and df_display.iloc[row_index][col] != "" and col != "Price":
                     if col == "Volume_Ratio":
                         cell_colors[(row_index, col_index)] = blue_color(val)
@@ -586,8 +639,7 @@ def render_grouped_table(df, groups, dark_mode=False, display_currency="Local"):
         st.info("No data available")
         return
 
-    price_symbol = "€" if display_currency == "EUR" else "$"
-    df_display = build_grouped_df(df, groups, price_symbol=price_symbol)
+    df_display = build_grouped_df(df, groups, display_currency=display_currency)
     if df_display.empty:
         st.info("No data available")
         return
@@ -629,7 +681,7 @@ def render_grouped_table(df, groups, dark_mode=False, display_currency="Local"):
             if is_header:
                 continue
 
-            align = "right" if val and val[0] in "+-$0123456789" else "left"
+            align = "right" if col in RIGHT_ALIGNED_COLUMNS or (val and val[0] in "+-$0123456789") else "left"
             html_table += (
                 f"<td style='padding:4px; text-align:{align}; color:{text_color}; "
                 f"background-color:{bg_color}; border:1px solid {theme['table_border']};'>"
@@ -650,6 +702,27 @@ def render_market_table(raw_df, page, dark_mode=False, display_currency="Local")
     tickers = page_tickers(page)
     page_df = raw_df[raw_df["Ticker"].isin(tickers)].copy() if not raw_df.empty else pd.DataFrame()
     render_grouped_table(page_df, groups, dark_mode=dark_mode, display_currency=display_currency)
+
+
+def render_table_legend(dark_mode=False):
+    theme = get_theme(dark_mode)
+    st.markdown(
+        f"""
+        <div style="font-size:12px; color:{theme['muted']}; margin:4px 0 8px 0;">
+            <span style="display:inline-block;width:12px;height:12px;background:#dcfce7;border:1px solid {theme['table_border']};vertical-align:middle;"></span>
+            Price: regular/latest close
+            &nbsp;&nbsp;
+            <span style="display:inline-block;width:12px;height:12px;background:#dbeafe;border:1px solid {theme['table_border']};vertical-align:middle;"></span>
+            pre-market estimate
+            &nbsp;&nbsp;
+            <span style="display:inline-block;width:12px;height:12px;background:#fef3c7;border:1px solid {theme['table_border']};vertical-align:middle;"></span>
+            after-hours estimate
+            &nbsp;&nbsp;|&nbsp;&nbsp;
+            Ticker cell color reflects beta: greener below 1, redder above 1.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def should_convert_price_ticker(ticker):
@@ -889,15 +962,26 @@ def build_breadth_chart(breadth_data, dark_mode=False):
     fig.add_hline(y=15, line_dash="dash", line_color="gray")
     fig.add_hline(y=80, line_dash="dash", line_color="gray")
     fig.update_layout(
-        title="Market Breadth (S&P 500)",
+        title=dict(text="Market Breadth (S&P 500)", font=dict(color=theme["text"], size=18)),
         height=400,
         template=theme["plot_template"],
         paper_bgcolor=theme["page_bg"],
         plot_bgcolor=theme["plot_bg"],
         font=dict(color=theme["text"]),
+        legend=dict(
+            font=dict(color=theme["text"]),
+            bgcolor="rgba(17,24,39,0.82)" if dark_mode else "rgba(255,255,255,0.82)",
+            bordercolor=theme["grid"],
+            borderwidth=1,
+        ),
         hovermode="x unified",
-        yaxis=dict(range=[0, 100], title="% Above MA", showgrid=True),
-        xaxis=dict(showgrid=True),
+        yaxis=dict(
+            range=[0, 100],
+            title=dict(text="% Above MA", font=dict(color=theme["text"])),
+            tickfont=dict(color=theme["text"]),
+            showgrid=True,
+        ),
+        xaxis=dict(tickfont=dict(color=theme["text"]), showgrid=True),
     )
     fig.update_xaxes(gridcolor=theme["grid"], zerolinecolor=theme["grid"])
     fig.update_yaxes(gridcolor=theme["grid"], zerolinecolor=theme["grid"])
@@ -1024,6 +1108,10 @@ def build_kline_chart(kline_data, ticker, fib_levels=None, dark_mode=False):
     title_suffix = ""
     if kline_data.get("display_currency") == "EUR":
         title_suffix = f" (EUR converted from {html.escape(str(kline_data.get('original_currency') or 'local'))}, latest FX)"
+    if kline_data.get("price_source"):
+        source_text = html.escape(str(kline_data.get("price_source")))
+        extended_time = html.escape(str(kline_data.get("extended_time") or ""))
+        title_suffix += f" | {source_text}" + (f" @ {extended_time}" if extended_time else "")
     title = (
         f"<b>K-Curve {html.escape(ticker)}{title_suffix}</b> | "
         f"Market Cap: {_fmt(financials.get('market_cap'))}, "
@@ -1464,6 +1552,7 @@ def render_page_editor(config, section, page_index, editable, user, dark_mode=Fa
 def render_section(section_title, section_key, config, raw_df, editable, user, dark_mode=False, display_currency="Local"):
     st.subheader(section_title)
     st.caption(SECTION_META[section_key]["help"])
+    render_table_legend(dark_mode=dark_mode)
     pages = config[section_key]
     tabs = st.tabs([page["name"] for page in pages])
     for i, tab in enumerate(tabs):

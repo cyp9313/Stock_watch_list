@@ -1314,6 +1314,50 @@ Behavior:
 - Each logged-in user's market-data cache is stored separately under `user_data/<username>_stock_cache.db`.
 - Accounts are created by the administrator with the command line; there is no public self-registration UI.
 
+## Recent Behavior Notes
+
+### Price Units And Display Currency
+
+The table price display uses Yahoo Finance ticker symbols as the canonical format. In local-currency mode, the frontend guesses the display unit from yfinance metadata when available and falls back to ticker suffix rules:
+
+- US tickers: `$`
+- China A-share / ETF tickers such as `.SS` and `.SZ`: `￥`
+- Hong Kong tickers such as `.HK`: `HK$`
+- Euro-market tickers such as `.DE`, `.PA`, `.AS`, `.MI`, `.MC`, `.BR`: `€`
+- UK pence tickers such as `.L`: `p`
+
+Non-price tickers such as indexes (`^VIX`, `^GSPC`), rates (`^TNX`), FX pairs (`EURUSD=X`), and market-breadth pseudo tickers do not receive a default dollar sign.
+
+The multi-user Streamlit frontend also offers a display-only EUR mode. This mode converts visible price-like values with the latest available FX rate for easier reading by European users. It does not change the stored original market data.
+
+### Price Source Colors
+
+The `Price` cell color indicates the source of the latest displayed price:
+
+- Green: regular/latest close.
+- Blue: pre-market estimate.
+- Yellow: after-hours estimate.
+
+The separate `Price Source` field is kept as backend metadata and is not shown as a separate table column in the Streamlit UI.
+
+### Extended-Hours Prices
+
+Outside US regular trading hours, the backend keeps the normal daily-history update logic and additionally tries to fetch recent extended-hours data with yfinance `prepost=True` using a lightweight `4h` interval. When a valid US pre-market or after-hours price is newer than the latest regular close, it can be used as the latest watchlist price and written into `price_cache` for the affected ticker/date.
+
+Market breadth calculations intentionally do not use extended-hours prices. They continue to use regular daily S&P 500 constituent data.
+
+For K-line charts:
+
+- Daily charts can overlay the latest extended-hours price when it is newer or on the same date as the latest regular daily bar.
+- Weekly charts ignore extended-hours overlays.
+- Intraday charts request yfinance data with `prepost=True`.
+
+### Cache Files By Frontend Mode
+
+- Tkinter, single-user Streamlit, and guest mode use the shared `stock_cache.db`.
+- Logged-in multi-user Streamlit accounts use separate price caches under `user_data/<username>_stock_cache.db`.
+- S&P 500 market-breadth data is shared rather than duplicated per user.
+
 ## License
 
 MIT License

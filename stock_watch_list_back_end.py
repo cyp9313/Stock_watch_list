@@ -38,6 +38,8 @@ SP500_SYMBOLS_CACHE_PATH = os.path.join(os.path.dirname(__file__), "sp500_symbol
 SP500_SYMBOLS_CACHE_MAX_AGE_DAYS = 7
 USER_CACHE_DIR = os.path.join(os.path.dirname(__file__), "user_data")
 CURRENT_DB_PATH = contextvars.ContextVar("CURRENT_DB_PATH", default=None)
+US_EXTENDED_HOURS_BATCH_SIZE = 80
+NON_EXTENDED_HOURS_TICKERS = {"20MA_Ratio", "50MA_Ratio", "200MA_Ratio"}
 
 
 def _safe_cache_key(cache_key):
@@ -327,6 +329,277 @@ def _safe_float(val):
 def _chunks(items, size):
     for i in range(0, len(items), size):
         yield items[i:i + size]
+
+
+def is_us_regular_trading_hours(now=None):
+    """Return True during the regular US cash session: 09:30-16:00 New York time."""
+    ny_tz = pytz.timezone('America/New_York')
+    now_ny = now.astimezone(ny_tz) if now is not None else datetime.datetime.now(ny_tz)
+    t = now_ny.time()
+    return (
+        now_ny.weekday() < 5 and
+        datetime.time(9, 30) <= t < datetime.time(16, 0)
+    )
+
+
+def should_fetch_extended_hours_overlay(now=None):
+    return not is_us_regular_trading_hours(now)
+
+
+def is_us_extended_hours(now=None):
+    """Compatibility helper: return a generic overlay marker outside regular hours."""
+    if not should_fetch_extended_hours_overlay(now):
+        return None
+    ny_tz = pytz.timezone('America/New_York')
+    now_ny = now.astimezone(ny_tz) if now is not None else datetime.datetime.now(ny_tz)
+    return {"label": "Extended-hours estimate", "now": now_ny}
+
+
+def is_us_extended_hours_candidate(ticker):
+    """Only US stocks/ETFs should use Yahoo pre/post-market overlay."""
+    if not ticker:
+        return False
+    t = str(ticker).upper()
+    if t in NON_EXTENDED_HOURS_TICKERS:
+        return False
+    if t.startswith("^") or t.endswith("=X") or t.endswith("=F"):
+        return False
+    if "." in t:
+        return False
+    if t.endswith("-USD"):
+        return False
+    return True
+
+
+def _extract_intraday_field(df, field, ticker, batch):
+    if df is None or df.empty:
+        return None
+    if isinstance(df.columns, pd.MultiIndex):
+        if (field, ticker) in df.columns:
+            return df[(field, ticker)]
+        if (ticker, field) in df.columns:
+            return df[(ticker, field)]
+        return None
+    if len(batch) == 1 and field in df.columns:
+        return df[field]
+    return None
+
+
+def _is_extended_hours_time(local_time):
+    return local_time < datetime.time(9, 30) or local_time >= datetime.time(16, 0)
+
+
+def _extended_label_for_timestamp(ts_ny):
+    local_time = ts_ny.time()
+    return "Pre-market estimate" if local_time < datetime.time(9, 30) else "After-hours estimate"
+
+
+def _filter_extended_session(series, now=None):
+    if series is None or series.empty:
+        return pd.Series(dtype=float)
+
+    s = series.dropna()
+    if s.empty:
+        return s
+
+    idx = pd.to_datetime(s.index)
+    if idx.tz is None:
+        idx_ny = idx.tz_localize('America/New_York')
+    else:
+        idx_ny = idx.tz_convert('America/New_York')
+
+    ny_tz = pytz.timezone('America/New_York')
+    now_ny = now.astimezone(ny_tz) if now is not None else datetime.datetime.now(ny_tz)
+    local_times = pd.Series(idx_ny.time, index=s.index)
+    mask = (
+        local_times.map(_is_extended_hours_time) &
+        (idx_ny <= now_ny)
+    )
+    return s[mask.to_numpy()]
+
+
+def _select_latest_extended_price(series):
+    close_ext = _filter_extended_session(series)
+    if close_ext.empty:
+        return None, None, None, None
+    latest_ts = close_ext.index[-1]
+    latest_price = _safe_float(close_ext.iloc[-1])
+    if latest_price is None:
+        return None, None, None, None
+    latest_ts_ny = _timestamp_to_ny(latest_ts)
+    return _extended_label_for_timestamp(latest_ts_ny), latest_ts, latest_ts_ny, latest_price
+
+
+def update_extended_hours_price_cache(tickers):
+    """
+    Outside regular US trading hours, write latest 4h prepost prices into the cache.
+    Returns {ticker: {"price": ..., "volume": ..., "date": ..., "source": ...}}.
+    """
+    if not should_fetch_extended_hours_overlay():
+        return {}
+
+    candidates = [t for t in dict.fromkeys(tickers) if is_us_extended_hours_candidate(t)]
+    if not candidates:
+        return {}
+
+    print(f"[ExtendedHours] fetching 4h prepost (1d) for {len(candidates)} tickers...")
+    updates = {}
+    for batch in _chunks(candidates, US_EXTENDED_HOURS_BATCH_SIZE):
+        try:
+            df_ext = yf.download(
+                tickers=batch,
+                period="1d",
+                interval="4h",
+                prepost=True,
+                auto_adjust=False,
+                group_by="column",
+                threads=True,
+                progress=False,
+                timeout=20,
+            )
+        except Exception as e:
+            print(f"[ExtendedHours] 4h batch failed ({len(batch)} tickers): {e}")
+            continue
+
+        if df_ext is None or df_ext.empty:
+            continue
+
+        for ticker in batch:
+            close_series = _extract_intraday_field(df_ext, "Close", ticker, batch)
+            source_label, latest_ts, latest_ts_ny, latest_price = _select_latest_extended_price(close_series)
+            if latest_price is None:
+                continue
+
+            updates[ticker] = {
+                "price": latest_price,
+                "volume": None,
+                "date": latest_ts_ny.date().strftime("%Y-%m-%d"),
+                "source": source_label,
+            }
+
+    if not updates:
+        print("[ExtendedHours] No valid extended-hours prices found; using regular cache prices.")
+        return {}
+
+    conn = init_db()
+    conn.executemany(
+        """
+        INSERT INTO price_cache (ticker, date, adj_close, volume)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(ticker, date) DO UPDATE SET
+            adj_close = excluded.adj_close,
+            volume = COALESCE(price_cache.volume, excluded.volume)
+        """,
+        [(t, u["date"], u["price"], u["volume"]) for t, u in updates.items()]
+    )
+    conn.commit()
+    conn.close()
+    print(f"[ExtendedHours] Wrote {len(updates)} extended-hours price rows into price_cache")
+    return updates
+
+
+def get_latest_extended_hours_price(ticker):
+    """Fetch latest 4h pre/post-market price for one US ticker."""
+    if not should_fetch_extended_hours_overlay() or not is_us_extended_hours_candidate(ticker):
+        return None
+
+    try:
+        df_ext = yf.download(
+            tickers=[ticker],
+            period="1d",
+            interval="4h",
+            prepost=True,
+            auto_adjust=False,
+            group_by="column",
+            threads=False,
+            progress=False,
+            timeout=20,
+        )
+    except Exception as e:
+        print(f"[ExtendedHours] K-line 4h fetch failed for {ticker}: {e}")
+        return None
+
+    close_series = _extract_intraday_field(df_ext, "Close", ticker, [ticker])
+    source_label, latest_ts, latest_ts_ny, latest_price = _select_latest_extended_price(close_series)
+    if latest_price is None:
+        return None
+
+    return {
+        "price": latest_price,
+        "timestamp": pd.Timestamp(latest_ts),
+        "date": latest_ts_ny.date().strftime("%Y-%m-%d"),
+        "source": source_label,
+    }
+
+
+def _timestamp_to_ny(ts):
+    ts = pd.Timestamp(ts)
+    if ts.tzinfo is None:
+        return pytz.timezone('America/New_York').localize(ts.to_pydatetime())
+    return ts.tz_convert('America/New_York')
+
+
+def _align_timestamp_to_index_tz(ts, index):
+    ts = pd.Timestamp(ts)
+    index_tz = getattr(index, "tz", None)
+    if index_tz is None:
+        if ts.tzinfo is not None:
+            return ts.tz_convert('America/New_York').tz_localize(None)
+        return ts
+    if ts.tzinfo is None:
+        ts = pd.Timestamp(pytz.timezone('America/New_York').localize(ts.to_pydatetime()))
+    return ts.tz_convert(index_tz)
+
+
+def apply_extended_hours_to_daily_kline(stock_data, ticker):
+    """
+    Add/update the daily K-line with extended-hours price when newer.
+    Returns (stock_data, extended_info).
+    """
+    if stock_data is None or stock_data.empty:
+        return stock_data, None
+
+    ext = get_latest_extended_hours_price(ticker)
+    if not ext:
+        return stock_data, None
+
+    latest_regular_ts_ny = _timestamp_to_ny(stock_data.index[-1])
+    ext_ts_ny = _timestamp_to_ny(ext["timestamp"])
+    latest_regular_date = latest_regular_ts_ny.date()
+    ext_date = ext_ts_ny.date()
+
+    if ext_date < latest_regular_date:
+        return stock_data, None
+
+    updated = stock_data.copy()
+
+    if ext_date == latest_regular_date:
+        target_idx = updated.index[-1]
+        updated.at[target_idx, "Close"] = ext["price"]
+        if "High" in updated.columns and pd.notna(updated.at[target_idx, "High"]):
+            updated.at[target_idx, "High"] = max(float(updated.at[target_idx, "High"]), ext["price"])
+        if "Low" in updated.columns and pd.notna(updated.at[target_idx, "Low"]):
+            updated.at[target_idx, "Low"] = min(float(updated.at[target_idx, "Low"]), ext["price"])
+    else:
+        row = {
+            "Open": ext["price"],
+            "High": ext["price"],
+            "Low": ext["price"],
+            "Close": ext["price"],
+            "Volume": 0,
+        }
+
+        for col in updated.columns:
+            if col not in row:
+                row[col] = np.nan
+
+        overlay_ts = _align_timestamp_to_index_tz(ext["timestamp"], updated.index)
+        updated.loc[overlay_ts, list(row.keys())] = list(row.values())
+
+    updated = updated.sort_index()
+
+    print(f"[ExtendedHours] K-line used {ext['source']} for {ticker}: {ext['price']} @ {ext_ts_ny}")
+    return updated, ext
 
 
 def _save_to_price_cache(conn, df, tickers):
@@ -995,6 +1268,20 @@ def get_stock_data():
             adj_close = df[[price_col]].rename(columns={price_col: only_ticker})
             volumes = pd.DataFrame({only_ticker: df['Volume']}) if 'Volume' in df.columns else pd.DataFrame()
 
+        extended_updates = update_extended_hours_price_cache(all_tickers)
+        if extended_updates:
+            for ext_ticker, ext_data in extended_updates.items():
+                ext_date = pd.Timestamp(ext_data["date"])
+                if ext_ticker not in adj_close.columns:
+                    adj_close[ext_ticker] = np.nan
+                adj_close.loc[ext_date, ext_ticker] = ext_data["price"]
+
+                if ext_ticker not in volumes.columns:
+                    volumes[ext_ticker] = np.nan
+
+            adj_close = adj_close.sort_index()
+            volumes = volumes.sort_index()
+
         results = []
 
         # 从缓存数据中提取标普500价格（无需单独下载）
@@ -1229,7 +1516,8 @@ def get_stock_data():
                 "PEG Ratio": PEG_ratio,
                 "Analysts": analyst_rating if pd.notna(analyst_rating) else None,
                 "Price Target": price_target if pd.notna(price_target) else None,
-                "Market Cap": market_cap 
+                "Market Cap": market_cap,
+                "Price Source": extended_updates.get(ticker, {}).get("source"),
             }
 
             for n in [5, 10, 20, 50, 100, 200]:
@@ -1357,11 +1645,12 @@ def get_kline_data():
         end_date = datetime.date.today() + pd.offsets.BusinessDay(1)
         start_date = end_date - datetime.timedelta(days=time_span)
         ticker_info = yf.Ticker(ticker)
+        extended_info = None
         if '1d' in interval:
             stock_data = ticker_info.history(start=start_date, end=end_date)
         elif interval in ['5m','15m','1h','4h']:
             intraday_days = min(time_span, 60)
-            stock_data = ticker_info.history(period=f"{intraday_days}d", interval = interval)
+            stock_data = ticker_info.history(period=f"{intraday_days}d", interval=interval, prepost=True)
         elif '1wk' in interval:
             stock_data = ticker_info.history(start=start_date, end=end_date, interval = interval)
         else:
@@ -1372,6 +1661,9 @@ def get_kline_data():
             return jsonify({"success": False, "error": f"未找到股票代码: {ticker}"})
         
         # 计算筹码分布
+        if '1d' in interval:
+            stock_data, extended_info = apply_extended_hours_to_daily_kline(stock_data, ticker)
+
         chip_data,chip_peak_price = calculate_chip_distribution(ticker)
         prices = chip_data['price'].values
         volumes = chip_data['volume'].values
@@ -1433,6 +1725,8 @@ def get_kline_data():
         kline_data = {
             "success": True,
             "ticker": ticker,
+            "price_source": extended_info.get("source") if extended_info else None,
+            "extended_time": extended_info.get("timestamp").strftime('%Y-%m-%d %H:%M') if extended_info else None,
             "dates": stock_data.index.strftime('%Y-%m-%d %H:%M').tolist(), 
             "ohlc": {
                 "open": stock_data['Open'].tolist(),

@@ -240,6 +240,85 @@ COLUMNS = (
 )
 
 # ===== 渲染表格 =====
+NON_PRICE_TICKERS = {"20MA_Ratio", "50MA_Ratio", "200MA_Ratio"}
+TICKER_CURRENCY_SUFFIXES = {
+    ".HK": "HKD",
+    ".SS": "CNY",
+    ".SZ": "CNY",
+    ".DE": "EUR",
+    ".PA": "EUR",
+    ".AS": "EUR",
+    ".MI": "EUR",
+    ".MC": "EUR",
+    ".BR": "EUR",
+    ".L": "GBX",
+    ".TO": "CAD",
+    ".T": "JPY",
+}
+CURRENCY_DISPLAY_UNITS = {
+    "USD": ("$", ""),
+    "EUR": ("€", ""),
+    "CNY": ("￥", ""),
+    "CNH": ("￥", ""),
+    "HKD": ("HK$", ""),
+    "CAD": ("CA$", ""),
+    "AUD": ("A$", ""),
+    "GBP": ("£", ""),
+    "GBX": ("", "p"),
+    "JPY": ("¥", ""),
+    "CHF": ("CHF ", ""),
+    "SEK": ("SEK ", ""),
+    "NOK": ("NOK ", ""),
+    "DKK": ("DKK ", ""),
+}
+
+
+def should_show_price_unit(ticker):
+    if not ticker:
+        return False
+    ticker = str(ticker).upper()
+    if ticker in NON_PRICE_TICKERS:
+        return False
+    if ticker.startswith("^") or ticker.endswith("=X"):
+        return False
+    return True
+
+
+def currency_for_ticker(ticker):
+    ticker_upper = str(ticker or "").upper()
+    if not should_show_price_unit(ticker_upper):
+        return None
+    for suffix, currency in TICKER_CURRENCY_SUFFIXES.items():
+        if ticker_upper.endswith(suffix):
+            return currency
+    if ticker_upper.endswith("-USD"):
+        return "USD"
+    return "USD"
+
+
+def format_money_value(value, ticker):
+    if pd.isna(value):
+        return ""
+    try:
+        formatted = f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return ""
+    currency = currency_for_ticker(ticker)
+    if not currency:
+        return formatted
+    prefix, suffix = CURRENCY_DISPLAY_UNITS.get(currency, (f"{currency} ", ""))
+    return f"{prefix}{formatted}{suffix}"
+
+
+def price_source_color(source):
+    source = str(source or "").lower()
+    if source.startswith("pre-market"):
+        return "#dbeafe"
+    if source.startswith("after-hours"):
+        return "#fef3c7"
+    return "#dcfce7"
+
+
 def render_table(df: pd.DataFrame, target_sheet=None, target_groups=None):
     if target_sheet is None:
         target_sheet = sheet_stocks
@@ -282,14 +361,16 @@ def render_table(df: pd.DataFrame, target_sheet=None, target_groups=None):
                         disp = tk_
                     elif col == "Rel. Momentum":
                         disp = f"{float(val):.2f}" if pd.notna(val) else ""
-                    elif col in ("Price", "Volume_Ratio"):
+                    elif col == "Price":
+                        disp = format_money_value(val, tk_)
+                    elif col == "Volume_Ratio":
                         disp = f"{float(val):.2f}" if pd.notna(val) else ""
                     elif col == "Next Earnings":
                         disp = val if isinstance(val, str) else val.strftime('%Y-%m-%d') if not pd.isna(val) else ""
                     elif col == "Analysts":
                         disp = str(val) if pd.notna(val) and val is not None else ""
                     elif col == "Price Target":
-                        disp = f"${float(val):.2f}" if pd.notna(val) and val is not None else ""
+                        disp = format_money_value(val, tk_) if pd.notna(val) and val is not None else ""
                     elif col == "Market Cap":
                         disp = f"{float(val):.2e}" if pd.notna(val) else ""
                     else:
@@ -300,6 +381,8 @@ def render_table(df: pd.DataFrame, target_sheet=None, target_groups=None):
                 if col == "Ticker":
                     beta_val = row.get("Beta", np.nan)
                     cell_bg[(r, j)] = beta_color(beta_val)
+                elif col == "Price" and pd.notna(val) and disp != "":
+                    cell_bg[(r, j)] = price_source_color(row.get("Price Source", ""))
                 elif pd.notna(val) and disp != "" and col != "Price":
                     if col == "Volume_Ratio":
                         cell_bg[(r, j)] = blue_color(val)
@@ -827,7 +910,12 @@ def plot_kline():
                 return _format_coord
             ax1.format_coord = _make_format_coord(ax1.format_coord)
 
-            ax1.set_title(f"K-Curve {ticker} | Market Cap: {data['financials']['market_cap']}, PE: {data['financials']['trailing_pe']}/{data['financials']['forward_pe']}, P/S: {data['financials']['price_to_sales']}, P/B: {data['financials']['price_to_book']}, PEG: {data['financials']['peg_ratio']}, Next Earnings: {data['financials']['next_earnings']}, Analysts: {data['financials'].get('analyst_rating', 'N/A')}, Target: {data['financials'].get('price_target', 'N/A')}")
+            price_source = data.get("price_source")
+            extended_time = data.get("extended_time")
+            source_suffix = ""
+            if price_source:
+                source_suffix = f" | {price_source}" + (f" @ {extended_time}" if extended_time else "")
+            ax1.set_title(f"K-Curve {ticker}{source_suffix} | Market Cap: {data['financials']['market_cap']}, PE: {data['financials']['trailing_pe']}/{data['financials']['forward_pe']}, P/S: {data['financials']['price_to_sales']}, P/B: {data['financials']['price_to_book']}, PEG: {data['financials']['peg_ratio']}, Next Earnings: {data['financials']['next_earnings']}, Analysts: {data['financials'].get('analyst_rating', 'N/A')}, Target: {data['financials'].get('price_target', 'N/A')}")
 
             # StockAnalysis 链接（可点击跳转浏览器）
             sa_url = stockanalysis_overview_url(ticker)
@@ -1026,6 +1114,18 @@ sheet_breadth = tksheet.Sheet(breadth_frame, data=[], headers=COLUMNS, show_row_
 sheet_breadth.pack(fill="both", expand=True)
 
 # 底部按钮
+legend_frame = tk.Frame(root)
+legend_frame.pack(fill="x", padx=10, pady=(0, 4))
+tk.Label(legend_frame, text="Price:", font=("Segoe UI", 8)).pack(side="left")
+for legend_text, legend_color in [
+    ("regular/latest close", "#dcfce7"),
+    ("pre-market estimate", "#dbeafe"),
+    ("after-hours estimate", "#fef3c7"),
+]:
+    tk.Label(legend_frame, text="  ", bg=legend_color, relief="solid", borderwidth=1).pack(side="left", padx=(8, 3))
+    tk.Label(legend_frame, text=legend_text, font=("Segoe UI", 8)).pack(side="left")
+tk.Label(legend_frame, text="   Ticker color reflects beta", font=("Segoe UI", 8)).pack(side="left")
+
 bottom = tk.Frame(root)
 bottom.pack(fill="x", padx=6, pady=(0, 8))
 refresh_stock_button = tk.Button(bottom, text="Refresh Stocks", command=refresh_stock_data, width=15)
