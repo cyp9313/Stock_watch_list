@@ -186,7 +186,7 @@ BROAD_MARKET_TICKERS = list(dict.fromkeys(
 # COLUMNS (EXACTLY matching tkinter version)
 # ════════════════════════════════════════════════════════════
 COLUMNS = (
-    ["Ticker", "Price", "1D%", "5D%", "1M%", "YTD%", "Rel. Momentum"] +
+    ["Ticker", "Name", "Price", "1D%", "5D%", "1M%", "YTD%", "Rel. Momentum"] +
     [f"Diff_EMA{n}%" for n in [5, 10, 20, 50, 100, 200]] +
     ["Diff_BB_Up%", "Diff_BB_Low%", "Volume_Ratio", "Next Earnings", "Trailing PE", "Forward PE", "PEG Ratio", "Analysts", "Price Target", "Market Cap"]
 )
@@ -418,6 +418,8 @@ def build_grouped_df(df, groups):
                 else:
                     if col == "Ticker":
                         disp = tk_
+                    elif col == "Name":
+                        disp = str(val) if pd.notna(val) and val is not None else ""
                     elif col == "Rel. Momentum":
                         disp = f"{float(val):.2f}" if pd.notna(val) else ""
                     elif col in ("Price", "Volume_Ratio"):
@@ -443,7 +445,7 @@ def build_grouped_df(df, groups):
 # ════════════════════════════════════════════════════════════
 # HELPER: Apply cell colors (EXACTLY matching tkinter version)
 # ════════════════════════════════════════════════════════════
-def apply_cell_colors(df_display, df_raw, groups):
+def apply_cell_colors(df_display, df_raw, groups, columns=None):
     """
     Apply cell background colors (EXACTLY matching tkinter/tksheet version).
     Returns a list of dicts: {row_index: {col_index: color_hex}}
@@ -451,13 +453,14 @@ def apply_cell_colors(df_display, df_raw, groups):
     if df_display.empty or df_raw.empty:
         return {}
     
+    columns = list(columns or COLUMNS)
     current_date = pd.Timestamp.now(tz='America/New_York').date()
     cell_colors = {}
     r = 0
     
     for grp_name, tickers in groups.items():
         # Header row: gray background
-        for c in range(len(COLUMNS)):
+        for c in range(len(columns)):
             cell_colors[(r, c)] = "#cccccc"
         r += 1
         
@@ -471,13 +474,15 @@ def apply_cell_colors(df_display, df_raw, groups):
             
             row = df_grp.loc[tk_]
             
-            for j, col in enumerate(COLUMNS):
+            for j, col in enumerate(columns):
                 val = row[col] if col in row else np.nan
                 
                 # Apply colors (EXACTLY matching tkinter logic)
                 if col == "Ticker":
                     beta_val = row.get("Beta", np.nan)
                     cell_colors[(r, j)] = beta_color(beta_val)
+                elif col == "Name":
+                    continue
                 elif pd.notna(val) and df_display.iloc[r][col] != "" and col != "Price":
                     if col == "Volume_Ratio":
                         cell_colors[(r, j)] = blue_color(val)
@@ -513,7 +518,7 @@ def apply_cell_colors(df_display, df_raw, groups):
 
 
 # ── Helper: render grouped table with colors ──────────────────
-def render_grouped_table(df, groups, key_prefix="", dark_mode=False):
+def render_grouped_table(df, groups, key_prefix="", dark_mode=False, show_name_column=False):
     """
     Render a table with group headers AND cell colors (matching tkinter), with fixed header.
     """
@@ -528,6 +533,7 @@ def render_grouped_table(df, groups, key_prefix="", dark_mode=False):
         st.info("No data available")
         return
     
+    visible_columns = COLUMNS if show_name_column else [col for col in COLUMNS if col != "Name"]
     theme = get_theme(dark_mode)
     # Display using HTML table with fixed header using CSS
     html_table = f"""
@@ -538,12 +544,12 @@ def render_grouped_table(df, groups, key_prefix="", dark_mode=False):
     """
     
     # Header
-    for col in COLUMNS:
+    for col in visible_columns:
         html_table += f"<th style='padding:4px; text-align:left; color:{theme['text']}; border:1px solid {theme['table_border']};'>{col}</th>"
     html_table += "</tr></thead><tbody>"
     
     # Apply colors
-    cell_colors = apply_cell_colors(df_display, df, groups)
+    cell_colors = apply_cell_colors(df_display, df, groups, columns=visible_columns)
     group_names = set(groups.keys())
     
     # Rows
@@ -552,7 +558,7 @@ def render_grouped_table(df, groups, key_prefix="", dark_mode=False):
         is_header = str(row["Ticker"]) in group_names
         
         html_table += "<tr>"
-        for j, col in enumerate(COLUMNS):
+        for j, col in enumerate(visible_columns):
             val = row[col]
             bg_color = cell_colors.get((r, j), theme["table_bg"] if not is_header else theme["table_group_bg"])
             if dark_mode and bg_color.lower() in ("#ffffff", "white", "#cccccc"):
@@ -561,7 +567,7 @@ def render_grouped_table(df, groups, key_prefix="", dark_mode=False):
             
             # Header row styling
             if is_header and j == 0:
-                html_table += f"<td colspan='{len(COLUMNS)}' style='padding:4px; color:{theme['text']}; background-color:{bg_color}; font-weight:bold; border:1px solid {theme['table_border']};'>{val}</td>"
+                html_table += f"<td colspan='{len(visible_columns)}' style='padding:4px; color:{theme['text']}; background-color:{bg_color}; font-weight:bold; border:1px solid {theme['table_border']};'>{val}</td>"
                 break
             elif is_header:
                 continue
@@ -1222,13 +1228,14 @@ tab1, tab2, tab3 = st.tabs(["📊 Stocks", "🌐 Broad Market", "📈 Market Bre
 # Tab 1: Stocks
 with tab1:
     st.subheader("Stock Watchlist")
+    show_stock_names = st.toggle("Show Name column next to Ticker", value=False, key="single_stocks_show_name_column")
     if not df.empty:
         # Filter stocks (exclude broad market and breadth tickers)
         broad_and_breadth_tickers = set(BROAD_MARKET_TICKERS) | {"20MA_Ratio", "50MA_Ratio", "200MA_Ratio"}
         stocks_df = df[~df["Ticker"].isin(broad_and_breadth_tickers)].copy()
         
         if not stocks_df.empty:
-            render_grouped_table(stocks_df, STOCK_GROUPS, dark_mode=dark_mode)
+            render_grouped_table(stocks_df, STOCK_GROUPS, dark_mode=dark_mode, show_name_column=show_stock_names)
         else:
             st.info("No stock data available")
     else:
@@ -1237,11 +1244,12 @@ with tab1:
 # Tab 2: Broad Market
 with tab2:
     st.subheader("Broad Market Indicators")
+    show_broad_names = st.toggle("Show Name column next to Ticker", value=False, key="single_broad_show_name_column")
     if not df.empty:
         broad_df = df[df["Ticker"].isin(BROAD_MARKET_TICKERS)].copy()
         
         if not broad_df.empty:
-            render_grouped_table(broad_df, BROAD_MARKET_GROUPS, dark_mode=dark_mode)
+            render_grouped_table(broad_df, BROAD_MARKET_GROUPS, dark_mode=dark_mode, show_name_column=show_broad_names)
         else:
             st.info("No broad market data available")
     else:
@@ -1250,6 +1258,7 @@ with tab2:
 # Tab 3: Market Breadth
 with tab3:
     st.subheader("Market Breadth")
+    show_breadth_names = st.toggle("Show Name column next to Ticker", value=False, key="single_breadth_show_name_column")
     
     # Fetch breadth data
     with st.spinner("Loading market breadth data..."):
@@ -1261,7 +1270,7 @@ with tab3:
         
         if not breadth_df.empty:
             # Display breadth table with grouped headers and colors (matching tkinter)
-            render_grouped_table(breadth_df, BREADTH_GROUPS, dark_mode=dark_mode)
+            render_grouped_table(breadth_df, BREADTH_GROUPS, dark_mode=dark_mode, show_name_column=show_breadth_names)
             
             # Display breadth chart
             st.divider()

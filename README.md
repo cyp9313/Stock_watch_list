@@ -1310,6 +1310,7 @@ python -m streamlit run app_streamlit_multiuser.py --server.address 127.0.0.1 --
 Behavior:
 
 - Logged-in users can edit their own Stocks and Broad Market pages, group names, and ticker lists.
+- The watch list editor supports multi-line bulk editing and one-click save for multiple group changes.
 - Guest users see the default watch list in read-only mode and cannot save changes.
 - Each logged-in user's market-data cache is stored separately under `user_data/<username>_stock_cache.db`.
 - Accounts are created by the administrator with the command line; there is no public self-registration UI.
@@ -1357,6 +1358,7 @@ For K-line charts:
 - Tkinter, single-user Streamlit, and guest mode use the shared `stock_cache.db`.
 - Logged-in multi-user Streamlit accounts use separate price caches under `user_data/<username>_stock_cache.db`.
 - S&P 500 market-breadth data and S&P 500 market-cap cache are shared rather than duplicated per user.
+- Ticker display-name cache follows the active price cache: logged-in users keep names in their own `user_data/<username>_stock_cache.db`, while Tkinter, single-user Streamlit, and guest mode use `stock_cache.db`. Existing ticker names are reused permanently; only tickers without a cached name are queried again.
 
 ## License
 

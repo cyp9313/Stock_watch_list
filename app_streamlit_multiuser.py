@@ -35,7 +35,7 @@ st.set_page_config(page_title="Stock Watchlist", layout="wide", initial_sidebar_
 
 API_BASE = "http://127.0.0.1:5000"
 COLUMNS = (
-    ["Ticker", "Price", "1D%", "5D%", "1M%", "YTD%", "Rel. Momentum"]
+    ["Ticker", "Name", "Price", "1D%", "5D%", "1M%", "YTD%", "Rel. Momentum"]
     + [f"Diff_EMA{n}%" for n in [5, 10, 20, 50, 100, 200]]
     + ["Diff_BB_Up%", "Diff_BB_Low%", "Volume_Ratio", "Next Earnings", "Trailing PE", "Forward PE",
        "PEG Ratio", "Analysts", "Price Target", "Market Cap"]
@@ -43,7 +43,7 @@ COLUMNS = (
 RIGHT_ALIGNED_COLUMNS = {
     col
     for col in COLUMNS
-    if col not in {"Ticker", "Next Earnings"}
+    if col not in {"Ticker", "Name", "Next Earnings"}
 }
 
 SECTION_META = {
@@ -347,6 +347,20 @@ def inject_css(dark_mode=False):
         div[data-testid="stDataEditor"] div {{
             border-color: {theme["table_border"]} !important;
         }}
+        div[data-testid="stDataEditor"] {{
+            --gdg-bg-cell: {theme["input_bg"]};
+            --gdg-bg-cell-medium: {theme["panel_bg"]};
+            --gdg-bg-header: {theme["table_header_bg"]};
+            --gdg-bg-header-hovered: {theme["button_hover"]};
+            --gdg-bg-header-has-focus: {theme["button_hover"]};
+            --gdg-text-dark: {theme["text"]};
+            --gdg-text-medium: {theme["text"]};
+            --gdg-text-light: {theme["muted"]};
+            --gdg-border-color: {theme["table_border"]};
+            --gdg-horizontal-border-color: {theme["table_border"]};
+            --gdg-accent-color: {theme["input_focus"]};
+            --gdg-accent-light: {theme["input_focus"]}22;
+        }}
         div[data-testid="stDataFrame"] [role="grid"],
         div[data-testid="stDataEditor"] [role="grid"],
         div[data-testid="stDataFrame"] canvas,
@@ -366,6 +380,14 @@ def inject_css(dark_mode=False):
             background-color: {theme["editor_bg"]} !important;
             color: {theme["text"]} !important;
         }}
+        div[data-testid="stDataEditor"] input,
+        div[data-testid="stDataEditor"] textarea,
+        div[data-testid="stDataEditor"] [contenteditable="true"] {{
+            background-color: {theme["input_bg"]} !important;
+            color: {theme["text"]} !important;
+            border-color: {theme["input_border"]} !important;
+            caret-color: {theme["input_focus"]} !important;
+        }}
         [data-testid="stAlert"] {{
             background-color: {theme["alert_bg"]};
             color: {theme["text"]};
@@ -383,18 +405,30 @@ def inject_css(dark_mode=False):
     )
 
 
-def groups_to_editor_rows(groups):
-    rows = []
-    for group, tickers in groups.items():
-        rows.append({"Group": group, "Tickers": ", ".join(tickers)})
-    return pd.DataFrame(rows or [{"Group": "", "Tickers": ""}])
+def groups_to_editor_text(groups):
+    return "\n".join(
+        f"{group} | {', '.join(tickers)}"
+        for group, tickers in groups.items()
+    )
 
 
-def editor_rows_to_groups(rows):
+def editor_text_to_groups(text):
     groups = {}
-    for _, row in rows.fillna("").iterrows():
-        group_name = str(row.get("Group", "")).strip()
-        tickers_raw = str(row.get("Tickers", "")).replace("\n", ",")
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if "|" in line:
+            group_name, tickers_raw = line.split("|", 1)
+        elif "\t" in line:
+            group_name, tickers_raw = line.split("\t", 1)
+        else:
+            parts = line.split(",", 1)
+            group_name = parts[0]
+            tickers_raw = parts[1] if len(parts) > 1 else ""
+
+        group_name = group_name.strip()
         tickers = []
         for token in tickers_raw.replace(";", ",").split(","):
             normalized = normalize_yfinance_ticker(token.strip())
@@ -550,6 +584,8 @@ def build_grouped_df(df, groups, display_currency="Local"):
                         disp = ""
                 elif col == "Ticker":
                     disp = ticker
+                elif col == "Name":
+                    disp = str(val) if pd.notna(val) and val is not None else ""
                 elif col == "Rel. Momentum":
                     disp = f"{float(val):.2f}" if pd.notna(val) else ""
                 elif col == "Price":
@@ -572,15 +608,16 @@ def build_grouped_df(df, groups, display_currency="Local"):
     return pd.DataFrame(rows)
 
 
-def apply_cell_colors(df_display, df_raw, groups):
+def apply_cell_colors(df_display, df_raw, groups, columns=None):
     if df_display.empty or df_raw.empty:
         return {}
 
+    columns = list(columns or COLUMNS)
     current_date = pd.Timestamp.now(tz="America/New_York").date()
     cell_colors = {}
     row_index = 0
     for _, tickers in groups.items():
-        for col_index in range(len(COLUMNS)):
+        for col_index in range(len(columns)):
             cell_colors[(row_index, col_index)] = "#cccccc"
         row_index += 1
 
@@ -591,10 +628,12 @@ def apply_cell_colors(df_display, df_raw, groups):
                 continue
 
             row = df_group.loc[ticker]
-            for col_index, col in enumerate(COLUMNS):
+            for col_index, col in enumerate(columns):
                 val = row[col] if col in row else np.nan
                 if col == "Ticker":
                     cell_colors[(row_index, col_index)] = beta_color(row.get("Beta", np.nan))
+                elif col == "Name":
+                    continue
                 elif col == "Price":
                     source = str(row.get("Price Source", "") or "").lower()
                     if source.startswith("pre-market"):
@@ -634,7 +673,7 @@ def apply_cell_colors(df_display, df_raw, groups):
     return cell_colors
 
 
-def render_grouped_table(df, groups, dark_mode=False, display_currency="Local"):
+def render_grouped_table(df, groups, dark_mode=False, display_currency="Local", show_name_column=False):
     if df.empty:
         st.info("No data available")
         return
@@ -644,6 +683,7 @@ def render_grouped_table(df, groups, dark_mode=False, display_currency="Local"):
         st.info("No data available")
         return
 
+    visible_columns = COLUMNS if show_name_column else [col for col in COLUMNS if col != "Name"]
     theme = get_theme(dark_mode)
     html_table = f"""
     <div style="width:100%; max-height:600px; overflow:auto; border:1px solid {theme['table_border']};">
@@ -651,20 +691,20 @@ def render_grouped_table(df, groups, dark_mode=False, display_currency="Local"):
             <thead style="position:sticky; top:0; z-index:10; background-color:{theme['table_header_bg']};">
                 <tr style="background-color:{theme['table_header_bg']};">
     """
-    for col in COLUMNS:
+    for col in visible_columns:
         html_table += (
             f"<th style='padding:4px; text-align:left; color:{theme['text']}; "
             f"border:1px solid {theme['table_border']};'>{html.escape(col)}</th>"
         )
     html_table += "</tr></thead><tbody>"
 
-    cell_colors = apply_cell_colors(df_display, df, groups)
+    cell_colors = apply_cell_colors(df_display, df, groups, columns=visible_columns)
     group_names = set(groups.keys())
     for row_index in range(len(df_display)):
         row = df_display.iloc[row_index]
         is_header = str(row["Ticker"]) in group_names
         html_table += "<tr>"
-        for col_index, col in enumerate(COLUMNS):
+        for col_index, col in enumerate(visible_columns):
             val = "" if pd.isna(row[col]) else str(row[col])
             bg_color = cell_colors.get((row_index, col_index), theme["table_group_bg"] if is_header else theme["table_bg"])
             if dark_mode and bg_color.lower() in ("#ffffff", "white", "#cccccc"):
@@ -697,11 +737,17 @@ def render_grouped_table(df, groups, dark_mode=False, display_currency="Local"):
     st.markdown(html_table, unsafe_allow_html=True)
 
 
-def render_market_table(raw_df, page, dark_mode=False, display_currency="Local"):
+def render_market_table(raw_df, page, dark_mode=False, display_currency="Local", show_name_column=False):
     groups = page.get("groups", {})
     tickers = page_tickers(page)
     page_df = raw_df[raw_df["Ticker"].isin(tickers)].copy() if not raw_df.empty else pd.DataFrame()
-    render_grouped_table(page_df, groups, dark_mode=dark_mode, display_currency=display_currency)
+    render_grouped_table(
+        page_df,
+        groups,
+        dark_mode=dark_mode,
+        display_currency=display_currency,
+        show_name_column=show_name_column,
+    )
 
 
 def render_table_legend(dark_mode=False):
@@ -886,9 +932,9 @@ def convert_kline_data_for_display(kline_data, ticker, display_currency):
     return converted
 
 
-def update_page_from_editor(config, section, page_index, name, edited_rows):
+def update_page_from_editor(config, section, page_index, name, edited_groups_text):
     config[section][page_index]["name"] = str(name).strip() or config[section][page_index]["name"]
-    config[section][page_index]["groups"] = editor_rows_to_groups(edited_rows)
+    config[section][page_index]["groups"] = editor_text_to_groups(edited_groups_text)
     return normalize_config(config)
 
 
@@ -1651,47 +1697,16 @@ def render_page_editor(config, section, page_index, editable, user, dark_mode=Fa
 
         with st.form(f"{section}_{page_index}_editor_form_{editor_version}"):
             new_name = st.text_input("Page name", page["name"], key=f"{section}_{page_index}_{editor_version}_name")
-            h1, h2, h3 = st.columns([2, 6, 1])
-            h1.caption("Group")
-            h2.caption("Tickers")
-            h3.caption("Delete")
-
-            rows = []
-            group_items = list(page["groups"].items()) + [("", [])]
-            for row_index, (group_name, tickers) in enumerate(group_items):
-                c1, c2, c3 = st.columns([2, 6, 1])
-                row_prefix = f"{section}_{page_index}_{editor_version}_editor_{row_index}"
-                with c1:
-                    edited_group = st.text_input(
-                        "Group",
-                        value=group_name,
-                        key=f"{row_prefix}_group",
-                        placeholder="Group",
-                        label_visibility="collapsed",
-                    )
-                with c2:
-                    edited_tickers = st.text_input(
-                        "Tickers",
-                        value=", ".join(tickers),
-                        key=f"{row_prefix}_tickers",
-                        placeholder="AAPL, MSFT, NVDA",
-                        label_visibility="collapsed",
-                    )
-                with c3:
-                    delete_row = st.checkbox(
-                        "Delete",
-                        value=False,
-                        key=f"{row_prefix}_delete",
-                        label_visibility="collapsed",
-                        disabled=not group_name,
-                    )
-                if not delete_row:
-                    rows.append({"Group": edited_group, "Tickers": edited_tickers})
-
+            edited = st.text_area(
+                "Groups",
+                value=groups_to_editor_text(page["groups"]),
+                key=f"{section}_{page_index}_{editor_version}_groups_text",
+                height=max(160, min(420, 28 * (len(page["groups"]) + 5))),
+                help="One line per group: Group | AAPL, MSFT, NVDA",
+            )
             submitted = st.form_submit_button("Save")
 
         if submitted:
-            edited = pd.DataFrame(rows)
             updated_config = update_page_from_editor(config, section, page_index, new_name, edited)
             save_active_config(user, updated_config)
             st.session_state[version_key] = editor_version + 1
@@ -1720,7 +1735,19 @@ def render_section(section_title, section_key, config, raw_df, editable, user, d
                             config = delete_page(config, section_key, i)
                             save_active_config(user, config)
                             st.rerun()
-            render_market_table(raw_df, config[section_key][i], dark_mode=dark_mode, display_currency=display_currency)
+            show_name_column = st.toggle(
+                "Show Name column next to Ticker",
+                value=False,
+                key=f"{section_key}_{i}_show_name_column",
+                help="Turn this on to insert the cached yfinance display-name column between Ticker and Price.",
+            )
+            render_market_table(
+                raw_df,
+                config[section_key][i],
+                dark_mode=dark_mode,
+                display_currency=display_currency,
+                show_name_column=show_name_column,
+            )
     return config
 
 

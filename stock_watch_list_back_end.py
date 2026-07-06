@@ -129,6 +129,14 @@ def init_db():
             updated_at      TEXT    DEFAULT (datetime('now'))
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ticker_name_cache (
+            ticker          TEXT    PRIMARY KEY,
+            name            TEXT,
+            checked_date    TEXT,
+            updated_at      TEXT    DEFAULT (datetime('now'))
+        )
+    """)
     # 迁移：为已存在的 stock_analysis_data 表添加 peg_ratio 列（如果缺失）
     try:
         conn.execute("SELECT peg_ratio FROM stock_analysis_data LIMIT 0")
@@ -359,6 +367,97 @@ def _safe_float(val):
 def _chunks(items, size):
     for i in range(0, len(items), size):
         yield items[i:i + size]
+
+
+def _short_ticker_name(name, max_len=28):
+    text = str(name or "").strip()
+    if not text or text.lower() == "nan":
+        return None
+    text = re.sub(r"\s+", " ", text)
+    return text if len(text) <= max_len else text[:max_len - 3].rstrip() + "..."
+
+
+def _fetch_yfinance_ticker_name(ticker):
+    try:
+        info = yf.Ticker(ticker).info
+        for key in ("shortName", "displayName", "longName"):
+            name = _short_ticker_name(info.get(key))
+            if name and name.upper() != ticker.upper():
+                return name
+    except Exception:
+        pass
+    return None
+
+
+def get_cached_ticker_names(tickers):
+    tickers = list(dict.fromkeys(normalize_yfinance_ticker(t) for t in tickers if t))
+    if not tickers:
+        return {}
+
+    today = get_market_date()
+    conn = init_db()
+    placeholders = ",".join("?" for _ in tickers)
+    rows = conn.execute(
+        f"SELECT ticker, name, checked_date FROM ticker_name_cache WHERE ticker IN ({placeholders})",
+        tickers,
+    ).fetchall()
+
+    cached = {ticker: name for ticker, name, _ in rows if name}
+    checked_today_without_name = {
+        ticker for ticker, name, checked_date in rows
+        if not name and checked_date == today
+    }
+    missing = [
+        ticker for ticker in tickers
+        if ticker not in cached and ticker not in checked_today_without_name
+    ]
+
+    if missing:
+        print(f"[TickerNameCache] Updating names for {len(missing)} tickers...")
+        fetched = {}
+        max_workers = min(12, max(1, len(missing)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_fetch_yfinance_ticker_name, ticker): ticker for ticker in missing}
+            for future in concurrent.futures.as_completed(futures):
+                ticker = futures[future]
+                try:
+                    fetched[ticker] = future.result()
+                except Exception:
+                    fetched[ticker] = None
+
+        for ticker in missing:
+            name = fetched.get(ticker)
+            if name:
+                cached[ticker] = name
+                conn.execute(
+                    """
+                    INSERT INTO ticker_name_cache (ticker, name, checked_date, updated_at)
+                    VALUES (?, ?, ?, datetime('now'))
+                    ON CONFLICT(ticker) DO UPDATE SET
+                        name=excluded.name,
+                        checked_date=excluded.checked_date,
+                        updated_at=datetime('now')
+                    """,
+                    (ticker, name, today),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO ticker_name_cache (ticker, name, checked_date, updated_at)
+                    VALUES (?, NULL, ?, datetime('now'))
+                    ON CONFLICT(ticker) DO UPDATE SET
+                        checked_date=excluded.checked_date,
+                        updated_at=datetime('now')
+                    """,
+                    (ticker, today),
+                )
+
+        conn.commit()
+        success_count = sum(1 for ticker in missing if fetched.get(ticker))
+        print(f"[TickerNameCache] Updated {success_count}/{len(missing)} names")
+
+    conn.close()
+    return cached
 
 
 def _fetch_yfinance_market_cap(ticker):
@@ -1392,6 +1491,7 @@ def get_stock_data():
             [t for group in groups.values() for t in group
              if t not in ["20MA_Ratio", "50MA_Ratio", "200MA_Ratio"]]
         ))
+        ticker_names = get_cached_ticker_names(all_tickers)
         
         ny_tz = pytz.timezone('America/New_York')
         current_date_ny = datetime.datetime.now(ny_tz).date()
@@ -1795,6 +1895,7 @@ def get_stock_data():
 
             row = {
                 "Ticker": ticker,
+                "Name": ticker_names.get(ticker),
                 "Price": float(round(latest["Adj Close"], 2)),
                 "Beta": round(beta, 2) if not pd.isna(beta) else np.nan,
                 "Rel. Momentum": round(float(relative_momentum), 2) if not pd.isna(relative_momentum) else np.nan,

@@ -234,7 +234,7 @@ def beta_color(beta):
 
 # ===== 列定义 =====
 COLUMNS = (
-    ["Ticker", "Price", "1D%", "5D%", "1M%", "YTD%", "Rel. Momentum"] +
+    ["Ticker", "Name", "Price", "1D%", "5D%", "1M%", "YTD%", "Rel. Momentum"] +
     [f"Diff_EMA{n}%" for n in [5, 10, 20, 50, 100, 200]] +
     ["Diff_BB_Up%", "Diff_BB_Low%", "Volume_Ratio","Next Earnings","Trailing PE","Forward PE","PEG Ratio","Analysts","Price Target","Market Cap"]
 )
@@ -359,6 +359,8 @@ def render_table(df: pd.DataFrame, target_sheet=None, target_groups=None):
                 else:
                     if col == "Ticker":
                         disp = tk_
+                    elif col == "Name":
+                        disp = str(val) if pd.notna(val) and val is not None else ""
                     elif col == "Rel. Momentum":
                         disp = f"{float(val):.2f}" if pd.notna(val) else ""
                     elif col == "Price":
@@ -381,6 +383,8 @@ def render_table(df: pd.DataFrame, target_sheet=None, target_groups=None):
                 if col == "Ticker":
                     beta_val = row.get("Beta", np.nan)
                     cell_bg[(r, j)] = beta_color(beta_val)
+                elif col == "Name":
+                    continue
                 elif col == "Price" and pd.notna(val) and disp != "":
                     cell_bg[(r, j)] = price_source_color(row.get("Price Source", ""))
                 elif pd.notna(val) and disp != "" and col != "Price":
@@ -418,7 +422,7 @@ def render_table(df: pd.DataFrame, target_sheet=None, target_groups=None):
     target_sheet.set_sheet_data(table_data)
     for (ri, ci), color in cell_bg.items():
         target_sheet.highlight_cells(row=ri, column=ci, bg=color)
-    target_sheet.set_column_widths([120]+[100] * (len(COLUMNS)-1))
+    target_sheet.set_column_widths([100, 180] + [100] * (len(COLUMNS) - 2))
 
 # ===== 数据刷新函数 =====
 def render_all_tabs():
@@ -698,12 +702,21 @@ def plot_kline():
                 ax.plot(dates, breadth_chart_data['20MA_Ratio'], label='Market_Breadth_MAV20', color='blue')
                 ax.plot(dates, breadth_chart_data['50MA_Ratio'], label='Market_Breadth_MAV50', color='red')
                 ax.plot(dates, breadth_chart_data['200MA_Ratio'], label='Market_Breadth_MAV200', color='orange')
+                if breadth_chart_data.get('GSPC'):
+                    ax_gspc = ax.twinx()
+                    ax_gspc.plot(dates, breadth_chart_data['GSPC'], label='^GSPC Adj Close', color='black', linewidth=1.5)
+                    ax_gspc.set_ylabel('^GSPC Adj Close')
             
             ax.axhline(y=15, color='gray', label='lower boundary line',linestyle='--', linewidth=1)
             ax.axhline(y=85, color='gray', label='higher boundary line',linestyle='--', linewidth=1)
             ax.set_title('Market Breadth (Last Year) in %')
             ax.set_ylabel('Market Breadth (%)')
-            ax.legend()
+            lines, labels = ax.get_legend_handles_labels()
+            if 'ax_gspc' in locals():
+                lines2, labels2 = ax_gspc.get_legend_handles_labels()
+                lines += lines2
+                labels += labels2
+            ax.legend(lines, labels, loc='upper left')
             ax.grid(True)
             plt.tight_layout()
 
