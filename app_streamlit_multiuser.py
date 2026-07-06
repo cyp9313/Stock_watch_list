@@ -958,6 +958,17 @@ def build_breadth_chart(breadth_data, dark_mode=False):
     for key, color in [("20MA_Ratio", "red"), ("50MA_Ratio", "orange"), ("200MA_Ratio", "blue")]:
         if key in chart_data:
             fig.add_trace(go.Scatter(x=dates, y=chart_data[key], name=key, line=dict(color=color, width=1.5)))
+    if chart_data.get("GSPC"):
+        gspc_color = "#f9fafb" if dark_mode else "#111827"
+        fig.add_trace(
+            go.Scatter(
+                x=dates,
+                y=chart_data["GSPC"],
+                name="^GSPC Adj Close",
+                line=dict(color=gspc_color, width=2.0),
+                yaxis="y2",
+            )
+        )
 
     fig.add_hline(y=15, line_dash="dash", line_color="gray")
     fig.add_hline(y=80, line_dash="dash", line_color="gray")
@@ -981,10 +992,136 @@ def build_breadth_chart(breadth_data, dark_mode=False):
             tickfont=dict(color=theme["text"]),
             showgrid=True,
         ),
+        yaxis2=dict(
+            title=dict(text="^GSPC Adj Close", font=dict(color=theme["text"])),
+            tickfont=dict(color=theme["text"]),
+            overlaying="y",
+            side="right",
+            showgrid=False,
+            zeroline=False,
+        ),
         xaxis=dict(tickfont=dict(color=theme["text"]), showgrid=True),
     )
     fig.update_xaxes(gridcolor=theme["grid"], zerolinecolor=theme["grid"])
     fig.update_yaxes(gridcolor=theme["grid"], zerolinecolor=theme["grid"])
+    return fig
+
+
+def build_sp500_treemap(breadth_data, dark_mode=False):
+    if not breadth_data or not breadth_data.get("breadth_treemap_data"):
+        return None
+    theme = get_theme(dark_mode)
+    rows = pd.DataFrame(breadth_data["breadth_treemap_data"])
+    if rows.empty or "Ticker" not in rows or "Sector" not in rows or "1D%" not in rows:
+        return None
+
+    rows["Sector"] = rows["Sector"].fillna("Unknown").replace("", "Unknown")
+    rows["Industry"] = rows.get("Industry", "Unknown")
+    rows["Name"] = rows.get("Name", rows["Ticker"])
+    rows["Size"] = pd.to_numeric(rows.get("Size", 1), errors="coerce").fillna(1).clip(lower=1)
+    rows["1D%"] = pd.to_numeric(rows["1D%"], errors="coerce").fillna(0)
+    rows["Price"] = pd.to_numeric(rows.get("Price", np.nan), errors="coerce")
+    rows["Market Cap"] = pd.to_numeric(rows.get("Market Cap", np.nan), errors="coerce")
+
+    def _format_market_cap(value):
+        if pd.isna(value):
+            return ""
+        value = float(value)
+        if value >= 1e12:
+            return f"${value / 1e12:.2f}T"
+        if value >= 1e9:
+            return f"${value / 1e9:.2f}B"
+        if value >= 1e6:
+            return f"${value / 1e6:.2f}M"
+        return f"${value:,.0f}"
+
+    labels = ["S&P 500"]
+    ids = ["root"]
+    parents = [""]
+    values = [float(rows["Size"].sum())]
+    colors = [0.0]
+    text = [""]
+    customdata = [["", "", "", "", "", ""]]
+
+    for sector, sector_df in rows.groupby("Sector", sort=True):
+        sector_id = f"sector:{sector}"
+        sector_value = float(sector_df["Size"].sum())
+        sector_color = float(np.average(sector_df["1D%"], weights=sector_df["Size"]))
+        labels.append(sector)
+        ids.append(sector_id)
+        parents.append("root")
+        values.append(sector_value)
+        colors.append(sector_color)
+        text.append(f"{sector_color:+.2f}%")
+        customdata.append([sector, "", "", "", "", f"{sector_color:+.2f}%"])
+
+        for _, row in sector_df.sort_values("Size", ascending=False).iterrows():
+            ticker = str(row["Ticker"])
+            pct = float(row["1D%"])
+            price = row["Price"]
+            stock_size = float(row["Size"])
+            labels.append(ticker)
+            ids.append(f"ticker:{ticker}")
+            parents.append(sector_id)
+            values.append(stock_size)
+            colors.append(pct)
+            text.append(f"{pct:+.2f}%")
+            customdata.append([
+                row.get("Name", ticker),
+                sector,
+                row.get("Industry", "Unknown"),
+                f"{float(price):.2f}" if pd.notna(price) else "",
+                _format_market_cap(row.get("Market Cap")),
+                f"{pct:+.2f}%",
+            ])
+
+    fig = go.Figure(
+        go.Treemap(
+            labels=labels,
+            ids=ids,
+            parents=parents,
+            values=values,
+            branchvalues="total",
+            text=text,
+            textinfo="label+text",
+            textfont=dict(size=18),
+            customdata=customdata,
+            marker=dict(
+                colors=colors,
+                colorscale=[
+                    [0.0, "#b91c1c"],
+                    [0.35, "#fca5a5"],
+                    [0.5, "#f3f4f6"],
+                    [0.65, "#86efac"],
+                    [1.0, "#15803d"],
+                ],
+                cmin=-3,
+                cmid=0,
+                cmax=3,
+                line=dict(width=1, color=theme["page_bg"]),
+            ),
+            hovertemplate=(
+                "<b>%{label}</b><br>"
+                "Name: %{customdata[0]}<br>"
+                "Sector: %{customdata[1]}<br>"
+                "Industry: %{customdata[2]}<br>"
+                "Price: %{customdata[3]}<br>"
+                "Market Cap: %{customdata[4]}<br>"
+                "1D: %{customdata[5]}"
+                "<extra></extra>"
+            ),
+            maxdepth=2,
+        )
+    )
+    fig.update_layout(
+        title=dict(text="S&P 500 Treemap by Sector (1D%)", font=dict(color=theme["text"], size=18)),
+        height=700,
+        margin=dict(l=8, r=8, t=44, b=8),
+        paper_bgcolor=theme["page_bg"],
+        plot_bgcolor=theme["plot_bg"],
+        font=dict(color=theme["text"], size=12),
+        uniformtext=dict(minsize=13, mode="hide"),
+    )
     return fig
 
 
@@ -1000,17 +1137,18 @@ def fear_greed_color(value):
     return "#2e7d32"
 
 
+def format_fear_greed_description(description):
+    return str(description or "N/A").strip().title()
+
+
 def build_fear_greed_gauge(value, description, title, dark_mode=False):
     theme = get_theme(dark_mode)
     color = fear_greed_color(value)
+    description = format_fear_greed_description(description)
     fig = go.Figure(
         go.Indicator(
-            mode="gauge+number",
+            mode="gauge",
             value=value,
-            number={
-                "font": {"size": 42, "color": color},
-                "valueformat": ".0f",
-            },
             title={
                 "text": f"<b>{html.escape(title)}</b>",
                 "font": {"size": 17},
@@ -1043,8 +1181,8 @@ def build_fear_greed_gauge(value, description, title, dark_mode=False):
         )
     )
     fig.update_layout(
-        height=230,
-        margin=dict(l=16, r=16, t=42, b=8),
+        height=250,
+        margin=dict(l=16, r=16, t=42, b=24),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         font=dict(family="Arial, sans-serif", color=theme["text"]),
@@ -1052,13 +1190,29 @@ def build_fear_greed_gauge(value, description, title, dark_mode=False):
             dict(
                 text=f"<b>{html.escape(description)}</b>",
                 x=0.5,
-                y=0.46,
+                y=0.28,
                 xref="paper",
                 yref="paper",
+                xanchor="center",
+                yanchor="middle",
+                yshift=42,
                 showarrow=False,
-                font=dict(size=18, color=color),
-            )
+                font=dict(size=17, color=color),
+            ),
+            dict(
+                text=f"<b>{value:.0f}</b>",
+                x=0.5,
+                y=0.28,
+                xref="paper",
+                yref="paper",
+                xanchor="center",
+                yanchor="middle",
+                yshift=-18,
+                showarrow=False,
+                font=dict(size=42, color=color),
+            ),
         ],
+        uirevision=f"{title}-{value:.0f}-{description}",
     )
     return fig
 
@@ -1733,7 +1887,7 @@ if not stock_payload.get("success"):
 raw_df = pd.DataFrame(stock_payload["data"])
 display_df = convert_stock_df_for_display(raw_df, display_currency)
 
-main_tabs = st.tabs([SECTION_META["stocks_pages"]["tab"], SECTION_META["broad_pages"]["tab"], "Market Breadth", "K-Line"])
+main_tabs = st.tabs([SECTION_META["stocks_pages"]["tab"], SECTION_META["broad_pages"]["tab"], "Market Breadth"])
 with main_tabs[0]:
     config = render_section(
         SECTION_META["stocks_pages"]["title"],
@@ -1768,8 +1922,12 @@ with main_tabs[2]:
         fig = build_breadth_chart(breadth, dark_mode=dark_mode)
         if fig is not None:
             st.plotly_chart(fig, width="stretch")
+        treemap_fig = build_sp500_treemap(breadth, dark_mode=dark_mode)
+        if treemap_fig is not None:
+            st.caption("Treemap tile area is based on cached latest market cap; color is the latest regular 1D% move.")
+            st.plotly_chart(treemap_fig, width="stretch")
     else:
         st.warning(breadth.get("error", "Failed to load market breadth data") if isinstance(breadth, dict) else "Failed to load market breadth data")
 
-with main_tabs[3]:
-    render_kline(cache_key, display_currency=display_currency)
+st.divider()
+render_kline(cache_key, display_currency=display_currency)

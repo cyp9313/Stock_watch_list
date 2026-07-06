@@ -1356,7 +1356,7 @@ For K-line charts:
 
 - Tkinter, single-user Streamlit, and guest mode use the shared `stock_cache.db`.
 - Logged-in multi-user Streamlit accounts use separate price caches under `user_data/<username>_stock_cache.db`.
-- S&P 500 market-breadth data is shared rather than duplicated per user.
+- S&P 500 market-breadth data and S&P 500 market-cap cache are shared rather than duplicated per user.
 
 ## License
 

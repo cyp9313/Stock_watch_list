@@ -35,11 +35,13 @@ requests_cache.uninstall_cache()
 DB_PATH = "stock_cache.db"
 YF_DOWNLOAD_BATCH_SIZE = 100
 SP500_SYMBOLS_CACHE_PATH = os.path.join(os.path.dirname(__file__), "sp500_symbols_cache.json")
+SP500_CONSTITUENTS_CACHE_PATH = os.path.join(os.path.dirname(__file__), "sp500_constituents_cache.json")
 SP500_SYMBOLS_CACHE_MAX_AGE_DAYS = 7
 USER_CACHE_DIR = os.path.join(os.path.dirname(__file__), "user_data")
 CURRENT_DB_PATH = contextvars.ContextVar("CURRENT_DB_PATH", default=None)
 US_EXTENDED_HOURS_BATCH_SIZE = 80
 NON_EXTENDED_HOURS_TICKERS = {"20MA_Ratio", "50MA_Ratio", "200MA_Ratio"}
+SP500_MARKET_CAP_WORKERS = 12
 
 
 def _safe_cache_key(cache_key):
@@ -118,6 +120,15 @@ def init_db():
             PRIMARY KEY (ticker, date)
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS market_cap_cache (
+            ticker          TEXT    PRIMARY KEY,
+            market_cap      REAL,
+            market_cap_date TEXT,
+            checked_date    TEXT,
+            updated_at      TEXT    DEFAULT (datetime('now'))
+        )
+    """)
     # 迁移：为已存在的 stock_analysis_data 表添加 peg_ratio 列（如果缺失）
     try:
         conn.execute("SELECT peg_ratio FROM stock_analysis_data LIMIT 0")
@@ -166,7 +177,26 @@ def init_db():
     # stock_analysis_data / beta_cache: 保留 90 天（每日一行，90 天足够）
     conn.execute("DELETE FROM stock_analysis_data WHERE date < date('now', '-90 days')")
     conn.execute("DELETE FROM beta_cache WHERE date < date('now', '-90 days')")
+    conn.execute("DELETE FROM market_cap_cache WHERE checked_date < date('now', '-730 days')")
 
+    conn.commit()
+    return conn
+
+
+def init_global_market_cap_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS market_cap_cache (
+            ticker          TEXT    PRIMARY KEY,
+            market_cap      REAL,
+            market_cap_date TEXT,
+            checked_date    TEXT,
+            updated_at      TEXT    DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute("DELETE FROM market_cap_cache WHERE checked_date < date('now', '-730 days')")
     conn.commit()
     return conn
 
@@ -329,6 +359,95 @@ def _safe_float(val):
 def _chunks(items, size):
     for i in range(0, len(items), size):
         yield items[i:i + size]
+
+
+def _fetch_yfinance_market_cap(ticker):
+    try:
+        ticker_obj = yf.Ticker(ticker)
+        fast_info = ticker_obj.fast_info
+        market_cap = getattr(fast_info, "market_cap", None)
+        if market_cap is None and hasattr(fast_info, "get"):
+            market_cap = fast_info.get("market_cap")
+        market_cap = _safe_float(market_cap)
+        if market_cap and market_cap > 0:
+            return market_cap
+    except Exception:
+        pass
+
+    try:
+        market_cap = yf.Ticker(ticker).info.get("marketCap")
+        market_cap = _safe_float(market_cap)
+        if market_cap and market_cap > 0:
+            return market_cap
+    except Exception:
+        pass
+    return None
+
+
+def get_cached_market_caps(tickers):
+    tickers = list(dict.fromkeys(normalize_yfinance_ticker(t) for t in tickers if t))
+    if not tickers:
+        return {}
+
+    today = get_market_date()
+    conn = init_global_market_cap_db()
+    placeholders = ",".join("?" for _ in tickers)
+    rows = conn.execute(
+        f"SELECT ticker, market_cap, checked_date FROM market_cap_cache WHERE ticker IN ({placeholders})",
+        tickers,
+    ).fetchall()
+
+    cached = {ticker: _safe_float(market_cap) for ticker, market_cap, _ in rows}
+    fresh = {ticker for ticker, _, checked_date in rows if checked_date == today}
+    missing = [ticker for ticker in tickers if ticker not in fresh]
+
+    if missing:
+        print(f"[MarketCapCache] Updating market caps for {len(missing)} S&P 500 tickers...")
+        fetched = {}
+        max_workers = min(SP500_MARKET_CAP_WORKERS, max(1, len(missing)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_fetch_yfinance_market_cap, ticker): ticker for ticker in missing}
+            for future in concurrent.futures.as_completed(futures):
+                ticker = futures[future]
+                try:
+                    fetched[ticker] = future.result()
+                except Exception:
+                    fetched[ticker] = None
+
+        for ticker in missing:
+            market_cap = fetched.get(ticker)
+            if market_cap is not None:
+                cached[ticker] = market_cap
+                conn.execute(
+                    """
+                    INSERT INTO market_cap_cache (ticker, market_cap, market_cap_date, checked_date, updated_at)
+                    VALUES (?, ?, ?, ?, datetime('now'))
+                    ON CONFLICT(ticker) DO UPDATE SET
+                        market_cap=excluded.market_cap,
+                        market_cap_date=excluded.market_cap_date,
+                        checked_date=excluded.checked_date,
+                        updated_at=datetime('now')
+                    """,
+                    (ticker, market_cap, today, today),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO market_cap_cache (ticker, market_cap, market_cap_date, checked_date, updated_at)
+                    VALUES (?, NULL, NULL, ?, datetime('now'))
+                    ON CONFLICT(ticker) DO UPDATE SET
+                        checked_date=excluded.checked_date,
+                        updated_at=datetime('now')
+                    """,
+                    (ticker, today),
+                )
+
+        conn.commit()
+        success_count = sum(1 for ticker in missing if fetched.get(ticker) is not None)
+        print(f"[MarketCapCache] Updated {success_count}/{len(missing)} market caps")
+
+    conn.close()
+    return cached
 
 
 def is_us_regular_trading_hours(now=None):
@@ -892,6 +1011,127 @@ def _write_sp500_symbols_cache(symbols, source):
         print(f"S&P 500 symbols cache write failed: {e}")
 
 
+def _normalize_sp500_constituents_df(df):
+    if df is None or df.empty or "Symbol" not in df.columns:
+        return []
+
+    sector_col = "GICS Sector" if "GICS Sector" in df.columns else "Sector" if "Sector" in df.columns else None
+    industry_col = (
+        "GICS Sub-Industry"
+        if "GICS Sub-Industry" in df.columns
+        else "Sub-Industry"
+        if "Sub-Industry" in df.columns
+        else "Industry"
+        if "Industry" in df.columns
+        else None
+    )
+    name_col = "Security" if "Security" in df.columns else "Name" if "Name" in df.columns else None
+
+    records = []
+    for _, row in df.iterrows():
+        symbol = _normalize_sp500_symbols([row.get("Symbol")])
+        if not symbol:
+            continue
+        records.append({
+            "ticker": symbol[0],
+            "name": str(row.get(name_col, symbol[0])).strip() if name_col else symbol[0],
+            "sector": str(row.get(sector_col, "Unknown")).strip() if sector_col else "Unknown",
+            "industry": str(row.get(industry_col, "Unknown")).strip() if industry_col else "Unknown",
+        })
+    return records
+
+
+def _read_sp500_constituents_cache(max_age_days=SP500_SYMBOLS_CACHE_MAX_AGE_DAYS):
+    try:
+        if not os.path.exists(SP500_CONSTITUENTS_CACHE_PATH):
+            return []
+        with open(SP500_CONSTITUENTS_CACHE_PATH, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        records = payload.get("constituents", payload if isinstance(payload, list) else [])
+        if not records:
+            return []
+        if max_age_days is not None:
+            mtime = datetime.datetime.fromtimestamp(os.path.getmtime(SP500_CONSTITUENTS_CACHE_PATH))
+            if datetime.datetime.now() - mtime > datetime.timedelta(days=max_age_days):
+                return []
+        normalized = []
+        for item in records:
+            ticker = _normalize_sp500_symbols([item.get("ticker")])
+            if ticker:
+                normalized.append({
+                    "ticker": ticker[0],
+                    "name": str(item.get("name") or ticker[0]),
+                    "sector": str(item.get("sector") or "Unknown"),
+                    "industry": str(item.get("industry") or "Unknown"),
+                })
+        return normalized
+    except Exception as e:
+        print(f"S&P 500 constituents cache read failed: {e}")
+        return []
+
+
+def _write_sp500_constituents_cache(records, source):
+    try:
+        payload = {
+            "source": source,
+            "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            "constituents": records,
+        }
+        with open(SP500_CONSTITUENTS_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"S&P 500 constituents cache write failed: {e}")
+
+
+def get_sp500_constituents_metadata(symbols=None):
+    cached_records = _read_sp500_constituents_cache()
+    if not cached_records:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/116.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        sources = [
+            (
+                "DataHub GitHub CSV",
+                "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv",
+                "csv",
+            ),
+            (
+                "Wikipedia",
+                "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+                "html",
+            ),
+        ]
+        for source_name, url, source_type in sources:
+            try:
+                response = requests.get(url, headers=headers, timeout=20)
+                response.raise_for_status()
+                if source_type == "html":
+                    df = pd.read_html(StringIO(response.text), attrs={"id": "constituents"})[0]
+                else:
+                    df = pd.read_csv(StringIO(response.text))
+                records = _normalize_sp500_constituents_df(df)
+                if records:
+                    _write_sp500_constituents_cache(records, source_name)
+                    cached_records = records
+                    print(f"S&P 500 constituents metadata loaded from {source_name}: {len(records)}")
+                    break
+            except Exception as e:
+                print(f"S&P 500 constituents source failed ({source_name}): {e}")
+
+    if not cached_records:
+        cached_records = _read_sp500_constituents_cache(max_age_days=None)
+
+    metadata = {item["ticker"]: item for item in cached_records}
+    if symbols:
+        wanted = set(_normalize_sp500_symbols(symbols))
+        return {ticker: metadata.get(ticker, {"ticker": ticker, "name": ticker, "sector": "Unknown", "industry": "Unknown"}) for ticker in wanted}
+    return metadata
+
+
 def get_sp500_symbols():
     """Fetch S&P 500 constituents with a local cache and non-Wikipedia fallback."""
     cached_symbols = _read_sp500_symbols_cache()
@@ -985,6 +1225,59 @@ def calculate_chip_distribution(stock_ticker,days="30d",num_bins=20):
     chip_peak_price = dist_df.loc[max_index, 'price']
     return dist_df,chip_peak_price
         
+
+
+def extract_adj_close_frame(data):
+    if data is None or len(data) == 0:
+        return pd.DataFrame()
+    if isinstance(data.columns, pd.MultiIndex):
+        for level in [0, 1]:
+            try:
+                candidate = data.xs('Adj Close', axis=1, level=level)
+                if not candidate.empty:
+                    return candidate.dropna(axis=1, how='all')
+            except KeyError:
+                continue
+        return pd.DataFrame()
+    return data.dropna(axis=1, how='all')
+
+
+def build_sp500_treemap_data(data, symbols):
+    close_prices = extract_adj_close_frame(data)
+    if close_prices.empty:
+        return []
+
+    metadata = get_sp500_constituents_metadata(symbols)
+    market_caps = get_cached_market_caps(symbols)
+    rows = []
+    fallback_rows = []
+    for ticker in _normalize_sp500_symbols(symbols):
+        if ticker not in close_prices.columns:
+            continue
+        series = close_prices[ticker].dropna()
+        if len(series) < 2:
+            continue
+        latest = _safe_float(series.iloc[-1])
+        prev = _safe_float(series.iloc[-2])
+        if latest is None or prev is None or prev == 0:
+            continue
+        pct_1d = (latest / prev - 1.0) * 100.0
+        meta = metadata.get(ticker, {})
+        market_cap = _safe_float(market_caps.get(ticker))
+        row = {
+            "Ticker": ticker,
+            "Name": meta.get("name") or ticker,
+            "Sector": meta.get("sector") or "Unknown",
+            "Industry": meta.get("industry") or "Unknown",
+            "Price": round(float(latest), 2),
+            "1D%": round(float(pct_1d), 2),
+            "Market Cap": round(float(market_cap), 2) if market_cap and market_cap > 0 else None,
+            "Size": float(market_cap) if market_cap and market_cap > 0 else 1,
+        }
+        fallback_rows.append(row.copy())
+        if market_cap and market_cap > 0:
+            rows.append(row)
+    return rows or fallback_rows
 
 
 def calculate_market_breadth(data, symbols):
@@ -1622,7 +1915,31 @@ def get_breadth_data():
         }
         
         print(f"/api/breadth_data 完成，总耗时 {time.perf_counter() - endpoint_start:.1f}s")
-        return jsonify({"success": True, "data": results, "breadth_chart_data": breadth_data})
+        try:
+            gspc_data = get_prices_with_cache(["^GSPC"], period="2y")
+            gspc_close = extract_adj_close_frame(gspc_data)
+            if "^GSPC" in gspc_close.columns:
+                gspc_series = gspc_close["^GSPC"].copy()
+                gspc_series.index = pd.to_datetime(gspc_series.index).tz_localize(None)
+                chart_index = pd.to_datetime(chart_df.index).tz_localize(None)
+                aligned_gspc = gspc_series.reindex(chart_index)
+                breadth_data["GSPC"] = [
+                    round(float(x), 2) if pd.notna(x) else None
+                    for x in aligned_gspc
+                ]
+            else:
+                breadth_data["GSPC"] = []
+        except Exception as e:
+            print(f"^GSPC breadth chart data failed: {e}")
+            breadth_data["GSPC"] = []
+
+        treemap_data = build_sp500_treemap_data(sp500_data, sp500_symbols)
+        return jsonify({
+            "success": True,
+            "data": results,
+            "breadth_chart_data": breadth_data,
+            "breadth_treemap_data": treemap_data,
+        })
         
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
