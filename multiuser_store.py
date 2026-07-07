@@ -213,7 +213,6 @@ def config_to_api_groups(config):
         for page in config.get(section, []):
             for group_name, tickers in page.get("groups", {}).items():
                 groups[f"{prefix}:{page['name']}:{group_name}"] = tickers
-    groups.update(BREADTH_GROUPS)
     return groups
 
 

@@ -1932,7 +1932,7 @@ inject_css(dark_mode)
 st.title("Stock Watchlist")
 st.caption(
     "Stock Watchlists are for custom stock/ETF lists. Market Dashboard is for indices and cross-asset signals. "
-    "Market Breadth is calculated from the S&P 500 universe and is not edited manually."
+    "Market Breadth is calculated from shared S&P 500 and Nasdaq 100 universes and is not edited manually."
 )
 
 fg1, fg2 = st.columns(2)

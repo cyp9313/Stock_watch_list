@@ -47,7 +47,9 @@ BREADTH_DISPLAY_TICKERS = {
     "SP500_20MA_Ratio", "SP500_50MA_Ratio", "SP500_200MA_Ratio",
     "NDX100_20MA_Ratio", "NDX100_50MA_Ratio", "NDX100_200MA_Ratio",
 }
-NON_EXTENDED_HOURS_TICKERS = BREADTH_RATIO_TICKERS | BREADTH_DISPLAY_TICKERS
+BREADTH_PSEUDO_TICKERS = BREADTH_RATIO_TICKERS | BREADTH_DISPLAY_TICKERS
+BREADTH_PSEUDO_TICKERS_UPPER = {ticker.upper() for ticker in BREADTH_PSEUDO_TICKERS}
+NON_EXTENDED_HOURS_TICKERS = BREADTH_PSEUDO_TICKERS
 SP500_MARKET_CAP_WORKERS = 12
 
 
@@ -231,7 +233,7 @@ def get_cached_stock_analysis(all_tickers):
     返回: dict {ticker: {"forward_pe": float/None, "peg_ratio": float/None, "trailing_pe": float/None, "market_cap": float/None, "earnings_date": str/None, "ps_ratio": float/None, "pb_ratio": float/None, "analyst_rating": str/None, "price_target": float/None}}
     """
     all_tickers = list(dict.fromkeys(normalize_yfinance_ticker(t) for t in all_tickers))
-    query_tickers = [t for t in all_tickers if should_query_forward_pe(t)]
+    query_tickers = [t for t in all_tickers if not is_breadth_pseudo_ticker(t) and should_query_forward_pe(t)]
     if not query_tickers:
         return {}
 
@@ -257,11 +259,12 @@ def get_cached_stock_analysis(all_tickers):
                 "pb_ratio": row[6],
                 "analyst_rating": row[7],
                 "price_target": row[8],
+                "raw_answer": row[9],
             }
             raw_answer = row[9] or ""
             old_empty_failure = (
                 not any(cached_data.values())
-                and not raw_answer.startswith("source=")
+                and "source=" not in raw_answer
                 and any(token in raw_answer for token in ("http_404", "not_found", "request_error"))
             )
             if old_empty_failure:
@@ -292,6 +295,7 @@ def get_cached_stock_analysis(all_tickers):
             "pb_ratio": data["pb_ratio"],
             "analyst_rating": data["analyst_rating"],
             "price_target": data["price_target"],
+            "raw_answer": data.get("raw", ""),
         }
         conn.execute(
             "INSERT OR REPLACE INTO stock_analysis_data (ticker, date, forward_pe, peg_ratio, trailing_pe, market_cap, earnings_date, ps_ratio, pb_ratio, analyst_rating, price_target, raw_answer) "
@@ -585,7 +589,7 @@ def is_us_extended_hours_candidate(ticker):
     if not ticker:
         return False
     t = str(ticker).upper()
-    if t in NON_EXTENDED_HOURS_TICKERS:
+    if is_breadth_pseudo_ticker(t):
         return False
     if t.startswith("^") or t.endswith("=X") or t.endswith("=F"):
         return False
@@ -619,15 +623,26 @@ def _extended_label_for_timestamp(ts_ny):
     return "Pre-market estimate" if local_time < datetime.time(9, 30) else "After-hours estimate"
 
 
+def _extended_label_for_effective_time(effective_ny):
+    local_time = effective_ny.time()
+    if effective_ny.weekday() < 5 and local_time < datetime.time(9, 30):
+        return "Pre-market estimate"
+    if effective_ny.weekday() < 5 and local_time >= datetime.time(16, 0):
+        return "After-hours estimate"
+    return "Extended-hours estimate"
+
+
 def _extended_label_for_now(now=None):
     ny_tz = pytz.timezone('America/New_York')
     now_ny = now.astimezone(ny_tz) if now is not None else datetime.datetime.now(ny_tz)
-    local_time = now_ny.time()
-    if now_ny.weekday() < 5 and local_time < datetime.time(9, 30):
-        return "Pre-market estimate"
-    if now_ny.weekday() < 5 and local_time >= datetime.time(16, 0):
-        return "After-hours estimate"
-    return "Extended-hours estimate"
+    return _extended_label_for_effective_time(now_ny)
+
+
+def _extended_effective_time_for_bar(latest_ts_ny, now=None, bar_hours=4):
+    ny_tz = pytz.timezone('America/New_York')
+    now_ny = now.astimezone(ny_tz) if now is not None else datetime.datetime.now(ny_tz)
+    bar_end_ny = latest_ts_ny + pd.Timedelta(hours=bar_hours)
+    return now_ny if bar_end_ny > now_ny else bar_end_ny
 
 
 def _filter_extended_session(series, now=None):
@@ -676,13 +691,14 @@ def _filter_intraday_until_now(series, now=None):
 def _select_latest_extended_price(series, now=None):
     close_latest = _filter_intraday_until_now(series, now=now)
     if close_latest.empty:
-        return None, None, None, None
+        return None, None, None, None, None
     latest_ts = close_latest.index[-1]
     latest_price = _safe_float(close_latest.iloc[-1])
     if latest_price is None:
-        return None, None, None, None
+        return None, None, None, None, None
     latest_ts_ny = _timestamp_to_ny(latest_ts)
-    return _extended_label_for_now(now), latest_ts, latest_ts_ny, latest_price
+    effective_ts_ny = _extended_effective_time_for_bar(latest_ts_ny, now=now)
+    return _extended_label_for_effective_time(effective_ts_ny), latest_ts, latest_ts_ny, effective_ts_ny, latest_price
 
 
 def update_extended_hours_price_cache(tickers):
@@ -721,15 +737,17 @@ def update_extended_hours_price_cache(tickers):
 
         for ticker in batch:
             close_series = _extract_intraday_field(df_ext, "Close", ticker, batch)
-            source_label, latest_ts, latest_ts_ny, latest_price = _select_latest_extended_price(close_series)
+            source_label, latest_ts, latest_ts_ny, effective_ts_ny, latest_price = _select_latest_extended_price(close_series)
             if latest_price is None:
                 continue
 
             updates[ticker] = {
                 "price": latest_price,
                 "volume": None,
-                "date": latest_ts_ny.date().strftime("%Y-%m-%d"),
+                "date": effective_ts_ny.date().strftime("%Y-%m-%d"),
                 "source": source_label,
+                "bar_timestamp": pd.Timestamp(latest_ts),
+                "effective_timestamp": pd.Timestamp(effective_ts_ny),
             }
 
     if not updates:
@@ -775,14 +793,15 @@ def get_latest_extended_hours_price(ticker):
         return None
 
     close_series = _extract_intraday_field(df_ext, "Close", ticker, [ticker])
-    source_label, latest_ts, latest_ts_ny, latest_price = _select_latest_extended_price(close_series)
+    source_label, latest_ts, latest_ts_ny, effective_ts_ny, latest_price = _select_latest_extended_price(close_series)
     if latest_price is None:
         return None
 
     return {
         "price": latest_price,
-        "timestamp": pd.Timestamp(latest_ts),
-        "date": latest_ts_ny.date().strftime("%Y-%m-%d"),
+        "timestamp": pd.Timestamp(effective_ts_ny),
+        "bar_timestamp": pd.Timestamp(latest_ts),
+        "date": effective_ts_ny.date().strftime("%Y-%m-%d"),
         "source": source_label,
     }
 
@@ -820,6 +839,7 @@ def apply_extended_hours_to_daily_kline(stock_data, ticker):
 
     latest_regular_ts_ny = _timestamp_to_ny(stock_data.index[-1])
     ext_ts_ny = _timestamp_to_ny(ext["timestamp"])
+    raw_bar_ts_ny = _timestamp_to_ny(ext.get("bar_timestamp", ext["timestamp"]))
     latest_regular_date = latest_regular_ts_ny.date()
     ext_date = ext_ts_ny.date()
 
@@ -848,12 +868,15 @@ def apply_extended_hours_to_daily_kline(stock_data, ticker):
             if col not in row:
                 row[col] = np.nan
 
-        overlay_ts = _align_timestamp_to_index_tz(ext["timestamp"], updated.index)
+        overlay_ts = _align_timestamp_to_index_tz(pd.Timestamp(ext["date"]), updated.index)
         updated.loc[overlay_ts, list(row.keys())] = list(row.values())
 
     updated = updated.sort_index()
 
-    print(f"[ExtendedHours] K-line used {ext['source']} for {ticker}: {ext['price']} @ {ext_ts_ny}")
+    print(
+        f"[ExtendedHours] K-line used {ext['source']} for {ticker}: "
+        f"{ext['price']} @ effective={ext_ts_ny}, bar={raw_bar_ts_ny}"
+    )
     return updated, ext
 
 
@@ -1105,6 +1128,16 @@ def normalize_groups_for_yfinance(groups):
         group_name: [normalize_yfinance_ticker(ticker) for ticker in tickers]
         for group_name, tickers in groups.items()
     }
+
+
+def is_breadth_pseudo_ticker(ticker):
+    return str(ticker or "").upper() in BREADTH_PSEUDO_TICKERS_UPPER
+
+
+def stock_analysis_marked_not_found(sa_data):
+    raw = str((sa_data or {}).get("raw_answer") or "")
+    return "source=" in raw and "not_found" in raw
+
 
 def _normalize_sp500_symbols(symbols):
     return [
@@ -1865,7 +1898,7 @@ def get_stock_data():
         # 去重：Dashboard 与 story groups 有大量重复标的，后端只需处理一次
         all_tickers = list(dict.fromkeys(
             [t for group in groups.values() for t in group
-             if t not in NON_EXTENDED_HOURS_TICKERS]
+             if not is_breadth_pseudo_ticker(t)]
         ))
         ticker_names = get_cached_ticker_names(all_tickers)
         
@@ -1877,7 +1910,7 @@ def get_stock_data():
         # 在循环之前一次性查询，避免循环内逐只调用
         sa_query_tickers = [t for t in all_tickers
                            if t not in broad_market_set
-                           and t not in groups.get("Market Breadth", [])
+                           and not is_breadth_pseudo_ticker(t)
                            and should_query_forward_pe(t)]
         sa_data_dict = get_cached_stock_analysis(sa_query_tickers)
 
@@ -1888,13 +1921,13 @@ def get_stock_data():
         tickers_need_info_yf = set()
 
         for ticker_symbol in all_tickers:
-            if ticker_symbol in broad_market_set or ticker_symbol in groups.get("Market Breadth", []):
+            if ticker_symbol in broad_market_set or is_breadth_pseudo_ticker(ticker_symbol):
                 continue
 
             sa_data = sa_data_dict.get(ticker_symbol)
 
             # SA 没有 earnings_date → 需要 yfinance calendar/earnings_dates
-            if sa_data is None or not sa_data.get("earnings_date"):
+            if (sa_data is None or not sa_data.get("earnings_date")) and not stock_analysis_marked_not_found(sa_data):
                 tickers_need_earnings_yf.add(ticker_symbol)
 
             # SA 缺少 trailing_pe / peg_ratio / market_cap → 需要 yfinance .info
@@ -1944,7 +1977,7 @@ def get_stock_data():
 
         # ===== Phase 3: 构建 earnings_df（无 API 调用，纯内存操作）=====
         for ticker_symbol in all_tickers:
-            if ticker_symbol in broad_market_set or ticker_symbol in groups.get("Market Breadth", []):
+            if ticker_symbol in broad_market_set or is_breadth_pseudo_ticker(ticker_symbol):
                 continue
 
             try:

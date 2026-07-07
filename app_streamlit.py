@@ -180,8 +180,8 @@ STOCK_GROUPS = normalize_group_tickers(STOCK_GROUPS)
 BROAD_MARKET_GROUPS = normalize_group_tickers(BROAD_MARKET_GROUPS)
 BREADTH_GROUPS = normalize_group_tickers(BREADTH_GROUPS)
 
-# Merge all groups (for API call)
-ALL_GROUPS = {**STOCK_GROUPS, **BROAD_MARKET_GROUPS, **BREADTH_GROUPS}
+# Merge watchlist groups for the stock-data API. Market breadth is fetched separately.
+ALL_GROUPS = {**STOCK_GROUPS, **BROAD_MARKET_GROUPS}
 
 # Broad market tickers (for API optimization)
 BROAD_MARKET_TICKERS = list(dict.fromkeys(
