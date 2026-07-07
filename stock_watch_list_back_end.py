@@ -701,6 +701,37 @@ def _select_latest_extended_price(series, now=None):
     return _extended_label_for_effective_time(effective_ts_ny), latest_ts, latest_ts_ny, effective_ts_ny, latest_price
 
 
+def get_latest_cached_volumes(tickers):
+    tickers = list(dict.fromkeys(normalize_yfinance_ticker(t) for t in tickers if t))
+    if not tickers:
+        return {}
+
+    conn = init_db()
+    placeholders = ",".join("?" for _ in tickers)
+    rows = conn.execute(
+        f"""
+        SELECT pc.ticker, pc.volume
+        FROM price_cache pc
+        JOIN (
+            SELECT ticker, MAX(date) AS max_date
+            FROM price_cache
+            WHERE ticker IN ({placeholders})
+              AND volume IS NOT NULL
+            GROUP BY ticker
+        ) latest
+          ON latest.ticker = pc.ticker
+         AND latest.max_date = pc.date
+        """,
+        tickers,
+    ).fetchall()
+    conn.close()
+    return {
+        ticker: volume
+        for ticker, volume in rows
+        if _safe_float(volume) is not None
+    }
+
+
 def update_extended_hours_price_cache(tickers):
     """
     Outside regular US trading hours, write latest 4h prepost prices into the cache.
@@ -753,6 +784,20 @@ def update_extended_hours_price_cache(tickers):
     if not updates:
         print("[ExtendedHours] No valid extended-hours prices found; using regular cache prices.")
         return {}
+
+    premarket_tickers = [
+        ticker for ticker, update in updates.items()
+        if update.get("source") == "Pre-market estimate"
+    ]
+    if premarket_tickers:
+        latest_regular_volumes = get_latest_cached_volumes(premarket_tickers)
+        for ticker in premarket_tickers:
+            updates[ticker]["volume"] = latest_regular_volumes.get(ticker)
+        print(
+            f"[ExtendedHours] Reused latest regular-session volume for "
+            f"{sum(updates[t].get('volume') is not None for t in premarket_tickers)}/"
+            f"{len(premarket_tickers)} pre-market rows"
+        )
 
     conn = init_db()
     conn.executemany(
@@ -2080,6 +2125,8 @@ def get_stock_data():
 
                 if ext_ticker not in volumes.columns:
                     volumes[ext_ticker] = np.nan
+                if ext_data.get("volume") is not None:
+                    volumes.loc[ext_date, ext_ticker] = ext_data["volume"]
 
             adj_close = adj_close.sort_index()
             volumes = volumes.sort_index()
