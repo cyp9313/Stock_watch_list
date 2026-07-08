@@ -37,7 +37,7 @@ DEFAULT_BROAD_PAGES = [
     {
         "name": "Macro Dashboard",
         "groups": {
-            "Dashboard": ["^GSPC", "^NDX", "RSP", "QQQE", "^TNX", "EURUSD=X", "^VIX", "GC=F", "BZ=F", "BTC-USD", "510300.SS"],
+            "Dashboard": ["^GSPC", "^NDX", "SPY","QQQ","RSP", "QQQE", "^TNX", "EURUSD=X", "^VIX", "GC=F", "BZ=F", "BTC-USD", "510300.SS"],
             "US Mkt Dir": ["^GSPC", "^NDX", "^DJI", "^RUT"],
             "Breadth": ["RSP", "QQQE"],
             "AI/Tech Risk": ["TQQQ", "^SOX"],
