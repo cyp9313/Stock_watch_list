@@ -366,6 +366,7 @@ def inject_css(dark_mode=False):
         div[data-testid="stDataEditor"] div {{
             border-color: {theme["table_border"]} !important;
         }}
+        div[data-testid="stDataFrame"],
         div[data-testid="stDataEditor"] {{
             --gdg-bg-cell: {theme["input_bg"]};
             --gdg-bg-cell-medium: {theme["panel_bg"]};
@@ -1936,6 +1937,37 @@ def render_report_form_fields(key_prefix, default_ticker="AAPL", include_email=F
     return ticker, recipient_email, int(months), search_provider, no_article_fetch
 
 
+def render_report_status_table(rows, dark_mode=False):
+    if not rows:
+        return
+    theme = get_theme(dark_mode)
+    columns = list(rows[0])
+    header_html = "".join(
+        f"<th style='padding:8px; text-align:left; white-space:nowrap; "
+        f"background:{theme['table_header_bg']}; color:{theme['text']}; "
+        f"border:1px solid {theme['table_border']};'>{html.escape(str(column))}</th>"
+        for column in columns
+    )
+    body_rows = []
+    for row in rows:
+        cells = "".join(
+            f"<td style='padding:8px; white-space:nowrap; color:{theme['text']}; "
+            f"background:{theme['table_bg']}; border:1px solid {theme['table_border']};'>"
+            f"{html.escape(str(row.get(column) if row.get(column) is not None else ''))}</td>"
+            for column in columns
+        )
+        body_rows.append(f"<tr>{cells}</tr>")
+    table_html = f"""
+    <div style="width:100%; max-height:320px; overflow:auto; border:1px solid {theme['table_border']}; border-radius:6px;">
+        <table style="width:100%; border-collapse:collapse; font-family:Arial,sans-serif; font-size:13px; background:{theme['table_bg']}; color:{theme['text']};">
+            <thead style="position:sticky; top:0; z-index:1;"><tr>{header_html}</tr></thead>
+            <tbody>{''.join(body_rows)}</tbody>
+        </table>
+    </div>
+    """
+    st.markdown(table_html, unsafe_allow_html=True)
+
+
 def render_email_job_status(owner_key):
     jobs = list_owner_jobs(owner_key, limit=10)
     heading_col, refresh_col = st.columns([5, 1])
@@ -1969,7 +2001,7 @@ def render_email_job_status(owner_key):
             "Generated (s)": round(job["generation_seconds"], 1) if job.get("generation_seconds") else None,
             "Created (UTC)": job["created_at"],
         })
-    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    render_report_status_table(rows, dark_mode=st.session_state.get("dark_mode", False))
 
     latest_error = next((job for job in jobs if job.get("last_error")), None)
     if latest_error:
@@ -2050,7 +2082,7 @@ def render_weekly_report_schedules(user, runner_ok, mail_ready):
             "Status": "Active" if schedule["is_active"] else "Paused",
             "Next send (Berlin)": _format_berlin_datetime(schedule["next_run_at"]),
         })
-    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    render_report_status_table(rows, dark_mode=st.session_state.get("dark_mode", False))
 
     schedule_map = {schedule["id"]: schedule for schedule in schedules}
     selected_id = st.selectbox(
