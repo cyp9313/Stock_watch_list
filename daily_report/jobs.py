@@ -1,0 +1,712 @@
+from __future__ import annotations
+
+from contextlib import contextmanager
+import datetime as dt
+from email.utils import parseaddr
+import os
+from pathlib import Path
+import re
+import sqlite3
+import threading
+import uuid
+from zoneinfo import ZoneInfo
+
+
+APP_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_JOB_DB = APP_ROOT / "daily_report_jobs.db"
+ACTIVE_STATUSES = ("queued", "generating", "sending")
+SCHEDULE_TIMEZONE = "Europe/Berlin"
+WEEKDAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+_EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+_TIME_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+_INIT_LOCK = threading.Lock()
+_INITIALIZED_DATABASES: set[str] = set()
+
+
+class JobQueueError(RuntimeError):
+    pass
+
+
+class ActiveJobError(JobQueueError):
+    pass
+
+
+class DailyLimitError(JobQueueError):
+    pass
+
+
+class ScheduleLimitError(JobQueueError):
+    pass
+
+
+def _now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def _iso(value: dt.datetime | None = None) -> str:
+    return (value or _now()).isoformat(timespec="seconds")
+
+
+def _db_path() -> Path:
+    configured = os.environ.get("REPORT_JOB_DB", "").strip()
+    return Path(configured).expanduser().resolve() if configured else DEFAULT_JOB_DB
+
+
+def _connect() -> sqlite3.Connection:
+    path = _db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path, timeout=30)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
+    return conn
+
+
+@contextmanager
+def _connection():
+    conn = _connect()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def init_job_db() -> None:
+    database_key = str(_db_path())
+    if database_key in _INITIALIZED_DATABASES:
+        return
+    with _INIT_LOCK:
+        if database_key in _INITIALIZED_DATABASES:
+            return
+        with _connection() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS report_jobs (
+                    id TEXT PRIMARY KEY,
+                    owner_key TEXT NOT NULL,
+                    ticker TEXT NOT NULL,
+                    recipient_email TEXT,
+                    recipient_masked TEXT NOT NULL,
+                    months INTEGER NOT NULL,
+                    search_provider TEXT NOT NULL,
+                    no_article_fetch INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 3,
+                    created_at TEXT NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    next_attempt_at TEXT,
+                    generation_seconds REAL,
+                    report_date TEXT,
+                    file_name TEXT,
+                    report_html BLOB,
+                    last_error TEXT
+                )
+                """
+            )
+            job_columns = {row[1] for row in conn.execute("PRAGMA table_info(report_jobs)")}
+            if "schedule_id" not in job_columns:
+                conn.execute("ALTER TABLE report_jobs ADD COLUMN schedule_id TEXT")
+            if "scheduled_for" not in job_columns:
+                conn.execute("ALTER TABLE report_jobs ADD COLUMN scheduled_for TEXT")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_report_jobs_queue "
+                "ON report_jobs(status, next_attempt_at, created_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_report_jobs_owner "
+                "ON report_jobs(owner_key, created_at DESC)"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_report_jobs_schedule_occurrence "
+                "ON report_jobs(schedule_id, scheduled_for)"
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS report_schedules (
+                    id TEXT PRIMARY KEY,
+                    owner_key TEXT NOT NULL,
+                    ticker TEXT NOT NULL,
+                    recipient_email TEXT NOT NULL,
+                    recipient_masked TEXT NOT NULL,
+                    weekday INTEGER NOT NULL,
+                    local_time TEXT NOT NULL,
+                    timezone TEXT NOT NULL DEFAULT 'Europe/Berlin',
+                    months INTEGER NOT NULL,
+                    search_provider TEXT NOT NULL,
+                    no_article_fetch INTEGER NOT NULL DEFAULT 0,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    next_run_at TEXT,
+                    last_enqueued_at TEXT,
+                    last_scheduled_for TEXT
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_report_schedules_due "
+                "ON report_schedules(is_active, next_run_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_report_schedules_owner "
+                "ON report_schedules(owner_key, created_at DESC)"
+            )
+        _INITIALIZED_DATABASES.add(database_key)
+
+
+def validate_email(email: str) -> str:
+    email = str(email or "").strip()
+    if not email or len(email) > 254 or "\n" in email or "\r" in email:
+        raise ValueError("Please enter a valid email address.")
+    _, parsed = parseaddr(email)
+    if parsed != email or not _EMAIL_PATTERN.fullmatch(email):
+        raise ValueError("Please enter a valid email address.")
+    return email
+
+
+def mask_email(email: str) -> str:
+    local, domain = email.rsplit("@", 1)
+    visible = local[:2] if len(local) > 2 else local[:1]
+    return f"{visible}{'*' * max(3, len(local) - len(visible))}@{domain}"
+
+
+def _normalize_local_time(value: str | dt.time) -> str:
+    if isinstance(value, dt.time):
+        value = value.strftime("%H:%M")
+    value = str(value or "").strip()
+    if not _TIME_PATTERN.fullmatch(value):
+        raise ValueError("Weekly send time must use HH:MM in Europe/Berlin time.")
+    return value
+
+
+def next_weekly_run_at(
+    weekday: int,
+    local_time: str | dt.time,
+    *,
+    after_utc: dt.datetime | None = None,
+    timezone_name: str = SCHEDULE_TIMEZONE,
+) -> dt.datetime:
+    weekday = int(weekday)
+    if weekday not in range(7):
+        raise ValueError("Weekday must be between Monday and Sunday.")
+    local_time = _normalize_local_time(local_time)
+    hour, minute = (int(part) for part in local_time.split(":"))
+    timezone = ZoneInfo(timezone_name)
+    after_utc = after_utc or _now()
+    if after_utc.tzinfo is None:
+        after_utc = after_utc.replace(tzinfo=dt.timezone.utc)
+    else:
+        after_utc = after_utc.astimezone(dt.timezone.utc)
+    local_after = after_utc.astimezone(timezone)
+
+    days_ahead = (weekday - local_after.weekday()) % 7
+    candidate_date = local_after.date() + dt.timedelta(days=days_ahead)
+    for _ in range(2):
+        local_candidate = dt.datetime.combine(
+            candidate_date,
+            dt.time(hour=hour, minute=minute),
+            tzinfo=timezone,
+        )
+        candidate_utc = local_candidate.astimezone(dt.timezone.utc)
+        # Normalizing through UTC moves nonexistent spring-forward times to
+        # the first valid local time while fold=0 selects the first fall-back occurrence.
+        candidate_utc = candidate_utc.astimezone(timezone).astimezone(dt.timezone.utc)
+        if candidate_utc > after_utc:
+            return candidate_utc
+        candidate_date += dt.timedelta(days=7)
+    raise RuntimeError("Unable to calculate the next weekly report time.")
+
+
+def enqueue_email_job(
+    *,
+    owner_key: str,
+    ticker: str,
+    recipient_email: str,
+    months: int = 3,
+    search_provider: str = "auto",
+    no_article_fetch: bool = False,
+) -> dict:
+    owner_key = str(owner_key or "").strip()
+    if not owner_key:
+        raise ValueError("A signed-in account is required for email delivery.")
+    ticker = str(ticker or "").strip().upper()
+    if not ticker:
+        raise ValueError("Please enter a ticker.")
+    recipient_email = validate_email(recipient_email)
+    daily_limit = max(1, int(os.environ.get("REPORT_DAILY_LIMIT_PER_USER", "3")))
+    max_attempts = max(1, int(os.environ.get("REPORT_EMAIL_MAX_ATTEMPTS", "3")))
+    now = _now()
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    init_job_db()
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        active = conn.execute(
+            "SELECT id FROM report_jobs WHERE owner_key=? AND status IN (?, ?, ?) LIMIT 1",
+            (owner_key, *ACTIVE_STATUSES),
+        ).fetchone()
+        if active:
+            raise ActiveJobError("This account already has an active email report job.")
+        today_count = conn.execute(
+            "SELECT COUNT(*) FROM report_jobs WHERE owner_key=? AND created_at>=? AND schedule_id IS NULL",
+            (owner_key, _iso(day_start)),
+        ).fetchone()[0]
+        if today_count >= daily_limit:
+            raise DailyLimitError(f"Daily email report limit reached ({daily_limit} per account).")
+
+        job_id = uuid.uuid4().hex
+        conn.execute(
+            """
+            INSERT INTO report_jobs (
+                id, owner_key, ticker, recipient_email, recipient_masked,
+                months, search_provider, no_article_fetch, status,
+                max_attempts, created_at, next_attempt_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
+            """,
+            (
+                job_id,
+                owner_key,
+                ticker,
+                recipient_email,
+                mask_email(recipient_email),
+                max(1, int(months)),
+                search_provider or "auto",
+                int(bool(no_article_fetch)),
+                max_attempts,
+                _iso(now),
+                _iso(now),
+            ),
+        )
+        conn.commit()
+        return get_job(job_id, owner_key=owner_key)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _public_job(row: sqlite3.Row | None) -> dict | None:
+    if row is None:
+        return None
+    return {
+        key: row[key]
+        for key in (
+            "id",
+            "owner_key",
+            "ticker",
+            "recipient_masked",
+            "months",
+            "search_provider",
+            "status",
+            "attempts",
+            "max_attempts",
+            "created_at",
+            "started_at",
+            "finished_at",
+            "next_attempt_at",
+            "generation_seconds",
+            "report_date",
+            "file_name",
+            "last_error",
+            "schedule_id",
+            "scheduled_for",
+        )
+    }
+
+
+def get_job(job_id: str, *, owner_key: str | None = None) -> dict | None:
+    init_job_db()
+    with _connection() as conn:
+        if owner_key is None:
+            row = conn.execute("SELECT * FROM report_jobs WHERE id=?", (job_id,)).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM report_jobs WHERE id=? AND owner_key=?",
+                (job_id, owner_key),
+            ).fetchone()
+    return _public_job(row)
+
+
+def list_owner_jobs(owner_key: str, limit: int = 10) -> list[dict]:
+    init_job_db()
+    with _connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM report_jobs WHERE owner_key=? ORDER BY created_at DESC LIMIT ?",
+            (owner_key, max(1, min(int(limit), 50))),
+        ).fetchall()
+    return [_public_job(row) for row in rows]
+
+
+def recover_interrupted_jobs() -> int:
+    init_job_db()
+    with _connection() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE report_jobs
+            SET status='queued', next_attempt_at=?,
+                last_error=COALESCE(last_error, 'Worker restarted; job resumed.')
+            WHERE status IN ('generating', 'sending')
+            """,
+            (_iso(),),
+        )
+    return cursor.rowcount
+
+
+def claim_next_job() -> dict | None:
+    init_job_db()
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT * FROM report_jobs
+            WHERE status='queued' AND (next_attempt_at IS NULL OR next_attempt_at<=?)
+            ORDER BY created_at ASC LIMIT 1
+            """,
+            (_iso(),),
+        ).fetchone()
+        if row is None:
+            conn.commit()
+            return None
+        next_status = "sending" if row["report_html"] is not None else "generating"
+        started_at = row["started_at"] or _iso()
+        conn.execute(
+            """
+            UPDATE report_jobs
+            SET status=?, attempts=attempts+1, started_at=?, next_attempt_at=NULL
+            WHERE id=?
+            """,
+            (next_status, started_at, row["id"]),
+        )
+        conn.commit()
+        claimed = dict(row)
+        claimed["status"] = next_status
+        claimed["attempts"] = int(row["attempts"]) + 1
+        return claimed
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def store_generated_report(
+    job_id: str,
+    html_bytes: bytes,
+    file_name: str,
+    report_date: str,
+    elapsed: float,
+) -> None:
+    with _connection() as conn:
+        conn.execute(
+            """
+            UPDATE report_jobs
+            SET status='sending', report_html=?, file_name=?, report_date=?, generation_seconds=?, last_error=NULL
+            WHERE id=?
+            """,
+            (sqlite3.Binary(html_bytes), file_name, report_date, float(elapsed), job_id),
+        )
+
+
+def mark_job_sent(job_id: str) -> None:
+    with _connection() as conn:
+        conn.execute(
+            """
+            UPDATE report_jobs
+            SET status='sent', finished_at=?, next_attempt_at=NULL,
+                recipient_email=NULL, report_html=NULL, last_error=NULL
+            WHERE id=?
+            """,
+            (_iso(), job_id),
+        )
+
+
+def mark_job_failure(job_id: str, error: str) -> str:
+    error = str(error or "Unknown error")[-4000:]
+    with _connection() as conn:
+        row = conn.execute(
+            "SELECT attempts, max_attempts FROM report_jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            return "missing"
+        if int(row["attempts"]) < int(row["max_attempts"]):
+            delay = min(900, 60 * (2 ** max(0, int(row["attempts"]) - 1)))
+            retry_at = _now() + dt.timedelta(seconds=delay)
+            conn.execute(
+                """
+                UPDATE report_jobs
+                SET status='queued', next_attempt_at=?, last_error=?
+                WHERE id=?
+                """,
+                (_iso(retry_at), error, job_id),
+            )
+            return "queued"
+        conn.execute(
+            """
+            UPDATE report_jobs
+            SET status='failed', finished_at=?, next_attempt_at=NULL,
+                recipient_email=NULL, report_html=NULL, last_error=?
+            WHERE id=?
+            """,
+            (_iso(), error, job_id),
+        )
+        return "failed"
+
+
+def prune_old_jobs(retention_days: int | None = None) -> int:
+    retention_days = retention_days or int(os.environ.get("REPORT_JOB_RETENTION_DAYS", "7"))
+    cutoff = _now() - dt.timedelta(days=max(1, retention_days))
+    with _connection() as conn:
+        cursor = conn.execute(
+            "DELETE FROM report_jobs WHERE status IN ('sent', 'failed') AND finished_at<?",
+            (_iso(cutoff),),
+        )
+    return cursor.rowcount
+
+
+def create_weekly_schedule(
+    *,
+    owner_key: str,
+    ticker: str,
+    recipient_email: str,
+    weekday: int,
+    local_time: str | dt.time,
+    months: int = 3,
+    search_provider: str = "auto",
+    no_article_fetch: bool = False,
+) -> dict:
+    owner_key = str(owner_key or "").strip()
+    if not owner_key:
+        raise ValueError("A signed-in account is required for weekly reports.")
+    ticker = str(ticker or "").strip().upper()
+    if not ticker:
+        raise ValueError("Please enter a ticker.")
+    recipient_email = validate_email(recipient_email)
+    weekday = int(weekday)
+    if weekday not in range(7):
+        raise ValueError("Please select a valid weekday.")
+    local_time = _normalize_local_time(local_time)
+    max_schedules = max(1, int(os.environ.get("REPORT_MAX_SCHEDULES_PER_USER", "10")))
+    now = _now()
+    next_run = next_weekly_run_at(weekday, local_time, after_utc=now)
+
+    init_job_db()
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        schedule_count = conn.execute(
+            "SELECT COUNT(*) FROM report_schedules WHERE owner_key=?",
+            (owner_key,),
+        ).fetchone()[0]
+        if schedule_count >= max_schedules:
+            raise ScheduleLimitError(f"Weekly schedule limit reached ({max_schedules} per account).")
+        duplicate = conn.execute(
+            """
+            SELECT id FROM report_schedules
+            WHERE owner_key=? AND ticker=? AND recipient_email=? AND weekday=? AND local_time=?
+            LIMIT 1
+            """,
+            (owner_key, ticker, recipient_email, weekday, local_time),
+        ).fetchone()
+        if duplicate:
+            raise ValueError("An identical weekly schedule already exists for this account.")
+        schedule_id = uuid.uuid4().hex
+        conn.execute(
+            """
+            INSERT INTO report_schedules (
+                id, owner_key, ticker, recipient_email, recipient_masked,
+                weekday, local_time, timezone, months, search_provider,
+                no_article_fetch, is_active, created_at, updated_at, next_run_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+            """,
+            (
+                schedule_id,
+                owner_key,
+                ticker,
+                recipient_email,
+                mask_email(recipient_email),
+                weekday,
+                local_time,
+                SCHEDULE_TIMEZONE,
+                max(1, int(months)),
+                search_provider or "auto",
+                int(bool(no_article_fetch)),
+                _iso(now),
+                _iso(now),
+                _iso(next_run),
+            ),
+        )
+        conn.commit()
+        return get_schedule(schedule_id, owner_key=owner_key)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _public_schedule(row: sqlite3.Row | None) -> dict | None:
+    if row is None:
+        return None
+    return {
+        key: row[key]
+        for key in (
+            "id",
+            "owner_key",
+            "ticker",
+            "recipient_masked",
+            "weekday",
+            "local_time",
+            "timezone",
+            "months",
+            "search_provider",
+            "no_article_fetch",
+            "is_active",
+            "created_at",
+            "updated_at",
+            "next_run_at",
+            "last_enqueued_at",
+            "last_scheduled_for",
+        )
+    }
+
+
+def get_schedule(schedule_id: str, *, owner_key: str | None = None) -> dict | None:
+    init_job_db()
+    with _connection() as conn:
+        if owner_key is None:
+            row = conn.execute("SELECT * FROM report_schedules WHERE id=?", (schedule_id,)).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM report_schedules WHERE id=? AND owner_key=?",
+                (schedule_id, owner_key),
+            ).fetchone()
+    return _public_schedule(row)
+
+
+def list_owner_schedules(owner_key: str) -> list[dict]:
+    init_job_db()
+    with _connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM report_schedules WHERE owner_key=? ORDER BY created_at DESC",
+            (owner_key,),
+        ).fetchall()
+    return [_public_schedule(row) for row in rows]
+
+
+def set_schedule_active(schedule_id: str, *, owner_key: str, active: bool) -> bool:
+    init_job_db()
+    with _connection() as conn:
+        row = conn.execute(
+            "SELECT weekday, local_time, timezone FROM report_schedules WHERE id=? AND owner_key=?",
+            (schedule_id, owner_key),
+        ).fetchone()
+        if row is None:
+            return False
+        next_run = (
+            _iso(next_weekly_run_at(row["weekday"], row["local_time"], timezone_name=row["timezone"]))
+            if active
+            else None
+        )
+        conn.execute(
+            "UPDATE report_schedules SET is_active=?, next_run_at=?, updated_at=? WHERE id=?",
+            (int(bool(active)), next_run, _iso(), schedule_id),
+        )
+    return True
+
+
+def delete_schedule(schedule_id: str, *, owner_key: str) -> bool:
+    init_job_db()
+    with _connection() as conn:
+        cursor = conn.execute(
+            "DELETE FROM report_schedules WHERE id=? AND owner_key=?",
+            (schedule_id, owner_key),
+        )
+    return cursor.rowcount > 0
+
+
+def materialize_due_schedules(now_utc: dt.datetime | None = None) -> int:
+    """Turn due weekly schedules into durable email jobs exactly once."""
+    now_utc = now_utc or _now()
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=dt.timezone.utc)
+    else:
+        now_utc = now_utc.astimezone(dt.timezone.utc)
+    now_iso = _iso(now_utc)
+    max_attempts = max(1, int(os.environ.get("REPORT_EMAIL_MAX_ATTEMPTS", "3")))
+    created = 0
+
+    init_job_db()
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        schedules = conn.execute(
+            """
+            SELECT * FROM report_schedules
+            WHERE is_active=1 AND next_run_at IS NOT NULL AND next_run_at<=?
+            ORDER BY next_run_at ASC
+            """,
+            (now_iso,),
+        ).fetchall()
+        for schedule in schedules:
+            scheduled_for = schedule["next_run_at"]
+            job_id = uuid.uuid4().hex
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO report_jobs (
+                    id, owner_key, ticker, recipient_email, recipient_masked,
+                    months, search_provider, no_article_fetch, status,
+                    max_attempts, created_at, next_attempt_at, schedule_id, scheduled_for
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    schedule["owner_key"],
+                    schedule["ticker"],
+                    schedule["recipient_email"],
+                    schedule["recipient_masked"],
+                    schedule["months"],
+                    schedule["search_provider"],
+                    schedule["no_article_fetch"],
+                    max_attempts,
+                    now_iso,
+                    now_iso,
+                    schedule["id"],
+                    scheduled_for,
+                ),
+            )
+            created += int(cursor.rowcount > 0)
+            next_run = next_weekly_run_at(
+                schedule["weekday"],
+                schedule["local_time"],
+                after_utc=now_utc,
+                timezone_name=schedule["timezone"],
+            )
+            conn.execute(
+                """
+                UPDATE report_schedules
+                SET next_run_at=?, last_enqueued_at=?, last_scheduled_for=?, updated_at=?
+                WHERE id=?
+                """,
+                (_iso(next_run), now_iso, scheduled_for, now_iso, schedule["id"]),
+            )
+        conn.commit()
+        return created
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()

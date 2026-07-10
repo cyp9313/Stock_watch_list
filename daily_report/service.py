@@ -142,6 +142,7 @@ def generate_report(
         return {
             "success": True,
             "ticker": ticker,
+            "report_date": report_date,
             "file_name": file_name,
             "html_bytes": output_html.read_bytes(),
             "elapsed": elapsed,

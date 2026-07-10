@@ -1,0 +1,20 @@
+[Unit]
+Description=Stock Watchlist AI Report Email Worker
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/Stock_watch_list
+ExecStart=/opt/Stock_watch_list/venv/bin/python -m daily_report.worker
+Restart=always
+RestartSec=5
+User=root
+UMask=0077
+Environment=PYTHONUNBUFFERED=1
+KillMode=control-group
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
+

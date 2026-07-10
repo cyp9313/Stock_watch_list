@@ -1374,15 +1374,56 @@ For K-line charts:
 - S&P 500 and Nasdaq 100 market-breadth data and market-cap cache are shared rather than duplicated per user.
 - Ticker display-name cache follows the active price cache: logged-in users keep names in their own `user_data/<username>_stock_cache.db`, while Tkinter, single-user Streamlit, and guest mode use `stock_cache.db`. Existing ticker names are reused permanently; only tickers without a cached name are queried again.
 
-### Integrated Daily Reports
+### Integrated AI Agent Daily Reports
 
-The multi-user frontend includes the v5.8 stock daily-report generator under the `Daily Report` tab. Its code and report resources are stored in `daily_report/`, so deployment no longer depends on a separate project directory or `STOCK_DAILY_REPORT_PROJECT` setting.
+The multi-user frontend includes the v5.8 stock daily-report generator under the `AI Agent Reports` tab. Its code and report resources are stored in `daily_report/`, so deployment no longer depends on a separate project directory or `STOCK_DAILY_REPORT_PROJECT` setting.
 
 Install the root `requirements.txt` after updating the project. Configure the required model and search credentials in the root `.env` or the systemd service environment, for example `DASHSCOPE_API_KEY`, `DEEPSEEK_API_KEY`, and `SERPER_API_KEY` according to the selected providers.
 
 Each generation runs in an isolated directory under `daily_report/runs/`. The completed HTML is loaded into the Streamlit session for downloading, then all server-side files from that run are deleted immediately. Failed and timed-out runs are cleaned in the same way, and `daily_report/runs/` is excluded from Git.
 
 For DashScope models, tool-calling mode is selected by model: the original `deepseek-v4-flash` setup uses native/raw tool calling, while `qwen-plus` uses Qwen-Agent's local parser by default. Raw responses are normalized to strict JSON before being added to API history. `QWEN_AGENT_USE_RAW_API=true` or `false` can explicitly override this selection.
+
+Logged-in users can also submit a background `Generate & Email` job. Guest users retain the direct download workflow but cannot submit email jobs. Email jobs are persisted in `daily_report_jobs.db` and processed by a separate worker, so closing the browser or restarting Streamlit does not cancel them. The worker processes one report at a time, recovers interrupted jobs after restart, and retries failures with backoff.
+
+The `Weekly Schedule` view lets a logged-in user select a ticker, recipient, weekday, and time in `Europe/Berlin`. Schedules continue without a browser session and automatically follow CET/CEST daylight-saving changes. A missed occurrence caused by server downtime creates one fresh report after the worker returns; older missed weeks are skipped. Schedules can be paused, resumed, or deleted, with a default maximum of ten schedules per account.
+
+The generated HTML is temporarily stored as a SQLite BLOB only while delivery is pending. After successful delivery, or after the final failed attempt, both the complete recipient address and HTML BLOB are cleared. Final status rows are retained for seven days by default and then pruned.
+
+Configure 163 Mail with its SMTP authorization code, not the mailbox login password:
+
+```env
+REPORT_SMTP_HOST=smtp.163.com
+REPORT_SMTP_PORT=465
+REPORT_SMTP_USE_SSL=true
+REPORT_SMTP_USER=your_account@163.com
+REPORT_SMTP_FROM=your_account@163.com
+REPORT_SMTP_AUTH_CODE=your_163_smtp_authorization_code
+REPORT_DAILY_LIMIT_PER_USER=3
+REPORT_MAX_SCHEDULES_PER_USER=10
+REPORT_EMAIL_MAX_ATTEMPTS=3
+```
+
+For local development, start the worker in a second terminal:
+
+```bash
+python -m daily_report.worker
+```
+
+On the cloud server, install and start the included systemd unit:
+
+```bash
+sudo cp deploy/stock-watchlist-report-worker.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now stock-watchlist-report-worker
+sudo systemctl status stock-watchlist-report-worker --no-pager
+```
+
+Worker logs are available through:
+
+```bash
+sudo journalctl -u stock-watchlist-report-worker -f
+```
 
 ## License
 

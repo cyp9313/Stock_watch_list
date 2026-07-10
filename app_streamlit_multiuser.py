@@ -8,6 +8,7 @@ import json
 import socket
 import threading
 import time
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -18,6 +19,19 @@ import streamlit as st
 import yfinance as yf
 
 import stock_watch_list_back_end
+from daily_report.jobs import (
+    ActiveJobError,
+    DailyLimitError,
+    ScheduleLimitError,
+    WEEKDAY_NAMES,
+    create_weekly_schedule,
+    delete_schedule,
+    enqueue_email_job,
+    list_owner_jobs,
+    list_owner_schedules,
+    set_schedule_active,
+)
+from daily_report.mailer import smtp_configured
 from daily_report.service import generate_report, runtime_available
 from multiuser_store import (
     BREADTH_GROUPS,
@@ -1882,78 +1896,298 @@ def render_kline(cache_key, display_currency="Local"):
         st.plotly_chart(fig, width="stretch", key="kline_main_chart")
 
 
-def render_daily_report(cache_key):
-    st.subheader("Daily Stock Report")
+def render_report_form_fields(key_prefix, default_ticker="AAPL", include_email=False):
+    widths = [2, 2, 1, 1] if include_email else [2, 1, 1]
+    columns = st.columns(widths)
+    with columns[0]:
+        ticker = st.text_input("Ticker", default_ticker, key=f"{key_prefix}_ticker").upper()
+    offset = 1
+    recipient_email = None
+    if include_email:
+        with columns[1]:
+            recipient_email = st.text_input(
+                "Recipient email",
+                key=f"{key_prefix}_email",
+                placeholder="name@example.com",
+            )
+        offset = 2
+    with columns[offset]:
+        months = st.number_input(
+            "Chart months",
+            min_value=1,
+            max_value=24,
+            value=3,
+            step=1,
+            key=f"{key_prefix}_months",
+        )
+    with columns[offset + 1]:
+        search_provider = st.selectbox(
+            "Search provider",
+            ["auto", "priority", "serper", "searxng", "both"],
+            index=0,
+            key=f"{key_prefix}_search_provider",
+        )
+    no_article_fetch = st.checkbox(
+        "Skip article body fetch",
+        value=False,
+        help="Faster, but the news notes may rely more on search snippets.",
+        key=f"{key_prefix}_no_article_fetch",
+    )
+    return ticker, recipient_email, int(months), search_provider, no_article_fetch
+
+
+def render_email_job_status(owner_key):
+    jobs = list_owner_jobs(owner_key, limit=10)
+    heading_col, refresh_col = st.columns([5, 1])
+    with heading_col:
+        st.markdown("#### Recent Email Jobs")
+    with refresh_col:
+        if st.button("Refresh", key="refresh_report_jobs", width="stretch"):
+            st.rerun()
+    if not jobs:
+        st.caption("No email report jobs yet.")
+        return
+
+    status_labels = {
+        "queued": "Queued",
+        "generating": "Generating",
+        "sending": "Sending",
+        "sent": "Sent",
+        "failed": "Failed",
+    }
+    rows = []
+    for job in jobs:
+        status = status_labels.get(job["status"], job["status"])
+        if job["status"] == "queued" and job.get("attempts"):
+            status = "Retry queued"
+        rows.append({
+            "Ticker": job["ticker"],
+            "Type": "Weekly" if job.get("schedule_id") else "One-time",
+            "Status": status,
+            "Recipient": job["recipient_masked"],
+            "Attempts": f"{job['attempts']}/{job['max_attempts']}",
+            "Generated (s)": round(job["generation_seconds"], 1) if job.get("generation_seconds") else None,
+            "Created (UTC)": job["created_at"],
+        })
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+    latest_error = next((job for job in jobs if job.get("last_error")), None)
+    if latest_error:
+        with st.expander(f"Latest job message ({latest_error['ticker']})", expanded=False):
+            st.code(latest_error["last_error"])
+
+
+def _format_berlin_datetime(value):
+    if not value:
+        return "Paused"
+    parsed = datetime.datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.astimezone(ZoneInfo("Europe/Berlin")).strftime("%Y-%m-%d %H:%M %Z")
+
+
+def render_weekly_report_schedules(user, runner_ok, mail_ready):
     st.caption(
-        "Generate a v5.8 HTML daily report for one yfinance ticker. "
-        "Generated files are held in memory for download; server-side temporary files are removed automatically."
+        "Create a recurring weekly report in Europe/Berlin time. Daylight-saving changes are handled automatically. "
+        "The recipient address remains stored until the schedule is deleted."
+    )
+    with st.form("daily_report_schedule_form"):
+        schedule_ticker, schedule_email, schedule_months, schedule_provider, schedule_no_fetch = render_report_form_fields(
+            "daily_report_schedule",
+            include_email=True,
+        )
+        day_col, time_col = st.columns(2)
+        with day_col:
+            weekday_name = st.selectbox(
+                "Weekday (Europe/Berlin)",
+                list(WEEKDAY_NAMES),
+                index=0,
+                key="daily_report_schedule_weekday",
+            )
+        with time_col:
+            local_time = st.time_input(
+                "Send time (Europe/Berlin)",
+                value=datetime.time(hour=18, minute=0),
+                step=datetime.timedelta(minutes=15),
+                key="daily_report_schedule_time",
+            )
+        schedule_submitted = st.form_submit_button(
+            "Create Weekly Schedule",
+            disabled=not runner_ok or not mail_ready,
+        )
+
+    if schedule_submitted:
+        try:
+            schedule = create_weekly_schedule(
+                owner_key=user["cache_key"],
+                ticker=normalize_yfinance_ticker(schedule_ticker),
+                recipient_email=schedule_email,
+                weekday=WEEKDAY_NAMES.index(weekday_name),
+                local_time=local_time,
+                months=schedule_months,
+                search_provider=schedule_provider,
+                no_article_fetch=schedule_no_fetch,
+            )
+            st.success(
+                f"Weekly schedule {schedule['id'][:8]} created. "
+                f"Next send: {_format_berlin_datetime(schedule['next_run_at'])}."
+            )
+        except (ValueError, ScheduleLimitError) as exc:
+            st.error(str(exc))
+
+    schedules = list_owner_schedules(user["cache_key"])
+    st.markdown("#### Weekly Schedules")
+    if not schedules:
+        st.caption("No weekly schedules yet.")
+        return
+
+    rows = []
+    for schedule in schedules:
+        rows.append({
+            "Ticker": schedule["ticker"],
+            "Recipient": schedule["recipient_masked"],
+            "Weekly time": f"{WEEKDAY_NAMES[schedule['weekday']]} {schedule['local_time']}",
+            "Status": "Active" if schedule["is_active"] else "Paused",
+            "Next send (Berlin)": _format_berlin_datetime(schedule["next_run_at"]),
+        })
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+    schedule_map = {schedule["id"]: schedule for schedule in schedules}
+    selected_id = st.selectbox(
+        "Manage schedule",
+        list(schedule_map),
+        format_func=lambda schedule_id: (
+            f"{schedule_map[schedule_id]['ticker']} - "
+            f"{WEEKDAY_NAMES[schedule_map[schedule_id]['weekday']]} "
+            f"{schedule_map[schedule_id]['local_time']} - "
+            f"{schedule_map[schedule_id]['recipient_masked']}"
+        ),
+        key="manage_report_schedule",
+    )
+    selected = schedule_map[selected_id]
+    action_col, delete_col = st.columns(2)
+    with action_col:
+        action_label = "Pause Schedule" if selected["is_active"] else "Resume Schedule"
+        if st.button(action_label, key="toggle_report_schedule", width="stretch"):
+            set_schedule_active(
+                selected_id,
+                owner_key=user["cache_key"],
+                active=not bool(selected["is_active"]),
+            )
+            st.rerun()
+    with delete_col:
+        confirm_delete = st.checkbox("Confirm delete", key="confirm_delete_report_schedule")
+        if st.button(
+            "Delete Schedule",
+            key="delete_report_schedule",
+            width="stretch",
+            disabled=not confirm_delete,
+        ):
+            delete_schedule(selected_id, owner_key=user["cache_key"])
+            st.rerun()
+
+
+def render_daily_report(user):
+    st.subheader("AI Agent Stock Daily Report")
+    st.caption(
+        "Generate a v5.8 AI Agent HTML report for one yfinance ticker. "
+        "Download it in this session, or let the background worker email it after you close the page."
     )
 
     runner_ok = runtime_available()
     if not runner_ok:
         st.warning("The integrated v5.8 daily report module is incomplete or unavailable.")
 
-    with st.form("daily_report_form"):
-        c1, c2, c3 = st.columns([2, 1, 1])
-        with c1:
-            ticker = st.text_input("Ticker", "AAPL", key="daily_report_ticker").upper()
-        with c2:
-            months = st.number_input("Chart months", min_value=1, max_value=24, value=3, step=1, key="daily_report_months")
-        with c3:
-            search_provider = st.selectbox(
-                "Search provider",
-                ["auto", "priority", "serper", "searxng", "both"],
-                index=0,
-                key="daily_report_search_provider",
+    download_tab, email_tab = st.tabs(["Generate & Download", "Generate & Email"])
+    with download_tab:
+        with st.form("daily_report_download_form"):
+            ticker, _, months, search_provider, no_article_fetch = render_report_form_fields("daily_report_download")
+            submitted = st.form_submit_button("Generate Download", disabled=not runner_ok)
+
+        if submitted:
+            cache_key = user["cache_key"] if user else "guest"
+            with st.spinner(f"Generating {ticker} AI Agent report... This can take a few minutes."):
+                st.session_state["daily_report_result"] = generate_report(
+                    normalize_yfinance_ticker(ticker),
+                    user_scope=cache_key,
+                    months=months,
+                    search_provider=search_provider,
+                    no_article_fetch=no_article_fetch,
+                )
+
+        result = st.session_state.get("daily_report_result")
+        if result:
+            if result.get("success"):
+                st.success(f"Report generated in {result.get('elapsed', 0):.1f}s")
+                st.download_button(
+                    "Download HTML Report",
+                    data=result["html_bytes"],
+                    file_name=result["file_name"],
+                    mime="text/html",
+                    width="stretch",
+                    key=f"download_daily_report_{result['file_name']}",
+                )
+                with st.expander("Generation log", expanded=False):
+                    if result.get("stdout"):
+                        st.code(result["stdout"])
+                    if result.get("stderr"):
+                        st.code(result["stderr"])
+            else:
+                st.error(result.get("error", "Daily report generation failed."))
+                with st.expander("Generation log", expanded=True):
+                    if result.get("stdout"):
+                        st.code(result["stdout"])
+                    if result.get("stderr"):
+                        st.code(result["stderr"])
+
+    with email_tab:
+        if not user:
+            st.info("Sign in with an administrator-issued account to submit background email reports.")
+            return
+
+        mail_ready = smtp_configured()
+        if not mail_ready:
+            st.warning(
+                "Email delivery is not configured. Set REPORT_SMTP_USER, "
+                "REPORT_SMTP_FROM, and REPORT_SMTP_AUTH_CODE in .env."
             )
-
-        no_article_fetch = st.checkbox(
-            "Skip article body fetch",
-            value=False,
-            help="Faster, but the news notes may rely more on search snippets.",
-            key="daily_report_no_article_fetch",
-        )
-        submitted = st.form_submit_button("Generate Daily Report", disabled=not runner_ok)
-
-    if submitted:
-        with st.spinner(f"Generating {ticker} daily report... This can take a few minutes."):
-            st.session_state["daily_report_result"] = generate_report(
-                normalize_yfinance_ticker(ticker),
-                user_scope=cache_key or "guest",
-                months=int(months),
-                search_provider=search_provider,
-                no_article_fetch=no_article_fetch,
+        one_time_tab, weekly_tab = st.tabs(["Send Once", "Weekly Schedule"])
+        with one_time_tab:
+            st.caption(
+                "The job continues in the server worker after this page is closed. "
+                "One active job and three manual submissions per account per UTC day are allowed by default."
             )
+            with st.form("daily_report_email_form"):
+                email_ticker, recipient_email, email_months, email_provider, email_no_fetch = render_report_form_fields(
+                    "daily_report_email",
+                    include_email=True,
+                )
+                email_submitted = st.form_submit_button(
+                    "Queue Report Email",
+                    disabled=not runner_ok or not mail_ready,
+                )
 
-    result = st.session_state.get("daily_report_result")
-    if not result:
-        return
+            if email_submitted:
+                try:
+                    job = enqueue_email_job(
+                        owner_key=user["cache_key"],
+                        ticker=normalize_yfinance_ticker(email_ticker),
+                        recipient_email=recipient_email,
+                        months=email_months,
+                        search_provider=email_provider,
+                        no_article_fetch=email_no_fetch,
+                    )
+                    st.success(
+                        f"Job {job['id'][:8]} queued for {job['recipient_masked']}. "
+                        "You may now close this page."
+                    )
+                except (ValueError, ActiveJobError, DailyLimitError) as exc:
+                    st.error(str(exc))
 
-    if result.get("success"):
-        st.success(f"Report generated in {result.get('elapsed', 0):.1f}s")
-        st.download_button(
-            "Download HTML Report",
-            data=result["html_bytes"],
-            file_name=result["file_name"],
-            mime="text/html",
-            width="stretch",
-            key=f"download_daily_report_{result['file_name']}",
-        )
-        with st.expander("Generation log", expanded=False):
-            if result.get("stdout"):
-                st.code(result["stdout"])
-            if result.get("stderr"):
-                st.code(result["stderr"])
-        return
+        with weekly_tab:
+            render_weekly_report_schedules(user, runner_ok, mail_ready)
 
-    st.error(result.get("error", "Daily report generation failed."))
-    with st.expander("Generation log", expanded=True):
-        if result.get("stdout"):
-            st.code(result["stdout"])
-        if result.get("stderr"):
-            st.code(result["stderr"])
-        if result.get("hint"):
-            st.info(result["hint"])
+        render_email_job_status(user["cache_key"])
 
 
 ensure_flask()
@@ -2030,7 +2264,7 @@ if not stock_payload.get("success"):
 raw_df = pd.DataFrame(stock_payload["data"])
 display_df = convert_stock_df_for_display(raw_df, display_currency)
 
-main_tabs = st.tabs([SECTION_META["stocks_pages"]["tab"], SECTION_META["broad_pages"]["tab"], "Market Breadth", "Daily Report"])
+main_tabs = st.tabs([SECTION_META["stocks_pages"]["tab"], SECTION_META["broad_pages"]["tab"], "Market Breadth", "AI Agent Reports"])
 with main_tabs[0]:
     config = render_section(
         SECTION_META["stocks_pages"]["title"],
@@ -2099,7 +2333,7 @@ with main_tabs[2]:
         st.warning(breadth.get("error", "Failed to load market breadth data") if isinstance(breadth, dict) else "Failed to load market breadth data")
 
 with main_tabs[3]:
-    render_daily_report(cache_key)
+    render_daily_report(user)
 
 st.divider()
 render_kline(cache_key, display_currency=display_currency)

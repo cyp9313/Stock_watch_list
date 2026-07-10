@@ -17,3 +17,5 @@ qwen-agent>=0.0.34
 dashscope>=1.20.0
 openai>=1.0.0
 json5>=0.9.0
+soundfile>=0.12.1
+tzdata>=2025.2
