@@ -18,6 +18,7 @@ import streamlit as st
 import yfinance as yf
 
 import stock_watch_list_back_end
+from daily_report.service import generate_report, runtime_available
 from multiuser_store import (
     BREADTH_GROUPS,
     authenticate,
@@ -1881,6 +1882,80 @@ def render_kline(cache_key, display_currency="Local"):
         st.plotly_chart(fig, width="stretch", key="kline_main_chart")
 
 
+def render_daily_report(cache_key):
+    st.subheader("Daily Stock Report")
+    st.caption(
+        "Generate a v5.8 HTML daily report for one yfinance ticker. "
+        "Generated files are held in memory for download; server-side temporary files are removed automatically."
+    )
+
+    runner_ok = runtime_available()
+    if not runner_ok:
+        st.warning("The integrated v5.8 daily report module is incomplete or unavailable.")
+
+    with st.form("daily_report_form"):
+        c1, c2, c3 = st.columns([2, 1, 1])
+        with c1:
+            ticker = st.text_input("Ticker", "AAPL", key="daily_report_ticker").upper()
+        with c2:
+            months = st.number_input("Chart months", min_value=1, max_value=24, value=3, step=1, key="daily_report_months")
+        with c3:
+            search_provider = st.selectbox(
+                "Search provider",
+                ["auto", "priority", "serper", "searxng", "both"],
+                index=0,
+                key="daily_report_search_provider",
+            )
+
+        no_article_fetch = st.checkbox(
+            "Skip article body fetch",
+            value=False,
+            help="Faster, but the news notes may rely more on search snippets.",
+            key="daily_report_no_article_fetch",
+        )
+        submitted = st.form_submit_button("Generate Daily Report", disabled=not runner_ok)
+
+    if submitted:
+        with st.spinner(f"Generating {ticker} daily report... This can take a few minutes."):
+            st.session_state["daily_report_result"] = generate_report(
+                normalize_yfinance_ticker(ticker),
+                user_scope=cache_key or "guest",
+                months=int(months),
+                search_provider=search_provider,
+                no_article_fetch=no_article_fetch,
+            )
+
+    result = st.session_state.get("daily_report_result")
+    if not result:
+        return
+
+    if result.get("success"):
+        st.success(f"Report generated in {result.get('elapsed', 0):.1f}s")
+        st.download_button(
+            "Download HTML Report",
+            data=result["html_bytes"],
+            file_name=result["file_name"],
+            mime="text/html",
+            width="stretch",
+            key=f"download_daily_report_{result['file_name']}",
+        )
+        with st.expander("Generation log", expanded=False):
+            if result.get("stdout"):
+                st.code(result["stdout"])
+            if result.get("stderr"):
+                st.code(result["stderr"])
+        return
+
+    st.error(result.get("error", "Daily report generation failed."))
+    with st.expander("Generation log", expanded=True):
+        if result.get("stdout"):
+            st.code(result["stdout"])
+        if result.get("stderr"):
+            st.code(result["stderr"])
+        if result.get("hint"):
+            st.info(result["hint"])
+
+
 ensure_flask()
 user = render_auth_panel()
 editable = bool(user)
@@ -1955,7 +2030,7 @@ if not stock_payload.get("success"):
 raw_df = pd.DataFrame(stock_payload["data"])
 display_df = convert_stock_df_for_display(raw_df, display_currency)
 
-main_tabs = st.tabs([SECTION_META["stocks_pages"]["tab"], SECTION_META["broad_pages"]["tab"], "Market Breadth"])
+main_tabs = st.tabs([SECTION_META["stocks_pages"]["tab"], SECTION_META["broad_pages"]["tab"], "Market Breadth", "Daily Report"])
 with main_tabs[0]:
     config = render_section(
         SECTION_META["stocks_pages"]["title"],
@@ -2022,6 +2097,9 @@ with main_tabs[2]:
             st.plotly_chart(ndx_treemap_fig, width="stretch")
     else:
         st.warning(breadth.get("error", "Failed to load market breadth data") if isinstance(breadth, dict) else "Failed to load market breadth data")
+
+with main_tabs[3]:
+    render_daily_report(cache_key)
 
 st.divider()
 render_kline(cache_key, display_currency=display_currency)

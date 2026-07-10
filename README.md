@@ -1374,6 +1374,16 @@ For K-line charts:
 - S&P 500 and Nasdaq 100 market-breadth data and market-cap cache are shared rather than duplicated per user.
 - Ticker display-name cache follows the active price cache: logged-in users keep names in their own `user_data/<username>_stock_cache.db`, while Tkinter, single-user Streamlit, and guest mode use `stock_cache.db`. Existing ticker names are reused permanently; only tickers without a cached name are queried again.
 
+### Integrated Daily Reports
+
+The multi-user frontend includes the v5.8 stock daily-report generator under the `Daily Report` tab. Its code and report resources are stored in `daily_report/`, so deployment no longer depends on a separate project directory or `STOCK_DAILY_REPORT_PROJECT` setting.
+
+Install the root `requirements.txt` after updating the project. Configure the required model and search credentials in the root `.env` or the systemd service environment, for example `DASHSCOPE_API_KEY`, `DEEPSEEK_API_KEY`, and `SERPER_API_KEY` according to the selected providers.
+
+Each generation runs in an isolated directory under `daily_report/runs/`. The completed HTML is loaded into the Streamlit session for downloading, then all server-side files from that run are deleted immediately. Failed and timed-out runs are cleaned in the same way, and `daily_report/runs/` is excluded from Git.
+
+For DashScope models, tool-calling mode is selected by model: the original `deepseek-v4-flash` setup uses native/raw tool calling, while `qwen-plus` uses Qwen-Agent's local parser by default. Raw responses are normalized to strict JSON before being added to API history. `QWEN_AGENT_USE_RAW_API=true` or `false` can explicitly override this selection.
+
 ## License
 
 MIT License

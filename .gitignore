@@ -58,6 +58,7 @@ user_data/
 # Logs
 *.log
 logs/
+daily_report/runs/
 
 # Streamlit
 .streamlit/
