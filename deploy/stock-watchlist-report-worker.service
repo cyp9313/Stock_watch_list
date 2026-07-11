@@ -9,12 +9,62 @@ WorkingDirectory=/opt/Stock_watch_list
 ExecStart=/opt/Stock_watch_list/venv/bin/python -m daily_report.worker
 Restart=always
 RestartSec=5
-User=root
-UMask=0077
+
+# ── Run as dedicated non-root user ───────────────────────────────
+User=stockwatch
+Group=stockwatch
+
+# ── Environment ──────────────────────────────────────────────────
+EnvironmentFile=/opt/Stock_watch_list/.env
 Environment=PYTHONUNBUFFERED=1
+Environment=REPORT_JOB_DB=/opt/Stock_watch_list/data/daily_report_jobs.db
+Environment=HOME=/opt/Stock_watch_list/data
+
+# ── Process management ───────────────────────────────────────────
+UMask=0077
 KillMode=control-group
 TimeoutStopSec=30
 
+# ── Privilege & escalation restrictions ──────────────────────────
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RemoveIPC=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# ── Filesystem hardening ─────────────────────────────────────────
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/Stock_watch_list/data /opt/Stock_watch_list/daily_report/runs
+RuntimeDirectory=stockwatch-report-worker
+RuntimeDirectoryMode=0700
+
+# ── Kernel protections ───────────────────────────────────────────
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+
+# ── Syscall filter ───────────────────────────────────────────────
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+
+# ── Network address family restriction ───────────────────────────
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# ── Resource limits ──────────────────────────────────────────────
+MemoryMax=4G
+TasksMax=512
+LimitNOFILE=4096
+
 [Install]
 WantedBy=multi-user.target
-

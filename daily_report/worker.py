@@ -9,6 +9,8 @@ from dotenv import load_dotenv
 
 from .jobs import (
     claim_next_job,
+    expire_stale_queued_jobs,
+    mark_email_sent,
     mark_job_failure,
     mark_job_sent,
     materialize_due_schedules,
@@ -16,7 +18,7 @@ from .jobs import (
     recover_interrupted_jobs,
     store_generated_report,
 )
-from .mailer import send_report_email
+from .mailer import compute_job_message_id, send_report_email
 from .service import generate_report
 
 
@@ -64,15 +66,29 @@ def process_one_job() -> bool:
                 flush=True,
             )
 
-        send_report_email(
-            recipient=job["recipient_email"],
-            ticker=ticker,
-            report_date=job.get("report_date") or dt.date.today().isoformat(),
-            file_name=file_name,
-            html_bytes=bytes(html_bytes),
-        )
-        mark_job_sent(job_id)
-        print(f"[ReportWorker] Job {job_id[:8]} sent successfully", flush=True)
+        # Idempotent email delivery: if the SMTP send already succeeded
+        # (crash between send and mark_job_sent), skip re-sending.
+        if job.get("email_sent_at"):
+            print(
+                f"[ReportWorker] Job {job_id[:8]} email already sent at "
+                f"{job['email_sent_at']}; confirming delivery without re-send",
+                flush=True,
+            )
+            mark_job_sent(job_id)
+            print(f"[ReportWorker] Job {job_id[:8]} confirmed as sent", flush=True)
+        else:
+            message_id = compute_job_message_id(job_id)
+            send_report_email(
+                recipient=job["recipient_email"],
+                ticker=ticker,
+                report_date=job.get("report_date") or dt.date.today().isoformat(),
+                file_name=file_name,
+                html_bytes=bytes(html_bytes),
+                message_id=message_id,
+            )
+            mark_email_sent(job_id, message_id)
+            mark_job_sent(job_id)
+            print(f"[ReportWorker] Job {job_id[:8]} sent successfully", flush=True)
     except Exception as exc:
         next_status = mark_job_failure(job_id, f"{type(exc).__name__}: {exc}")
         print(
@@ -96,6 +112,9 @@ def main() -> None:
     last_prune = 0.0
     try:
         while True:
+            expired = expire_stale_queued_jobs()
+            if expired:
+                print(f"[ReportWorker] Expired {expired} stale queued job(s)", flush=True)
             scheduled = materialize_due_schedules()
             if scheduled:
                 print(f"[ReportWorker] Queued {scheduled} due weekly schedule(s)", flush=True)

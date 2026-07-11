@@ -5,7 +5,7 @@ import datetime
 import colorsys
 import html
 import json
-import socket
+import os
 import threading
 import time
 from zoneinfo import ZoneInfo
@@ -22,6 +22,7 @@ import stock_watch_list_back_end
 from daily_report.jobs import (
     ActiveJobError,
     DailyLimitError,
+    QueueFullError,
     ScheduleLimitError,
     WEEKDAY_NAMES,
     check_download_generation_limits,
@@ -40,6 +41,7 @@ from multiuser_store import (
     BREADTH_GROUPS,
     authenticate,
     broad_market_tickers,
+    check_login_lock_status,
     config_to_api_groups,
     default_watchlist_config,
     get_user_config,
@@ -51,7 +53,7 @@ from ticker_mapping import normalize_yfinance_ticker, stockanalysis_overview_url
 
 st.set_page_config(page_title="Stock Watchlist", layout="wide", initial_sidebar_state="expanded")
 
-API_BASE = "http://127.0.0.1:5000"
+API_BASE = os.environ.get("STOCK_API_BASE_URL", "http://127.0.0.1:5000")
 COLUMNS = (
     ["Ticker", "Name", "Price", "1D%", "5D%", "1M%", "YTD%", "Rel. Momentum"]
     + [f"Diff_EMA{n}%" for n in [5, 10, 20, 50, 100, 200]]
@@ -170,24 +172,53 @@ THEMES = {
     },
 }
 
-_flask_started = False
+_DEV_MODE = os.environ.get("STOCK_DEV_MODE", "1") != "0"
+_backend_ready = False
 
 
-def is_port_open(host, port, timeout=0.5):
+def check_backend_health(timeout=3):
+    """Verify the backend is our app by calling /api/health.
+
+    Returns (ok, message).
+    """
     try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
+        resp = requests.get(f"{API_BASE}/api/health", timeout=timeout)
+        if resp.status_code != 200:
+            return False, f"后端返回 HTTP {resp.status_code}"
+        data = resp.json()
+        if data.get("service") != "stock-watchlist-api":
+            return False, "端口上的服务不是 Stock Watchlist API"
+        return True, "ok"
+    except requests.ConnectionError:
+        return False, "无法连接后端服务"
+    except requests.Timeout:
+        return False, "后端健康检查超时"
+    except Exception as e:
+        return False, f"健康检查失败: {e}"
 
 
-def ensure_flask():
-    global _flask_started
-    if _flask_started:
-        return
-    if is_port_open("127.0.0.1", 5000):
-        _flask_started = True
-        return
+def ensure_backend():
+    """Ensure backend is running. In dev mode, start Flask if needed.
+
+    In production mode (STOCK_DEV_MODE=0), only check health.
+    Returns (ok, message).
+    """
+    global _backend_ready
+    if _backend_ready:
+        return True, "ok"
+
+    ok, msg = check_backend_health()
+    if ok:
+        _backend_ready = True
+        return True, msg
+
+    if not _DEV_MODE:
+        return False, (
+            f"后端不可用 ({msg})。"
+            f"请确保后端服务已启动: python stock_watch_list_back_end.py"
+        )
+
+    # Dev mode: try to start Flask in a daemon thread
     t = threading.Thread(
         target=lambda: stock_watch_list_back_end.app.run(
             host="127.0.0.1", port=5000, debug=False, use_reloader=False, threaded=True
@@ -195,8 +226,16 @@ def ensure_flask():
         daemon=True,
     )
     t.start()
-    _flask_started = True
-    time.sleep(2)
+
+    # Retry loop instead of fixed sleep (max ~5s)
+    for _ in range(10):
+        time.sleep(0.5)
+        ok, msg = check_backend_health(timeout=1)
+        if ok:
+            _backend_ready = True
+            return True, "ok"
+
+    return False, f"后端启动失败 ({msg})"
 
 
 def get_theme(dark_mode=False):
@@ -975,13 +1014,13 @@ def delete_page(config, section, page_index):
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_stock_data(config_json, cache_key):
     config = normalize_config(json.loads(config_json))
-    params = {
-        "groups": json.dumps(config_to_api_groups(config)),
-        "broad_market_tickers": json.dumps(broad_market_tickers(config)),
+    payload = {
+        "groups": config_to_api_groups(config),
+        "broad_market_tickers": broad_market_tickers(config),
     }
     if cache_key:
-        params["cache_key"] = cache_key
-    resp = requests.get(f"{API_BASE}/api/stock_data", params=params, timeout=180)
+        payload["cache_key"] = cache_key
+    resp = requests.post(f"{API_BASE}/api/stock_data", json=payload, timeout=180)
     if resp.status_code != 200:
         return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
     return resp.json()
@@ -1689,13 +1728,29 @@ def render_auth_panel():
             password = st.text_input("Password", type="password")
             submitted = st.form_submit_button("Sign in")
         if submitted:
-            user = authenticate(username, password)
-            if user:
-                st.session_state["user"] = user
-                st.session_state["watchlist_config"] = get_user_config(user["id"])
-                st.rerun()
+            # Check lock status before attempting authentication.
+            is_locked, remaining = check_login_lock_status(username)
+            if is_locked:
+                mins = remaining // 60
+                secs = remaining % 60
+                if mins > 0:
+                    st.error(f"Too many failed attempts. Please try again in {mins}m {secs}s.")
+                else:
+                    st.error(f"Too many failed attempts. Please try again in {secs}s.")
             else:
-                st.error("Invalid username or password")
+                user = authenticate(username, password)
+                if user:
+                    st.session_state["user"] = user
+                    st.session_state["watchlist_config"] = get_user_config(user["id"])
+                    st.rerun()
+                else:
+                    # Check if this attempt triggered a lockout.
+                    is_locked_now, remaining_now = check_login_lock_status(username)
+                    if is_locked_now:
+                        mins = remaining_now // 60
+                        st.error(f"Too many failed attempts. Please try again in {mins} minutes.")
+                    else:
+                        st.error("Invalid username or password")
         return None
 
 
@@ -1989,12 +2044,15 @@ def render_email_job_status(owner_key):
         "sending": "Sending",
         "sent": "Sent",
         "failed": "Failed",
+        "expired": "Expired",
     }
     rows = []
     for job in jobs:
         status = status_labels.get(job["status"], job["status"])
         if job["status"] == "queued" and job.get("attempts"):
             status = "Retry queued"
+        if job.get("email_sent_at") and job["status"] != "sent":
+            status = "Possibly sent"
         rows.append({
             "Ticker": job["ticker"],
             "Type": "Weekly" if job.get("schedule_id") else "One-time",
@@ -2243,7 +2301,7 @@ def render_daily_report(user):
                         f"Job {job['id'][:8]} queued for {job['recipient_masked']}. "
                         "You may now close this page."
                     )
-                except (ValueError, ActiveJobError, DailyLimitError) as exc:
+                except (ValueError, ActiveJobError, DailyLimitError, QueueFullError) as exc:
                     st.error(str(exc))
 
         with weekly_tab:
@@ -2252,7 +2310,10 @@ def render_daily_report(user):
         render_email_job_status(user["cache_key"])
 
 
-ensure_flask()
+_backend_ok, _backend_msg = ensure_backend()
+if not _backend_ok:
+    st.error(f"⚠️ 后端服务不可用: {_backend_msg}")
+    st.stop()
 user = render_auth_panel()
 editable = bool(user)
 cache_key = user["cache_key"] if user else ""

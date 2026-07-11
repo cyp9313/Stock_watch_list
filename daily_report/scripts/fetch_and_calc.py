@@ -23,6 +23,9 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 
+# Shared market data service — provides OHLCV snapshot sharing and unified provider layer.
+from market_data_service import MarketDataService
+
 # Optional StockAnalysis.com fundamentals scraper.
 # It is used for valuation / analyst fields because yfinance info can be stale or inaccurate.
 try:
@@ -47,7 +50,10 @@ OUT_FILE = sys.argv[2] if len(sys.argv) >= 3 else f"{TICKER.lower().replace('-',
 print(f"[INFO] 获取 {TICKER} 数据...")
 
 # ── 数据获取 ───────────────────────────────────────────────────────
-raw = yf.download(TICKER, period='1y', interval='1d', auto_adjust=False)
+# Use MarketDataService for unified data fetching. Save a snapshot so
+# gen_chart.py can reuse the same OHLCV data instead of re-downloading.
+raw = MarketDataService.fetch_ohlcv(TICKER, period='1y', interval='1d', auto_adjust=False)
+MarketDataService.save_ohlcv_snapshot(raw, TICKER, run_dir=os.getcwd())
 if isinstance(raw.columns, pd.MultiIndex):
     raw.columns = [c[0] if isinstance(c, tuple) else c for c in raw.columns]
 raw = raw.dropna(subset=['Close'])
@@ -59,12 +65,7 @@ if len(raw) < 30:
 df = raw.copy()
 
 # ── 基础信息 ───────────────────────────────────────────────────────
-ticker_obj = yf.Ticker(TICKER)
-info = {}
-try:
-    info = ticker_obj.info or {}
-except Exception:
-    pass
+info = MarketDataService.fetch_ticker_info(TICKER)
 
 LAST_CLOSE  = float(df['Close'].iloc[-1])
 PREV_CLOSE  = float(df['Close'].iloc[-2])

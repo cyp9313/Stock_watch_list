@@ -15,6 +15,7 @@ gen_chart.py — 通用 Plotly K线图生成脚本
 """
 
 import sys
+import os
 import re
 import warnings
 import yfinance as yf
@@ -22,6 +23,9 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+
+# Shared market data service — provides OHLCV snapshot sharing and unified provider layer.
+from market_data_service import MarketDataService
 
 warnings.filterwarnings('ignore')
 
@@ -34,8 +38,16 @@ for i, arg in enumerate(sys.argv):
         MONTHS = int(sys.argv[i+1])
 
 # ── 数据获取 ───────────────────────────────────────────────────────
-print(f"[INFO] 获取 {TICKER} 近1年数据...")
-data = yf.download(TICKER, period='1y', interval='1d', auto_adjust=False)
+# Try to reuse the OHLCV snapshot saved by fetch_and_calc.py (same run_dir).
+# This ensures the chart uses the same data as the technical indicators,
+# and avoids a redundant yf.download call.
+snapshot = MarketDataService.load_ohlcv_snapshot(TICKER, run_dir=os.getcwd())
+if snapshot is not None:
+    print(f"[INFO] 使用 fetch_and_calc.py 保存的 {TICKER} 数据快照...")
+    data = snapshot
+else:
+    print(f"[INFO] 获取 {TICKER} 近1年数据...")
+    data = MarketDataService.fetch_ohlcv(TICKER, period='1y', interval='1d', auto_adjust=False)
 if isinstance(data.columns, pd.MultiIndex):
     data.columns = [c[0] if isinstance(c, tuple) else c for c in data.columns]
 data = data.dropna(subset=['Close'])

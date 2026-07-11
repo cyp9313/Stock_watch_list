@@ -1,4 +1,19 @@
-"""StockAnalysis.com scraper used by the app-level fundamentals cache."""
+"""StockAnalysis.com fundamentals scraper (unified V5.8 version).
+
+This is the merged scraper that combines the original 9-field version with
+the daily_report V5.8 expansion (20 fields).  It is used by both the Flask
+backend (via ``get_cached_stock_analysis``) and the daily report pipeline
+(via ``fetch_and_calc.py`` / ``MarketDataService``).
+
+The 20-field superset is backward-compatible with callers that only read the
+original 9 fields: ``forward_pe``, ``peg_ratio``, ``trailing_pe``,
+``market_cap``, ``earnings_date``, ``ps_ratio``, ``pb_ratio``,
+``analyst_rating``, ``price_target``.
+
+V5.8 expands the valuation/risk fields but deliberately does not add peer-group
+comparison. StockAnalysis is treated as a best-effort source; callers must audit
+missing fields and may fall back to yfinance only where explicitly allowed.
+"""
 
 import html
 import re
@@ -12,7 +27,6 @@ from ticker_mapping import (
     stockanalysis_candidate_urls,
 )
 
-
 MAX_WORKERS = 5
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -20,15 +34,10 @@ HEADERS = {
 }
 
 RESULT_KEYS = (
-    "forward_pe",
-    "peg_ratio",
-    "trailing_pe",
-    "market_cap",
-    "earnings_date",
-    "ps_ratio",
-    "pb_ratio",
-    "analyst_rating",
-    "price_target",
+    "forward_pe", "peg_ratio", "trailing_pe", "market_cap", "earnings_date",
+    "ps_ratio", "pb_ratio", "analyst_rating", "price_target",
+    "ev_sales", "ev_ebitda", "ev_fcf", "p_fcf", "p_ocf", "forward_ps",
+    "fcf_yield", "debt_equity", "debt_ebitda", "debt_fcf", "interest_coverage",
 )
 
 
@@ -38,18 +47,9 @@ def should_query_forward_pe(ticker):
 
 
 def empty_result(raw):
-    return {
-        "forward_pe": None,
-        "peg_ratio": None,
-        "trailing_pe": None,
-        "market_cap": None,
-        "earnings_date": None,
-        "ps_ratio": None,
-        "pb_ratio": None,
-        "analyst_rating": None,
-        "price_target": None,
-        "raw": raw,
-    }
+    result = {key: None for key in RESULT_KEYS}
+    result["raw"] = raw
+    return result
 
 
 def clean_text(value):
@@ -62,7 +62,7 @@ def clean_text(value):
 
 def parse_float(value_str):
     value_str = clean_text(value_str)
-    if not value_str or value_str.lower() == "n/a":
+    if not value_str or value_str.lower() in {"n/a", "na", "-", "\u2014"}:
         return None
     match = re.search(r"[-+]?\d+(?:,\d{3})*(?:\.\d+)?|[-+]?\d+(?:\.\d+)?", value_str)
     if not match:
@@ -75,7 +75,7 @@ def parse_float(value_str):
 
 def parse_market_cap(value_str):
     value_str = clean_text(value_str)
-    if not value_str or value_str.lower() == "n/a":
+    if not value_str or value_str.lower() in {"n/a", "na", "-", "\u2014"}:
         return None
     try:
         match = re.search(r"([-+]?\d+(?:\.\d+)?)\s*([TtBbMmKk]?)", value_str.replace(",", ""))
@@ -83,22 +83,21 @@ def parse_market_cap(value_str):
             return None
         value = float(match.group(1))
         suffix = match.group(2).upper()
-        if suffix == "T":
-            return value * 1e12
-        if suffix == "B":
-            return value * 1e9
-        if suffix == "M":
-            return value * 1e6
-        if suffix == "K":
-            return value * 1e3
-        return value
+        return value * {"T": 1e12, "B": 1e9, "M": 1e6, "K": 1e3}.get(suffix, 1.0)
     except (ValueError, TypeError):
         return None
 
 
 def extract_js_value(text, title):
-    match = re.search(rf'{re.escape(title)}",value:"([^"]+)"', text)
-    return match.group(1) if match else None
+    patterns = [
+        rf'{re.escape(title)}",value:"([^"]+)"',
+        rf'"title":"{re.escape(title)}"[^}}]*?"value":"([^"]+)"',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return clean_text(match.group(1))
+    return None
 
 
 def extract_table_value(text, label):
@@ -110,66 +109,63 @@ def extract_table_value(text, label):
     return clean_text(match.group(1)) if match else None
 
 
+def extract_first(text, aliases):
+    for label in aliases:
+        value = extract_js_value(text, label) or extract_table_value(text, label)
+        if value:
+            return value, label
+    return None, None
+
+
 def has_useful_data(data):
     return any(data.get(key) is not None for key in RESULT_KEYS)
+
+
+FIELD_ALIASES = {
+    "forward_pe": ("Forward PE", "Forward P/E"),
+    "peg_ratio": ("PEG Ratio", "PEG"),
+    "trailing_pe": ("PE Ratio", "P/E Ratio", "Trailing PE"),
+    "market_cap": ("Market Cap", "Assets"),
+    "earnings_date": ("Earnings Date",),
+    "ps_ratio": ("PS Ratio", "P/S Ratio", "Price / Sales"),
+    "pb_ratio": ("PB Ratio", "P/B Ratio", "Price / Book"),
+    "analyst_rating": ("Analyst Consensus", "Analyst Rating"),
+    "price_target": ("Price Target", "Average Price Target"),
+    "ev_sales": ("EV / Sales", "EV/Sales", "Enterprise Value / Sales"),
+    "ev_ebitda": ("EV / EBITDA", "EV/EBITDA", "Enterprise Value / EBITDA"),
+    "ev_fcf": ("EV / FCF", "EV/FCF", "Enterprise Value / FCF"),
+    "p_fcf": ("P / FCF", "P/FCF", "Price / FCF", "Price / Free Cash Flow"),
+    "p_ocf": ("P / OCF", "P/OCF", "Price / Operating Cash Flow"),
+    "forward_ps": ("Forward PS", "Forward P/S", "Forward Price / Sales"),
+    "fcf_yield": ("FCF Yield", "Free Cash Flow Yield"),
+    "debt_equity": ("Debt / Equity", "Debt/Equity", "Debt to Equity"),
+    "debt_ebitda": ("Debt / EBITDA", "Debt/EBITDA"),
+    "debt_fcf": ("Debt / FCF", "Debt/FCF"),
+    "interest_coverage": ("Interest Coverage", "Interest Coverage Ratio"),
+}
 
 
 def parse_stockanalysis_page(text, source_url):
     result = empty_result("")
     raw_parts = [f"source={source_url}"]
 
-    # Stock statistics pages use embedded JS data. ETF and many non-US overview
-    # pages expose the relevant data in the visible two-column overview table.
-    forward_pe_raw = extract_js_value(text, "Forward PE") or extract_table_value(text, "Forward PE")
-    if forward_pe_raw:
-        raw_parts.append(f"pe={forward_pe_raw}")
-        result["forward_pe"] = parse_float(forward_pe_raw)
+    for key, aliases in FIELD_ALIASES.items():
+        raw_value, matched_label = extract_first(text, aliases)
+        if not raw_value:
+            continue
+        raw_parts.append(f"{key}={raw_value}")
+        if key == "market_cap":
+            result[key] = parse_market_cap(raw_value)
+        elif key in {"earnings_date", "analyst_rating"}:
+            if raw_value.lower() not in {"n/a", "na", "-", "\u2014"}:
+                result[key] = raw_value
+        else:
+            result[key] = parse_float(raw_value)
 
-    peg_raw = extract_js_value(text, "PEG Ratio") or extract_table_value(text, "PEG Ratio")
-    if peg_raw:
-        raw_parts.append(f"peg={peg_raw}")
-        result["peg_ratio"] = parse_float(peg_raw)
-
-    trailing_pe_raw = extract_js_value(text, "PE Ratio") or extract_table_value(text, "PE Ratio")
-    if trailing_pe_raw:
-        raw_parts.append(f"trail_pe={trailing_pe_raw}")
-        result["trailing_pe"] = parse_float(trailing_pe_raw)
-
-    market_cap_raw = (
-        extract_js_value(text, "Market Cap")
-        or extract_table_value(text, "Market Cap")
-        or extract_table_value(text, "Assets")
-    )
-    if market_cap_raw:
-        raw_parts.append(f"mcap={market_cap_raw}")
-        result["market_cap"] = parse_market_cap(market_cap_raw)
-
-    earnings_raw = extract_js_value(text, "Earnings Date") or extract_table_value(text, "Earnings Date")
-    if earnings_raw:
-        raw_parts.append(f"earnings={earnings_raw}")
-        if earnings_raw.lower() != "n/a":
-            result["earnings_date"] = earnings_raw
-
-    ps_raw = extract_js_value(text, "PS Ratio") or extract_table_value(text, "PS Ratio")
-    if ps_raw:
-        raw_parts.append(f"ps={ps_raw}")
-        result["ps_ratio"] = parse_float(ps_raw)
-
-    pb_raw = extract_js_value(text, "PB Ratio") or extract_table_value(text, "PB Ratio")
-    if pb_raw:
-        raw_parts.append(f"pb={pb_raw}")
-        result["pb_ratio"] = parse_float(pb_raw)
-
-    rating_raw = extract_js_value(text, "Analyst Consensus") or extract_table_value(text, "Analyst Consensus")
-    if rating_raw:
-        raw_parts.append(f"rating={rating_raw}")
-        if rating_raw.lower() != "n/a":
-            result["analyst_rating"] = rating_raw
-
-    target_raw = extract_js_value(text, "Price Target") or extract_table_value(text, "Price Target")
-    if target_raw:
-        raw_parts.append(f"target={target_raw}")
-        result["price_target"] = parse_float(target_raw)
+    # FCF yield is a percentage. Derive it from P/FCF when a direct field is absent.
+    if result.get("fcf_yield") is None and result.get("p_fcf") not in {None, 0}:
+        result["fcf_yield"] = 100.0 / float(result["p_fcf"])
+        raw_parts.append(f"fcf_yield_derived={result['fcf_yield']:.4f}%")
 
     result["raw"] = ", ".join(raw_parts) if has_useful_data(result) else f"source={source_url}, not_found"
     return result
@@ -191,19 +187,16 @@ def scrape_stock_analysis(ticker):
     for url in urls:
         try:
             resp = requests.get(url, headers=HEADERS, timeout=15)
-        except Exception as e:
-            failures.append(f"{url}: request_error: {e}")
+        except Exception as exc:
+            failures.append(f"{url}: request_error: {exc}")
             continue
-
         if resp.status_code != 200:
             failures.append(f"{url}: http_{resp.status_code}")
             continue
-
         result = parse_stockanalysis_page(resp.text, url)
         if has_useful_data(result):
             return result
         failures.append(result["raw"])
-
     return empty_result("; ".join(failures) if failures else "not_found")
 
 
@@ -223,30 +216,15 @@ def scrape_batch(tickers):
     results = {}
 
     def _scrape_one(ticker):
-        data = scrape_stock_analysis(ticker)
-        return ticker, data
+        return ticker, scrape_stock_analysis(ticker)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(_scrape_one, t): t for t in query_tickers}
+        futures = {executor.submit(_scrape_one, ticker): ticker for ticker in query_tickers}
         for future in as_completed(futures):
             ticker, data = future.result()
             results[ticker] = data
-            pe_str = f"{data['forward_pe']}" if data["forward_pe"] is not None else "N/A"
-            peg_str = f"{data['peg_ratio']}" if data["peg_ratio"] is not None else "N/A"
-            trail_str = f"{data['trailing_pe']}" if data["trailing_pe"] is not None else "N/A"
-            mcap_str = f"{data['market_cap']}" if data["market_cap"] is not None else "N/A"
-            ed_str = data["earnings_date"] or "N/A"
-            ps_str = f"{data['ps_ratio']}" if data["ps_ratio"] is not None else "N/A"
-            pb_str = f"{data['pb_ratio']}" if data["pb_ratio"] is not None else "N/A"
-            rating_str = data["analyst_rating"] or "N/A"
-            target_str = f"${data['price_target']}" if data["price_target"] is not None else "N/A"
-            print(
-                f"[StockAnalysis] {ticker}: PE={pe_str}, PEG={peg_str}, "
-                f"TrailPE={trail_str}, MCap={mcap_str}, Earnings={ed_str}, "
-                f"PS={ps_str}, PB={pb_str}, Rating={rating_str}, Target={target_str} "
-                f"(raw: {data['raw']})"
-            )
-
+            compact = ", ".join(f"{k}={data.get(k)}" for k in RESULT_KEYS if data.get(k) is not None)
+            print(f"[StockAnalysis] {ticker}: {compact or 'N/A'} (raw: {data['raw']})")
     return results
 
 
@@ -254,11 +232,11 @@ if __name__ == "__main__":
     test_tickers = ["AAPL", "MSFT", "QQQ", "SPY", "2800.HK", "510300.SS", "BRK-B"]
     result = scrape_batch(test_tickers)
     print("\n=== Test result ===")
-    for t, data in result.items():
+    for ticker, data in result.items():
         mcap = data["market_cap"]
         mcap_display = f"{mcap:,.0f}" if mcap else "N/A"
         print(
-            f"  {t}: Forward PE={data['forward_pe']}, PEG Ratio={data['peg_ratio']}, "
+            f"  {ticker}: Forward PE={data['forward_pe']}, PEG Ratio={data['peg_ratio']}, "
             f"Trailing PE={data['trailing_pe']}, MCap={mcap_display}, "
             f"Earnings={data['earnings_date']}, PS={data['ps_ratio']}, "
             f"PB={data['pb_ratio']}, Analysts={data['analyst_rating']}, "

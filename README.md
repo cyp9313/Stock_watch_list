@@ -319,13 +319,39 @@ python -m streamlit run app_streamlit.py --server.port 8501 --server.address loc
 
 ### 单独启动后端
 
-通常不需要手动启动后端，因为两个前端都会自动启动 Flask 后端线程。若只想调试 API，可以单独运行：
+在开发模式下（默认），Tkinter 和 Streamlit 前端会自动启动 Flask 后端线程。若只想调试 API，可以单独运行：
 
 ```bash
 python stock_watch_list_back_end.py
 ```
 
 注意：如果你已经启动了 Tkinter 或 Streamlit 前端，它们通常会占用 `127.0.0.1:5000`。此时再单独启动后端可能出现端口占用。
+
+### 生产部署
+
+生产环境下应将前端和后端分别启动：
+
+```bash
+# 1. 启动后端
+python stock_watch_list_back_end.py
+
+# 2. 启动前端（不在自身进程中启动 Flask）
+STOCK_DEV_MODE=0 STOCK_API_BASE_URL=http://127.0.0.1:5000 streamlit run app_streamlit_multiuser.py --server.port 8502 --server.headless true
+```
+
+环境变量：
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `STOCK_API_BASE_URL` | `http://127.0.0.1:5000` | 后端 API 地址 |
+| `STOCK_DEV_MODE` | `1` | `1` = 开发模式（前端自动启动 Flask）；`0` = 生产模式（前端仅连接已有后端） |
+
+后端启动后可通过 `/api/health` 验证服务状态：
+
+```bash
+curl http://127.0.0.1:5000/api/health
+# {"service":"stock-watchlist-api","status":"ok","version":"1.0"}
+```
 
 ## 使用说明
 
@@ -1308,11 +1334,13 @@ The app supports tickers recognized by Yahoo Finance, such as China A-share ETFs
 
 `app_streamlit_multiuser.py` is an optional multi-user web frontend. It keeps the existing single-user `app_streamlit.py` unchanged.
 
-Create or reset a user account:
+Create or reset a user account (password is read securely via `getpass`; the `--password` flag is deprecated and insecure):
 
 ```bash
-python multiuser_store.py create-user alice "your-password"
-python multiuser_store.py create-user alice "new-password" --overwrite
+python multiuser_store.py create-user alice
+python multiuser_store.py create-user alice --overwrite
+# Deprecated insecure option (visible in shell history):
+python multiuser_store.py create-user alice --password "your-password"
 ```
 
 Run the multi-user frontend:
@@ -1410,7 +1438,15 @@ For local development, start the worker in a second terminal:
 python -m daily_report.worker
 ```
 
-On the cloud server, install and start the included systemd unit:
+On the cloud server, the worker runs as a dedicated non-root system user
+(`stockwatch`) with systemd security hardening. Run the setup script first to
+create the user, prepare the `data/` directory, and migrate the job database:
+
+```bash
+sudo bash deploy/setup-worker-user.sh
+```
+
+Then install and start the systemd unit:
 
 ```bash
 sudo cp deploy/stock-watchlist-report-worker.service /etc/systemd/system/
@@ -1418,6 +1454,28 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now stock-watchlist-report-worker
 sudo systemctl status stock-watchlist-report-worker --no-pager
 ```
+
+Verify the security posture of the service:
+
+```bash
+systemd-analyze security stock-watchlist-report-worker
+```
+
+The hardened service file includes:
+
+- **Non-root execution** as the `stockwatch` system user with `/usr/sbin/nologin`
+- **NoNewPrivileges** — prevents gaining new capabilities
+- **ProtectSystem=strict** — entire filesystem read-only except `ReadWritePaths`
+- **ProtectHome** — hides `/home`, `/root`, `/run/user`
+- **PrivateTmp / PrivateDevices** — isolated `/tmp` and no device access
+- **CapabilityBoundingSet=** — zero Linux capabilities granted
+- **SystemCallFilter** — only `@system-service` syscalls; `@privileged` and `@resources` denied
+- **RestrictAddressFamilies** — only `AF_INET`, `AF_INET6`, `AF_UNIX`
+- **ProtectKernel\***, **ProtectControlGroups**, **ProtectClock**, **ProtectHostname**
+- **RestrictNamespaces**, **RestrictRealtime**, **RestrictSUIDSGID**, **LockPersonality**
+- **MemoryMax=4G**, **TasksMax=512** — resource limits
+- **EnvironmentFile** — loads `/opt/Stock_watch_list/.env` explicitly
+- **REPORT_JOB_DB** — job database stored in `data/daily_report_jobs.db`
 
 Worker logs are available through:
 

@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 import json
 import sqlite3
 import yfinance as yf
@@ -13,6 +13,7 @@ import concurrent.futures
 import time
 import contextvars
 import re
+import threading
 # import random
 import pytz
 import fear_and_greed 
@@ -32,7 +33,8 @@ requests_cache.uninstall_cache()
 
 
 # ===== SQLite 缓存层 =====
-DB_PATH = "stock_cache.db"
+_PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.environ.get("STOCK_CACHE_DB_PATH") or os.path.join(_PROJECT_DIR, "stock_cache.db")
 YF_DOWNLOAD_BATCH_SIZE = 100
 SP500_SYMBOLS_CACHE_PATH = os.path.join(os.path.dirname(__file__), "sp500_symbols_cache.json")
 SP500_CONSTITUENTS_CACHE_PATH = os.path.join(os.path.dirname(__file__), "sp500_constituents_cache.json")
@@ -51,6 +53,7 @@ BREADTH_PSEUDO_TICKERS = BREADTH_RATIO_TICKERS | BREADTH_DISPLAY_TICKERS
 BREADTH_PSEUDO_TICKERS_UPPER = {ticker.upper() for ticker in BREADTH_PSEUDO_TICKERS}
 NON_EXTENDED_HOURS_TICKERS = BREADTH_PSEUDO_TICKERS
 SP500_MARKET_CAP_WORKERS = 12
+MAX_STOCK_DATA_BODY_SIZE = 2 * 1024 * 1024  # 2 MB — stock_data POST body 上限
 
 
 def _safe_cache_key(cache_key):
@@ -74,18 +77,28 @@ def get_active_db_path():
 
 def set_request_cache_db():
     cache_key = request.values.get("cache_key", "")
+    if not cache_key:
+        json_body = request.get_json(silent=True)
+        if isinstance(json_body, dict):
+            ck = json_body.get("cache_key", "")
+            if isinstance(ck, str):
+                cache_key = ck
     return CURRENT_DB_PATH.set(db_path_for_cache_key(cache_key))
 
 
-def init_db():
-    """初始化 SQLite 数据库，返回连接"""
-    conn = sqlite3.connect(get_active_db_path())
-    # 性能优化：WAL 模式提升并发读写；增量 auto_vacuum 让被删除的页面可复用
+_DB_SCHEMA_INITIALIZED = set()
+_DB_INIT_LOCK = threading.Lock()
+
+
+def _set_connection_pragmas(conn):
+    """Set WAL mode, incremental auto_vacuum, and busy_timeout on a connection."""
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
 
-    # ===== 价格缓存表（增量更新的核心）=====
-    # 所有标的（watchlist + 宽基指数 + S&P500 breadth）统一存一张表
+
+def _create_schema(conn):
+    """Create all tables and indexes if they don't exist. Idempotent."""
     conn.execute("""
         CREATE TABLE IF NOT EXISTS price_cache (
             ticker      TEXT    NOT NULL,
@@ -95,12 +108,10 @@ def init_db():
             PRIMARY KEY (ticker, date)
         )
     """)
-    # 为按 ticker 查询创建索引（MAX(date) 查询走索引）
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_price_cache_ticker
         ON price_cache(ticker)
     """)
-
     conn.execute("""
         CREATE TABLE IF NOT EXISTS stock_analysis_data (
             ticker          TEXT    NOT NULL,
@@ -146,75 +157,165 @@ def init_db():
             updated_at      TEXT    DEFAULT (datetime('now'))
         )
     """)
-    # 迁移：为已存在的 stock_analysis_data 表添加 peg_ratio 列（如果缺失）
-    try:
-        conn.execute("SELECT peg_ratio FROM stock_analysis_data LIMIT 0")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE stock_analysis_data ADD COLUMN peg_ratio REAL")
-        print("[DB] 已添加 peg_ratio 列到 stock_analysis_data 表")
-    # 迁移：trailing_pe
-    try:
-        conn.execute("SELECT trailing_pe FROM stock_analysis_data LIMIT 0")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE stock_analysis_data ADD COLUMN trailing_pe REAL")
-        print("[DB] 已添加 trailing_pe 列到 stock_analysis_data 表")
-    # 迁移：market_cap
-    try:
-        conn.execute("SELECT market_cap FROM stock_analysis_data LIMIT 0")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE stock_analysis_data ADD COLUMN market_cap REAL")
-        print("[DB] 已添加 market_cap 列到 stock_analysis_data 表")
-    # 迁移：earnings_date
-    try:
-        conn.execute("SELECT earnings_date FROM stock_analysis_data LIMIT 0")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE stock_analysis_data ADD COLUMN earnings_date TEXT")
-        print("[DB] 已添加 earnings_date 列到 stock_analysis_data 表")
-    # 迁移：ps_ratio
-    try:
-        conn.execute("SELECT ps_ratio FROM stock_analysis_data LIMIT 0")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE stock_analysis_data ADD COLUMN ps_ratio REAL")
-        print("[DB] 已添加 ps_ratio 列到 stock_analysis_data 表")
-    # 迁移：pb_ratio
-    try:
-        conn.execute("SELECT pb_ratio FROM stock_analysis_data LIMIT 0")
-    except sqlite3.OperationalError:
-        conn.execute("ALTER TABLE stock_analysis_data ADD COLUMN pb_ratio REAL")
-        print("[DB] 已添加 pb_ratio 列到 stock_analysis_data 表")
 
-    # ===== 滚动窗口清理 =====
-    # price_cache: 保留 750 个自然日（≈517 交易日）
-    #   MA200 需 200 交易日 warmup + 1 年图表 252 交易日 = 452 交易日最低需求
-    #   750 自然日 ≈ 517 交易日，留有 ~65 交易日余量
-    #   注意：不能用 500 自然日，因为 500 自然日 ≈ 345 交易日 < 452 交易日
-    deleted = conn.execute("DELETE FROM price_cache WHERE date < date('now', '-750 days')").rowcount
-    if deleted > 0:
-        print(f"[DB] price_cache 清理: 删除 {deleted} 条 750 天前的记录")
-    # stock_analysis_data / beta_cache: 保留 90 天（每日一行，90 天足够）
-    conn.execute("DELETE FROM stock_analysis_data WHERE date < date('now', '-90 days')")
-    conn.execute("DELETE FROM beta_cache WHERE date < date('now', '-90 days')")
-    conn.execute("DELETE FROM market_cap_cache WHERE checked_date < date('now', '-730 days')")
 
-    conn.commit()
+# 列名 → 类型的映射，用于 stock_analysis_data 表的增量迁移
+_SAD_MIGRATION_COLUMNS = [
+    ("peg_ratio", "REAL"),
+    ("trailing_pe", "REAL"),
+    ("market_cap", "REAL"),
+    ("earnings_date", "TEXT"),
+    ("ps_ratio", "REAL"),
+    ("pb_ratio", "REAL"),
+]
+
+
+def _run_migrations(conn):
+    """Run schema migrations (add missing columns). Idempotent.
+
+    Only catches OperationalError containing 'no such column'; all other
+    errors are re-raised so they are not silently swallowed.
+    """
+    for col_name, col_type in _SAD_MIGRATION_COLUMNS:
+        try:
+            conn.execute(f"SELECT {col_name} FROM stock_analysis_data LIMIT 0")
+        except sqlite3.OperationalError as exc:
+            if "no such column" in str(exc).lower():
+                conn.execute(
+                    f"ALTER TABLE stock_analysis_data ADD COLUMN {col_name} {col_type}"
+                )
+                print(f"[DB] 已添加 {col_name} 列到 stock_analysis_data 表")
+            else:
+                raise
+
+
+def _ensure_schema_initialized(db_path=None):
+    """Ensure schema + migrations have been run for the given DB path.
+
+    Only executes once per process per path. Subsequent calls are no-ops.
+    Does NOT run retention cleanup.
+    """
+    path = db_path or get_active_db_path()
+    with _DB_INIT_LOCK:
+        if path in _DB_SCHEMA_INITIALIZED:
+            return
+    conn = sqlite3.connect(path, timeout=30)
+    try:
+        _set_connection_pragmas(conn)
+        _create_schema(conn)
+        _run_migrations(conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    with _DB_INIT_LOCK:
+        _DB_SCHEMA_INITIALIZED.add(path)
+
+
+def init_database(db_path=None):
+    """Explicitly initialize database schema + run migrations. Idempotent.
+
+    Does NOT run retention cleanup. Safe to call multiple times.
+    Returns None — use get_db_connection() to obtain a query connection.
+    """
+    path = db_path or get_active_db_path()
+    conn = sqlite3.connect(path, timeout=30)
+    try:
+        _set_connection_pragmas(conn)
+        _create_schema(conn)
+        _run_migrations(conn)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    with _DB_INIT_LOCK:
+        _DB_SCHEMA_INITIALIZED.add(path)
+
+
+def get_db_connection(db_path=None):
+    """Get a plain database connection with PRAGMAs set.
+
+    Does NOT execute schema creation, migrations, or retention cleanup
+    (schema is auto-initialized only once per path on first call).
+    Use this for normal queries. Use init_database() for explicit setup,
+    and cleanup_old_data() for periodic cleanup.
+    """
+    _ensure_schema_initialized(db_path)
+    path = db_path or get_active_db_path()
+    conn = sqlite3.connect(path, timeout=30)
+    _set_connection_pragmas(conn)
+    return conn
+
+
+def get_global_db_connection():
+    """Get a connection to the global (non-per-user) DB.
+
+    Used for shared caches (market_cap_cache) that are not per-user.
+    """
+    _ensure_schema_initialized(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    _set_connection_pragmas(conn)
+    return conn
+
+
+def cleanup_old_data(conn=None, db_path=None):
+    """Run retention cleanup on old cached data.
+
+    Must be called explicitly — get_db_connection() does NOT trigger cleanup.
+    Can be called with an existing connection or a db_path (opens its own).
+
+    price_cache:       retain 750 calendar days (MA200 warmup + 1yr chart)
+    stock_analysis_data / beta_cache: retain 90 days
+    market_cap_cache:  retain 730 days
+    """
+    own_conn = conn is None
+    if own_conn:
+        path = db_path or get_active_db_path()
+        conn = sqlite3.connect(path, timeout=30)
+        _set_connection_pragmas(conn)
+    try:
+        deleted = conn.execute(
+            "DELETE FROM price_cache WHERE date < date('now', '-750 days')"
+        ).rowcount
+        if deleted > 0:
+            print(f"[DB] price_cache 清理: 删除 {deleted} 条 750 天前的记录")
+        conn.execute(
+            "DELETE FROM stock_analysis_data WHERE date < date('now', '-90 days')"
+        )
+        conn.execute(
+            "DELETE FROM beta_cache WHERE date < date('now', '-90 days')"
+        )
+        conn.execute(
+            "DELETE FROM market_cap_cache WHERE checked_date < date('now', '-730 days')"
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    if own_conn:
+        conn.close()
+
+
+def init_db():
+    """[Deprecated] Backward-compatible wrapper.
+
+    Calls get_db_connection() + cleanup_old_data().
+    Prefer calling init_database() once at startup, then get_db_connection()
+    for queries, and cleanup_old_data() periodically.
+    """
+    conn = get_db_connection()
+    cleanup_old_data(conn)
     return conn
 
 
 def init_global_market_cap_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS market_cap_cache (
-            ticker          TEXT    PRIMARY KEY,
-            market_cap      REAL,
-            market_cap_date TEXT,
-            checked_date    TEXT,
-            updated_at      TEXT    DEFAULT (datetime('now'))
-        )
-    """)
-    conn.execute("DELETE FROM market_cap_cache WHERE checked_date < date('now', '-730 days')")
-    conn.commit()
+    """[Deprecated] Backward-compatible wrapper. Use get_global_db_connection()."""
+    conn = get_global_db_connection()
+    cleanup_old_data(conn, db_path=DB_PATH)
     return conn
 
 
@@ -237,7 +338,7 @@ def get_cached_stock_analysis(all_tickers):
     if not query_tickers:
         return {}
 
-    conn = init_db()
+    conn = get_db_connection()
     today = get_market_date()
     results = {}
     missing = []
@@ -312,7 +413,7 @@ def get_cached_stock_analysis(all_tickers):
 
 def get_cached_beta(ticker, date_str):
     """从缓存读取 Beta，未命中返回 None"""
-    conn = init_db()
+    conn = get_db_connection()
     row = conn.execute(
         "SELECT beta FROM beta_cache WHERE ticker=? AND date=?",
         (ticker, date_str)
@@ -323,7 +424,7 @@ def get_cached_beta(ticker, date_str):
 
 def save_beta(ticker, date_str, beta, data_points):
     """将 Beta 计算结果写入缓存"""
-    conn = init_db()
+    conn = get_db_connection()
     conn.execute(
         "INSERT OR REPLACE INTO beta_cache (ticker, date, beta, data_points) VALUES (?, ?, ?, ?)",
         (ticker, date_str, beta, data_points)
@@ -338,7 +439,7 @@ def get_cached_betas(tickers, date_str):
     if not tickers:
         return {}
 
-    conn = init_db()
+    conn = get_db_connection()
     placeholders = ','.join('?' * len(tickers))
     rows = conn.execute(
         f"SELECT ticker, beta FROM beta_cache WHERE date=? AND ticker IN ({placeholders})",
@@ -353,7 +454,7 @@ def save_betas(beta_rows):
     if not beta_rows:
         return
 
-    conn = init_db()
+    conn = get_db_connection()
     conn.executemany(
         "INSERT OR REPLACE INTO beta_cache (ticker, date, beta, data_points) VALUES (?, ?, ?, ?)",
         beta_rows
@@ -406,7 +507,7 @@ def get_cached_ticker_names(tickers):
         return {}
 
     today = get_market_date()
-    conn = init_db()
+    conn = get_db_connection()
     placeholders = ",".join("?" for _ in tickers)
     rows = conn.execute(
         f"SELECT ticker, name, checked_date FROM ticker_name_cache WHERE ticker IN ({placeholders})",
@@ -500,7 +601,7 @@ def get_cached_market_caps(tickers):
         return {}
 
     today = get_market_date()
-    conn = init_global_market_cap_db()
+    conn = get_global_db_connection()
     placeholders = ",".join("?" for _ in tickers)
     rows = conn.execute(
         f"SELECT ticker, market_cap, checked_date FROM market_cap_cache WHERE ticker IN ({placeholders})",
@@ -706,7 +807,7 @@ def get_latest_cached_volumes(tickers):
     if not tickers:
         return {}
 
-    conn = init_db()
+    conn = get_db_connection()
     placeholders = ",".join("?" for _ in tickers)
     rows = conn.execute(
         f"""
@@ -799,7 +900,7 @@ def update_extended_hours_price_cache(tickers):
             f"{len(premarket_tickers)} pre-market rows"
         )
 
-    conn = init_db()
+    conn = get_db_connection()
     conn.executemany(
         """
         INSERT INTO price_cache (ticker, date, adj_close, volume)
@@ -1031,7 +1132,7 @@ def get_prices_with_cache(tickers, period="2y", delete_stale=False):
 
     注意: stale 删除默认关闭。因为 /api/stock_data 和 /api/breadth_data
     请求的标的集不同，开启 stale 删除会导致两个端点互删对方数据。
-    旧数据由 init_db() 的 750 天滚动窗口自动清理。
+    旧数据由 cleanup_old_data() 的 750 天滚动窗口清理（需显式调用）。
 
     增量下载的 period 由 gap 决定（均为自然日，用 gap+2 留 2 天缓冲）：
       - gap ≤ 7 天  → "{gap+2}d"（例: gap=1→3d, gap=6→8d，确保覆盖最新交易日）
@@ -1044,7 +1145,7 @@ def get_prices_with_cache(tickers, period="2y", delete_stale=False):
     if not tickers:
         return pd.DataFrame()
 
-    conn = init_db()
+    conn = get_db_connection()
     today = datetime.date.today()
 
     # 去重保持顺序
@@ -1138,6 +1239,33 @@ def get_prices_with_cache(tickers, period="2y", delete_stale=False):
 
 
 app = Flask(__name__)
+
+BACKEND_SERVICE_NAME = "stock-watchlist-api"
+BACKEND_SERVICE_VERSION = "1.0"
+
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Health check endpoint — returns service identity and status.
+
+    Allows frontends to verify that the service on the target port is
+    actually this backend (not some other process that grabbed the same port).
+    """
+    return jsonify({
+        "status": "ok",
+        "service": BACKEND_SERVICE_NAME,
+        "version": BACKEND_SERVICE_VERSION,
+    })
+
+
+@app.after_request
+def _mark_deprecated_endpoints(response):
+    """为已弃用的 GET /api/stock_data 添加 X-Deprecated header。"""
+    if getattr(g, "stock_data_get_deprecated", False):
+        response.headers["X-Deprecated"] = (
+            "GET /api/stock_data is deprecated; use POST with JSON body"
+        )
+    return response
 
 # 分组配置
 # groups = {
@@ -1908,36 +2036,96 @@ def build_breadth_chart_payload(breadth_df, all_price_data=None, index_ticker=No
     return payload
 
 
-@app.route('/api/stock_data', methods=['GET'])
+@app.route('/api/stock_data', methods=['GET', 'POST'])
 def get_stock_data():
-    """获取股票数据"""
+    """获取股票数据
+
+    POST (推荐): JSON body { groups: {name: [tickers]}, broad_market_tickers: [...], cache_key: "..." }
+    GET  (弃用): query params groups=<json>, broad_market_tickers=<json>, cache_key=<str>
+    """
     cache_token = set_request_cache_db()
     try:
-        # 从查询参数获取分组数据
-        groups_json = request.args.get('groups', '{}')
-        
-        try:
-            groups = json.loads(groups_json)
-        except json.JSONDecodeError:
-            return jsonify({
-                "success": False, 
-                "error": "股票代码分组数据格式错误，请提供有效的JSON格式"
-            })
-        groups = normalize_groups_for_yfinance(groups)
-        
-        # 如果客户端没有提供分组，使用默认分组（可选）
-        if not groups:
-            return jsonify({
-                "success": False, 
-                "error": "股票代码分组数据为空，请提供有效的JSON格式股票代码分组"
-            })
-        
-        # 获取 broad_market_tickers 列表（指数/商品/加密货币等，不需要爬取 SA 财务数据）
-        broad_market_json = request.args.get('broad_market_tickers', '[]')
-        try:
-            broad_market_set = set(normalize_yfinance_ticker(t) for t in json.loads(broad_market_json))
-        except json.JSONDecodeError:
-            broad_market_set = set()
+        if request.method == 'POST':
+            # ── 请求体大小检查 ──
+            content_length = request.content_length or 0
+            if content_length > MAX_STOCK_DATA_BODY_SIZE:
+                return jsonify({
+                    "success": False,
+                    "error": "请求体过大，最大允许 2 MB"
+                }), 413
+
+            body = request.get_json(silent=True)
+            if body is None:
+                return jsonify({
+                    "success": False,
+                    "error": "请求体必须是有效的 JSON"
+                }), 400
+            if not isinstance(body, dict):
+                return jsonify({
+                    "success": False,
+                    "error": "请求体必须是 JSON 对象"
+                }), 400
+
+            # ── groups 验证 (必填) ──
+            groups = body.get('groups')
+            if groups is None:
+                return jsonify({
+                    "success": False,
+                    "error": "缺少必要字段: groups"
+                }), 400
+            if not isinstance(groups, dict):
+                return jsonify({
+                    "success": False,
+                    "error": "字段 groups 必须是对象"
+                }), 400
+            groups = normalize_groups_for_yfinance(groups)
+            if not groups:
+                return jsonify({
+                    "success": False,
+                    "error": "股票代码分组数据为空，请提供有效的股票代码分组"
+                }), 400
+
+            # ── broad_market_tickers 验证 (可选) ──
+            broad_market_raw = body.get('broad_market_tickers', [])
+            if broad_market_raw is None:
+                broad_market_raw = []
+            if not isinstance(broad_market_raw, list):
+                return jsonify({
+                    "success": False,
+                    "error": "字段 broad_market_tickers 必须是数组"
+                }), 400
+            broad_market_set = set(
+                normalize_yfinance_ticker(t) for t in broad_market_raw
+            )
+
+            # cache_key 已由 set_request_cache_db() 从 JSON body 提取
+
+        else:
+            # ── GET (弃用兼容路径) ──
+            g.stock_data_get_deprecated = True
+
+            groups_json = request.args.get('groups', '{}')
+
+            try:
+                groups = json.loads(groups_json)
+            except json.JSONDecodeError:
+                return jsonify({
+                    "success": False,
+                    "error": "股票代码分组数据格式错误，请提供有效的JSON格式"
+                })
+            groups = normalize_groups_for_yfinance(groups)
+
+            if not groups:
+                return jsonify({
+                    "success": False,
+                    "error": "股票代码分组数据为空，请提供有效的JSON格式股票代码分组"
+                })
+
+            broad_market_json = request.args.get('broad_market_tickers', '[]')
+            try:
+                broad_market_set = set(normalize_yfinance_ticker(t) for t in json.loads(broad_market_json))
+            except json.JSONDecodeError:
+                broad_market_set = set()
         
         base_date = datetime.date(datetime.date.today().year - 1, 12, 31).strftime('%Y-%m-%d')
         # 去重：Dashboard 与 story groups 有大量重复标的，后端只需处理一次
@@ -2802,5 +2990,5 @@ def get_breadth_data_trail():
     except Exception as e:
         return jsonify({"success": False, "error": f"预热标普500数据失败: {str(e)}"})
     
-# if __name__ == "__main__":
-#     app.run(host="127.0.0.1", port=5000, debug=True, use_reloader=False)
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=5000, debug=False, use_reloader=False, threaded=True)

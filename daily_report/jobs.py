@@ -15,6 +15,8 @@ from zoneinfo import ZoneInfo
 APP_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_JOB_DB = APP_ROOT / "daily_report_jobs.db"
 ACTIVE_STATUSES = ("queued", "generating", "sending")
+RUNNING_STATUSES = ("generating", "sending")
+EXPIRED_STATUS = "expired"
 SCHEDULE_TIMEZONE = "Europe/Berlin"
 WEEKDAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
 _EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
@@ -39,12 +41,33 @@ class ScheduleLimitError(JobQueueError):
     pass
 
 
+class QueueFullError(JobQueueError):
+    """Raised when the global or per-user pending limit would be exceeded."""
+    pass
+
+
 def _now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
 
 def _iso(value: dt.datetime | None = None) -> str:
     return (value or _now()).isoformat(timespec="seconds")
+
+
+def _max_global_pending() -> int:
+    return max(1, int(os.environ.get("REPORT_MAX_GLOBAL_PENDING", "50")))
+
+
+def _max_pending_per_user() -> int:
+    return max(1, int(os.environ.get("REPORT_MAX_PENDING_PER_USER", "5")))
+
+
+def _max_global_running() -> int:
+    return max(1, int(os.environ.get("REPORT_MAX_GLOBAL_RUNNING", "1")))
+
+
+def _max_queue_hours() -> float:
+    return max(0.5, float(os.environ.get("REPORT_MAX_QUEUE_HOURS", "6")))
 
 
 def _db_path() -> Path:
@@ -118,6 +141,10 @@ def init_job_db() -> None:
                 conn.execute("ALTER TABLE report_jobs ADD COLUMN schedule_id TEXT")
             if "scheduled_for" not in job_columns:
                 conn.execute("ALTER TABLE report_jobs ADD COLUMN scheduled_for TEXT")
+            if "smtp_message_id" not in job_columns:
+                conn.execute("ALTER TABLE report_jobs ADD COLUMN smtp_message_id TEXT")
+            if "email_sent_at" not in job_columns:
+                conn.execute("ALTER TABLE report_jobs ADD COLUMN email_sent_at TEXT")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_report_jobs_queue "
                 "ON report_jobs(status, next_attempt_at, created_at)"
@@ -273,12 +300,29 @@ def enqueue_email_job(
     conn = _connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        active = conn.execute(
-            "SELECT id FROM report_jobs WHERE owner_key=? AND status IN (?, ?, ?) LIMIT 1",
+
+        # Per-user pending limit (applies to manual AND schedule jobs)
+        user_pending = conn.execute(
+            "SELECT COUNT(*) FROM report_jobs WHERE owner_key=? AND status IN (?, ?, ?)",
             (owner_key, *ACTIVE_STATUSES),
-        ).fetchone()
-        if active:
-            raise ActiveJobError("This account already has an active email report job.")
+        ).fetchone()[0]
+        if user_pending >= _max_pending_per_user():
+            raise QueueFullError(
+                f"This account already has {user_pending} active report job(s). "
+                f"Maximum {_max_pending_per_user()} per account."
+            )
+
+        # Global pending limit
+        global_pending = conn.execute(
+            "SELECT COUNT(*) FROM report_jobs WHERE status IN (?, ?, ?)",
+            ACTIVE_STATUSES,
+        ).fetchone()[0]
+        if global_pending >= _max_global_pending():
+            raise QueueFullError(
+                f"The report queue is full ({global_pending}/{_max_global_pending()} pending). "
+                f"Please try again later."
+            )
+
         today_count = conn.execute(
             "SELECT COUNT(*) FROM report_jobs WHERE owner_key=? AND created_at>=? AND schedule_id IS NULL",
             (owner_key, _iso(day_start)),
@@ -343,6 +387,7 @@ def _public_job(row: sqlite3.Row | None) -> dict | None:
             "last_error",
             "schedule_id",
             "scheduled_for",
+            "email_sent_at",
         )
     }
 
@@ -390,6 +435,18 @@ def claim_next_job() -> dict | None:
     conn = _connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
+
+        # Global running limit – prevents over-subscription when multiple
+        # workers are active.  Default 1 matches the single-worker design.
+        max_running = _max_global_running()
+        running = conn.execute(
+            "SELECT COUNT(*) FROM report_jobs WHERE status IN (?, ?)",
+            RUNNING_STATUSES,
+        ).fetchone()[0]
+        if running >= max_running:
+            conn.commit()
+            return None
+
         row = conn.execute(
             """
             SELECT * FROM report_jobs
@@ -441,13 +498,32 @@ def store_generated_report(
         )
 
 
+def mark_email_sent(job_id: str, message_id: str) -> None:
+    """Record that the SMTP send returned success for this job.
+
+    Idempotent: if ``email_sent_at`` is already set the call is a no-op,
+    so a retry after a crash between *this* write and ``mark_job_sent``
+    will not overwrite the original timestamp.
+    """
+    with _connection() as conn:
+        conn.execute(
+            """
+            UPDATE report_jobs
+            SET email_sent_at=?, smtp_message_id=?
+            WHERE id=? AND email_sent_at IS NULL
+            """,
+            (_iso(), message_id, job_id),
+        )
+
+
 def mark_job_sent(job_id: str) -> None:
     with _connection() as conn:
         conn.execute(
             """
             UPDATE report_jobs
             SET status='sent', finished_at=?, next_attempt_at=NULL,
-                recipient_email=NULL, report_html=NULL, last_error=NULL
+                recipient_email=NULL, report_html=NULL, last_error=NULL,
+                smtp_message_id=NULL, email_sent_at=NULL
             WHERE id=?
             """,
             (_iso(), job_id),
@@ -487,12 +563,40 @@ def mark_job_failure(job_id: str, error: str) -> str:
         return "failed"
 
 
+def expire_stale_queued_jobs(now_utc: dt.datetime | None = None) -> int:
+    """Mark queued jobs older than ``REPORT_MAX_QUEUE_HOURS`` as expired.
+
+    Expired jobs are no longer processed by the worker — their report content
+    would be stale and potentially misleading (e.g. a Monday morning report
+    sent on Wednesday).
+    """
+    now_utc = now_utc or _now()
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=dt.timezone.utc)
+    else:
+        now_utc = now_utc.astimezone(dt.timezone.utc)
+    max_hours = _max_queue_hours()
+    cutoff = now_utc - dt.timedelta(hours=max_hours)
+    with _connection() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE report_jobs
+            SET status='expired', finished_at=?, next_attempt_at=NULL,
+                last_error=COALESCE(last_error,
+                    'Job expired: queued longer than the maximum queue time.')
+            WHERE status='queued' AND created_at<?
+            """,
+            (_iso(now_utc), _iso(cutoff)),
+        )
+    return cursor.rowcount
+
+
 def prune_old_jobs(retention_days: int | None = None) -> int:
     retention_days = retention_days or int(os.environ.get("REPORT_JOB_RETENTION_DAYS", "7"))
     cutoff = _now() - dt.timedelta(days=max(1, retention_days))
     with _connection() as conn:
         cursor = conn.execute(
-            "DELETE FROM report_jobs WHERE status IN ('sent', 'failed') AND finished_at<?",
+            "DELETE FROM report_jobs WHERE status IN ('sent', 'failed', 'expired') AND finished_at<?",
             (_iso(cutoff),),
         )
     return cursor.rowcount
@@ -674,6 +778,16 @@ def materialize_due_schedules(now_utc: dt.datetime | None = None) -> int:
     conn = _connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
+
+        max_global = _max_global_pending()
+        max_per_user = _max_pending_per_user()
+
+        # Snapshot global pending once; increment locally as we create jobs.
+        global_pending = conn.execute(
+            "SELECT COUNT(*) FROM report_jobs WHERE status IN (?, ?, ?)",
+            ACTIVE_STATUSES,
+        ).fetchone()[0]
+
         schedules = conn.execute(
             """
             SELECT * FROM report_schedules
@@ -683,6 +797,18 @@ def materialize_due_schedules(now_utc: dt.datetime | None = None) -> int:
             (now_iso,),
         ).fetchall()
         for schedule in schedules:
+            # Global pending limit — stop all materialization
+            if global_pending >= max_global:
+                break
+
+            # Per-user pending limit — skip this schedule, don't advance next_run_at
+            user_pending = conn.execute(
+                "SELECT COUNT(*) FROM report_jobs WHERE owner_key=? AND status IN (?, ?, ?)",
+                (schedule["owner_key"], *ACTIVE_STATUSES),
+            ).fetchone()[0]
+            if user_pending >= max_per_user:
+                continue
+
             scheduled_for = schedule["next_run_at"]
             job_id = uuid.uuid4().hex
             cursor = conn.execute(
@@ -709,7 +835,14 @@ def materialize_due_schedules(now_utc: dt.datetime | None = None) -> int:
                     scheduled_for,
                 ),
             )
-            created += int(cursor.rowcount > 0)
+            if cursor.rowcount > 0:
+                created += 1
+                global_pending += 1
+
+            # Always advance next_run_at — whether we just created the job
+            # or it already existed (dedup).  Schedules that were skipped
+            # due to per-user limit do NOT get advanced, so the same
+            # occurrence is retried in the next materialization cycle.
             next_run = next_weekly_run_at(
                 schedule["weekday"],
                 schedule["local_time"],
