@@ -49,8 +49,20 @@ def smtp_configured() -> bool:
     try:
         load_smtp_config()
         return True
-    except Exception:
+    except (RuntimeError, ValueError):
         return False
+
+
+def compute_job_message_id(job_id: str) -> str:
+    """Return a deterministic RFC 5322 Message-ID derived from *job_id*.
+
+    Using a stable Message-ID means that even if the worker re-sends the
+    same job after a crash, mail servers and clients can deduplicate by
+    Message-ID header.
+    """
+    config = load_smtp_config()
+    domain = config.sender.split("@")[-1] if "@" in config.sender else "localhost"
+    return f"<job-{job_id}@{domain}>"
 
 
 def send_report_email(
@@ -60,6 +72,7 @@ def send_report_email(
     report_date: str,
     file_name: str,
     html_bytes: bytes,
+    message_id: str | None = None,
 ) -> None:
     config = load_smtp_config()
     message = EmailMessage()
@@ -67,7 +80,7 @@ def send_report_email(
     message["To"] = recipient
     message["Subject"] = f"{ticker} AI Stock Daily Report - {report_date}"
     message["Date"] = formatdate(localtime=True)
-    message["Message-ID"] = make_msgid(domain=config.sender.split("@")[-1])
+    message["Message-ID"] = message_id or make_msgid(domain=config.sender.split("@")[-1])
     message.set_content(
         f"Your AI Agent daily report for {ticker} is attached.\n\n"
         "This report is for research purposes only and is not investment advice."

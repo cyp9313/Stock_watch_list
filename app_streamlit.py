@@ -8,6 +8,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import json
+import os
 import requests
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -15,7 +16,6 @@ import datetime
 import time
 import threading
 import colorsys
-import socket
 from ticker_mapping import normalize_yfinance_ticker, stockanalysis_overview_url
 
 # ── Page config ──────────────────────────────────────────────
@@ -94,27 +94,57 @@ def inject_theme_css(dark_mode=False):
         unsafe_allow_html=True,
     )
 
-# ── Start Flask backend in daemon thread ─────────────────────
+# ── Backend configuration & health check ─────────────────────
 import stock_watch_list_back_end
 
-_flask_started = False
+API_BASE = os.environ.get("STOCK_API_BASE_URL", "http://127.0.0.1:5000")
+_DEV_MODE = os.environ.get("STOCK_DEV_MODE", "1") != "0"
+_backend_ready = False
 
 
-def is_port_open(host, port, timeout=0.5):
+def check_backend_health(timeout=3):
+    """Verify the backend is our app by calling /api/health.
+
+    Returns (ok, message).
+    """
     try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
+        resp = requests.get(f"{API_BASE}/api/health", timeout=timeout)
+        if resp.status_code != 200:
+            return False, f"后端返回 HTTP {resp.status_code}"
+        data = resp.json()
+        if data.get("service") != "stock-watchlist-api":
+            return False, "端口上的服务不是 Stock Watchlist API"
+        return True, "ok"
+    except requests.ConnectionError:
+        return False, "无法连接后端服务"
+    except requests.Timeout:
+        return False, "后端健康检查超时"
+    except Exception as e:
+        return False, f"健康检查失败: {e}"
 
 
-def ensure_flask():
-    global _flask_started
-    if _flask_started:
-        return
-    if is_port_open("127.0.0.1", 5000):
-        _flask_started = True
-        return
+def ensure_backend():
+    """Ensure backend is running. In dev mode, start Flask if needed.
+
+    In production mode (STOCK_DEV_MODE=0), only check health.
+    Returns (ok, message).
+    """
+    global _backend_ready
+    if _backend_ready:
+        return True, "ok"
+
+    ok, msg = check_backend_health()
+    if ok:
+        _backend_ready = True
+        return True, msg
+
+    if not _DEV_MODE:
+        return False, (
+            f"后端不可用 ({msg})。"
+            f"请确保后端服务已启动: python stock_watch_list_back_end.py"
+        )
+
+    # Dev mode: try to start Flask in a daemon thread
     t = threading.Thread(
         target=lambda: stock_watch_list_back_end.app.run(
             host="127.0.0.1", port=5000, debug=False, use_reloader=False, threaded=True
@@ -122,11 +152,16 @@ def ensure_flask():
         daemon=True,
     )
     t.start()
-    _flask_started = True
-    time.sleep(2)  # wait for Flask to boot
 
+    # Retry loop instead of fixed sleep (max ~5s)
+    for _ in range(10):
+        time.sleep(0.5)
+        ok, msg = check_backend_health(timeout=1)
+        if ok:
+            _backend_ready = True
+            return True, "ok"
 
-API_BASE = "http://127.0.0.1:5000"
+    return False, f"后端启动失败 ({msg})"
 
 # ── Group definitions (EXACTLY matching tkinter version) ──────
 STOCK_GROUPS = {
@@ -306,11 +341,11 @@ def readable_text_color(bg_color, default="#111827"):
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_stock_data():
     """Fetch stock data for all groups."""
-    resp = requests.get(
+    resp = requests.post(
         f"{API_BASE}/api/stock_data",
-        params={
-            "groups": json.dumps(ALL_GROUPS),
-            "broad_market_tickers": json.dumps(BROAD_MARKET_TICKERS)
+        json={
+            "groups": ALL_GROUPS,
+            "broad_market_tickers": BROAD_MARKET_TICKERS
         },
         timeout=120
     )
@@ -330,7 +365,7 @@ def fetch_fear_greed():
         resp = requests.get(f"{API_BASE}/api/fear_greed", timeout=10)
         if resp.status_code == 200:
             return resp.json()
-    except Exception:
+    except (requests.RequestException, ValueError):
         pass
     return None
 
@@ -341,7 +376,7 @@ def fetch_crypto_fear_greed():
         resp = requests.get(f"{API_BASE}/api/fear_greed_crypto", timeout=10)
         if resp.status_code == 200:
             return resp.json()
-    except Exception:
+    except (requests.RequestException, ValueError):
         pass
     return None
 
@@ -360,7 +395,7 @@ def fetch_breadth_data(sp500_list):
         if resp.status_code != 200:
             return {"success": False, "error": f"Breadth API HTTP {resp.status_code}: {resp.text}"}
         return resp.json()
-    except Exception as e:
+    except (requests.RequestException, ValueError) as e:
         return {"success": False, "error": f"Breadth API exception: {e}"}
 
 
@@ -983,7 +1018,7 @@ def build_market_treemap(
     rows["Industry"] = rows.get("Industry", "Unknown")
     rows["Name"] = rows.get("Name", rows["Ticker"])
     rows["Size"] = pd.to_numeric(rows.get("Size", 1), errors="coerce").fillna(1).clip(lower=1)
-    rows["1D%"] = pd.to_numeric(rows["1D%"], errors="coerce").fillna(0)
+    rows["1D%"] = pd.to_numeric(rows["1D%"], errors="coerce")
     rows["Price"] = pd.to_numeric(rows.get("Price", np.nan), errors="coerce")
     rows["Market Cap"] = pd.to_numeric(rows.get("Market Cap", np.nan), errors="coerce")
 
@@ -1010,33 +1045,46 @@ def build_market_treemap(
     for sector, sector_df in rows.groupby("Sector", sort=True):
         sector_id = f"sector:{sector}"
         sector_value = float(sector_df["Size"].sum())
-        sector_color = float(np.average(sector_df["1D%"], weights=sector_df["Size"]))
+        valid_mask = sector_df["1D%"].notna()
+        if valid_mask.any():
+            valid_df = sector_df[valid_mask]
+            sector_color = float(np.average(valid_df["1D%"], weights=valid_df["Size"]))
+            sector_text = f"{sector_color:+.2f}%"
+        else:
+            sector_color = 0.0
+            sector_text = "N/A"
         labels.append(sector)
         ids.append(sector_id)
         parents.append("root")
         values.append(sector_value)
         colors.append(sector_color)
-        text.append(f"{sector_color:+.2f}%")
-        customdata.append([sector, "", "", "", "", f"{sector_color:+.2f}%"])
+        text.append(sector_text)
+        customdata.append([sector, "", "", "", "", sector_text])
 
         for _, row in sector_df.sort_values("Size", ascending=False).iterrows():
             ticker = str(row["Ticker"])
-            pct = float(row["1D%"])
+            pct_raw = row["1D%"]
             price = row["Price"]
             stock_size = float(row["Size"])
+            if pd.notna(pct_raw):
+                pct = float(pct_raw)
+                pct_text = f"{pct:+.2f}%"
+            else:
+                pct = 0.0
+                pct_text = "N/A"
             labels.append(ticker)
             ids.append(f"ticker:{ticker}")
             parents.append(sector_id)
             values.append(stock_size)
             colors.append(pct)
-            text.append(f"{pct:+.2f}%")
+            text.append(pct_text)
             customdata.append([
                 row.get("Name", ticker),
                 sector,
                 row.get("Industry", "Unknown"),
                 f"{float(price):.2f}" if pd.notna(price) else "",
                 _format_market_cap(row.get("Market Cap")),
-                f"{pct:+.2f}%",
+                pct_text,
             ])
 
     fig = go.Figure(
@@ -1219,7 +1267,10 @@ def display_fear_greed(fg_data, title, prefix="", dark_mode=False):
 # MAIN APP
 # ════════════════════════════════════════════════════════════
 
-ensure_flask()
+_backend_ok, _backend_msg = ensure_backend()
+if not _backend_ok:
+    st.error(f"⚠️ 后端服务不可用: {_backend_msg}")
+    st.stop()
 
 # ── Sidebar ──────────────────────────────────────────────────
 with st.sidebar:

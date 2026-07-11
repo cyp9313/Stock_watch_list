@@ -48,20 +48,81 @@ if sys.platform == 'win32':
         _ucrt.freopen(b'NUL', b'w', _stderr_ptr)  # C stderr → NUL
         # 重建 Python sys.stderr → 控制台（yfinance/Flask 日志正常工作）
         sys.stderr = os.fdopen(_saved_stderr_fd, 'w', encoding='utf-8', errors='replace', buffering=1)
-    except Exception:
+    except (OSError, AttributeError, ValueError):
         pass
 
 import stock_watch_list_back_end
 
-def run_flask():
-    stock_watch_list_back_end.app.run(host="127.0.0.1", port=5000, debug=False, use_reloader=False, threaded=True)
-
-t = threading.Thread(target=run_flask, daemon=True)
-t.start()
-
 # API配置
-# API_BASE_URL = "http://43.157.122.165:6000"  # 修改为你的服务器地址
-API_BASE_URL = "http://127.0.0.1:5000"  # 修改为你的服务器地址
+API_BASE_URL = os.environ.get("STOCK_API_BASE_URL", "http://127.0.0.1:5000")
+_DEV_MODE = os.environ.get("STOCK_DEV_MODE", "1") != "0"
+_backend_ready = False
+
+
+def check_backend_health(timeout=3):
+    """Verify the backend is our app by calling /api/health.
+
+    Returns (ok, message).
+    """
+    try:
+        resp = requests.get(f"{API_BASE_URL}/api/health", timeout=timeout)
+        if resp.status_code != 200:
+            return False, f"后端返回 HTTP {resp.status_code}"
+        data = resp.json()
+        if data.get("service") != "stock-watchlist-api":
+            return False, "端口上的服务不是 Stock Watchlist API"
+        return True, "ok"
+    except requests.ConnectionError:
+        return False, "无法连接后端服务"
+    except requests.Timeout:
+        return False, "后端健康检查超时"
+    except Exception as e:
+        return False, f"健康检查失败: {e}"
+
+
+def ensure_backend():
+    """Ensure backend is running. In dev mode, start Flask if needed.
+
+    In production mode (STOCK_DEV_MODE=0), only check health.
+    Returns (ok, message).
+    """
+    global _backend_ready
+    if _backend_ready:
+        return True, "ok"
+
+    ok, msg = check_backend_health()
+    if ok:
+        _backend_ready = True
+        return True, msg
+
+    if not _DEV_MODE:
+        return False, (
+            f"后端不可用 ({msg})。"
+            f"请确保后端服务已启动: python stock_watch_list_back_end.py"
+        )
+
+    # Dev mode: try to start Flask in a daemon thread
+    t = threading.Thread(
+        target=lambda: stock_watch_list_back_end.app.run(
+            host="127.0.0.1", port=5000, debug=False, use_reloader=False, threaded=True
+        ),
+        daemon=True,
+    )
+    t.start()
+
+    # Retry loop instead of fixed sleep (max ~5s)
+    for _ in range(10):
+        time.sleep(0.5)
+        ok, msg = check_backend_health(timeout=1)
+        if ok:
+            _backend_ready = True
+            return True, "ok"
+
+    return False, f"后端启动失败 ({msg})"
+
+
+# Ensure backend is available before proceeding
+_tk_backend_ok, _tk_backend_msg = ensure_backend()
 # 分组配置 — 按分页拆分
 stock_groups = {
     "Mag7": ["AAPL", "MSFT", "GOOG", "AMZN", "META", "TSLA", "NVDA","SPCX"],
@@ -141,6 +202,19 @@ def fetch_from_api(endpoint, params=None):
     """调用API获取数据"""
     try:
         response = requests.get(f"{API_BASE_URL}{endpoint}", params=params, timeout=120)
+        return response.json()
+    except Exception as e:
+        print(f"API调用失败: {e}")
+        return {"success": False, "error": str(e)}
+
+def _post_stock_data(payload):
+    """通过 POST JSON 调用 /api/stock_data"""
+    try:
+        response = requests.post(
+            f"{API_BASE_URL}/api/stock_data",
+            json=payload,
+            timeout=120
+        )
         return response.json()
     except Exception as e:
         print(f"API调用失败: {e}")
@@ -456,9 +530,9 @@ def refresh_stock_data():
 
 def _refresh_stock_data_worker():
     try:
-        result = fetch_from_api('/api/stock_data', {
-            'groups': json.dumps(groups),
-            'broad_market_tickers': json.dumps(broad_market_tickers)
+        result = _post_stock_data({
+            'groups': groups,
+            'broad_market_tickers': broad_market_tickers
         })
         if result.get('success'):
             stock_df = pd.DataFrame(result['data'])
@@ -943,7 +1017,7 @@ def plot_kline():
                         return
                     try:
                         renderer = fig.canvas.get_renderer()
-                    except Exception:
+                    except (AttributeError, RuntimeError):
                         return
                     bbox = _txt.get_window_extent(renderer=renderer)
                     if bbox.contains(event.x, event.y):
@@ -1060,7 +1134,7 @@ def plot_kline():
                 f.write(f"Time: {datetime.datetime.now()}\n")
                 f.write(f"Error: {str(e)}\n")
                 f.write(f"Traceback:\n{err_msg}\n")
-        except Exception:
+        except OSError:
             pass
         messagebox.showerror("错误", f"绘制K线图时出错: {str(e)}")
 

@@ -5,7 +5,7 @@ import datetime
 import colorsys
 import html
 import json
-import socket
+import os
 import threading
 import time
 from zoneinfo import ZoneInfo
@@ -22,14 +22,18 @@ import stock_watch_list_back_end
 from daily_report.jobs import (
     ActiveJobError,
     DailyLimitError,
+    QueueFullError,
     ScheduleLimitError,
     WEEKDAY_NAMES,
+    check_download_generation_limits,
     create_weekly_schedule,
     delete_schedule,
     enqueue_email_job,
+    finish_download_generation,
     list_owner_jobs,
     list_owner_schedules,
     set_schedule_active,
+    start_download_generation,
 )
 from daily_report.mailer import smtp_configured
 from daily_report.service import generate_report, runtime_available
@@ -37,6 +41,7 @@ from multiuser_store import (
     BREADTH_GROUPS,
     authenticate,
     broad_market_tickers,
+    check_login_lock_status,
     config_to_api_groups,
     default_watchlist_config,
     get_user_config,
@@ -48,7 +53,7 @@ from ticker_mapping import normalize_yfinance_ticker, stockanalysis_overview_url
 
 st.set_page_config(page_title="Stock Watchlist", layout="wide", initial_sidebar_state="expanded")
 
-API_BASE = "http://127.0.0.1:5000"
+API_BASE = os.environ.get("STOCK_API_BASE_URL", "http://127.0.0.1:5000")
 COLUMNS = (
     ["Ticker", "Name", "Price", "1D%", "5D%", "1M%", "YTD%", "Rel. Momentum"]
     + [f"Diff_EMA{n}%" for n in [5, 10, 20, 50, 100, 200]]
@@ -167,24 +172,53 @@ THEMES = {
     },
 }
 
-_flask_started = False
+_DEV_MODE = os.environ.get("STOCK_DEV_MODE", "1") != "0"
+_backend_ready = False
 
 
-def is_port_open(host, port, timeout=0.5):
+def check_backend_health(timeout=3):
+    """Verify the backend is our app by calling /api/health.
+
+    Returns (ok, message).
+    """
     try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
+        resp = requests.get(f"{API_BASE}/api/health", timeout=timeout)
+        if resp.status_code != 200:
+            return False, f"后端返回 HTTP {resp.status_code}"
+        data = resp.json()
+        if data.get("service") != "stock-watchlist-api":
+            return False, "端口上的服务不是 Stock Watchlist API"
+        return True, "ok"
+    except requests.ConnectionError:
+        return False, "无法连接后端服务"
+    except requests.Timeout:
+        return False, "后端健康检查超时"
+    except Exception as e:
+        return False, f"健康检查失败: {e}"
 
 
-def ensure_flask():
-    global _flask_started
-    if _flask_started:
-        return
-    if is_port_open("127.0.0.1", 5000):
-        _flask_started = True
-        return
+def ensure_backend():
+    """Ensure backend is running. In dev mode, start Flask if needed.
+
+    In production mode (STOCK_DEV_MODE=0), only check health.
+    Returns (ok, message).
+    """
+    global _backend_ready
+    if _backend_ready:
+        return True, "ok"
+
+    ok, msg = check_backend_health()
+    if ok:
+        _backend_ready = True
+        return True, msg
+
+    if not _DEV_MODE:
+        return False, (
+            f"后端不可用 ({msg})。"
+            f"请确保后端服务已启动: python stock_watch_list_back_end.py"
+        )
+
+    # Dev mode: try to start Flask in a daemon thread
     t = threading.Thread(
         target=lambda: stock_watch_list_back_end.app.run(
             host="127.0.0.1", port=5000, debug=False, use_reloader=False, threaded=True
@@ -192,8 +226,16 @@ def ensure_flask():
         daemon=True,
     )
     t.start()
-    _flask_started = True
-    time.sleep(2)
+
+    # Retry loop instead of fixed sleep (max ~5s)
+    for _ in range(10):
+        time.sleep(0.5)
+        ok, msg = check_backend_health(timeout=1)
+        if ok:
+            _backend_ready = True
+            return True, "ok"
+
+    return False, f"后端启动失败 ({msg})"
 
 
 def get_theme(dark_mode=False):
@@ -831,13 +873,13 @@ def get_ticker_currency(ticker):
             currency = fast_info.get("currency")
         if currency:
             return normalize_currency_code(currency)
-    except Exception:
+    except (KeyError, ValueError, AttributeError, TypeError, RuntimeError):
         pass
     try:
         currency = yf.Ticker(ticker).info.get("currency")
         if currency:
             return normalize_currency_code(currency)
-    except Exception:
+    except (KeyError, ValueError, AttributeError, TypeError, RuntimeError):
         pass
     return fallback_currency_from_ticker(ticker)
 
@@ -868,7 +910,7 @@ def currency_to_eur_rate(currency):
         quote_per_eur = _latest_yahoo_price(eur_base)
         if quote_per_eur and quote_per_eur > 0:
             return 1.0 / quote_per_eur
-    except Exception:
+    except (ValueError, TypeError, KeyError, AttributeError, RuntimeError):
         pass
 
     eur_quote = f"{currency}EUR=X"
@@ -876,7 +918,7 @@ def currency_to_eur_rate(currency):
         eur_per_quote = _latest_yahoo_price(eur_quote)
         if eur_per_quote and eur_per_quote > 0:
             return eur_per_quote
-    except Exception:
+    except (ValueError, TypeError, KeyError, AttributeError, RuntimeError):
         pass
     return None
 
@@ -972,16 +1014,19 @@ def delete_page(config, section, page_index):
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_stock_data(config_json, cache_key):
     config = normalize_config(json.loads(config_json))
-    params = {
-        "groups": json.dumps(config_to_api_groups(config)),
-        "broad_market_tickers": json.dumps(broad_market_tickers(config)),
+    payload = {
+        "groups": config_to_api_groups(config),
+        "broad_market_tickers": broad_market_tickers(config),
     }
     if cache_key:
-        params["cache_key"] = cache_key
-    resp = requests.get(f"{API_BASE}/api/stock_data", params=params, timeout=180)
-    if resp.status_code != 200:
-        return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
-    return resp.json()
+        payload["cache_key"] = cache_key
+    try:
+        resp = requests.post(f"{API_BASE}/api/stock_data", json=payload, timeout=180)
+        if resp.status_code != 200:
+            return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
+        return resp.json()
+    except (requests.RequestException, ValueError) as e:
+        return {"success": False, "error": f"Backend request failed: {e}"}
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -995,7 +1040,7 @@ def fetch_breadth_data():
     try:
         resp = requests.post(f"{API_BASE}/api/breadth_data", data=payload, timeout=300)
         return resp.json() if resp.status_code == 200 else {"success": False, "error": resp.text}
-    except Exception as e:
+    except (requests.RequestException, ValueError) as e:
         return {"success": False, "error": str(e)}
 
 
@@ -1004,7 +1049,7 @@ def fetch_fear_greed(path):
     try:
         resp = requests.get(f"{API_BASE}{path}", timeout=10)
         return resp.json() if resp.status_code == 200 else None
-    except Exception:
+    except (requests.RequestException, ValueError):
         return None
 
 
@@ -1013,8 +1058,11 @@ def fetch_kline_data(ticker, period, interval, cache_key=""):
     params = {"ticker": ticker, "period": period, "interval": interval}
     if cache_key:
         params["cache_key"] = cache_key
-    resp = requests.get(f"{API_BASE}/api/kline_data", params=params, timeout=120)
-    return resp.json() if resp.status_code == 200 else None
+    try:
+        resp = requests.get(f"{API_BASE}/api/kline_data", params=params, timeout=120)
+        return resp.json() if resp.status_code == 200 else None
+    except (requests.RequestException, ValueError):
+        return None
 
 
 def build_breadth_chart(
@@ -1102,7 +1150,7 @@ def build_market_treemap(
     rows["Industry"] = rows.get("Industry", "Unknown")
     rows["Name"] = rows.get("Name", rows["Ticker"])
     rows["Size"] = pd.to_numeric(rows.get("Size", 1), errors="coerce").fillna(1).clip(lower=1)
-    rows["1D%"] = pd.to_numeric(rows["1D%"], errors="coerce").fillna(0)
+    rows["1D%"] = pd.to_numeric(rows["1D%"], errors="coerce")
     rows["Price"] = pd.to_numeric(rows.get("Price", np.nan), errors="coerce")
     rows["Market Cap"] = pd.to_numeric(rows.get("Market Cap", np.nan), errors="coerce")
 
@@ -1129,33 +1177,46 @@ def build_market_treemap(
     for sector, sector_df in rows.groupby("Sector", sort=True):
         sector_id = f"sector:{sector}"
         sector_value = float(sector_df["Size"].sum())
-        sector_color = float(np.average(sector_df["1D%"], weights=sector_df["Size"]))
+        valid_mask = sector_df["1D%"].notna()
+        if valid_mask.any():
+            valid_df = sector_df[valid_mask]
+            sector_color = float(np.average(valid_df["1D%"], weights=valid_df["Size"]))
+            sector_text = f"{sector_color:+.2f}%"
+        else:
+            sector_color = 0.0
+            sector_text = "N/A"
         labels.append(sector)
         ids.append(sector_id)
         parents.append("root")
         values.append(sector_value)
         colors.append(sector_color)
-        text.append(f"{sector_color:+.2f}%")
-        customdata.append([sector, "", "", "", "", f"{sector_color:+.2f}%"])
+        text.append(sector_text)
+        customdata.append([sector, "", "", "", "", sector_text])
 
         for _, row in sector_df.sort_values("Size", ascending=False).iterrows():
             ticker = str(row["Ticker"])
-            pct = float(row["1D%"])
+            pct_raw = row["1D%"]
             price = row["Price"]
             stock_size = float(row["Size"])
+            if pd.notna(pct_raw):
+                pct = float(pct_raw)
+                pct_text = f"{pct:+.2f}%"
+            else:
+                pct = 0.0
+                pct_text = "N/A"
             labels.append(ticker)
             ids.append(f"ticker:{ticker}")
             parents.append(sector_id)
             values.append(stock_size)
             colors.append(pct)
-            text.append(f"{pct:+.2f}%")
+            text.append(pct_text)
             customdata.append([
                 row.get("Name", ticker),
                 sector,
                 row.get("Industry", "Unknown"),
                 f"{float(price):.2f}" if pd.notna(price) else "",
                 _format_market_cap(row.get("Market Cap")),
-                f"{pct:+.2f}%",
+                pct_text,
             ])
 
     fig = go.Figure(
@@ -1686,13 +1747,29 @@ def render_auth_panel():
             password = st.text_input("Password", type="password")
             submitted = st.form_submit_button("Sign in")
         if submitted:
-            user = authenticate(username, password)
-            if user:
-                st.session_state["user"] = user
-                st.session_state["watchlist_config"] = get_user_config(user["id"])
-                st.rerun()
+            # Check lock status before attempting authentication.
+            is_locked, remaining = check_login_lock_status(username)
+            if is_locked:
+                mins = remaining // 60
+                secs = remaining % 60
+                if mins > 0:
+                    st.error(f"Too many failed attempts. Please try again in {mins}m {secs}s.")
+                else:
+                    st.error(f"Too many failed attempts. Please try again in {secs}s.")
             else:
-                st.error("Invalid username or password")
+                user = authenticate(username, password)
+                if user:
+                    st.session_state["user"] = user
+                    st.session_state["watchlist_config"] = get_user_config(user["id"])
+                    st.rerun()
+                else:
+                    # Check if this attempt triggered a lockout.
+                    is_locked_now, remaining_now = check_login_lock_status(username)
+                    if is_locked_now:
+                        mins = remaining_now // 60
+                        st.error(f"Too many failed attempts. Please try again in {mins} minutes.")
+                    else:
+                        st.error("Invalid username or password")
         return None
 
 
@@ -1986,12 +2063,15 @@ def render_email_job_status(owner_key):
         "sending": "Sending",
         "sent": "Sent",
         "failed": "Failed",
+        "expired": "Expired",
     }
     rows = []
     for job in jobs:
         status = status_labels.get(job["status"], job["status"])
         if job["status"] == "queued" and job.get("attempts"):
             status = "Retry queued"
+        if job.get("email_sent_at") and job["status"] != "sent":
+            status = "Possibly sent"
         rows.append({
             "Ticker": job["ticker"],
             "Type": "Weekly" if job.get("schedule_id") else "One-time",
@@ -2021,6 +2101,7 @@ def _format_berlin_datetime(value):
 def render_weekly_report_schedules(user, runner_ok, mail_ready):
     st.caption(
         "Create a recurring weekly report in Europe/Berlin time. Daylight-saving changes are handled automatically. "
+        "Select every day for this ticker in one plan; each account can keep up to seven ticker schedules. "
         "The recipient address remains stored until the schedule is deleted."
     )
     with st.form("daily_report_schedule_form"):
@@ -2028,14 +2109,19 @@ def render_weekly_report_schedules(user, runner_ok, mail_ready):
             "daily_report_schedule",
             include_email=True,
         )
-        day_col, time_col = st.columns(2)
+        day_col, time_col = st.columns([4, 1])
         with day_col:
-            weekday_name = st.selectbox(
-                "Weekday (Europe/Berlin)",
-                list(WEEKDAY_NAMES),
-                index=0,
-                key="daily_report_schedule_weekday",
-            )
+            st.markdown("**Send on (Europe/Berlin)**")
+            weekday_columns = st.columns(7)
+            selected_weekdays = []
+            for weekday, weekday_name in enumerate(WEEKDAY_NAMES):
+                with weekday_columns[weekday]:
+                    if st.checkbox(
+                        weekday_name,
+                        value=weekday == 0,
+                        key=f"daily_report_schedule_weekday_{weekday}",
+                    ):
+                        selected_weekdays.append(weekday)
         with time_col:
             local_time = st.time_input(
                 "Send time (Europe/Berlin)",
@@ -2044,7 +2130,7 @@ def render_weekly_report_schedules(user, runner_ok, mail_ready):
                 key="daily_report_schedule_time",
             )
         schedule_submitted = st.form_submit_button(
-            "Create Weekly Schedule",
+            "Create Weekly Plan",
             disabled=not runner_ok or not mail_ready,
         )
 
@@ -2054,14 +2140,14 @@ def render_weekly_report_schedules(user, runner_ok, mail_ready):
                 owner_key=user["cache_key"],
                 ticker=normalize_yfinance_ticker(schedule_ticker),
                 recipient_email=schedule_email,
-                weekday=WEEKDAY_NAMES.index(weekday_name),
                 local_time=local_time,
+                weekdays=selected_weekdays,
                 months=schedule_months,
                 search_provider=schedule_provider,
                 no_article_fetch=schedule_no_fetch,
             )
             st.success(
-                f"Weekly schedule {schedule['id'][:8]} created. "
+                f"Weekly plan for {', '.join(WEEKDAY_NAMES[day] for day in schedule['weekdays'])} created. "
                 f"Next send: {_format_berlin_datetime(schedule['next_run_at'])}."
             )
         except (ValueError, ScheduleLimitError) as exc:
@@ -2078,7 +2164,7 @@ def render_weekly_report_schedules(user, runner_ok, mail_ready):
         rows.append({
             "Ticker": schedule["ticker"],
             "Recipient": schedule["recipient_masked"],
-            "Weekly time": f"{WEEKDAY_NAMES[schedule['weekday']]} {schedule['local_time']}",
+            "Weekly time": f"{', '.join(WEEKDAY_NAMES[day] for day in schedule['weekdays'])} {schedule['local_time']}",
             "Status": "Active" if schedule["is_active"] else "Paused",
             "Next send (Berlin)": _format_berlin_datetime(schedule["next_run_at"]),
         })
@@ -2090,7 +2176,7 @@ def render_weekly_report_schedules(user, runner_ok, mail_ready):
         list(schedule_map),
         format_func=lambda schedule_id: (
             f"{schedule_map[schedule_id]['ticker']} - "
-            f"{WEEKDAY_NAMES[schedule_map[schedule_id]['weekday']]} "
+            f"{', '.join(WEEKDAY_NAMES[day] for day in schedule_map[schedule_id]['weekdays'])} "
             f"{schedule_map[schedule_id]['local_time']} - "
             f"{schedule_map[schedule_id]['recipient_masked']}"
         ),
@@ -2132,45 +2218,72 @@ def render_daily_report(user):
 
     download_tab, email_tab = st.tabs(["Generate & Download", "Generate & Email"])
     with download_tab:
-        with st.form("daily_report_download_form"):
-            ticker, _, months, search_provider, no_article_fetch = render_report_form_fields("daily_report_download")
-            submitted = st.form_submit_button("Generate Download", disabled=not runner_ok)
+        if not user:
+            st.info(
+                "Sign in with an administrator-issued account to generate AI Agent reports. "
+                "Guest access is not available for this resource-intensive feature."
+            )
+        else:
+            st.caption(
+                "One active generation and five downloads per account per UTC day are allowed by default. "
+                "A server-wide concurrency limit also applies."
+            )
+            with st.form("daily_report_download_form"):
+                ticker, _, months, search_provider, no_article_fetch = render_report_form_fields("daily_report_download")
+                submitted = st.form_submit_button("Generate Download", disabled=not runner_ok)
 
-        if submitted:
-            cache_key = user["cache_key"] if user else "guest"
-            with st.spinner(f"Generating {ticker} AI Agent report... This can take a few minutes."):
-                st.session_state["daily_report_result"] = generate_report(
-                    normalize_yfinance_ticker(ticker),
-                    user_scope=cache_key,
-                    months=months,
-                    search_provider=search_provider,
-                    no_article_fetch=no_article_fetch,
-                )
+            if submitted:
+                cache_key = user["cache_key"]
+                session_id = None
+                try:
+                    check_download_generation_limits(cache_key)
+                    session_id = start_download_generation(cache_key, normalize_yfinance_ticker(ticker))
+                except (ActiveJobError, DailyLimitError, ValueError) as exc:
+                    st.error(str(exc))
+                    st.session_state["daily_report_result"] = None
+                else:
+                    result = None
+                    try:
+                        with st.spinner(f"Generating {ticker} AI Agent report... This can take a few minutes."):
+                            result = generate_report(
+                                normalize_yfinance_ticker(ticker),
+                                user_scope=cache_key,
+                                months=months,
+                                search_provider=search_provider,
+                                no_article_fetch=no_article_fetch,
+                            )
+                            st.session_state["daily_report_result"] = result
+                    finally:
+                        if session_id:
+                            finish_download_generation(
+                                session_id,
+                                success=bool(result and result.get("success")),
+                            )
 
-        result = st.session_state.get("daily_report_result")
-        if result:
-            if result.get("success"):
-                st.success(f"Report generated in {result.get('elapsed', 0):.1f}s")
-                st.download_button(
-                    "Download HTML Report",
-                    data=result["html_bytes"],
-                    file_name=result["file_name"],
-                    mime="text/html",
-                    width="stretch",
-                    key=f"download_daily_report_{result['file_name']}",
-                )
-                with st.expander("Generation log", expanded=False):
-                    if result.get("stdout"):
-                        st.code(result["stdout"])
-                    if result.get("stderr"):
-                        st.code(result["stderr"])
-            else:
-                st.error(result.get("error", "Daily report generation failed."))
-                with st.expander("Generation log", expanded=True):
-                    if result.get("stdout"):
-                        st.code(result["stdout"])
-                    if result.get("stderr"):
-                        st.code(result["stderr"])
+            result = st.session_state.get("daily_report_result")
+            if result:
+                if result.get("success"):
+                    st.success(f"Report generated in {result.get('elapsed', 0):.1f}s")
+                    st.download_button(
+                        "Download HTML Report",
+                        data=result["html_bytes"],
+                        file_name=result["file_name"],
+                        mime="text/html",
+                        width="stretch",
+                        key=f"download_daily_report_{result['file_name']}",
+                    )
+                    with st.expander("Generation log", expanded=False):
+                        if result.get("stdout"):
+                            st.code(result["stdout"])
+                        if result.get("stderr"):
+                            st.code(result["stderr"])
+                else:
+                    st.error(result.get("error", "Daily report generation failed."))
+                    with st.expander("Generation log", expanded=True):
+                        if result.get("stdout"):
+                            st.code(result["stdout"])
+                        if result.get("stderr"):
+                            st.code(result["stderr"])
 
     with email_tab:
         if not user:
@@ -2213,7 +2326,7 @@ def render_daily_report(user):
                         f"Job {job['id'][:8]} queued for {job['recipient_masked']}. "
                         "You may now close this page."
                     )
-                except (ValueError, ActiveJobError, DailyLimitError) as exc:
+                except (ValueError, ActiveJobError, DailyLimitError, QueueFullError) as exc:
                     st.error(str(exc))
 
         with weekly_tab:
@@ -2222,7 +2335,12 @@ def render_daily_report(user):
         render_email_job_status(user["cache_key"])
 
 
-ensure_flask()
+_backend_ok, _backend_msg = ensure_backend()
+if not _backend_ok:
+    st.warning(
+        f"⚠️ 后端服务不可用: {_backend_msg}。"
+        "AI 日报功能不受影响，股票数据和 K 线图功能可能受限。"
+    )
 user = render_auth_panel()
 editable = bool(user)
 cache_key = user["cache_key"] if user else ""
@@ -2289,37 +2407,43 @@ config_json = json.dumps(config, sort_keys=True)
 with st.spinner("Loading watch list data..."):
     stock_payload = fetch_stock_data(config_json, cache_key)
 
-if not stock_payload.get("success"):
-    st.error(stock_payload.get("error", "Failed to load stock data"))
-    st.stop()
-
-raw_df = pd.DataFrame(stock_payload["data"])
-display_df = convert_stock_df_for_display(raw_df, display_currency)
+_stock_data_ok = stock_payload.get("success", False)
+if _stock_data_ok:
+    raw_df = pd.DataFrame(stock_payload["data"])
+    display_df = convert_stock_df_for_display(raw_df, display_currency)
+else:
+    display_df = pd.DataFrame()
 
 main_tabs = st.tabs([SECTION_META["stocks_pages"]["tab"], SECTION_META["broad_pages"]["tab"], "Market Breadth", "AI Agent Reports"])
 with main_tabs[0]:
-    config = render_section(
-        SECTION_META["stocks_pages"]["title"],
-        "stocks_pages",
-        config,
-        display_df,
-        editable,
-        user,
-        dark_mode=dark_mode,
-        display_currency=display_currency,
-    )
+    if not _stock_data_ok:
+        st.error(stock_payload.get("error", "Failed to load stock data"))
+    else:
+        config = render_section(
+            SECTION_META["stocks_pages"]["title"],
+            "stocks_pages",
+            config,
+            display_df,
+            editable,
+            user,
+            dark_mode=dark_mode,
+            display_currency=display_currency,
+        )
 
 with main_tabs[1]:
-    config = render_section(
-        SECTION_META["broad_pages"]["title"],
-        "broad_pages",
-        config,
-        display_df,
-        editable,
-        user,
-        dark_mode=dark_mode,
-        display_currency=display_currency,
-    )
+    if not _stock_data_ok:
+        st.error(stock_payload.get("error", "Failed to load stock data"))
+    else:
+        config = render_section(
+            SECTION_META["broad_pages"]["title"],
+            "broad_pages",
+            config,
+            display_df,
+            editable,
+            user,
+            dark_mode=dark_mode,
+            display_currency=display_currency,
+        )
 
 with main_tabs[2]:
     st.subheader("Market Breadth")

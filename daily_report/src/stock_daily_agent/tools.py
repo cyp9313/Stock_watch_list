@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import http.client
+import ipaddress
 import json
 import os
 import re
+import socket
+import ssl
 import time
 from html import unescape
 from html.parser import HTMLParser
@@ -12,7 +16,7 @@ from urllib.parse import urljoin, urlparse
 
 try:
     from qwen_agent.tools.base import BaseTool
-except Exception:  # Allows static checks before qwen-agent is installed.
+except ImportError:  # Allows static checks before qwen-agent is installed.
     class BaseTool:  # type: ignore
         name = ""
         description = ""
@@ -127,7 +131,7 @@ def _extract_json_payload(text: str) -> dict[str, Any] | None:
     try:
         data = json.loads(raw)
         return data if isinstance(data, dict) else None
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         pass
     start = raw.find("{")
     end = raw.rfind("}")
@@ -135,7 +139,7 @@ def _extract_json_payload(text: str) -> dict[str, Any] | None:
         try:
             data = json.loads(raw[start : end + 1])
             return data if isinstance(data, dict) else None
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             return None
     return None
 
@@ -205,7 +209,7 @@ def _load_current_data(ctx: RunContext) -> dict[str, Any]:
         return {}
     try:
         return json.loads(ctx.data_file.read_text(encoding="utf-8"))
-    except Exception:
+    except (json.JSONDecodeError, OSError, ValueError):
         return {}
 
 
@@ -498,7 +502,7 @@ def _dedupe_evidence(items: list[dict[str, Any]], max_items: int) -> list[dict[s
 def _source_domain(url: str) -> str:
     try:
         return urlparse(url).netloc.lower().removeprefix("www.")
-    except Exception:
+    except (ValueError, TypeError, AttributeError):
         return ""
 
 
@@ -828,7 +832,7 @@ def _load_json_file(path: Path) -> dict[str, Any]:
         return {}
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except (json.JSONDecodeError, OSError, ValueError):
         return {}
 
 
@@ -919,161 +923,27 @@ def _resolve_note_to_evidence(note: Any, records: dict[str, dict[str, Any]]) -> 
     return False, None, "缺少 evidence_id，且无法通过 URL 匹配到本地 evidence/articles。"
 
 
-class _ArticleTextParser(HTMLParser):
-    """Small stdlib HTML text extractor; intentionally dependency-light."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.skip_depth = 0
-        self.parts: list[str] = []
-        self.title_parts: list[str] = []
-        self.meta_description = ""
-        self.meta_date = ""
-        self.in_title = False
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        tag_l = tag.lower()
-        attrs_d = {k.lower(): (v or "") for k, v in attrs}
-        if tag_l in {"script", "style", "noscript", "svg", "nav", "footer", "form"}:
-            self.skip_depth += 1
-        if tag_l == "title":
-            self.in_title = True
-        if tag_l == "meta":
-            name = (attrs_d.get("name") or attrs_d.get("property") or "").lower()
-            content = attrs_d.get("content") or ""
-            if name in {"description", "og:description", "twitter:description"} and not self.meta_description:
-                self.meta_description = content.strip()
-            if name in {"article:published_time", "published_time", "date", "dc.date", "dc.date.issued", "pubdate"} and not self.meta_date:
-                self.meta_date = content.strip()[:10]
-
-    def handle_endtag(self, tag: str) -> None:
-        tag_l = tag.lower()
-        if tag_l in {"script", "style", "noscript", "svg", "nav", "footer", "form"} and self.skip_depth > 0:
-            self.skip_depth -= 1
-        if tag_l == "title":
-            self.in_title = False
-        if tag_l in {"p", "br", "li", "h1", "h2", "h3", "div"} and self.skip_depth == 0:
-            self.parts.append("\n")
-
-    def handle_data(self, data: str) -> None:
-        if not data or self.skip_depth > 0:
-            return
-        txt = unescape(data).strip()
-        if not txt:
-            return
-        if self.in_title:
-            self.title_parts.append(txt)
-        # Keep paragraph-like text and meaningful short metadata text.
-        if len(txt) >= 30 or any(ch.isdigit() for ch in txt):
-            self.parts.append(txt)
-
-    @property
-    def title(self) -> str:
-        return re.sub(r"\s+", " ", " ".join(self.title_parts)).strip()
-
-    @property
-    def text(self) -> str:
-        raw = " ".join(self.parts)
-        raw = re.sub(r"\s+", " ", raw)
-        return raw.strip()
-
-
-def _fetch_article_text(url: str, timeout: float = 12, max_chars: int = 5000) -> dict[str, Any]:
-    try:
-        import requests
-    except Exception as exc:
-        raise ToolError("缺少 requests 依赖，请运行: python -m pip install requests") from exc
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; qwen-stock-skill-agent/0.5; +https://example.local)",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
-    resp = requests.get(url, timeout=timeout, headers=headers, allow_redirects=True)
-    resp.raise_for_status()
-    content_type = resp.headers.get("Content-Type", "")
-    if "html" not in content_type.lower() and not resp.text.lstrip().startswith("<"):
-        return {
-            "url": url,
-            "ok": False,
-            "error": f"Unsupported content type: {content_type}",
-            "status_code": resp.status_code,
-        }
-    parser = _ArticleTextParser()
-    parser.feed(resp.text[: max(max_chars * 20, 120000)])
-    text = parser.text
-    if len(text) > max_chars:
-        text = text[:max_chars].rsplit(" ", 1)[0] + " ...[TRUNCATED]"
-    record = {
-        "url": url,
-        "final_url": resp.url,
-        "ok": bool(text or parser.meta_description),
-        "status_code": resp.status_code,
-        "title": parser.title,
-        "meta_description": parser.meta_description,
-        "published_date": parser.meta_date,
-        "text": text,
-        "text_chars": len(text),
-        "source_domain": _source_domain(resp.url),
-    }
-    record["article_text_quality_ok"] = _article_text_quality_ok(record)
-    if not record["article_text_quality_ok"]:
-        if _is_blocked_or_consent_text(" ".join([parser.title, parser.meta_description, text]), resp.url):
-            record["quality_reason"] = "blocked_or_consent_or_login_page"
-        elif len(text) < int(os.environ.get("ARTICLE_MIN_TEXT_CHARS", "800")):
-            record["quality_reason"] = f"text_too_short:{len(text)}"
-        else:
-            record["quality_reason"] = "missing_finance_context_or_numbers"
-    return record
-
-
-def _enrich_evidence_with_articles(items: list[dict[str, Any]], max_urls: int, max_chars: int, timeout: float) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    if max_urls <= 0:
-        return items, []
-    enriched: list[dict[str, Any]] = []
-    article_records: list[dict[str, Any]] = []
-    candidates = sorted(items, key=lambda x: int(x.get("source_quality_score") or _source_quality_score(x)), reverse=True)
-    urls_done = 0
-    url_to_article: dict[str, dict[str, Any]] = {}
-    for item in candidates:
-        url = str(item.get("url") or "").strip()
-        if not url or urls_done >= max_urls:
-            break
-        domain = _source_domain(url)
-        # Skip sources that are commonly hostile to scraping or too low value unless they scored high.
-        if int(item.get("source_quality_score") or _source_quality_score(item)) < 55 and not any(x in domain for x in ["oracle.com", "sec.gov"]):
-            continue
-        try:
-            article = _fetch_article_text(url, timeout=timeout, max_chars=max_chars)
-        except Exception as exc:
-            article = {"url": url, "ok": False, "error": str(exc), "source_domain": domain}
-        url_to_article[url] = article
-        article_records.append(article)
-        urls_done += 1
-
-    for item in items:
-        url = str(item.get("url") or "").strip()
-        article = url_to_article.get(url)
-        if article and article.get("ok"):
-            item = dict(item)
-            item["article_fetch_ok"] = True
-            item["article_text_quality_ok"] = bool(article.get("article_text_quality_ok"))
-            item["article_quality_reason"] = article.get("quality_reason", "")
-            if article.get("published_date") and str(item.get("source_date") or "unknown").lower() == "unknown":
-                item["source_date"] = article.get("published_date")
-            title = article.get("title") or item.get("title")
-            meta = article.get("meta_description") or ""
-            body = article.get("text") or ""
-            combined = " ".join(x for x in [meta, body] if x).strip()
-            if combined and article.get("article_text_quality_ok"):
-                item["article_text"] = combined[:max_chars]
-                # facts remains compact but now grounded in fetched page text, not only SERP snippet.
-                item["facts"] = (combined[:900].rsplit(" ", 1)[0] + " ...") if len(combined) > 900 else combined
-            elif meta:
-                item.setdefault("meta_description", meta)
-            if title:
-                item["title"] = title
-        enriched.append(item)
-    return enriched, article_records
+# Article fetching subsystem (SSRF defenses) extracted to article_fetcher.py
+# (P2-10B).  Re-exported here for backward compatibility so that callers
+# and tests referencing tools._fetch_article_text etc. continue to work.
+from .article_fetcher import (
+    ArticleFetchSecurityError,
+    _ArticleTextParser,
+    _ARTICLE_REDIRECT_STATUSES,
+    _MAX_ARTICLE_RESPONSE_BYTES,
+    _PinnedHTTPSConnection,
+    _article_fetch_allowed_ports,
+    _article_fetch_int_env,
+    _article_host_header,
+    _article_request_target,
+    _decode_article_response,
+    _enrich_evidence_with_articles,
+    _fetch_article_text,
+    _is_public_ip,
+    _open_pinned_article_request,
+    _read_article_response,
+    _validate_article_url,
+)
 
 
 def _build_market_queries(ticker: str, data: dict[str, Any], language: str) -> list[tuple[str, str]]:
@@ -2272,7 +2142,7 @@ class SaveEvidenceTool(BaseTool):
 def _clamp_score(v: float, lo: float = 0.0, hi: float = 100.0) -> float:
     try:
         return max(lo, min(hi, float(v)))
-    except Exception:
+    except (ValueError, TypeError):
         return 50.0
 
 
@@ -2305,7 +2175,7 @@ def _safe_float_value(v: Any, default: float = 0.0) -> float:
         if v is None or v == "":
             return default
         return float(v)
-    except Exception:
+    except (ValueError, TypeError):
         return default
 
 
@@ -2663,12 +2533,12 @@ def _compute_final_rating_payload(ctx: RunContext, notes: list[Any]) -> dict[str
             current["final_rating"] = payload
             current["score_input_audit"] = audit
             ctx.data_file.write_text(json_dumps(current), encoding="utf-8")
-    except Exception:
+    except (OSError, json.JSONDecodeError, ValueError):
         pass
     try:
         (ctx.run_dir / f"{ctx.ticker}_final_rating.json").write_text(json_dumps(payload), encoding="utf-8")
         (ctx.run_dir / f"{ctx.ticker}_score_input_audit.json").write_text(json_dumps(audit), encoding="utf-8")
-    except Exception:
+    except OSError:
         pass
     return payload
 
@@ -2725,7 +2595,7 @@ class SaveNewsNotesTool(BaseTool):
                             if eid and eid not in existing_tech_ids:
                                 notes.append(tech_note)
                                 existing_tech_ids.add(eid)
-                except Exception:
+                except (KeyError, AttributeError, TypeError, ValueError):
                     pass
 
             # V5 evidence gate: every non-technical note must bind to a local, verifiable
@@ -2879,7 +2749,7 @@ class BuildHtmlReportTool(BaseTool):
             return json_dumps({"ok": False, "errors": ["缺少 data_file，请先调用 fetch_technical_data。"]})
         if not ctx.chart_file.exists():
             return json_dumps({"ok": False, "errors": ["缺少 chart_file，请先调用 generate_technical_chart。"]})
-        args = [str(ctx.data_file), str(ctx.chart_file), str(ctx.final_output_html), "--date", ctx.report_date]
+        args = [str(ctx.data_file), str(ctx.chart_file), str(ctx.final_output_html), "--date", ctx.report_date, "--months", str(ctx.months)]
         if use_notes:
             if not ctx.notes_file.exists():
                 return json_dumps({"ok": False, "errors": ["缺少 notes_file，请先调用 save_news_notes，或 use_notes=false。"]})
