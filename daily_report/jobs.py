@@ -161,6 +161,27 @@ def init_job_db() -> None:
                 "CREATE INDEX IF NOT EXISTS idx_report_schedules_owner "
                 "ON report_schedules(owner_key, created_at DESC)"
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS download_generations (
+                    id TEXT PRIMARY KEY,
+                    owner_key TEXT NOT NULL,
+                    ticker TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    elapsed REAL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_download_generations_owner "
+                "ON download_generations(owner_key, created_at DESC)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_download_generations_status "
+                "ON download_generations(status, created_at)"
+            )
         _INITIALIZED_DATABASES.add(database_key)
 
 
@@ -710,3 +731,126 @@ def materialize_due_schedules(now_utc: dt.datetime | None = None) -> int:
         raise
     finally:
         conn.close()
+
+
+# ── Synchronous download generation rate-limiting ────────────────
+
+DOWNLOAD_ACTIVE_STATUSES = ("generating",)
+_DOWNLOAD_STALE_SECONDS = 1860  # DEFAULT_TIMEOUT_SECONDS (1800) + 60s grace
+
+
+def cleanup_stale_download_generations(now: dt.datetime | None = None) -> int:
+    """Mark download generations stuck in 'generating' as 'failed'."""
+    now = now or _now()
+    cutoff = now - dt.timedelta(seconds=_DOWNLOAD_STALE_SECONDS)
+    with _connection() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE download_generations
+            SET status='failed', finished_at=?
+            WHERE status='generating' AND created_at<?
+            """,
+            (_iso(now), _iso(cutoff)),
+        )
+    return cursor.rowcount
+
+
+def check_download_generation_limits(owner_key: str) -> None:
+    """Raise ActiveJobError or DailyLimitError if the user cannot start a download.
+
+    Limits (all configurable via environment variables):
+    - Per-user active downloads: REPORT_DOWNLOAD_MAX_ACTIVE_PER_USER (default 1)
+    - Per-user daily downloads:  REPORT_DOWNLOAD_DAILY_LIMIT_PER_USER (default 5)
+    - Global active downloads:   REPORT_DOWNLOAD_MAX_GLOBAL_ACTIVE (default 3)
+    """
+    owner_key = str(owner_key or "").strip()
+    if not owner_key:
+        raise ValueError("A signed-in account is required to generate download reports.")
+
+    cleanup_stale_download_generations()
+
+    max_per_user = max(1, int(os.environ.get("REPORT_DOWNLOAD_MAX_ACTIVE_PER_USER", "1")))
+    daily_limit = max(1, int(os.environ.get("REPORT_DOWNLOAD_DAILY_LIMIT_PER_USER", "5")))
+    max_global = max(1, int(os.environ.get("REPORT_DOWNLOAD_MAX_GLOBAL_ACTIVE", "3")))
+
+    now = _now()
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    init_job_db()
+    with _connection() as conn:
+        user_active = conn.execute(
+            "SELECT COUNT(*) FROM download_generations WHERE owner_key=? AND status='generating'",
+            (owner_key,),
+        ).fetchone()[0]
+        if user_active >= max_per_user:
+            raise ActiveJobError(
+                f"You already have a download report generating. "
+                f"Max {max_per_user} concurrent per account."
+            )
+
+        global_active = conn.execute(
+            "SELECT COUNT(*) FROM download_generations WHERE status='generating'",
+        ).fetchone()[0]
+        if global_active >= max_global:
+            raise ActiveJobError(
+                f"The server is currently generating the maximum number of reports ({max_global}). "
+                f"Please try again in a few minutes."
+            )
+
+        today_count = conn.execute(
+            "SELECT COUNT(*) FROM download_generations WHERE owner_key=? AND created_at>=?",
+            (owner_key, _iso(day_start)),
+        ).fetchone()[0]
+        if today_count >= daily_limit:
+            raise DailyLimitError(
+                f"Daily download report limit reached ({daily_limit} per account)."
+            )
+
+
+def start_download_generation(owner_key: str, ticker: str) -> str:
+    """Record the start of a synchronous download generation and return its session ID."""
+    owner_key = str(owner_key or "").strip()
+    ticker = str(ticker or "").strip().upper()
+    if not owner_key:
+        raise ValueError("A signed-in account is required to generate download reports.")
+    session_id = uuid.uuid4().hex
+    now = _now()
+    init_job_db()
+    with _connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO download_generations (id, owner_key, ticker, status, created_at)
+            VALUES (?, ?, ?, 'generating', ?)
+            """,
+            (session_id, owner_key, ticker, _iso(now)),
+        )
+    return session_id
+
+
+def finish_download_generation(session_id: str, *, success: bool = True) -> None:
+    """Mark a download generation as done or failed."""
+    status = "done" if success else "failed"
+    now = _now()
+    init_job_db()
+    with _connection() as conn:
+        row = conn.execute(
+            "SELECT created_at FROM download_generations WHERE id=?",
+            (session_id,),
+        ).fetchone()
+        elapsed = None
+        if row is not None:
+            try:
+                created = dt.datetime.fromisoformat(row["created_at"])
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=dt.timezone.utc)
+                elapsed = (now - created).total_seconds()
+            except (ValueError, TypeError):
+                pass
+        conn.execute(
+            """
+            UPDATE download_generations
+            SET status=?, finished_at=?, elapsed=?
+            WHERE id=?
+            """,
+            (status, _iso(now), elapsed, session_id),
+        )

@@ -24,12 +24,15 @@ from daily_report.jobs import (
     DailyLimitError,
     ScheduleLimitError,
     WEEKDAY_NAMES,
+    check_download_generation_limits,
     create_weekly_schedule,
     delete_schedule,
     enqueue_email_job,
+    finish_download_generation,
     list_owner_jobs,
     list_owner_schedules,
     set_schedule_active,
+    start_download_generation,
 )
 from daily_report.mailer import smtp_configured
 from daily_report.service import generate_report, runtime_available
@@ -2132,45 +2135,72 @@ def render_daily_report(user):
 
     download_tab, email_tab = st.tabs(["Generate & Download", "Generate & Email"])
     with download_tab:
-        with st.form("daily_report_download_form"):
-            ticker, _, months, search_provider, no_article_fetch = render_report_form_fields("daily_report_download")
-            submitted = st.form_submit_button("Generate Download", disabled=not runner_ok)
+        if not user:
+            st.info(
+                "Sign in with an administrator-issued account to generate AI Agent reports. "
+                "Guest access is not available for this resource-intensive feature."
+            )
+        else:
+            st.caption(
+                "One active generation and five downloads per account per UTC day are allowed by default. "
+                "A server-wide concurrency limit also applies."
+            )
+            with st.form("daily_report_download_form"):
+                ticker, _, months, search_provider, no_article_fetch = render_report_form_fields("daily_report_download")
+                submitted = st.form_submit_button("Generate Download", disabled=not runner_ok)
 
-        if submitted:
-            cache_key = user["cache_key"] if user else "guest"
-            with st.spinner(f"Generating {ticker} AI Agent report... This can take a few minutes."):
-                st.session_state["daily_report_result"] = generate_report(
-                    normalize_yfinance_ticker(ticker),
-                    user_scope=cache_key,
-                    months=months,
-                    search_provider=search_provider,
-                    no_article_fetch=no_article_fetch,
-                )
+            if submitted:
+                cache_key = user["cache_key"]
+                session_id = None
+                try:
+                    check_download_generation_limits(cache_key)
+                    session_id = start_download_generation(cache_key, normalize_yfinance_ticker(ticker))
+                except (ActiveJobError, DailyLimitError, ValueError) as exc:
+                    st.error(str(exc))
+                    st.session_state["daily_report_result"] = None
+                else:
+                    result = None
+                    try:
+                        with st.spinner(f"Generating {ticker} AI Agent report... This can take a few minutes."):
+                            result = generate_report(
+                                normalize_yfinance_ticker(ticker),
+                                user_scope=cache_key,
+                                months=months,
+                                search_provider=search_provider,
+                                no_article_fetch=no_article_fetch,
+                            )
+                            st.session_state["daily_report_result"] = result
+                    finally:
+                        if session_id:
+                            finish_download_generation(
+                                session_id,
+                                success=bool(result and result.get("success")),
+                            )
 
-        result = st.session_state.get("daily_report_result")
-        if result:
-            if result.get("success"):
-                st.success(f"Report generated in {result.get('elapsed', 0):.1f}s")
-                st.download_button(
-                    "Download HTML Report",
-                    data=result["html_bytes"],
-                    file_name=result["file_name"],
-                    mime="text/html",
-                    width="stretch",
-                    key=f"download_daily_report_{result['file_name']}",
-                )
-                with st.expander("Generation log", expanded=False):
-                    if result.get("stdout"):
-                        st.code(result["stdout"])
-                    if result.get("stderr"):
-                        st.code(result["stderr"])
-            else:
-                st.error(result.get("error", "Daily report generation failed."))
-                with st.expander("Generation log", expanded=True):
-                    if result.get("stdout"):
-                        st.code(result["stdout"])
-                    if result.get("stderr"):
-                        st.code(result["stderr"])
+            result = st.session_state.get("daily_report_result")
+            if result:
+                if result.get("success"):
+                    st.success(f"Report generated in {result.get('elapsed', 0):.1f}s")
+                    st.download_button(
+                        "Download HTML Report",
+                        data=result["html_bytes"],
+                        file_name=result["file_name"],
+                        mime="text/html",
+                        width="stretch",
+                        key=f"download_daily_report_{result['file_name']}",
+                    )
+                    with st.expander("Generation log", expanded=False):
+                        if result.get("stdout"):
+                            st.code(result["stdout"])
+                        if result.get("stderr"):
+                            st.code(result["stderr"])
+                else:
+                    st.error(result.get("error", "Daily report generation failed."))
+                    with st.expander("Generation log", expanded=True):
+                        if result.get("stdout"):
+                            st.code(result["stdout"])
+                        if result.get("stderr"):
+                            st.code(result["stderr"])
 
     with email_tab:
         if not user:

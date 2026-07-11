@@ -67,9 +67,11 @@ daily_report/runs/
 .DS_Store
 Thumbs.db
 
-# Test files
+# Keep legacy ad-hoc test scripts ignored, but track the maintained suite.
 test_*.py
 _test_*.py
+!tests/
+!tests/**
 
 # Workbuddy
 .workbuddy/

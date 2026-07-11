@@ -24,6 +24,23 @@ import sys
 import json
 import re
 from datetime import date as Date
+from html import escape as html_escape
+
+
+_ALLOWED_SIGNAL_CLASSES = {"signal-bull", "signal-bear", "signal-neutral"}
+_ALLOWED_RATING_CLASSES = {"buy", "hold", "avoid"}
+_ALLOWED_PRICE_COLORS = {"#3fb950", "#f85149"}
+_ALLOWED_INSTRUMENT_TYPES = {"EQUITY", "ETF", "INDEX", "CRYPTO", "OTHER"}
+
+
+def escape_text(value):
+    """Escape all untrusted text before it is interpolated into report HTML."""
+    return html_escape(str(value if value is not None else ""), quote=True)
+
+
+def allow_value(value, allowed, fallback):
+    """Keep dynamic HTML/CSS tokens within a small, fixed allowlist."""
+    return value if isinstance(value, str) and value in allowed else fallback
 
 
 # ─────────────────────────────────────────────────
@@ -47,6 +64,8 @@ while i < len(sys.argv):
         NOTES_FILE = sys.argv[i+1]; i += 2
     else:
         i += 1
+
+REPORT_DATE = escape_text(REPORT_DATE)
 
 # ─────────────────────────────────────────────────
 #  读取数据
@@ -85,12 +104,16 @@ CHG       = d['CHG']
 PCT       = d['PCT']
 chg_sign  = d['chg_sign']
 chg_arrow = d['chg_arrow']
-price_col = d['price_color']
-TICKER    = d['TICKER']
-LONG_NAME = d['LONG_NAME']
-SHORT_NAME= d['SHORT_NAME']
-SECTOR    = d.get('SECTOR', '—')
-EXCHANGE  = d.get('EXCHANGE', '—')
+price_col = allow_value(
+    d['price_color'],
+    _ALLOWED_PRICE_COLORS,
+    '#3fb950' if CHG >= 0 else '#f85149',
+)
+TICKER    = escape_text(d['TICKER'])
+LONG_NAME = escape_text(d['LONG_NAME'])
+SHORT_NAME= escape_text(d['SHORT_NAME'])
+SECTOR    = escape_text(d.get('SECTOR', '—'))
+EXCHANGE  = escape_text(d.get('EXCHANGE', '—'))
 CURRENCY  = d.get('CURRENCY', 'USD')
 EMPLOYEES = d.get('EMPLOYEES', 0)
 
@@ -145,12 +168,12 @@ tgt_mean_str = fs(TARGET_MEAN); tgt_hi_str = fs(TARGET_HI); tgt_lo_str = fs(TARG
 ana_cnt_str = str(ANALYST_CNT)
 ma5_str  = fs(ma5); ma10_str = fs(ma10); ma20_str = fs(ma20)
 ma50_str = fs(ma50); ma120_str= fs(ma120); ma200_str= fs(ma200)
-ma5_sig  = ma5_pos[0]; ma5_cls  = ma5_pos[1]
-ma10_sig = ma10_pos[0]; ma10_cls = ma10_pos[1]
-ma20_sig = ma20_pos[0]; ma20_cls = ma20_pos[1]
-ma50_sig = ma50_pos[0]; ma50_cls = ma50_pos[1]
-ma120_sig= ma120_pos[0]; ma120_cls= ma120_pos[1]
-ma200_sig= ma200_pos[0]; ma200_cls= ma200_pos[1]
+ma5_sig  = escape_text(ma5_pos[0]); ma5_cls  = allow_value(ma5_pos[1], _ALLOWED_SIGNAL_CLASSES, 'signal-neutral')
+ma10_sig = escape_text(ma10_pos[0]); ma10_cls = allow_value(ma10_pos[1], _ALLOWED_SIGNAL_CLASSES, 'signal-neutral')
+ma20_sig = escape_text(ma20_pos[0]); ma20_cls = allow_value(ma20_pos[1], _ALLOWED_SIGNAL_CLASSES, 'signal-neutral')
+ma50_sig = escape_text(ma50_pos[0]); ma50_cls = allow_value(ma50_pos[1], _ALLOWED_SIGNAL_CLASSES, 'signal-neutral')
+ma120_sig= escape_text(ma120_pos[0]); ma120_cls= allow_value(ma120_pos[1], _ALLOWED_SIGNAL_CLASSES, 'signal-neutral')
+ma200_sig= escape_text(ma200_pos[0]); ma200_cls= allow_value(ma200_pos[1], _ALLOWED_SIGNAL_CLASSES, 'signal-neutral')
 rsi_str   = fs(rsi, 1); macd_str  = fs(macd_line, 3)
 signal_str= fs(signal_l, 3); hist_str = fs(hist_val, 3)
 k_str = fs(k_val, 1); d_str = fs(d_val, 1); j_str = fs(j_val, 1)
@@ -177,7 +200,7 @@ chip_va_str = (fs(float(chip.get('value_area_low', 0) or 0)) + ' – ' + fs(floa
 chip_overhead_str = f"{float(chip.get('overhead_supply_ratio', 0) or 0)*100:.1f}%" if chip_ok else '—'
 chip_support_str = f"{float(chip.get('support_volume_ratio', 0) or 0)*100:.1f}%" if chip_ok else '—'
 chip_score_str = f"{float(chip.get('chip_score', 50) or 50):.1f}/100" if chip_ok else '—'
-chip_signal = str(chip.get('chip_signal') or 'N/A') if chip_ok else 'N/A'
+chip_signal = escape_text(chip.get('chip_signal') or 'N/A') if chip_ok else 'N/A'
 tech_score = float(d.get('technical_score', 50) or 50)
 tech_subscores = d.get('technical_subscores') or {}
 final_rating = d.get('final_rating') or {}
@@ -249,6 +272,11 @@ else:
     rating_effective_weights = {}
     instrument_type = str(d.get('INSTRUMENT_TYPE') or 'EQUITY')
 
+rating_text = escape_text(rating_text)
+rating_cls = allow_value(rating_cls, _ALLOWED_RATING_CLASSES, 'hold')
+rating_method = escape_text(rating_method)
+instrument_type = allow_value(instrument_type.upper(), _ALLOWED_INSTRUMENT_TYPES, 'OTHER')
+
 # 消息面区块
 def build_news_html(news_items):
     if not news_items:
@@ -260,7 +288,7 @@ def build_news_html(news_items):
     for sentiment, tag_cls, tag_label, text in news_items:
         parts.append(f'''<div class="news-card {sentiment}">
   <div class="news-tag {tag_cls}">{tag_label}</div>
-  <div class="news-summary">{text}</div>
+  <div class="news-summary">{escape_text(text)}</div>
 </div>''')
     return '\n'.join(parts)
 
@@ -275,6 +303,7 @@ beta_str = fs(BETA, 2) if BETA > 0 else '—'
 # 描述
 desc = d.get('DESCRIPTION', '')
 desc_short = (desc[:200] + '...') if len(desc) > 200 else desc
+desc_short = escape_text(desc_short)
 
 # ─────────────────────────────────────────────────
 #  HTML 模板拼装（用字符串连接，避免 f-string 嵌套）
@@ -406,6 +435,9 @@ html += '  <!-- 技术面分析 -->\n  <div class="section">\n'
 html += '    <div class="section-title"><span class="icon">📊</span> 技术面分析</div>\n\n'
 html += '    <!-- K线图 -->\n    <div class="chart-container">\n'
 html += '      <div style="font-size:13px; color:#8b949e; margin-bottom:12px;">📈 近3个月K线图（含均线、布林带、成交量、MACD、RSI、KDJ）</div>\n'
+# chart_html is the only trusted HTML fragment: it is generated locally by
+# scripts/gen_chart.py in the isolated report run directory. All other text
+# interpolated into this document is escaped or allowlisted above.
 html += chart_html + '\n    </div>\n\n'
 
 # 技术指标卡片
@@ -518,7 +550,7 @@ html += '      <div class="score-grid">\n'
 for key, label in [('technical_score','技术'), ('news_score','消息'), ('valuation_score','估值'), ('analyst_score','分析师'), ('risk_score','风险')]:
     raw_val = rating_subscores.get(key)
     val_text = f"{float(raw_val):.0f}" if raw_val is not None else 'N/A'
-    status = str(rating_status.get(key, '') or '')
+    status = escape_text(rating_status.get(key, '') or '')
     eff_weight = rating_effective_weights.get(key)
     weight_text = f" · 权重 {float(eff_weight)*100:.0f}%" if eff_weight is not None else ''
     status_html = '<div style="font-size:10px;color:#8b949e;margin-top:2px;">' + status + weight_text + '</div>' if (status or weight_text) else ''
