@@ -1,0 +1,15 @@
+# ─────────────────────────────────────────────────────────────────────
+# Locked development/testing dependencies — DO NOT EDIT MANUALLY.
+# Generated from requirements-dev.in via: pip-compile requirements-dev.in
+# To update: pip-compile requirements-dev.in --upgrade
+# ─────────────────────────────────────────────────────────────────────
+
+# Includes all production dependencies from requirements.txt
+-r requirements.txt
+
+# ── Dev/test direct dependencies ─────────────────────────────────────
+pytest==9.1.1
+
+# ── Dev/test transitive dependencies ─────────────────────────────────
+iniconfig==2.3.0
+pluggy==1.6.0

@@ -1,0 +1,38 @@
+# Production dependencies — direct requirements with version constraints.
+# The locked versions are in requirements.txt (generated via pip-compile).
+# To regenerate: pip-compile requirements.in --upgrade
+#
+# Compatibility constraints documented below.
+
+# ── Web framework ────────────────────────────────────────────────────
+Flask>=3.0,<4.0           # Flask 3.x API; Flask 4 not yet released
+python-dotenv>=1.0,<2.0   # Used by test fixtures; config_loader replaces in production
+
+# ── Frontend ────────────────────────────────────────────────────────
+streamlit>=1.30,<2.0      # Streamlit 1.x API; st.* calls, session_state
+tksheet>=7.0,<8.0         # Tkinter table widget
+
+# ── Data / Finance ──────────────────────────────────────────────────
+yfinance>=0.2.50,<0.3     # yf.download/Ticker API; 0.2.x stable
+pandas>=2.0,<4.0          # DataFrame API; 2.x and 3.x compatible
+numpy>=1.24,<3.0          # Array operations; 2.x compatible
+pytz>=2024.1              # Timezone data
+tzdata>=2025.2            # IANA timezone database (Windows zoneinfo fallback)
+lxml>=5.0,<7.0            # XML/HTML parser for scraper
+
+# ── Plotting ────────────────────────────────────────────────────────
+matplotlib>=3.8,<4.0      # Chart rendering
+mplfinance>=0.12,<0.13    # Financial charts (K-line)
+plotly>=5.0,<7.0          # Interactive charts; include_plotlyjs=True for offline
+
+# ── HTTP / Caching ──────────────────────────────────────────────────
+Requests>=2.31,<3.0       # HTTP client
+requests_cache>=1.0,<2.0  # HTTP caching (installed_cache/uninstall_cache)
+fear_and_greed             # CNN Fear & Greed index (no version constraint, rarely updated)
+
+# ── AI / LLM ────────────────────────────────────────────────────────
+qwen-agent>=0.0.34        # Qwen Agent framework; exact API surface used
+dashscope>=1.20.0         # Alibaba DashScope SDK
+openai>=1.0.0             # OpenAI-compatible API client (for DeepSeek)
+json5>=0.9.0              # JSON5 parsing for LLM output
+soundfile>=0.12.1         # Audio file handling (qwen-agent dependency)
