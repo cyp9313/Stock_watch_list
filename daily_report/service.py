@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import datetime
 import os
 from pathlib import Path
 import re
@@ -9,6 +8,19 @@ import subprocess
 import sys
 import time
 import uuid
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None  # type: ignore[assignment]
+
+
+def _get_market_date() -> str:
+    """Get current date in US/Eastern timezone (NYSE/NASDAQ market date)."""
+    import datetime
+    if ZoneInfo is not None:
+        return datetime.datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    return datetime.date.today().isoformat()
 
 
 REPORT_ROOT = Path(__file__).resolve().parent
@@ -73,7 +85,7 @@ def generate_report(
     if not runtime_available():
         return {"success": False, "error": f"Integrated daily report runner not found: {REPORT_RUNNER}"}
 
-    report_date = datetime.date.today().isoformat()
+    report_date = _get_market_date()
     file_name = f"{_safe_ticker(ticker)}_report_{report_date}.html"
     run_dir = (
         REPORT_ROOT

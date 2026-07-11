@@ -49,7 +49,7 @@ def smtp_configured() -> bool:
     try:
         load_smtp_config()
         return True
-    except Exception:
+    except (RuntimeError, ValueError):
         return False
 
 

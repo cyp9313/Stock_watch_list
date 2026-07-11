@@ -1,7 +1,7 @@
 # Environment variables
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 
 # Virtual environment
 .venv/
@@ -54,6 +54,10 @@ user_data/
 *.pyc
 *.pyo
 *.pyd
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
 
 # Logs
 *.log
@@ -67,11 +71,10 @@ daily_report/runs/
 .DS_Store
 Thumbs.db
 
-# Keep legacy ad-hoc test scripts ignored, but track the maintained suite.
-test_*.py
-_test_*.py
-!tests/
-!tests/**
+# Keep legacy ad-hoc test scripts ignored only at the repository root.
+# Maintained tests under tests/ and daily_report/tests/ must be versioned.
+/test_*.py
+/_test_*.py
 
 # Workbuddy
 .workbuddy/

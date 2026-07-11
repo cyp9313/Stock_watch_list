@@ -26,11 +26,67 @@ import re
 from datetime import date as Date
 from html import escape as html_escape
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None  # type: ignore[assignment]
+
 
 _ALLOWED_SIGNAL_CLASSES = {"signal-bull", "signal-bear", "signal-neutral"}
 _ALLOWED_RATING_CLASSES = {"buy", "hold", "avoid"}
 _ALLOWED_PRICE_COLORS = {"#3fb950", "#f85149"}
 _ALLOWED_INSTRUMENT_TYPES = {"EQUITY", "ETF", "INDEX", "CRYPTO", "OTHER"}
+
+# ── 货币符号映射 ──────────────────────────────────────────────────
+# P2-1: 根据数据中的 currency 字段动态选择符号，不再统一硬编码 $。
+# 未知 currency 使用 currency code 本身作为前缀，而非错误的美元符号。
+CURRENCY_SYMBOLS = {
+    "USD": "$",
+    "EUR": "€",
+    "GBP": "£",
+    "GBX": "",       # 便士单位，后缀 "p"
+    "HKD": "HK$",
+    "CNY": "￥",
+    "CNH": "￥",
+    "CAD": "CA$",
+    "AUD": "A$",
+    "JPY": "¥",
+    "CHF": "CHF ",
+    "SEK": "SEK ",
+    "NOK": "NOK ",
+    "DKK": "DKK ",
+}
+
+# 便士等使用后缀的货币
+_CURRENCY_SUFFIXES = {"GBX": "p"}
+
+
+def format_price(value_str, currency):
+    """Format a price string with the appropriate currency symbol.
+
+    For known currencies, uses the mapped symbol as prefix.
+    For GBX (pence), uses 'p' as suffix.
+    For unknown currencies, uses the currency code as prefix (e.g. 'SGD 123.45').
+    """
+    currency = str(currency or "USD").upper()
+    symbol = CURRENCY_SYMBOLS.get(currency)
+    if symbol is not None:
+        suffix = _CURRENCY_SUFFIXES.get(currency, "")
+        return symbol + value_str + suffix
+    # Unknown currency — use the code itself to avoid a misleading $
+    return currency + " " + value_str
+
+
+def get_market_date():
+    """Get current date in US/Eastern timezone (NYSE/NASDAQ market date).
+
+    Returns ISO date string (YYYY-MM-DD). Uses zoneinfo (Python 3.9+ builtin,
+    no extra dependency). Falls back to date.today() if zoneinfo is unavailable.
+    """
+    if ZoneInfo is not None:
+        from datetime import datetime
+        return datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    return Date.today().isoformat()
 
 
 def escape_text(value):
@@ -47,19 +103,22 @@ def allow_value(value, allowed, fallback):
 #  参数解析
 # ─────────────────────────────────────────────────
 if len(sys.argv) < 4:
-    print("用法: python build_report.py <DATA_JSON> <CHART_HTML> <OUTPUT_HTML> [--date YYYY-MM-DD] [--notes NOTES_FILE]")
+    print("用法: python build_report.py <DATA_JSON> <CHART_HTML> <OUTPUT_HTML> [--date YYYY-MM-DD] [--months N] [--notes NOTES_FILE]")
     sys.exit(1)
 
 DATA_FILE  = sys.argv[1]
 CHART_FILE = sys.argv[2]
 OUT_FILE   = sys.argv[3]
-REPORT_DATE = str(Date.today())
+REPORT_DATE = get_market_date()
+MONTHS      = 3
 NOTES_FILE  = None
 
 i = 4
 while i < len(sys.argv):
     if sys.argv[i] == '--date' and i+1 < len(sys.argv):
         REPORT_DATE = sys.argv[i+1]; i += 2
+    elif sys.argv[i] == '--months' and i+1 < len(sys.argv):
+        MONTHS = int(sys.argv[i+1]); i += 2
     elif sys.argv[i] == '--notes' and i+1 < len(sys.argv):
         NOTES_FILE = sys.argv[i+1]; i += 2
     else:
@@ -116,6 +175,9 @@ SECTOR    = escape_text(d.get('SECTOR', '—'))
 EXCHANGE  = escape_text(d.get('EXCHANGE', '—'))
 CURRENCY  = d.get('CURRENCY', 'USD')
 EMPLOYEES = d.get('EMPLOYEES', 0)
+# P2-3: 市场数据截止日期 — 来自 OHLCV 最后一条数据的 timestamp，
+# 由 fetch_and_calc.py 写入 data.json。区分报告生成日期和数据截止日期。
+DATA_END  = escape_text(str(d.get('data_end', '') or ''))
 
 TODAY_HIGH = d['TODAY_HIGH']
 TODAY_LOW  = d['TODAY_LOW']
@@ -406,17 +468,17 @@ elif SECTOR and SECTOR != '—':
     subtitle_parts.append(SECTOR)
 html += '      <div class="subtitle">' + ' · '.join(subtitle_parts) + '</div>\n'
 html += '    </div>\n    <div class="header-badge">\n'
-html += '      <div class="badge-price" style="color:' + price_col + '">$' + last_str + '</div>\n'
+html += '      <div class="badge-price" style="color:' + price_col + '">' + format_price(last_str, CURRENCY) + '</div>\n'
 html += '      <div class="badge-change ' + chg_cls + '">' + chg_arrow + ' ' + chg_str + ' (' + pct_str + '%)</div>\n'
-html += '      <div class="badge-date">' + REPORT_DATE + ' 数据</div>\n'
+html += '      <div class="badge-date">' + REPORT_DATE + ' 生成' + (' · 数据截止 ' + DATA_END if DATA_END else '') + '</div>\n'
 html += '    </div>\n  </div>\n\n'
 
 # KPI：不适用的基本面/分析师字段显示为真正的 N/A，而不是数值 0。
 html += '  <!-- KPI 概览 -->\n  <div class="kpi-grid">\n'
-html += '    <div class="kpi-card"><div class="kpi-label">52周区间</div><div class="kpi-value">$' + fw52lo_str + ' – $' + fw52hi_str + '</div><div class="kpi-sub">当前位于 ' + pct52_str + '% 分位</div></div>\n'
+html += '    <div class="kpi-card"><div class="kpi-label">52周区间</div><div class="kpi-value">' + format_price(fw52lo_str, CURRENCY) + ' – ' + format_price(fw52hi_str, CURRENCY) + '</div><div class="kpi-sub">当前位于 ' + pct52_str + '% 分位</div></div>\n'
 if instrument_type == 'EQUITY':
-    html += '    <div class="kpi-card"><div class="kpi-label">总市值</div><div class="kpi-value">$' + mcap_str + '</div><div class="kpi-sub">远期 PE ' + fwpe_str + 'x · TTM PE ' + ttmpe_str + 'x</div></div>\n'
-    html += '    <div class="kpi-card"><div class="kpi-label">分析师目标价</div><div class="kpi-value up">$' + tgt_mean_str + '</div><div class="kpi-sub">潜在涨幅 ' + tgt_up_str + '% · ' + ana_cnt_str + '位分析师</div></div>\n'
+    html += '    <div class="kpi-card"><div class="kpi-label">总市值</div><div class="kpi-value">' + format_price(mcap_str, CURRENCY) + '</div><div class="kpi-sub">远期 PE ' + fwpe_str + 'x · TTM PE ' + ttmpe_str + 'x</div></div>\n'
+    html += '    <div class="kpi-card"><div class="kpi-label">分析师目标价</div><div class="kpi-value up">' + format_price(tgt_mean_str, CURRENCY) + '</div><div class="kpi-sub">潜在涨幅 ' + tgt_up_str + '% · ' + ana_cnt_str + '位分析师</div></div>\n'
 elif instrument_type == 'ETF':
     valuation_bits = []
     if FW_PE > 0: valuation_bits.append('Forward PE ' + fwpe_str + 'x')
@@ -427,14 +489,14 @@ elif instrument_type == 'ETF':
 else:
     html += '    <div class="kpi-card"><div class="kpi-label">风险概览</div><div class="kpi-value">波动率 ' + realized_vol_str + '</div><div class="kpi-sub">63日最大回撤 ' + max_drawdown_str + ' · ATR占比 ' + atr_pct_str + '</div></div>\n'
     html += '    <div class="kpi-card"><div class="kpi-label">成交活跃度</div><div class="kpi-value">量比 ' + vol_ratio_str + '</div><div class="kpi-sub">估值与分析师评分：N/A</div></div>\n'
-html += '    <div class="kpi-card"><div class="kpi-label">今日行情</div><div class="kpi-value">开 $' + open_str + ' / 高 $' + high_str + ' / 低 $' + low_str + '</div><div class="kpi-sub">成交量 ' + vol_str + '</div></div>\n'
+html += '    <div class="kpi-card"><div class="kpi-label">今日行情</div><div class="kpi-value">开 ' + format_price(open_str, CURRENCY) + ' / 高 ' + format_price(high_str, CURRENCY) + ' / 低 ' + format_price(low_str, CURRENCY) + '</div><div class="kpi-sub">成交量 ' + vol_str + '</div></div>\n'
 html += '  </div>\n\n'
 
 # 技术面
 html += '  <!-- 技术面分析 -->\n  <div class="section">\n'
 html += '    <div class="section-title"><span class="icon">📊</span> 技术面分析</div>\n\n'
 html += '    <!-- K线图 -->\n    <div class="chart-container">\n'
-html += '      <div style="font-size:13px; color:#8b949e; margin-bottom:12px;">📈 近3个月K线图（含均线、布林带、成交量、MACD、RSI、KDJ）</div>\n'
+html += '      <div style="font-size:13px; color:#8b949e; margin-bottom:12px;">📈 近' + str(MONTHS) + '个月K线图（含均线、布林带、成交量、MACD、RSI、KDJ）</div>\n'
 # chart_html is the only trusted HTML fragment: it is generated locally by
 # scripts/gen_chart.py in the isolated report run directory. All other text
 # interpolated into this document is escaped or allowlisted above.
@@ -443,7 +505,7 @@ html += chart_html + '\n    </div>\n\n'
 # 技术指标卡片
 html += '    <div class="tech-grid" style="margin-top:20px;">\n'
 html += '      <div class="tech-card">\n        <h4>📈 均线系统（精确值）</h4>\n'
-html += '        <div class="tech-item"><span class="tech-key">当前价 $' + last_str + '</span><span class="tech-val">—</span></div>\n'
+html += '        <div class="tech-item"><span class="tech-key">当前价 ' + format_price(last_str, CURRENCY) + '</span><span class="tech-val">—</span></div>\n'
 for label, val_s, sig, cls in [
     ('MA5', ma5_str, ma5_sig, ma5_cls),
     ('MA10', ma10_str, ma10_sig, ma10_cls),
@@ -465,7 +527,7 @@ html += '        <div class="tech-item"><span class="tech-key">MACD柱</span><sp
 html += '        <div class="tech-item"><span class="tech-key">K值(9,3,3)</span><span class="tech-val">' + k_str + '</span></div>\n'
 html += '        <div class="tech-item"><span class="tech-key">D值(9,3,3)</span><span class="tech-val">' + d_str + '</span></div>\n'
 html += '        <div class="tech-item"><span class="tech-key">J值(9,3,3)</span><span class="tech-val ' + kdj_cls + '">' + j_str + ' · ' + kdj_sig + '</span></div>\n'
-html += '        <div class="tech-item"><span class="tech-key">ATR(14)</span><span class="tech-val">$' + atr_str + '</span></div>\n'
+html += '        <div class="tech-item"><span class="tech-key">ATR(14)</span><span class="tech-val">' + format_price(atr_str, CURRENCY) + '</span></div>\n'
 html += '        <div class="tech-item" style="border-top:1px solid #30363d; padding-top:10px; margin-top:4px;">'
 html += '<span class="tech-key"><strong>技术综合</strong></span><span class="tech-val ' + ma_overall_cls + '">' + ma_overall + '</span></div>\n'
 html += '      </div>\n    </div>\n\n'
@@ -474,8 +536,8 @@ html += '      </div>\n    </div>\n\n'
 if chip_ok:
     html += '    <div class="tech-card" style="margin-top:16px;">\n      <h4>🧩 筹码峰 / Volume Profile（126日近似）</h4>\n'
     html += '      <div class="tech-grid">\n'
-    html += '        <div class="tech-item"><span class="tech-key">POC 主筹码峰</span><span class="tech-val">$' + chip_poc_str + ' (' + chip_dist_str + ')</span></div>\n'
-    html += '        <div class="tech-item"><span class="tech-key">70%价值区间</span><span class="tech-val">$' + chip_va_str + '</span></div>\n'
+    html += '        <div class="tech-item"><span class="tech-key">POC 主筹码峰</span><span class="tech-val">' + format_price(chip_poc_str, CURRENCY) + ' (' + chip_dist_str + ')</span></div>\n'
+    html += '        <div class="tech-item"><span class="tech-key">70%价值区间</span><span class="tech-val">' + format_price(chip_va_str, CURRENCY) + '</span></div>\n'
     html += '        <div class="tech-item"><span class="tech-key">上方筹码占比</span><span class="tech-val signal-bear">' + chip_overhead_str + '</span></div>\n'
     html += '        <div class="tech-item"><span class="tech-key">下方支撑占比</span><span class="tech-val signal-bull">' + chip_support_str + '</span></div>\n'
     html += '      </div>\n'
@@ -486,9 +548,9 @@ if chip_ok:
 html += '    <table style="margin-top:18px;">\n'
 html += '      <thead><tr><th>布林带（20, 2σ）</th><th class="num">上轨</th><th class="num">中轨（MA20）</th><th class="num">下轨</th><th>BB分位</th></tr></thead>\n'
 html += '      <tbody><tr><td>当前值</td>'
-html += '<td class="num">$' + bb_up_str + '</td>'
-html += '<td class="num">$' + bb_mid_str + '</td>'
-html += '<td class="num">$' + bb_dn_str + '</td>'
+html += '<td class="num">' + format_price(bb_up_str, CURRENCY) + '</td>'
+html += '<td class="num">' + format_price(bb_mid_str, CURRENCY) + '</td>'
+html += '<td class="num">' + format_price(bb_dn_str, CURRENCY) + '</td>'
 bb_pct_str = f"{d.get('bb_pct', 50.0):.1f}"
 html += '<td>' + bb_pct_str + '% (0%=下轨)</td>'
 html += '</tr></tbody></table>\n\n'
@@ -503,9 +565,9 @@ html += '          <div class="ruler-dot current" style="left:' + pct52_str + '%
 html += '          <div class="ruler-dot high" style="left:100%"></div>\n'
 html += '        </div>\n      </div>\n'
 html += '      <div class="ruler-labels">\n'
-html += '        <span class="val">$' + fw52lo_str + '<br><span style="color:#3fb950;">52周低点</span></span>\n'
-html += '        <span class="val" style="color:#58a6ff;">$' + last_str + ' 当前价</span>\n'
-html += '        <span class="val" style="text-align:right;">$' + fw52hi_str + '<br><span style="color:#f85149;">52周高点</span></span>\n'
+html += '        <span class="val">' + format_price(fw52lo_str, CURRENCY) + '<br><span style="color:#3fb950;">52周低点</span></span>\n'
+html += '        <span class="val" style="color:#58a6ff;">' + format_price(last_str, CURRENCY) + ' 当前价</span>\n'
+html += '        <span class="val" style="text-align:right;">' + format_price(fw52hi_str, CURRENCY) + '<br><span style="color:#f85149;">52周高点</span></span>\n'
 html += '      </div>\n    </div>\n  </div>\n\n'
 
 # 基本面（仅在有数据时展示，加密货币会较少）
@@ -517,7 +579,7 @@ if instrument_type in {'EQUITY', 'ETF'}:
     html += '        <tr><td>Beta（市场敏感度）</td><td class="num">' + beta_str + '</td><td>' + ('高波动' if BETA > 1.5 else ('中等' if BETA > 0.8 else '低波动')) + '</td></tr>\n'
     html += '        <tr><td>股息收益率</td><td class="num">' + div_str + '</td><td>' + ('正股息' if DIV_YIELD > 0 else '无/未获取') + '</td></tr>\n'
 if instrument_type == 'EQUITY':
-    html += '        <tr><td>目标价区间</td><td class="num">$' + tgt_lo_str + ' – $' + tgt_hi_str + '</td><td>' + ana_cnt_str + '位分析师覆盖</td></tr>\n'
+    html += '        <tr><td>目标价区间</td><td class="num">' + format_price(tgt_lo_str, CURRENCY) + ' – ' + format_price(tgt_hi_str, CURRENCY) + '</td><td>' + ana_cnt_str + '位分析师覆盖</td></tr>\n'
 if desc_short:
     html += '        <tr><td colspan="3" style="color:#8b949e; font-size:12px; line-height:1.6;">' + desc_short + '</td></tr>\n'
 html += '      </tbody>\n    </table>\n'
@@ -541,9 +603,9 @@ html += '    <div class="rating-hero">\n'
 html += '      <div class="rating-badge ' + rating_cls + '">' + rating_text + '</div>\n'
 html += '      <div style="font-size:28px; font-weight:800; color:#58a6ff; margin-top:8px;">' + final_score_str + '<span style="font-size:14px;color:#8b949e;"> / 100</span></div>\n'
 html += '      <div style="font-size:14px; color:#e6edf3; margin-top:10px;">'
-html += '当前价 $' + last_str + ' · 标的类型 ' + instrument_type
+html += '当前价 ' + format_price(last_str, CURRENCY) + ' · 标的类型 ' + instrument_type
 if instrument_type == 'EQUITY' and TARGET_MEAN > 0:
-    html += ' · 分析师目标价 $' + tgt_mean_str + ' · 潜在涨幅 <strong style="color:#3fb950;">' + tgt_up_str + '%</strong>'
+    html += ' · 分析师目标价 ' + format_price(tgt_mean_str, CURRENCY) + ' · 潜在涨幅 <strong style="color:#3fb950;">' + tgt_up_str + '%</strong>'
 html += '</div>\n'
 html += '      <div class="rating-target">评分方法：' + rating_method + ' ｜ 技术多头 ' + str(signals_bull) + '/5 ｜ 均线多头数 ' + str(bull_count) + '/6</div>\n'
 html += '      <div class="score-grid">\n'
@@ -560,13 +622,13 @@ html += '    </div>\n'
 html += '    <div style="padding:14px 18px; background:rgba(31,111,235,0.06); border:1px solid rgba(31,111,235,0.2); border-radius:8px; font-size:13px; color:#e6edf3; line-height:1.8;">\n'
 html += '      <strong style="color:#58a6ff;">📌 技术面：</strong>RSI(' + rsi_str + ') ' + rsi_sig + '；MACD ' + macd_sig + '（柱 ' + hist_str + '）；KDJ ' + kdj_sig + '；均线系统：' + ma_overall + '。\n'
 if chip_ok:
-    html += '      <br><strong style="color:#58a6ff;">🧩 筹码峰：</strong>126日 POC $' + chip_poc_str + '，上方筹码 ' + chip_overhead_str + '，下方支撑 ' + chip_support_str + '，chip_score ' + chip_score_str + '。\n'
+    html += '      <br><strong style="color:#58a6ff;">🧩 筹码峰：</strong>126日 POC ' + format_price(chip_poc_str, CURRENCY) + '，上方筹码 ' + chip_overhead_str + '，下方支撑 ' + chip_support_str + '，chip_score ' + chip_score_str + '。\n'
 html += '      <br><strong style="color:#d29922;">⚠️ 注意：</strong>v5.8 会按 EQUITY / ETF / INDEX / CRYPTO 切换适用评分项；N/A 或缺失项不会填充中性50分，而是重新归一化有效权重。\n'
 html += '    </div>\n  </div>\n\n'
 
 # 页脚
 html += '  <!-- 页脚 -->\n  <div class="footer">\n'
-html += '    <div>📊 ' + TICKER + ' ' + LONG_NAME + ' 每日投资日报 — ' + REPORT_DATE + '</div>\n'
+html += '    <div>📊 ' + TICKER + ' ' + LONG_NAME + ' 每日投资日报 — ' + REPORT_DATE + (' (数据截止 ' + DATA_END + ')' if DATA_END else '') + '</div>\n'
 html += '    <div style="margin-top:6px;">数据来源：yfinance · StockAnalysis.com（适用时）· Serper/DashScope/SearXNG 金融搜索</div>\n'
 html += '    <div style="margin-top:8px; color:#f85149;">⚠️ 本报告仅供参考，不构成任何投资建议。投资有风险，入市需谨慎。</div>\n'
 html += '  </div>\n\n</div>\n</body>\n</html>'

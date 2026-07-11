@@ -17,7 +17,6 @@ gen_chart.py — 通用 Plotly K线图生成脚本
 import sys
 import os
 import re
-import warnings
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -26,8 +25,6 @@ from plotly.subplots import make_subplots
 
 # Shared market data service — provides OHLCV snapshot sharing and unified provider layer.
 from market_data_service import MarketDataService
-
-warnings.filterwarnings('ignore')
 
 # ── 参数 ──────────────────────────────────────────────────────────
 TICKER = sys.argv[1].upper() if len(sys.argv) > 1 else 'ORCL'
@@ -182,8 +179,11 @@ fig.update_xaxes(gridcolor='#21262d', zeroline=False, showgrid=True)
 fig.update_yaxes(gridcolor='#21262d', zeroline=False, showgrid=True)
 
 # ── 输出为嵌入片段（只取 body 内容）────────────────────────────────
+# P2-4: include_plotlyjs=True 内联完整 plotly.js (~3.4MB)，使报告完全离线可用。
+# 不再依赖公共 CDN (https://cdn.plot.ly/plotly-*.min.js)。
+# 图表交互功能不受影响。报告体积会增大约 3.4MB。
 html_str = fig.to_html(
-    include_plotlyjs='cdn',
+    include_plotlyjs=True,
     config={'displayModeBar': True, 'responsive': True}
 )
 body_match = re.search(r'<body>(.*?)</body>', html_str, re.DOTALL)

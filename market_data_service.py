@@ -39,6 +39,23 @@ from typing import Any
 import pandas as pd
 import yfinance as yf
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None  # type: ignore[assignment]
+
+
+def get_market_date() -> str:
+    """Get current date in US/Eastern timezone (NYSE/NASDAQ market date).
+
+    Returns ISO date string (YYYY-MM-DD). Uses zoneinfo (Python 3.9+ builtin,
+    no extra dependency). Falls back to date.today() if zoneinfo is unavailable.
+    """
+    from datetime import datetime, date
+    if ZoneInfo is not None:
+        return datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    return date.today().isoformat()
+
 
 # ---------------------------------------------------------------------------
 # Data status enum
@@ -156,7 +173,7 @@ class MarketDataService:
         try:
             with open(path, "rb") as f:
                 return pickle.load(f)
-        except Exception:
+        except (pickle.UnpicklingError, EOFError, OSError, ValueError):
             return None
 
     @staticmethod
@@ -169,7 +186,7 @@ class MarketDataService:
         path = directory / MarketDataService._snapshot_filename(ticker)
         try:
             path.unlink(missing_ok=True)
-        except Exception:
+        except OSError:
             pass
 
     # -- Ticker info ---------------------------------------------------------
@@ -183,7 +200,7 @@ class MarketDataService:
         """
         try:
             return yf.Ticker(ticker).info or {}
-        except Exception:
+        except (KeyError, ValueError, AttributeError, TypeError, RuntimeError):
             return {}
 
     # -- StockAnalysis fundamentals ------------------------------------------

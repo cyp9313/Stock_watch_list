@@ -48,7 +48,7 @@ if sys.platform == 'win32':
         _ucrt.freopen(b'NUL', b'w', _stderr_ptr)  # C stderr → NUL
         # 重建 Python sys.stderr → 控制台（yfinance/Flask 日志正常工作）
         sys.stderr = os.fdopen(_saved_stderr_fd, 'w', encoding='utf-8', errors='replace', buffering=1)
-    except Exception:
+    except (OSError, AttributeError, ValueError):
         pass
 
 import stock_watch_list_back_end
@@ -1017,7 +1017,7 @@ def plot_kline():
                         return
                     try:
                         renderer = fig.canvas.get_renderer()
-                    except Exception:
+                    except (AttributeError, RuntimeError):
                         return
                     bbox = _txt.get_window_extent(renderer=renderer)
                     if bbox.contains(event.x, event.y):
@@ -1134,7 +1134,7 @@ def plot_kline():
                 f.write(f"Time: {datetime.datetime.now()}\n")
                 f.write(f"Error: {str(e)}\n")
                 f.write(f"Traceback:\n{err_msg}\n")
-        except Exception:
+        except OSError:
             pass
         messagebox.showerror("错误", f"绘制K线图时出错: {str(e)}")
 

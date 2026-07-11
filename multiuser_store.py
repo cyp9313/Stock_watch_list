@@ -141,7 +141,7 @@ def verify_password(password, stored_hash):
         expected = base64.b64decode(digest_b64)
         actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, int(iterations))
         return hmac.compare_digest(actual, expected)
-    except Exception:
+    except (ValueError, TypeError):
         return False
 
 
@@ -376,7 +376,7 @@ def authenticate(username, password):
     except Exception:
         try:
             conn.execute("ROLLBACK")
-        except Exception:
+        except sqlite3.Error:
             pass
         raise
     finally:

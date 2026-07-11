@@ -365,7 +365,7 @@ def fetch_fear_greed():
         resp = requests.get(f"{API_BASE}/api/fear_greed", timeout=10)
         if resp.status_code == 200:
             return resp.json()
-    except Exception:
+    except (requests.RequestException, ValueError):
         pass
     return None
 
@@ -376,7 +376,7 @@ def fetch_crypto_fear_greed():
         resp = requests.get(f"{API_BASE}/api/fear_greed_crypto", timeout=10)
         if resp.status_code == 200:
             return resp.json()
-    except Exception:
+    except (requests.RequestException, ValueError):
         pass
     return None
 
@@ -395,7 +395,7 @@ def fetch_breadth_data(sp500_list):
         if resp.status_code != 200:
             return {"success": False, "error": f"Breadth API HTTP {resp.status_code}: {resp.text}"}
         return resp.json()
-    except Exception as e:
+    except (requests.RequestException, ValueError) as e:
         return {"success": False, "error": f"Breadth API exception: {e}"}
 
 
@@ -1018,7 +1018,7 @@ def build_market_treemap(
     rows["Industry"] = rows.get("Industry", "Unknown")
     rows["Name"] = rows.get("Name", rows["Ticker"])
     rows["Size"] = pd.to_numeric(rows.get("Size", 1), errors="coerce").fillna(1).clip(lower=1)
-    rows["1D%"] = pd.to_numeric(rows["1D%"], errors="coerce").fillna(0)
+    rows["1D%"] = pd.to_numeric(rows["1D%"], errors="coerce")
     rows["Price"] = pd.to_numeric(rows.get("Price", np.nan), errors="coerce")
     rows["Market Cap"] = pd.to_numeric(rows.get("Market Cap", np.nan), errors="coerce")
 
@@ -1045,33 +1045,46 @@ def build_market_treemap(
     for sector, sector_df in rows.groupby("Sector", sort=True):
         sector_id = f"sector:{sector}"
         sector_value = float(sector_df["Size"].sum())
-        sector_color = float(np.average(sector_df["1D%"], weights=sector_df["Size"]))
+        valid_mask = sector_df["1D%"].notna()
+        if valid_mask.any():
+            valid_df = sector_df[valid_mask]
+            sector_color = float(np.average(valid_df["1D%"], weights=valid_df["Size"]))
+            sector_text = f"{sector_color:+.2f}%"
+        else:
+            sector_color = 0.0
+            sector_text = "N/A"
         labels.append(sector)
         ids.append(sector_id)
         parents.append("root")
         values.append(sector_value)
         colors.append(sector_color)
-        text.append(f"{sector_color:+.2f}%")
-        customdata.append([sector, "", "", "", "", f"{sector_color:+.2f}%"])
+        text.append(sector_text)
+        customdata.append([sector, "", "", "", "", sector_text])
 
         for _, row in sector_df.sort_values("Size", ascending=False).iterrows():
             ticker = str(row["Ticker"])
-            pct = float(row["1D%"])
+            pct_raw = row["1D%"]
             price = row["Price"]
             stock_size = float(row["Size"])
+            if pd.notna(pct_raw):
+                pct = float(pct_raw)
+                pct_text = f"{pct:+.2f}%"
+            else:
+                pct = 0.0
+                pct_text = "N/A"
             labels.append(ticker)
             ids.append(f"ticker:{ticker}")
             parents.append(sector_id)
             values.append(stock_size)
             colors.append(pct)
-            text.append(f"{pct:+.2f}%")
+            text.append(pct_text)
             customdata.append([
                 row.get("Name", ticker),
                 sector,
                 row.get("Industry", "Unknown"),
                 f"{float(price):.2f}" if pd.notna(price) else "",
                 _format_market_cap(row.get("Market Cap")),
-                f"{pct:+.2f}%",
+                pct_text,
             ])
 
     fig = go.Figure(

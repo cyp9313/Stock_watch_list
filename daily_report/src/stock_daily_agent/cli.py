@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 
 from .agent_runner import run_agent
-from .config import ProjectPaths, RunContext, load_dotenv
+from .config import ProjectPaths, RunContext, load_dotenv, get_market_date
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -21,7 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", default=None, help="主 Agent 模型名；默认读取 LLM_MODEL/QWEN_MODEL。provider=deepseek 时默认 deepseek-v4-flash，否则 qwen-plus")
     p.add_argument("--provider", choices=["auto", "dashscope", "deepseek", "openai_compatible"], default=None, help="主 Agent 模型提供商；默认读取 LLM_PROVIDER/auto，若有有效 DEEPSEEK_API_KEY 则优先 deepseek，否则 dashscope")
     p.add_argument("--run-dir", help="中间文件目录，默认 runs/<ticker>_<date>")
-    p.add_argument("--date", default=date.today().isoformat(), help="报告日期，默认今天")
+    p.add_argument("--date", default=get_market_date(), help="报告日期，默认美东市场日期")
     p.add_argument("--min-notes", type=int, default=10, help="消息面 notes 最少条数，默认 10")
     p.add_argument("--no-web-tools", action="store_true", help="不加载 Qwen-Agent 内置 web_search/web_extractor 工具；SearXNG 和 DashScope 回退工具仍可用")
     p.add_argument("--searxng-url", help="临时覆盖 .env 中的 SEARXNG_URL，例如 http://127.0.0.1:8080")

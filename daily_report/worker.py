@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import sys
 from pathlib import Path
 import time
 
-from dotenv import load_dotenv
+# Ensure project root is importable for config_loader
+APP_ROOT = Path(__file__).resolve().parent.parent
+if str(APP_ROOT) not in sys.path:
+    sys.path.insert(0, str(APP_ROOT))
+
+from config_loader import load_project_env
 
 from .jobs import (
     claim_next_job,
@@ -19,10 +25,7 @@ from .jobs import (
     store_generated_report,
 )
 from .mailer import compute_job_message_id, send_report_email
-from .service import generate_report
-
-
-APP_ROOT = Path(__file__).resolve().parent.parent
+from .service import generate_report, _get_market_date
 
 
 def process_one_job() -> bool:
@@ -81,7 +84,7 @@ def process_one_job() -> bool:
             send_report_email(
                 recipient=job["recipient_email"],
                 ticker=ticker,
-                report_date=job.get("report_date") or dt.date.today().isoformat(),
+                report_date=job.get("report_date") or _get_market_date(),
                 file_name=file_name,
                 html_bytes=bytes(html_bytes),
                 message_id=message_id,
@@ -99,7 +102,7 @@ def process_one_job() -> bool:
 
 
 def main() -> None:
-    load_dotenv(APP_ROOT / ".env")
+    load_project_env()
     recovered = recover_interrupted_jobs()
     if recovered:
         print(f"[ReportWorker] Recovered {recovered} interrupted job(s)", flush=True)

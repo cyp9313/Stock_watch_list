@@ -873,13 +873,13 @@ def get_ticker_currency(ticker):
             currency = fast_info.get("currency")
         if currency:
             return normalize_currency_code(currency)
-    except Exception:
+    except (KeyError, ValueError, AttributeError, TypeError, RuntimeError):
         pass
     try:
         currency = yf.Ticker(ticker).info.get("currency")
         if currency:
             return normalize_currency_code(currency)
-    except Exception:
+    except (KeyError, ValueError, AttributeError, TypeError, RuntimeError):
         pass
     return fallback_currency_from_ticker(ticker)
 
@@ -910,7 +910,7 @@ def currency_to_eur_rate(currency):
         quote_per_eur = _latest_yahoo_price(eur_base)
         if quote_per_eur and quote_per_eur > 0:
             return 1.0 / quote_per_eur
-    except Exception:
+    except (ValueError, TypeError, KeyError, AttributeError, RuntimeError):
         pass
 
     eur_quote = f"{currency}EUR=X"
@@ -918,7 +918,7 @@ def currency_to_eur_rate(currency):
         eur_per_quote = _latest_yahoo_price(eur_quote)
         if eur_per_quote and eur_per_quote > 0:
             return eur_per_quote
-    except Exception:
+    except (ValueError, TypeError, KeyError, AttributeError, RuntimeError):
         pass
     return None
 
@@ -1020,10 +1020,13 @@ def fetch_stock_data(config_json, cache_key):
     }
     if cache_key:
         payload["cache_key"] = cache_key
-    resp = requests.post(f"{API_BASE}/api/stock_data", json=payload, timeout=180)
-    if resp.status_code != 200:
-        return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
-    return resp.json()
+    try:
+        resp = requests.post(f"{API_BASE}/api/stock_data", json=payload, timeout=180)
+        if resp.status_code != 200:
+            return {"success": False, "error": f"HTTP {resp.status_code}: {resp.text}"}
+        return resp.json()
+    except (requests.RequestException, ValueError) as e:
+        return {"success": False, "error": f"Backend request failed: {e}"}
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -1037,7 +1040,7 @@ def fetch_breadth_data():
     try:
         resp = requests.post(f"{API_BASE}/api/breadth_data", data=payload, timeout=300)
         return resp.json() if resp.status_code == 200 else {"success": False, "error": resp.text}
-    except Exception as e:
+    except (requests.RequestException, ValueError) as e:
         return {"success": False, "error": str(e)}
 
 
@@ -1046,7 +1049,7 @@ def fetch_fear_greed(path):
     try:
         resp = requests.get(f"{API_BASE}{path}", timeout=10)
         return resp.json() if resp.status_code == 200 else None
-    except Exception:
+    except (requests.RequestException, ValueError):
         return None
 
 
@@ -1055,8 +1058,11 @@ def fetch_kline_data(ticker, period, interval, cache_key=""):
     params = {"ticker": ticker, "period": period, "interval": interval}
     if cache_key:
         params["cache_key"] = cache_key
-    resp = requests.get(f"{API_BASE}/api/kline_data", params=params, timeout=120)
-    return resp.json() if resp.status_code == 200 else None
+    try:
+        resp = requests.get(f"{API_BASE}/api/kline_data", params=params, timeout=120)
+        return resp.json() if resp.status_code == 200 else None
+    except (requests.RequestException, ValueError):
+        return None
 
 
 def build_breadth_chart(
@@ -1144,7 +1150,7 @@ def build_market_treemap(
     rows["Industry"] = rows.get("Industry", "Unknown")
     rows["Name"] = rows.get("Name", rows["Ticker"])
     rows["Size"] = pd.to_numeric(rows.get("Size", 1), errors="coerce").fillna(1).clip(lower=1)
-    rows["1D%"] = pd.to_numeric(rows["1D%"], errors="coerce").fillna(0)
+    rows["1D%"] = pd.to_numeric(rows["1D%"], errors="coerce")
     rows["Price"] = pd.to_numeric(rows.get("Price", np.nan), errors="coerce")
     rows["Market Cap"] = pd.to_numeric(rows.get("Market Cap", np.nan), errors="coerce")
 
@@ -1171,33 +1177,46 @@ def build_market_treemap(
     for sector, sector_df in rows.groupby("Sector", sort=True):
         sector_id = f"sector:{sector}"
         sector_value = float(sector_df["Size"].sum())
-        sector_color = float(np.average(sector_df["1D%"], weights=sector_df["Size"]))
+        valid_mask = sector_df["1D%"].notna()
+        if valid_mask.any():
+            valid_df = sector_df[valid_mask]
+            sector_color = float(np.average(valid_df["1D%"], weights=valid_df["Size"]))
+            sector_text = f"{sector_color:+.2f}%"
+        else:
+            sector_color = 0.0
+            sector_text = "N/A"
         labels.append(sector)
         ids.append(sector_id)
         parents.append("root")
         values.append(sector_value)
         colors.append(sector_color)
-        text.append(f"{sector_color:+.2f}%")
-        customdata.append([sector, "", "", "", "", f"{sector_color:+.2f}%"])
+        text.append(sector_text)
+        customdata.append([sector, "", "", "", "", sector_text])
 
         for _, row in sector_df.sort_values("Size", ascending=False).iterrows():
             ticker = str(row["Ticker"])
-            pct = float(row["1D%"])
+            pct_raw = row["1D%"]
             price = row["Price"]
             stock_size = float(row["Size"])
+            if pd.notna(pct_raw):
+                pct = float(pct_raw)
+                pct_text = f"{pct:+.2f}%"
+            else:
+                pct = 0.0
+                pct_text = "N/A"
             labels.append(ticker)
             ids.append(f"ticker:{ticker}")
             parents.append(sector_id)
             values.append(stock_size)
             colors.append(pct)
-            text.append(f"{pct:+.2f}%")
+            text.append(pct_text)
             customdata.append([
                 row.get("Name", ticker),
                 sector,
                 row.get("Industry", "Unknown"),
                 f"{float(price):.2f}" if pd.notna(price) else "",
                 _format_market_cap(row.get("Market Cap")),
-                f"{pct:+.2f}%",
+                pct_text,
             ])
 
     fig = go.Figure(
@@ -2082,6 +2101,7 @@ def _format_berlin_datetime(value):
 def render_weekly_report_schedules(user, runner_ok, mail_ready):
     st.caption(
         "Create a recurring weekly report in Europe/Berlin time. Daylight-saving changes are handled automatically. "
+        "Select every day for this ticker in one plan; each account can keep up to seven ticker schedules. "
         "The recipient address remains stored until the schedule is deleted."
     )
     with st.form("daily_report_schedule_form"):
@@ -2089,14 +2109,19 @@ def render_weekly_report_schedules(user, runner_ok, mail_ready):
             "daily_report_schedule",
             include_email=True,
         )
-        day_col, time_col = st.columns(2)
+        day_col, time_col = st.columns([4, 1])
         with day_col:
-            weekday_name = st.selectbox(
-                "Weekday (Europe/Berlin)",
-                list(WEEKDAY_NAMES),
-                index=0,
-                key="daily_report_schedule_weekday",
-            )
+            st.markdown("**Send on (Europe/Berlin)**")
+            weekday_columns = st.columns(7)
+            selected_weekdays = []
+            for weekday, weekday_name in enumerate(WEEKDAY_NAMES):
+                with weekday_columns[weekday]:
+                    if st.checkbox(
+                        weekday_name,
+                        value=weekday == 0,
+                        key=f"daily_report_schedule_weekday_{weekday}",
+                    ):
+                        selected_weekdays.append(weekday)
         with time_col:
             local_time = st.time_input(
                 "Send time (Europe/Berlin)",
@@ -2105,7 +2130,7 @@ def render_weekly_report_schedules(user, runner_ok, mail_ready):
                 key="daily_report_schedule_time",
             )
         schedule_submitted = st.form_submit_button(
-            "Create Weekly Schedule",
+            "Create Weekly Plan",
             disabled=not runner_ok or not mail_ready,
         )
 
@@ -2115,14 +2140,14 @@ def render_weekly_report_schedules(user, runner_ok, mail_ready):
                 owner_key=user["cache_key"],
                 ticker=normalize_yfinance_ticker(schedule_ticker),
                 recipient_email=schedule_email,
-                weekday=WEEKDAY_NAMES.index(weekday_name),
                 local_time=local_time,
+                weekdays=selected_weekdays,
                 months=schedule_months,
                 search_provider=schedule_provider,
                 no_article_fetch=schedule_no_fetch,
             )
             st.success(
-                f"Weekly schedule {schedule['id'][:8]} created. "
+                f"Weekly plan for {', '.join(WEEKDAY_NAMES[day] for day in schedule['weekdays'])} created. "
                 f"Next send: {_format_berlin_datetime(schedule['next_run_at'])}."
             )
         except (ValueError, ScheduleLimitError) as exc:
@@ -2139,7 +2164,7 @@ def render_weekly_report_schedules(user, runner_ok, mail_ready):
         rows.append({
             "Ticker": schedule["ticker"],
             "Recipient": schedule["recipient_masked"],
-            "Weekly time": f"{WEEKDAY_NAMES[schedule['weekday']]} {schedule['local_time']}",
+            "Weekly time": f"{', '.join(WEEKDAY_NAMES[day] for day in schedule['weekdays'])} {schedule['local_time']}",
             "Status": "Active" if schedule["is_active"] else "Paused",
             "Next send (Berlin)": _format_berlin_datetime(schedule["next_run_at"]),
         })
@@ -2151,7 +2176,7 @@ def render_weekly_report_schedules(user, runner_ok, mail_ready):
         list(schedule_map),
         format_func=lambda schedule_id: (
             f"{schedule_map[schedule_id]['ticker']} - "
-            f"{WEEKDAY_NAMES[schedule_map[schedule_id]['weekday']]} "
+            f"{', '.join(WEEKDAY_NAMES[day] for day in schedule_map[schedule_id]['weekdays'])} "
             f"{schedule_map[schedule_id]['local_time']} - "
             f"{schedule_map[schedule_id]['recipient_masked']}"
         ),
@@ -2312,8 +2337,10 @@ def render_daily_report(user):
 
 _backend_ok, _backend_msg = ensure_backend()
 if not _backend_ok:
-    st.error(f"⚠️ 后端服务不可用: {_backend_msg}")
-    st.stop()
+    st.warning(
+        f"⚠️ 后端服务不可用: {_backend_msg}。"
+        "AI 日报功能不受影响，股票数据和 K 线图功能可能受限。"
+    )
 user = render_auth_panel()
 editable = bool(user)
 cache_key = user["cache_key"] if user else ""
@@ -2380,37 +2407,43 @@ config_json = json.dumps(config, sort_keys=True)
 with st.spinner("Loading watch list data..."):
     stock_payload = fetch_stock_data(config_json, cache_key)
 
-if not stock_payload.get("success"):
-    st.error(stock_payload.get("error", "Failed to load stock data"))
-    st.stop()
-
-raw_df = pd.DataFrame(stock_payload["data"])
-display_df = convert_stock_df_for_display(raw_df, display_currency)
+_stock_data_ok = stock_payload.get("success", False)
+if _stock_data_ok:
+    raw_df = pd.DataFrame(stock_payload["data"])
+    display_df = convert_stock_df_for_display(raw_df, display_currency)
+else:
+    display_df = pd.DataFrame()
 
 main_tabs = st.tabs([SECTION_META["stocks_pages"]["tab"], SECTION_META["broad_pages"]["tab"], "Market Breadth", "AI Agent Reports"])
 with main_tabs[0]:
-    config = render_section(
-        SECTION_META["stocks_pages"]["title"],
-        "stocks_pages",
-        config,
-        display_df,
-        editable,
-        user,
-        dark_mode=dark_mode,
-        display_currency=display_currency,
-    )
+    if not _stock_data_ok:
+        st.error(stock_payload.get("error", "Failed to load stock data"))
+    else:
+        config = render_section(
+            SECTION_META["stocks_pages"]["title"],
+            "stocks_pages",
+            config,
+            display_df,
+            editable,
+            user,
+            dark_mode=dark_mode,
+            display_currency=display_currency,
+        )
 
 with main_tabs[1]:
-    config = render_section(
-        SECTION_META["broad_pages"]["title"],
-        "broad_pages",
-        config,
-        display_df,
-        editable,
-        user,
-        dark_mode=dark_mode,
-        display_currency=display_currency,
-    )
+    if not _stock_data_ok:
+        st.error(stock_payload.get("error", "Failed to load stock data"))
+    else:
+        config = render_section(
+            SECTION_META["broad_pages"]["title"],
+            "broad_pages",
+            config,
+            display_df,
+            editable,
+            user,
+            dark_mode=dark_mode,
+            display_currency=display_currency,
+        )
 
 with main_tabs[2]:
     st.subheader("Market Breadth")

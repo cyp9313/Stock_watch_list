@@ -8,7 +8,7 @@ import datetime
 import os
 import requests
 from io import StringIO
-from dotenv import load_dotenv
+from config_loader import load_project_env
 import concurrent.futures
 import time
 import contextvars
@@ -17,14 +17,12 @@ import threading
 # import random
 import pytz
 import fear_and_greed 
-import warnings
-warnings.filterwarnings('ignore')
 import requests_cache
 from stockanalysis_scraper import scrape_batch, should_query_forward_pe
 from ticker_mapping import normalize_yfinance_ticker
 
-# 加载 .env 文件中的环境变量
-load_dotenv()
+# 加载 .env 文件中的环境变量（CWD 无关，始终从项目根目录加载）
+load_project_env()
 # DashScope API key (当前未使用，保留供未来扩展)
 # DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY")
 
@@ -496,7 +494,7 @@ def _fetch_yfinance_ticker_name(ticker):
             name = _short_ticker_name(info.get(key))
             if name and name.upper() != ticker.upper():
                 return name
-    except Exception:
+    except (KeyError, ValueError, AttributeError, TypeError, RuntimeError):
         pass
     return None
 
@@ -534,7 +532,7 @@ def get_cached_ticker_names(tickers):
                 ticker = futures[future]
                 try:
                     fetched[ticker] = future.result()
-                except Exception:
+                except (KeyError, ValueError, AttributeError, TypeError, RuntimeError):
                     fetched[ticker] = None
 
         for ticker in missing:
@@ -582,7 +580,7 @@ def _fetch_yfinance_market_cap(ticker):
         market_cap = _safe_float(market_cap)
         if market_cap and market_cap > 0:
             return market_cap
-    except Exception:
+    except (KeyError, ValueError, AttributeError, TypeError, RuntimeError):
         pass
 
     try:
@@ -590,7 +588,7 @@ def _fetch_yfinance_market_cap(ticker):
         market_cap = _safe_float(market_cap)
         if market_cap and market_cap > 0:
             return market_cap
-    except Exception:
+    except (KeyError, ValueError, AttributeError, TypeError, RuntimeError):
         pass
     return None
 
@@ -622,7 +620,7 @@ def get_cached_market_caps(tickers):
                 ticker = futures[future]
                 try:
                     fetched[ticker] = future.result()
-                except Exception:
+                except (KeyError, ValueError, AttributeError, TypeError, RuntimeError):
                     fetched[ticker] = None
 
         for ticker in missing:
@@ -1292,7 +1290,7 @@ def get_financial_info(ticker, attr_name, default_value=None):
     try:
         value = getattr(ticker.info, attr_name, None)
         return value if value is not None else default_value
-    except Exception:
+    except (KeyError, ValueError, AttributeError, TypeError, RuntimeError):
         return default_value
 
 
@@ -1690,7 +1688,7 @@ def _fetch_yfinance_sector_metadata(ticker):
             str(info.get("sector") or "Unknown"),
             str(info.get("industry") or "Unknown"),
         )
-    except Exception:
+    except (KeyError, ValueError, AttributeError, TypeError, RuntimeError):
         return (ticker, "Unknown", "Unknown")
 
 
@@ -1796,7 +1794,7 @@ def calculate_chip_distribution(stock_ticker,days="30d",num_bins=20):
             low = float(row['Low'])
             high = float(row['High'])
             vol = float(row['Volume'])
-        except Exception:
+        except (ValueError, TypeError):
             continue
 
         if not (np.isfinite(low) and np.isfinite(high) and np.isfinite(vol)):
@@ -1988,14 +1986,14 @@ def build_breadth_summary_rows(breadth_df, ticker_prefix="", display_prefix=""):
             "Ticker": f"{ticker_prefix}{ratio}",
             "Name": f"{display_prefix}{ratio}" if display_prefix else ratio,
             "Price": round(float(latest_val), 2),
-            "1D%": round(float(chg_1d), 2) if not np.isnan(chg_1d) else np.nan,
-            "5D%": round(float(chg_5d), 2) if not np.isnan(chg_5d) else np.nan,
-            "1M%": round(float(chg_20d), 2) if not np.isnan(chg_20d) else np.nan,
-            "YTD%": np.nan,
-            "Volume_Ratio": np.nan,
-            **{f"Diff_EMA{n}%": np.nan for n in [5, 10, 20, 50, 100, 200]},
-            "Diff_BB_Up%": np.nan,
-            "Diff_BB_Low%": np.nan,
+            "1D%": round(float(chg_1d), 2) if not np.isnan(chg_1d) else None,
+            "5D%": round(float(chg_5d), 2) if not np.isnan(chg_5d) else None,
+            "1M%": round(float(chg_20d), 2) if not np.isnan(chg_20d) else None,
+            "YTD%": None,
+            "Volume_Ratio": None,
+            **{f"Diff_EMA{n}%": None for n in [5, 10, 20, 50, 100, 200]},
+            "Diff_BB_Up%": None,
+            "Diff_BB_Low%": None,
         })
     return results
 
@@ -2007,14 +2005,14 @@ def build_breadth_chart_payload(breadth_df, all_price_data=None, index_ticker=No
     else:
         try:
             index_list = pd.to_datetime(chart_df.index).strftime('%Y-%m-%d').tolist()
-        except Exception:
+        except (AttributeError, TypeError, ValueError):
             index_list = []
 
     payload = {
         "index": index_list,
-        "20MA_Ratio": [round(float(x), 2) if not np.isnan(x) else 0 for x in chart_df["20MA_Ratio"]] if "20MA_Ratio" in chart_df.columns else [],
-        "50MA_Ratio": [round(float(x), 2) if not np.isnan(x) else 0 for x in chart_df["50MA_Ratio"]] if "50MA_Ratio" in chart_df.columns else [],
-        "200MA_Ratio": [round(float(x), 2) if not np.isnan(x) else 0 for x in chart_df["200MA_Ratio"]] if "200MA_Ratio" in chart_df.columns else [],
+        "20MA_Ratio": [round(float(x), 2) if not np.isnan(x) else None for x in chart_df["20MA_Ratio"]] if "20MA_Ratio" in chart_df.columns else [],
+        "50MA_Ratio": [round(float(x), 2) if not np.isnan(x) else None for x in chart_df["50MA_Ratio"]] if "50MA_Ratio" in chart_df.columns else [],
+        "200MA_Ratio": [round(float(x), 2) if not np.isnan(x) else None for x in chart_df["200MA_Ratio"]] if "200MA_Ratio" in chart_df.columns else [],
     }
 
     if index_ticker and index_key:
@@ -2373,7 +2371,7 @@ def get_stock_data():
             # 统一去掉时区，只保留日期部分比较，避免时区不一致问题
             try:
                 prices_dates = prices.index.normalize().tz_localize(None) if prices.index.tz is not None else prices.index.normalize()
-            except Exception:
+            except (AttributeError, TypeError):
                 prices_dates = prices.index
 
             # 确保 target_date 是无时区的 pd.Timestamp（只保留日期）
@@ -2417,7 +2415,7 @@ def get_stock_data():
 
             try:
                 base_price = d.loc[d.index <= base_date, "Adj Close"].iloc[-1]
-            except Exception:
+            except (IndexError, KeyError):
                 base_price = np.nan
 
             # 计算技术指标
@@ -2701,14 +2699,14 @@ def get_breadth_data():
                     results.append({
                         "Ticker": ratio,
                         "Price": round(float(latest_val), 2),
-                        "1D%": round(float(chg_1d), 2) if not np.isnan(chg_1d) else np.nan,
-                        "5D%": round(float(chg_5d), 2) if not np.isnan(chg_5d) else np.nan,
-                        "1M%": round(float(chg_20d), 2) if not np.isnan(chg_20d) else np.nan,
-                        "YTD%": np.nan,
-                        "Volume_Ratio": np.nan,
-                        **{f"Diff_EMA{n}%": np.nan for n in [5, 10, 20, 50, 100, 200]},
-                        "Diff_BB_Up%": np.nan,
-                        "Diff_BB_Low%": np.nan
+                        "1D%": round(float(chg_1d), 2) if not np.isnan(chg_1d) else None,
+                        "5D%": round(float(chg_5d), 2) if not np.isnan(chg_5d) else None,
+                        "1M%": round(float(chg_20d), 2) if not np.isnan(chg_20d) else None,
+                        "YTD%": None,
+                        "Volume_Ratio": None,
+                        **{f"Diff_EMA{n}%": None for n in [5, 10, 20, 50, 100, 200]},
+                        "Diff_BB_Up%": None,
+                        "Diff_BB_Low%": None
                     })
 
         # 准备图表数据（只取最近 252 个交易日 = 1 年）
@@ -2723,9 +2721,9 @@ def get_breadth_data():
 
         breadth_data = {
             "index": index_list,
-            "20MA_Ratio": [round(float(x), 2) if not np.isnan(x) else 0 for x in chart_df["20MA_Ratio"]] if "20MA_Ratio" in chart_df.columns else [],
-            "50MA_Ratio": [round(float(x), 2) if not np.isnan(x) else 0 for x in chart_df["50MA_Ratio"]] if "50MA_Ratio" in chart_df.columns else [],
-            "200MA_Ratio": [round(float(x), 2) if not np.isnan(x) else 0 for x in chart_df["200MA_Ratio"]] if "200MA_Ratio" in chart_df.columns else []
+            "20MA_Ratio": [round(float(x), 2) if not np.isnan(x) else None for x in chart_df["20MA_Ratio"]] if "20MA_Ratio" in chart_df.columns else [],
+            "50MA_Ratio": [round(float(x), 2) if not np.isnan(x) else None for x in chart_df["50MA_Ratio"]] if "50MA_Ratio" in chart_df.columns else [],
+            "200MA_Ratio": [round(float(x), 2) if not np.isnan(x) else None for x in chart_df["200MA_Ratio"]] if "200MA_Ratio" in chart_df.columns else []
         }
         
         print(f"/api/breadth_data 完成，总耗时 {time.perf_counter() - endpoint_start:.1f}s")
@@ -2849,7 +2847,7 @@ def get_kline_data():
         else:
             try:
                 market_cap = f"{float(ticker_info.info['marketCap']):.2e}"
-            except Exception:
+            except (KeyError, ValueError, TypeError, AttributeError, RuntimeError):
                 market_cap = None
 
         # 准备返回数据

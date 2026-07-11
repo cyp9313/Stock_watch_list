@@ -409,7 +409,7 @@ class TestMarketDataService:
 
     def test_fetch_ticker_info_returns_empty_on_error(self):
         """fetch_ticker_info should return {} on exception."""
-        with patch("market_data_service.yf.Ticker", side_effect=Exception("network")):
+        with patch("market_data_service.yf.Ticker", side_effect=RuntimeError("network")):
             result = MarketDataService.fetch_ticker_info("AAPL")
             assert result == {}
 
@@ -886,7 +886,7 @@ class TestProviderMissingData:
 
     def test_ticker_info_empty_on_error(self):
         """fetch_ticker_info should return {} on error, not crash."""
-        with patch("market_data_service.yf.Ticker", side_effect=Exception("fail")):
+        with patch("market_data_service.yf.Ticker", side_effect=RuntimeError("fail")):
             result = MarketDataService.fetch_ticker_info("AAPL")
             assert result == {}
 

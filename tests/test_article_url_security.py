@@ -7,7 +7,7 @@ import socket
 import unittest
 from unittest.mock import Mock, patch
 
-from daily_report.src.stock_daily_agent import tools
+from daily_report.src.stock_daily_agent import article_fetcher
 
 
 def _addr(address: str, port: int = 80):
@@ -40,8 +40,8 @@ class ArticleUrlSecurityTests(unittest.TestCase):
             "::1", "fc00::1", "fe80::1", "ff00::1", "::ffff:127.0.0.1",
         ]:
             with self.subTest(address=address):
-                self.assertFalse(tools._is_public_ip(address))
-        self.assertTrue(tools._is_public_ip("93.184.216.34"))
+                self.assertFalse(article_fetcher._is_public_ip(address))
+        self.assertTrue(article_fetcher._is_public_ip("93.184.216.34"))
 
     def test_rejects_private_dns_and_disallowed_url_forms_before_connection(self) -> None:
         blocked_urls = [
@@ -50,26 +50,26 @@ class ArticleUrlSecurityTests(unittest.TestCase):
             "http://user:password@example.com/",
             "http://safe.example:8080/",
         ]
-        with patch.dict("os.environ", {"ARTICLE_FETCH_ALLOWED_PORTS": ""}), patch.object(tools, "_open_pinned_article_request") as open_request:
+        with patch.dict("os.environ", {"ARTICLE_FETCH_ALLOWED_PORTS": ""}), patch.object(article_fetcher, "_open_pinned_article_request") as open_request:
             for url in blocked_urls:
-                with self.subTest(url=url), self.assertRaises(tools.ArticleFetchSecurityError):
-                    tools._fetch_article_text(url)
-            with patch.object(tools.socket, "getaddrinfo", return_value=_addr("169.254.169.254")):
-                with self.assertRaises(tools.ArticleFetchSecurityError):
-                    tools._fetch_article_text("http://metadata.example/")
-            with patch.object(tools.socket, "getaddrinfo", return_value=_addr("10.0.0.8")):
-                with self.assertRaises(tools.ArticleFetchSecurityError):
-                    tools._fetch_article_text("http://internal.example/")
+                with self.subTest(url=url), self.assertRaises(article_fetcher.ArticleFetchSecurityError):
+                    article_fetcher._fetch_article_text(url)
+            with patch.object(article_fetcher.socket, "getaddrinfo", return_value=_addr("169.254.169.254")):
+                with self.assertRaises(article_fetcher.ArticleFetchSecurityError):
+                    article_fetcher._fetch_article_text("http://metadata.example/")
+            with patch.object(article_fetcher.socket, "getaddrinfo", return_value=_addr("10.0.0.8")):
+                with self.assertRaises(article_fetcher.ArticleFetchSecurityError):
+                    article_fetcher._fetch_article_text("http://internal.example/")
         open_request.assert_not_called()
 
     def test_uses_validated_ip_instead_of_a_second_dns_lookup(self) -> None:
         response = _Response(body=b"<html><title>Acme</title><p>Revenue was 123 and market conditions remain stable.</p></html>")
         connection = Mock()
         with (
-            patch.object(tools.socket, "getaddrinfo", return_value=_addr("93.184.216.34")) as resolve,
-            patch.object(tools, "_open_pinned_article_request", return_value=(response, connection)) as open_request,
+            patch.object(article_fetcher.socket, "getaddrinfo", return_value=_addr("93.184.216.34")) as resolve,
+            patch.object(article_fetcher, "_open_pinned_article_request", return_value=(response, connection)) as open_request,
         ):
-            record = tools._fetch_article_text("https://public.example/article")
+            record = article_fetcher._fetch_article_text("https://public.example/article")
 
         self.assertTrue(record["ok"])
         self.assertEqual(record["final_url"], "https://public.example/article")
@@ -85,11 +85,11 @@ class ArticleUrlSecurityTests(unittest.TestCase):
             return _addr("93.184.216.34" if host == "public.example" else "127.0.0.1", port)
 
         with (
-            patch.object(tools.socket, "getaddrinfo", side_effect=resolve),
-            patch.object(tools, "_open_pinned_article_request", return_value=(redirect, connection)) as open_request,
-            self.assertRaises(tools.ArticleFetchSecurityError),
+            patch.object(article_fetcher.socket, "getaddrinfo", side_effect=resolve),
+            patch.object(article_fetcher, "_open_pinned_article_request", return_value=(redirect, connection)) as open_request,
+            self.assertRaises(article_fetcher.ArticleFetchSecurityError),
         ):
-            tools._fetch_article_text("https://public.example/redirect")
+            article_fetcher._fetch_article_text("https://public.example/redirect")
 
         self.assertEqual(open_request.call_count, 1)
         connection.close.assert_called_once()
@@ -104,36 +104,36 @@ class ArticleUrlSecurityTests(unittest.TestCase):
             return _addr("93.184.216.34" if host == "public.example" else "8.8.8.8", port)
 
         with (
-            patch.object(tools.socket, "getaddrinfo", side_effect=resolve),
+            patch.object(article_fetcher.socket, "getaddrinfo", side_effect=resolve),
             patch.object(
-                tools,
+                article_fetcher,
                 "_open_pinned_article_request",
                 side_effect=[(redirect, first_connection), (success, second_connection)],
             ) as open_request,
         ):
-            record = tools._fetch_article_text("https://public.example/redirect")
+            record = article_fetcher._fetch_article_text("https://public.example/redirect")
 
         self.assertEqual(record["final_url"], "https://second.example/article")
         self.assertEqual(open_request.call_count, 2)
 
         too_large = _Response(body=b"x" * 1025)
         with (
-            patch.object(tools.socket, "getaddrinfo", return_value=_addr("93.184.216.34")),
-            patch.object(tools, "_open_pinned_article_request", return_value=(too_large, Mock())),
+            patch.object(article_fetcher.socket, "getaddrinfo", return_value=_addr("93.184.216.34")),
+            patch.object(article_fetcher, "_open_pinned_article_request", return_value=(too_large, Mock())),
             patch.dict("os.environ", {"ARTICLE_FETCH_MAX_RESPONSE_BYTES": "1024"}),
-            self.assertRaises(tools.ToolError),
+            self.assertRaises(article_fetcher.ToolError),
         ):
-            tools._fetch_article_text("https://public.example/large")
+            article_fetcher._fetch_article_text("https://public.example/large")
 
     def test_enforces_redirect_limit(self) -> None:
         redirect = _Response(status=302, headers={"Location": "https://second.example/article"})
         with (
-            patch.object(tools.socket, "getaddrinfo", return_value=_addr("93.184.216.34")),
-            patch.object(tools, "_open_pinned_article_request", return_value=(redirect, Mock())) as open_request,
+            patch.object(article_fetcher.socket, "getaddrinfo", return_value=_addr("93.184.216.34")),
+            patch.object(article_fetcher, "_open_pinned_article_request", return_value=(redirect, Mock())) as open_request,
             patch.dict("os.environ", {"ARTICLE_FETCH_MAX_REDIRECTS": "0"}),
-            self.assertRaises(tools.ToolError),
+            self.assertRaises(article_fetcher.ToolError),
         ):
-            tools._fetch_article_text("https://public.example/redirect")
+            article_fetcher._fetch_article_text("https://public.example/redirect")
         self.assertEqual(open_request.call_count, 1)
 
 

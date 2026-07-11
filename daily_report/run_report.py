@@ -10,6 +10,8 @@ SRC = ROOT / "src"
 APP_ROOT = ROOT.parent
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
+if str(APP_ROOT) not in sys.path:
+    sys.path.insert(0, str(APP_ROOT))
 
 # Report helper scripts reuse shared app modules such as ticker_mapping.py.
 python_path = os.environ.get("PYTHONPATH", "")

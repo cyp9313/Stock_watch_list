@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import datetime as dt
 from email.utils import parseaddr
+import json
 import os
 from pathlib import Path
 import re
@@ -166,6 +167,7 @@ def init_job_db() -> None:
                     recipient_email TEXT NOT NULL,
                     recipient_masked TEXT NOT NULL,
                     weekday INTEGER NOT NULL,
+                    weekdays_json TEXT,
                     local_time TEXT NOT NULL,
                     timezone TEXT NOT NULL DEFAULT 'Europe/Berlin',
                     months INTEGER NOT NULL,
@@ -179,6 +181,15 @@ def init_job_db() -> None:
                     last_scheduled_for TEXT
                 )
                 """
+            )
+            schedule_columns = {row[1] for row in conn.execute("PRAGMA table_info(report_schedules)")}
+            if "weekdays_json" not in schedule_columns:
+                conn.execute("ALTER TABLE report_schedules ADD COLUMN weekdays_json TEXT")
+            # Existing schedules were one-row-per-weekday.  Preserve their
+            # behaviour by treating the legacy weekday as a one-item set.
+            conn.execute(
+                "UPDATE report_schedules SET weekdays_json='[' || weekday || ']' "
+                "WHERE weekdays_json IS NULL OR weekdays_json=''"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_report_schedules_due "
@@ -273,6 +284,45 @@ def next_weekly_run_at(
             return candidate_utc
         candidate_date += dt.timedelta(days=7)
     raise RuntimeError("Unable to calculate the next weekly report time.")
+
+
+def _normalize_weekdays(weekdays: object) -> tuple[int, ...]:
+    """Validate and canonicalize a non-empty Monday-to-Sunday selection."""
+    if isinstance(weekdays, (str, bytes)) or not isinstance(weekdays, (list, tuple, set)):
+        raise ValueError("Please select at least one valid weekday.")
+    try:
+        selected = tuple(sorted({int(day) for day in weekdays}))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Please select valid weekdays.") from exc
+    if not selected or any(day not in range(7) for day in selected):
+        raise ValueError("Please select at least one valid weekday.")
+    return selected
+
+
+def _schedule_weekdays(row: sqlite3.Row | dict) -> tuple[int, ...]:
+    """Return a schedule's selected weekdays, including legacy rows."""
+    raw = row["weekdays_json"] if "weekdays_json" in row.keys() else None
+    if raw:
+        try:
+            return _normalize_weekdays(json.loads(raw))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+    return _normalize_weekdays([row["weekday"]])
+
+
+def next_scheduled_run_at(
+    weekdays: object,
+    local_time: str | dt.time,
+    *,
+    after_utc: dt.datetime | None = None,
+    timezone_name: str = SCHEDULE_TIMEZONE,
+) -> dt.datetime:
+    """Return the earliest future occurrence across a schedule's weekdays."""
+    selected = _normalize_weekdays(weekdays)
+    return min(
+        next_weekly_run_at(day, local_time, after_utc=after_utc, timezone_name=timezone_name)
+        for day in selected
+    )
 
 
 def enqueue_email_job(
@@ -607,8 +657,9 @@ def create_weekly_schedule(
     owner_key: str,
     ticker: str,
     recipient_email: str,
-    weekday: int,
+    weekday: int | None = None,
     local_time: str | dt.time,
+    weekdays: object | None = None,
     months: int = 3,
     search_provider: str = "auto",
     no_article_fetch: bool = False,
@@ -620,13 +671,17 @@ def create_weekly_schedule(
     if not ticker:
         raise ValueError("Please enter a ticker.")
     recipient_email = validate_email(recipient_email)
-    weekday = int(weekday)
-    if weekday not in range(7):
-        raise ValueError("Please select a valid weekday.")
+    selected_weekdays = _normalize_weekdays(
+        weekdays if weekdays is not None else [weekday]
+    )
+    # Keep the legacy column populated for older databases and callers.  New
+    # behaviour is driven by weekdays_json, which represents one ticker plan.
+    weekday = selected_weekdays[0]
+    weekdays_json = json.dumps(selected_weekdays, separators=(",", ":"))
     local_time = _normalize_local_time(local_time)
-    max_schedules = max(1, int(os.environ.get("REPORT_MAX_SCHEDULES_PER_USER", "10")))
+    max_schedules = min(7, max(1, int(os.environ.get("REPORT_MAX_SCHEDULES_PER_USER", "7"))))
     now = _now()
-    next_run = next_weekly_run_at(weekday, local_time, after_utc=now)
+    next_run = next_scheduled_run_at(selected_weekdays, local_time, after_utc=now)
 
     init_job_db()
     conn = _connect()
@@ -638,24 +693,23 @@ def create_weekly_schedule(
         ).fetchone()[0]
         if schedule_count >= max_schedules:
             raise ScheduleLimitError(f"Weekly schedule limit reached ({max_schedules} per account).")
-        duplicate = conn.execute(
+        duplicates = conn.execute(
             """
-            SELECT id FROM report_schedules
-            WHERE owner_key=? AND ticker=? AND recipient_email=? AND weekday=? AND local_time=?
-            LIMIT 1
+            SELECT id, weekday, weekdays_json FROM report_schedules
+            WHERE owner_key=? AND ticker=? AND recipient_email=? AND local_time=?
             """,
-            (owner_key, ticker, recipient_email, weekday, local_time),
-        ).fetchone()
-        if duplicate:
+            (owner_key, ticker, recipient_email, local_time),
+        ).fetchall()
+        if any(_schedule_weekdays(row) == selected_weekdays for row in duplicates):
             raise ValueError("An identical weekly schedule already exists for this account.")
         schedule_id = uuid.uuid4().hex
         conn.execute(
             """
             INSERT INTO report_schedules (
                 id, owner_key, ticker, recipient_email, recipient_masked,
-                weekday, local_time, timezone, months, search_provider,
+                weekday, weekdays_json, local_time, timezone, months, search_provider,
                 no_article_fetch, is_active, created_at, updated_at, next_run_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
             """,
             (
                 schedule_id,
@@ -664,6 +718,7 @@ def create_weekly_schedule(
                 recipient_email,
                 mask_email(recipient_email),
                 weekday,
+                weekdays_json,
                 local_time,
                 SCHEDULE_TIMEZONE,
                 max(1, int(months)),
@@ -686,7 +741,7 @@ def create_weekly_schedule(
 def _public_schedule(row: sqlite3.Row | None) -> dict | None:
     if row is None:
         return None
-    return {
+    schedule = {
         key: row[key]
         for key in (
             "id",
@@ -707,6 +762,8 @@ def _public_schedule(row: sqlite3.Row | None) -> dict | None:
             "last_scheduled_for",
         )
     }
+    schedule["weekdays"] = list(_schedule_weekdays(row))
+    return schedule
 
 
 def get_schedule(schedule_id: str, *, owner_key: str | None = None) -> dict | None:
@@ -736,13 +793,13 @@ def set_schedule_active(schedule_id: str, *, owner_key: str, active: bool) -> bo
     init_job_db()
     with _connection() as conn:
         row = conn.execute(
-            "SELECT weekday, local_time, timezone FROM report_schedules WHERE id=? AND owner_key=?",
+            "SELECT weekday, weekdays_json, local_time, timezone FROM report_schedules WHERE id=? AND owner_key=?",
             (schedule_id, owner_key),
         ).fetchone()
         if row is None:
             return False
         next_run = (
-            _iso(next_weekly_run_at(row["weekday"], row["local_time"], timezone_name=row["timezone"]))
+            _iso(next_scheduled_run_at(_schedule_weekdays(row), row["local_time"], timezone_name=row["timezone"]))
             if active
             else None
         )
@@ -843,8 +900,8 @@ def materialize_due_schedules(now_utc: dt.datetime | None = None) -> int:
             # or it already existed (dedup).  Schedules that were skipped
             # due to per-user limit do NOT get advanced, so the same
             # occurrence is retried in the next materialization cycle.
-            next_run = next_weekly_run_at(
-                schedule["weekday"],
+            next_run = next_scheduled_run_at(
+                _schedule_weekdays(schedule),
                 schedule["local_time"],
                 after_utc=now_utc,
                 timezone_name=schedule["timezone"],

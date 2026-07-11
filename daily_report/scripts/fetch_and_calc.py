@@ -18,7 +18,6 @@ fetch_and_calc.py — 通用金融日报数据获取与技术指标计算脚本
 import sys
 import os
 import json
-import warnings
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -31,13 +30,11 @@ from market_data_service import MarketDataService
 try:
     from stockanalysis_scraper import scrape_stock_analysis, should_query_forward_pe
     from ticker_mapping import is_known_us_etf
-except Exception:
+except ImportError:
     scrape_stock_analysis = None
     should_query_forward_pe = None
     is_known_us_etf = None
 
-
-warnings.filterwarnings('ignore')
 
 # ── 参数处理 ──────────────────────────────────────────────────────
 if len(sys.argv) < 2:
@@ -107,7 +104,7 @@ beta         = info.get('beta', 0) or 0
 raw_div_yield = info.get('dividendYield', 0) or 0
 try:
     raw_div_yield = float(raw_div_yield)
-except Exception:
+except (ValueError, TypeError):
     raw_div_yield = 0
 if 0 < raw_div_yield <= 1:
     div_yield = raw_div_yield * 100
@@ -322,7 +319,7 @@ distance_from_52w_high_pct = float((hi52 - LAST_CLOSE) / hi52 * 100) if hi52 > 0
 def _clamp(v, lo=0.0, hi=100.0):
     try:
         return max(lo, min(hi, float(v)))
-    except Exception:
+    except (ValueError, TypeError):
         return 50.0
 
 

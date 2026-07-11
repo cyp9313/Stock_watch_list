@@ -1,10 +1,26 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import date
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 import os
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None  # type: ignore[assignment]
+
+
+def get_market_date() -> str:
+    """Get current date in US/Eastern timezone (NYSE/NASDAQ market date).
+
+    Returns ISO date string (YYYY-MM-DD). Falls back to date.today() if
+    zoneinfo is unavailable.
+    """
+    from datetime import datetime, date
+    if ZoneInfo is not None:
+        return datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    return date.today().isoformat()
 
 
 @dataclass(frozen=True)
@@ -33,7 +49,7 @@ class RunContext:
     ticker: str
     run_dir: Path
     months: int = 3
-    report_date: str = date.today().isoformat()
+    report_date: str = field(default_factory=get_market_date)
     output_html: Optional[Path] = None
     min_notes: int = 10
     keep_intermediate: bool = False
@@ -110,19 +126,14 @@ class RunContext:
 
 
 def load_dotenv(project_root: Path) -> None:
-    """Small .env loader so the project works without python-dotenv."""
-    env_path = project_root / ".env"
-    if not env_path.exists():
-        return
-    for raw in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key and key not in os.environ:
-            os.environ[key] = value
+    """Load .env from *project_root* using the unified config_loader.
+
+    Delegates to :func:`config_loader.load_project_env` so every entry point
+    uses the same loading rule.  Existing ``os.environ`` entries are never
+    overridden.
+    """
+    from config_loader import load_project_env
+    load_project_env(project_root / ".env")
 
 
 def build_llm_cfg(model: str, provider: str = "dashscope") -> dict:

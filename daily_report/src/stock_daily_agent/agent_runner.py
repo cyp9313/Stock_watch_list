@@ -43,7 +43,7 @@ def _strict_json_arguments(arguments: Any) -> str:
         for loader in (json.loads, json5.loads):
             try:
                 parsed = loader(candidate)
-            except Exception:
+            except (json.JSONDecodeError, ValueError, TypeError):
                 continue
             if isinstance(parsed, dict):
                 return json.dumps(parsed, ensure_ascii=False)
