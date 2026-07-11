@@ -14,7 +14,8 @@ import pytest
 # We must restore the real versions before each test.
 _REAL_MODULES = [
     "flask", "flask.testing", "flask.json", "werkzeug", "werkzeug.test",
-    "pandas", "numpy", "pytz", "requests", "requests_cache",
+    "pandas", "numpy", "pytz", "requests", "requests.sessions",
+    "requests.adapters", "requests_cache",
     "fear_and_greed", "dotenv", "concurrent", "concurrent.futures",
     "stockanalysis_scraper", "ticker_mapping", "stock_watch_list_back_end",
 ]
@@ -40,6 +41,15 @@ def _ensure_real_modules():
             continue
         if _m == "stock_watch_list_back_end" or isinstance(mod, MagicMock):
             sys.modules.pop(_m, None)
+
+    # Also pop submodules of requests/requests_cache so that reimport
+    # re-binds package-level attributes.  Without this, from .sessions
+    # import Session in requests/__init__.py skips re-binding
+    # requests.sessions because the cached submodule still exists.
+    for _prefix in ("requests.", "requests_cache."):
+        for _k in list(sys.modules):
+            if _k.startswith(_prefix):
+                sys.modules.pop(_k, None)
 
     # Reimport real modules
     import flask
