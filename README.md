@@ -6,7 +6,8 @@
 
 ## 功能概览
 
-- 股票与跨市场观察列表：价格、收益率、均线偏离、布林带、成交量、估值、分析师目标价、相对动量和 Beta。
+- 股票与跨市场观察列表：价格、收益率、相对 `^GSPC` 的短中期超额收益、RSI、均线偏离、布林带、成交量、估值、分析师目标价、加权相对动量和 Beta。
+- 顶部情绪仪表：CNN Fear & Greed、`^VIX` 波动率压力 gauge 和 Crypto Fear & Greed。
 - 市场宽度：S&P 500 与 Nasdaq 100 成分股位于 20/50/200 日均线上方的比例。
 - K 线与技术图表：K 线、均线、MACD、RSI、KDJ、布林带、成交量和 Fibonacci 工具。
 - 单用户与多用户 watchlist：多用户版本支持账户、独立配置、独立缓存和只读游客视图。
@@ -45,6 +46,22 @@ app_tkinter.py          app_streamlit.py             app_streamlit_multiuser.py
 - `app_streamlit_multiuser.py` 是多用户网页端；包含登录、每用户 watchlist、AI 报告下载、邮件任务和周计划。
 - `stock_watch_list_back_end.py` 是市场数据 API。开发模式下 Streamlit 可以启动本地后台线程；生产环境应把 Flask 作为独立服务运行。
 - `daily_report.worker` 是独立进程，只处理持久化的邮件报告任务和周计划物化，不依赖浏览器会话。
+
+## Watchlist 指标
+
+观察列表中的相对动量列统一以 `^GSPC` 为基准：
+
+- `20D Rel%`、`60D Rel%`、`120D Rel%`：标的过去 20、60、120 个交易日收益率减去 `^GSPC` 同窗口收益率，单位为百分点。
+- `3/6/12M Rel%`：原相对动量列，计算为 3、6、12 个月相对 `^GSPC` 超额收益的加权值，权重为 `0.2 / 0.3 / 0.5`，单位为百分点。
+- `RSI`：14 日 RSI。表格颜色以 50 为中性白色，高于 50 越多越红，低于 50 越多越绿。
+
+多用户 Streamlit 的表格提供列组开关：
+
+- `Show relative momentum columns`：统一显示或折叠 `20D Rel%`、`60D Rel%`、`120D Rel%` 和 `3/6/12M Rel%`，默认折叠。
+- `Show financial columns`：统一显示或折叠 `Next Earnings`、`Trailing PE`、`Forward PE`、`PEG Ratio`、`Analysts`、`Price Target` 和 `Market Cap`，默认显示。
+- `Show EMA deviation columns`：单独控制 EMA 偏离列，默认折叠。
+
+表格使用固定列宽和横向滚动来压缩窄数值列；`Name` 列会以省略号显示过长名称，鼠标悬停可查看完整名称。
 
 ## 目录结构
 
@@ -190,6 +207,8 @@ copy .env.example .env        # Windows 命令提示符
 ```
 
 `GET /api/stock_data` 仅为兼容旧客户端保留，并在响应中标记为弃用。市场宽度接口使用 `POST /api/breadth_data`；K 线接口为 `GET /api/kline_data`。
+
+响应数据会包含 watchlist 表格所需的价格、收益率、RSI、相对动量、估值、财报日期、分析师评级和市值字段。相对动量相关字段为 `20D Rel%`、`60D Rel%`、`120D Rel%` 和 `3/6/12M Rel%`；后端会在价格请求中隐式加入 `^GSPC` 用于基准计算，但不会把它额外显示为用户 watchlist 行，除非用户自己配置了 `^GSPC`。
 
 ## SQLite 数据位置
 

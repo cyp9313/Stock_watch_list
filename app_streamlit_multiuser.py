@@ -1,5 +1,6 @@
 """Multi-user Streamlit frontend with per-account editable watch lists."""
-
+import warnings
+warnings.filterwarnings("ignore", message="Timestamp.utcnow is deprecated")
 import copy
 import datetime
 import colorsys
@@ -54,12 +55,49 @@ from ticker_mapping import normalize_yfinance_ticker, stockanalysis_overview_url
 st.set_page_config(page_title="Stock Watchlist", layout="wide", initial_sidebar_state="expanded")
 
 API_BASE = os.environ.get("STOCK_API_BASE_URL", "http://127.0.0.1:5000")
+RELATIVE_RETURN_COLUMNS = ["20D Rel%", "60D Rel%", "120D Rel%"]
+RELATIVE_MOMENTUM_COLUMN = "3/6/12M Rel%"
+RELATIVE_MOMENTUM_COLUMNS = RELATIVE_RETURN_COLUMNS + [RELATIVE_MOMENTUM_COLUMN]
+EMA_DIFF_COLUMNS = [f"Diff_EMA{n}%" for n in [5, 10, 20, 50, 100, 200]]
+FINANCIAL_COLUMNS = [
+    "Next Earnings", "Trailing PE", "Forward PE", "PEG Ratio",
+    "Analysts", "Price Target", "Market Cap",
+]
 COLUMNS = (
-    ["Ticker", "Name", "Price", "1D%", "5D%", "1M%", "YTD%", "Rel. Momentum"]
-    + [f"Diff_EMA{n}%" for n in [5, 10, 20, 50, 100, 200]]
-    + ["Diff_BB_Up%", "Diff_BB_Low%", "Volume_Ratio", "Next Earnings", "Trailing PE", "Forward PE",
-       "PEG Ratio", "Analysts", "Price Target", "Market Cap"]
+    ["Ticker", "Name", "Price", "1D%", "5D%", "1M%", "YTD%"]
+    + RELATIVE_RETURN_COLUMNS
+    + [RELATIVE_MOMENTUM_COLUMN]
+    + EMA_DIFF_COLUMNS
+    + ["Diff_BB_Up%", "Diff_BB_Low%", "RSI", "Volume_Ratio"]
+    + FINANCIAL_COLUMNS
 )
+DEFAULT_COLUMN_WIDTH = 78
+COLUMN_WIDTHS = {
+    "Ticker": 78,
+    "Name": 260,
+    "Price": 86,
+    "1D%": 58,
+    "5D%": 58,
+    "1M%": 58,
+    "YTD%": 62,
+    "20D Rel%": 76,
+    "60D Rel%": 76,
+    "120D Rel%": 84,
+    "3/6/12M Rel%": 98,
+    "Diff_BB_Up%": 88,
+    "Diff_BB_Low%": 92,
+    "RSI": 54,
+    "Volume_Ratio": 86,
+    "Next Earnings": 98,
+    "Trailing PE": 82,
+    "Forward PE": 84,
+    "PEG Ratio": 74,
+    "Analysts": 88,
+    "Price Target": 96,
+    "Market Cap": 96,
+}
+for _ema_column in EMA_DIFF_COLUMNS:
+    COLUMN_WIDTHS[_ema_column] = 76
 RIGHT_ALIGNED_COLUMNS = {
     col
     for col in COLUMNS
@@ -566,6 +604,12 @@ def price_target_color(target_price, current_price):
     return red_green(upside_pct, neg_clip=-50.0, pos_clip=50.0)
 
 
+def rsi_color(value):
+    if value is None or pd.isna(value):
+        return "white"
+    return red_green(50.0 - float(value), neg_clip=-50.0, pos_clip=50.0)
+
+
 def beta_color(beta):
     if beta is None or pd.isna(beta):
         return "white"
@@ -648,11 +692,13 @@ def build_grouped_df(df, groups, display_currency="Local"):
                     disp = ticker
                 elif col == "Name":
                     disp = str(val) if pd.notna(val) and val is not None else ""
-                elif col == "Rel. Momentum":
+                elif col == RELATIVE_MOMENTUM_COLUMN:
+                    disp = f"{float(val):.2f}" if pd.notna(val) else ""
+                elif col in RELATIVE_RETURN_COLUMNS:
                     disp = f"{float(val):.2f}" if pd.notna(val) else ""
                 elif col == "Price":
                     disp = format_money_value(val, ticker, display_currency)
-                elif col == "Volume_Ratio":
+                elif col in ("RSI", "Volume_Ratio"):
                     disp = f"{float(val):.2f}" if pd.notna(val) else ""
                 elif col == "Next Earnings":
                     disp = val if isinstance(val, str) else val.strftime("%Y-%m-%d") if not pd.isna(val) else ""
@@ -707,7 +753,9 @@ def apply_cell_colors(df_display, df_raw, groups, columns=None):
                 elif pd.notna(val) and df_display.iloc[row_index][col] != "" and col != "Price":
                     if col == "Volume_Ratio":
                         cell_colors[(row_index, col_index)] = blue_color(val)
-                    elif col == "Rel. Momentum":
+                    elif col == "RSI":
+                        cell_colors[(row_index, col_index)] = rsi_color(val)
+                    elif col in RELATIVE_MOMENTUM_COLUMNS:
                         cell_colors[(row_index, col_index)] = red_green(val, neg_clip=-50.0, pos_clip=50.0)
                     elif col == "Next Earnings":
                         if isinstance(val, str):
@@ -735,60 +783,156 @@ def apply_cell_colors(df_display, df_raw, groups, columns=None):
     return cell_colors
 
 
-def render_grouped_table(df, groups, dark_mode=False, display_currency="Local", show_name_column=False):
+def render_grouped_table(
+    df,
+    groups,
+    dark_mode=False,
+    display_currency="Local",
+    show_name_column=False,
+    show_relative_momentum_columns=False,
+    show_ema_columns=False,
+    show_financial_columns=True,
+):
     if df.empty:
         st.info("No data available")
         return
 
-    df_display = build_grouped_df(df, groups, display_currency=display_currency)
+    df_display = build_grouped_df(
+        df,
+        groups,
+        display_currency=display_currency,
+    )
+
     if df_display.empty:
         st.info("No data available")
         return
 
-    visible_columns = COLUMNS if show_name_column else [col for col in COLUMNS if col != "Name"]
+    hidden_columns = set()
+
+    if not show_name_column:
+        hidden_columns.add("Name")
+
+    if not show_relative_momentum_columns:
+        hidden_columns.update(RELATIVE_MOMENTUM_COLUMNS)
+
+    if not show_ema_columns:
+        hidden_columns.update(EMA_DIFF_COLUMNS)
+
+    if not show_financial_columns:
+        hidden_columns.update(FINANCIAL_COLUMNS)
+
+    visible_columns = [
+        col for col in COLUMNS
+        if col not in hidden_columns
+    ]
+
     theme = get_theme(dark_mode)
+    table_width = sum(COLUMN_WIDTHS.get(col, DEFAULT_COLUMN_WIDTH) for col in visible_columns)
+
     html_table = f"""
-    <div style="width:100%; max-height:600px; overflow:auto; border:1px solid {theme['table_border']};">
-        <table style="width:100%; border-collapse:collapse; font-family:Arial; font-size:12px; background-color:{theme['table_bg']}; color:{theme['text']};">
-            <thead style="position:sticky; top:0; z-index:10; background-color:{theme['table_header_bg']};">
+    <div style="width:100%; max-height:600px; overflow:auto;
+                border:1px solid {theme['table_border']};">
+        <table style="width:{table_width}px; min-width:100%; table-layout:fixed; border-collapse:collapse;
+                      font-family:Arial; font-size:12px;
+                      background-color:{theme['table_bg']};
+                      color:{theme['text']};">
+            <colgroup>
+    """
+
+    for col in visible_columns:
+        html_table += f"<col style='width:{COLUMN_WIDTHS.get(col, DEFAULT_COLUMN_WIDTH)}px;'>"
+
+    html_table += f"""
+            </colgroup>
+            <thead style="position:sticky; top:0; z-index:10;
+                          background-color:{theme['table_header_bg']};">
                 <tr style="background-color:{theme['table_header_bg']};">
     """
+
     for col in visible_columns:
         html_table += (
-            f"<th style='padding:4px; text-align:left; color:{theme['text']}; "
-            f"border:1px solid {theme['table_border']};'>{html.escape(col)}</th>"
+            f"<th style='padding:4px; text-align:left; "
+            f"color:{theme['text']}; "
+            f"white-space:nowrap; overflow:hidden; text-overflow:ellipsis; "
+            f"border:1px solid {theme['table_border']};'>"
+            f"{html.escape(col)}</th>"
         )
+
     html_table += "</tr></thead><tbody>"
 
-    cell_colors = apply_cell_colors(df_display, df, groups, columns=visible_columns)
+    cell_colors = apply_cell_colors(
+        df_display,
+        df,
+        groups,
+        columns=visible_columns,
+    )
+
     group_names = set(groups.keys())
+
     for row_index in range(len(df_display)):
         row = df_display.iloc[row_index]
         is_header = str(row["Ticker"]) in group_names
         html_table += "<tr>"
+
         for col_index, col in enumerate(visible_columns):
             val = "" if pd.isna(row[col]) else str(row[col])
-            bg_color = cell_colors.get((row_index, col_index), theme["table_group_bg"] if is_header else theme["table_bg"])
-            if dark_mode and bg_color.lower() in ("#ffffff", "white", "#cccccc"):
-                bg_color = theme["table_group_bg"] if is_header else theme["table_bg"]
-            text_color = theme["text"] if bg_color == theme["table_bg"] else readable_text_color(bg_color)
+
+            bg_color = cell_colors.get(
+                (row_index, col_index),
+                theme["table_group_bg"] if is_header else theme["table_bg"],
+            )
+
+            if dark_mode and bg_color.lower() in (
+                "#ffffff",
+                "white",
+                "#cccccc",
+            ):
+                bg_color = (
+                    theme["table_group_bg"]
+                    if is_header
+                    else theme["table_bg"]
+                )
+
+            text_color = (
+                theme["text"]
+                if bg_color == theme["table_bg"]
+                else readable_text_color(bg_color)
+            )
 
             if is_header and col_index == 0:
                 html_table += (
-                    f"<td colspan='{len(COLUMNS)}' style='padding:4px; color:{theme['text']}; "
-                    f"background-color:{bg_color}; font-weight:bold; border:1px solid {theme['table_border']};'>"
+                    # 注意这里必须使用 visible_columns
+                    f"<td colspan='{len(visible_columns)}' "
+                    f"style='padding:4px; color:{theme['text']}; "
+                    f"background-color:{bg_color}; font-weight:bold; "
+                    f"border:1px solid {theme['table_border']};'>"
                     f"{html.escape(val)}</td>"
                 )
                 break
+
             if is_header:
                 continue
 
-            align = "right" if col in RIGHT_ALIGNED_COLUMNS or (val and val[0] in "+-$0123456789") else "left"
+            align = (
+                "right"
+                if col in RIGHT_ALIGNED_COLUMNS
+                or (val and val[0] in "+-$0123456789")
+                else "left"
+            )
+            title_attr = (
+                f" title='{html.escape(val, quote=True)}'"
+                if col == "Name" and val
+                else ""
+            )
+
             html_table += (
-                f"<td style='padding:4px; text-align:{align}; color:{text_color}; "
-                f"background-color:{bg_color}; border:1px solid {theme['table_border']};'>"
+                f"<td{title_attr} style='padding:4px; text-align:{align}; "
+                f"color:{text_color}; background-color:{bg_color}; "
+                f"white-space:nowrap; overflow:hidden; text-overflow:ellipsis; "
+                f"border:1px solid {theme['table_border']};'>"
                 f"{html.escape(val)}</td>"
             )
+
         html_table += "</tr>"
 
     html_table += """
@@ -796,19 +940,38 @@ def render_grouped_table(df, groups, dark_mode=False, display_currency="Local", 
         </table>
     </div>
     """
+
     st.markdown(html_table, unsafe_allow_html=True)
 
 
-def render_market_table(raw_df, page, dark_mode=False, display_currency="Local", show_name_column=False):
+def render_market_table(
+    raw_df,
+    page,
+    dark_mode=False,
+    display_currency="Local",
+    show_name_column=False,
+    show_relative_momentum_columns=False,
+    show_ema_columns=False,
+    show_financial_columns=True,
+):
     groups = page.get("groups", {})
     tickers = page_tickers(page)
-    page_df = raw_df[raw_df["Ticker"].isin(tickers)].copy() if not raw_df.empty else pd.DataFrame()
+
+    page_df = (
+        raw_df[raw_df["Ticker"].isin(tickers)].copy()
+        if not raw_df.empty
+        else pd.DataFrame()
+    )
+
     render_grouped_table(
         page_df,
         groups,
         dark_mode=dark_mode,
         display_currency=display_currency,
         show_name_column=show_name_column,
+        show_relative_momentum_columns=show_relative_momentum_columns,
+        show_ema_columns=show_ema_columns,
+        show_financial_columns=show_financial_columns,
     )
 
 
@@ -1048,6 +1211,16 @@ def fetch_breadth_data():
 def fetch_fear_greed(path):
     try:
         resp = requests.get(f"{API_BASE}{path}", timeout=10)
+        return resp.json() if resp.status_code == 200 else None
+    except (requests.RequestException, ValueError):
+        return None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_vix_kline():
+    params = {"ticker": "^VIX", "period": 10, "interval": "1d"}
+    try:
+        resp = requests.get(f"{API_BASE}/api/kline_data", params=params, timeout=120)
         return resp.json() if resp.status_code == 200 else None
     except (requests.RequestException, ValueError):
         return None
@@ -1393,6 +1566,133 @@ def display_fear_greed(fg_data, title, dark_mode=False):
     value = max(0, min(100, value))
     description = fg_data.get("description", "") or "N/A"
     st.plotly_chart(build_fear_greed_gauge(value, description, title, dark_mode=dark_mode), width="stretch")
+
+
+def vix_status(value):
+    if value <= 12:
+        return "Complacent"
+    if value <= 16:
+        return "Calm"
+    if value <= 20:
+        return "Neutral"
+    if value <= 30:
+        return "Caution"
+    if value <= 40:
+        return "Fear"
+    return "Panic"
+
+
+def vix_color(value):
+    if value <= 12:
+        return "#2e7d32"
+    if value <= 16:
+        return "#7cb342"
+    if value <= 20:
+        return "#9ca3af"
+    if value <= 30:
+        return "#f57c00"
+    if value <= 40:
+        return "#d32f2f"
+    return "#7f1d1d"
+
+
+def latest_vix_value(kline_data):
+    if not kline_data or not kline_data.get("success"):
+        return None
+    closes = kline_data.get("ohlc", {}).get("close") or []
+    for value in reversed(closes):
+        try:
+            if value is not None and not pd.isna(value):
+                return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def build_vix_gauge(value, dark_mode=False):
+    theme = get_theme(dark_mode)
+    gauge_value = max(0.0, min(80.0, float(value)))
+    color = vix_color(float(value))
+    description = vix_status(float(value))
+    fig = go.Figure(
+        go.Indicator(
+            mode="gauge",
+            value=gauge_value,
+            title={
+                "text": "<b>VIX Volatility</b>",
+                "font": {"size": 17},
+            },
+            gauge={
+                "axis": {
+                    "range": [0, 80],
+                    "tickwidth": 1,
+                    "tickcolor": theme["muted"],
+                    "tickmode": "array",
+                    "tickvals": [0, 12, 16, 20, 30, 40, 80],
+                },
+                "bar": {"color": color, "thickness": 0.22},
+                "bgcolor": theme["plot_bg"],
+                "borderwidth": 1,
+                "bordercolor": theme["table_border"],
+                "steps": [
+                    {"range": [0, 12], "color": "#c8e6c9"},
+                    {"range": [12, 16], "color": "#dcedc8"},
+                    {"range": [16, 20], "color": "#f3f4f6"},
+                    {"range": [20, 30], "color": "#ffe0b2"},
+                    {"range": [30, 40], "color": "#ffcdd2"},
+                    {"range": [40, 80], "color": "#fecaca"},
+                ],
+                "threshold": {
+                    "line": {"color": color, "width": 5},
+                    "thickness": 0.85,
+                    "value": gauge_value,
+                },
+            },
+        )
+    )
+    fig.update_layout(
+        height=250,
+        margin=dict(l=16, r=16, t=42, b=24),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="Arial, sans-serif", color=theme["text"]),
+        annotations=[
+            dict(
+                text=f"<b>{description}</b>",
+                x=0.5,
+                y=0.28,
+                xref="paper",
+                yref="paper",
+                xanchor="center",
+                yanchor="middle",
+                yshift=42,
+                showarrow=False,
+                font=dict(size=17, color=color),
+            ),
+            dict(
+                text=f"<b>{float(value):.1f}</b>",
+                x=0.5,
+                y=0.28,
+                xref="paper",
+                yref="paper",
+                xanchor="center",
+                yanchor="middle",
+                yshift=-18,
+                showarrow=False,
+                font=dict(size=42, color=color),
+            ),
+        ],
+        uirevision=f"VIX-{float(value):.1f}-{description}",
+    )
+    return fig
+
+
+def display_vix_gauge(kline_data, dark_mode=False):
+    value = latest_vix_value(kline_data)
+    if value is None:
+        st.metric("VIX Volatility", "N/A")
+        return
+    st.plotly_chart(build_vix_gauge(value, dark_mode=dark_mode), width="stretch")
 
 
 def build_kline_chart(kline_data, ticker, fib_levels=None, dark_mode=False):
@@ -1869,18 +2169,62 @@ def render_section(section_title, section_key, config, raw_df, editable, user, d
                             config = delete_page(config, section_key, i)
                             save_active_config(user, config)
                             st.rerun()
-            show_name_column = st.toggle(
-                "Show Name column next to Ticker",
-                value=False,
-                key=f"{section_key}_{i}_show_name_column",
-                help="Turn this on to insert the cached yfinance display-name column between Ticker and Price.",
-            )
+            # Table column display controls
+            display_col1, display_col2, display_col3, display_col4 = st.columns(4)
+
+            with display_col1:
+                show_name_column = st.toggle(
+                    "Show Name column next to Ticker",
+                    value=False,
+                    key=f"{section_key}_{i}_show_name_column",
+                    help=(
+                        "Turn this on to insert the cached yfinance "
+                        "display-name column between Ticker and Price."
+                    ),
+                )
+
+            with display_col2:
+                show_relative_momentum_columns = st.toggle(
+                    "Show relative momentum columns",
+                    value=False,
+                    key=f"{section_key}_{i}_show_relative_momentum_columns",
+                    help=(
+                        "Show 20D/60D/120D excess returns versus ^GSPC "
+                        "and the weighted 3/6/12M relative momentum column."
+                    ),
+                )
+
+            with display_col3:
+                show_financial_columns = st.toggle(
+                    "Show financial columns",
+                    value=True,
+                    key=f"{section_key}_{i}_show_financial_columns",
+                    help=(
+                        "Show Next Earnings, PE, PEG, Analysts, Price Target "
+                        "and Market Cap columns."
+                    ),
+                )
+
+            with display_col4:
+                show_ema_columns = st.toggle(
+                    "Show EMA deviation columns",
+                    value=False,
+                    key=f"{section_key}_{i}_show_ema_columns",
+                    help=(
+                        "Show Diff_EMA5%, Diff_EMA10%, Diff_EMA20%, "
+                        "Diff_EMA50%, Diff_EMA100% and Diff_EMA200%."
+                    ),
+                )
+
             render_market_table(
                 raw_df,
                 config[section_key][i],
                 dark_mode=dark_mode,
                 display_currency=display_currency,
                 show_name_column=show_name_column,
+                show_relative_momentum_columns=show_relative_momentum_columns,
+                show_ema_columns=show_ema_columns,
+                show_financial_columns=show_financial_columns,
             )
     return config
 
@@ -2394,10 +2738,13 @@ st.caption(
     "Market Breadth is calculated from shared S&P 500 and Nasdaq 100 universes and is not edited manually."
 )
 
-fg1, fg2 = st.columns(2)
+fg1, fg_vix, fg2 = st.columns(3)
 with fg1:
     fg = fetch_fear_greed("/api/fear_greed")
     display_fear_greed(fg, "CNN Fear & Greed", dark_mode=dark_mode)
+with fg_vix:
+    vix_data = fetch_vix_kline()
+    display_vix_gauge(vix_data, dark_mode=dark_mode)
 with fg2:
     cfg = fetch_fear_greed("/api/fear_greed_crypto")
     display_fear_greed(cfg, "Crypto Fear & Greed", dark_mode=dark_mode)

@@ -21,7 +21,7 @@ DEFAULT_STOCK_PAGES = [
         "name": "Core Watchlist",
         "groups": {
             "Mag7": ["AAPL", "MSFT", "GOOG", "AMZN", "META", "TSLA", "NVDA", "SPCX"],
-            "Chips/AI": ["MU", "ORCL", "AMD", "INTC", "AVGO", "SMCI", "PLTR", "RGTI", "DXYZ", "SNPS", "APP"],
+            "Chips/AI": ["TSM", "MU", "ORCL", "AMD", "INTC", "AVGO", "SMCI", "PLTR", "RGTI", "DXYZ", "SNPS", "APP"],
             "Fin/Crypto": ["V", "JPM", "BRK-B", "COIN", "HOOD", "MSTR", "CRCL", "SOFI", "OSCR"],
             "Health": ["LLY", "NVO", "ABBV", "UNH"],
             "Energy": ["SMR", "VST", "OKLO", "NEE", "ENPH", "GE", "GEV"],

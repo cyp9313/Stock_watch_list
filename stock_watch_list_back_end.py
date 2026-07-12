@@ -21,6 +21,15 @@ import requests_cache
 from stockanalysis_scraper import scrape_batch, should_query_forward_pe
 from ticker_mapping import normalize_yfinance_ticker
 
+RELATIVE_RETURN_BENCHMARK = "^GSPC"
+RELATIVE_RETURN_WINDOWS = (20, 60, 120)
+RELATIVE_RETURN_COLUMNS = {
+    20: "20D Rel%",
+    60: "60D Rel%",
+    120: "120D Rel%",
+}
+RELATIVE_MOMENTUM_COLUMN = "3/6/12M Rel%"
+
 # 加载 .env 文件中的环境变量（CWD 无关，始终从项目根目录加载）
 load_project_env()
 # DashScope API key (当前未使用，保留供未来扩展)
@@ -298,6 +307,94 @@ def cleanup_old_data(conn=None, db_path=None):
         conn.close()
 
 
+def _normalize_price_dates(prices):
+    try:
+        return (
+            prices.index.normalize().tz_localize(None)
+            if prices.index.tz is not None
+            else prices.index.normalize()
+        )
+    except (AttributeError, TypeError):
+        return prices.index
+
+
+def _price_on_or_near_date(prices, target_date, max_days=10):
+    if prices is None or len(prices) == 0:
+        return np.nan
+
+    price_dates = _normalize_price_dates(prices)
+    target = pd.Timestamp(target_date).normalize()
+    if target.tzinfo is not None:
+        target = target.tz_localize(None)
+
+    for delta in range(0, max_days + 1):
+        for sign in ([0] if delta == 0 else [-1, 1]):
+            candidate = target + pd.Timedelta(days=delta * sign if sign else 0)
+            matches = (price_dates == candidate)
+            if matches.any():
+                return prices.iloc[matches.argmax()]
+
+    return np.nan
+
+
+def compute_relative_return_scores(
+    adj_close,
+    tickers,
+    benchmark_ticker=RELATIVE_RETURN_BENCHMARK,
+    windows=RELATIVE_RETURN_WINDOWS,
+):
+    """Compute N-day excess returns versus the benchmark, in percentage points."""
+    tickers = list(dict.fromkeys(tickers))
+    scores = {
+        ticker: {RELATIVE_RETURN_COLUMNS[window]: np.nan for window in windows}
+        for ticker in tickers
+    }
+
+    if adj_close is None or adj_close.empty or benchmark_ticker not in adj_close.columns:
+        return scores
+
+    benchmark_prices = adj_close[benchmark_ticker].dropna()
+    if benchmark_prices.empty:
+        return scores
+
+    for window in windows:
+        if len(benchmark_prices) < window + 1:
+            continue
+
+        ref_date = pd.Timestamp(benchmark_prices.index[-(window + 1)]).normalize()
+        benchmark_ref = _price_on_or_near_date(benchmark_prices, ref_date)
+        benchmark_latest = benchmark_prices.iloc[-1]
+        if pd.isna(benchmark_ref) or pd.isna(benchmark_latest) or benchmark_ref == 0:
+            continue
+
+        benchmark_return = benchmark_latest / benchmark_ref - 1.0
+
+        for ticker in tickers:
+            if ticker not in adj_close.columns:
+                continue
+            prices = adj_close[ticker].dropna()
+            if prices.empty:
+                continue
+
+            ticker_ref = _price_on_or_near_date(prices, ref_date)
+            ticker_latest = prices.iloc[-1]
+            if pd.isna(ticker_ref) or pd.isna(ticker_latest) or ticker_ref == 0:
+                continue
+
+            column = RELATIVE_RETURN_COLUMNS[window]
+            scores[ticker][column] = float((ticker_latest / ticker_ref - 1.0 - benchmark_return) * 100.0)
+
+    return scores
+
+
+def compute_rsi_series(prices, window=14):
+    delta = prices.diff()
+    gain = delta.where(delta > 0, 0).rolling(window).mean()
+    loss = -delta.where(delta < 0, 0).rolling(window).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+
 def init_db():
     """[Deprecated] Backward-compatible wrapper.
 
@@ -479,18 +576,25 @@ def _chunks(items, size):
         yield items[i:i + size]
 
 
-def _short_ticker_name(name, max_len=28):
+def _short_ticker_name(name, max_len=None):
     text = str(name or "").strip()
     if not text or text.lower() == "nan":
         return None
     text = re.sub(r"\s+", " ", text)
+    if max_len is None:
+        return text
     return text if len(text) <= max_len else text[:max_len - 3].rstrip() + "..."
+
+
+def _is_legacy_truncated_ticker_name(name):
+    text = str(name or "").strip()
+    return text.endswith("...") and len(text) <= 28
 
 
 def _fetch_yfinance_ticker_name(ticker):
     try:
         info = yf.Ticker(ticker).info
-        for key in ("shortName", "displayName", "longName"):
+        for key in ("longName", "displayName", "shortName"):
             name = _short_ticker_name(info.get(key))
             if name and name.upper() != ticker.upper():
                 return name
@@ -512,7 +616,11 @@ def get_cached_ticker_names(tickers):
         tickers,
     ).fetchall()
 
-    cached = {ticker: name for ticker, name, _ in rows if name}
+    cached = {
+        ticker: name
+        for ticker, name, _ in rows
+        if name and not _is_legacy_truncated_ticker_name(name)
+    }
     checked_today_without_name = {
         ticker for ticker, name, checked_date in rows
         if not name and checked_date == today
@@ -2283,7 +2391,8 @@ def get_stock_data():
                 earnings_df.loc[ticker_symbol] = None
 
         # 获取价格数据（增量更新：已有标的只下载最近几天，新标的全量下载）
-        df = get_prices_with_cache(all_tickers, period="2y")
+        price_tickers = list(dict.fromkeys(all_tickers + [RELATIVE_RETURN_BENCHMARK]))
+        df = get_prices_with_cache(price_tickers, period="2y")
 
         if isinstance(df.columns, pd.MultiIndex):
             top_fields = {lvl[0] for lvl in df.columns}
@@ -2297,11 +2406,11 @@ def get_stock_data():
                 price_col = 'Adj Close'
             else:
                 price_col = df.columns[0]
-            only_ticker = all_tickers[0]
+            only_ticker = price_tickers[0]
             adj_close = df[[price_col]].rename(columns={price_col: only_ticker})
             volumes = pd.DataFrame({only_ticker: df['Volume']}) if 'Volume' in df.columns else pd.DataFrame()
 
-        extended_updates = update_extended_hours_price_cache(all_tickers)
+        extended_updates = update_extended_hours_price_cache(price_tickers)
         if extended_updates:
             for ext_ticker, ext_data in extended_updates.items():
                 ext_date = pd.Timestamp(ext_data["date"])
@@ -2397,6 +2506,7 @@ def get_stock_data():
         today_str = get_market_date()
         beta_cache = get_cached_betas(all_tickers, today_str)
         beta_updates = []
+        relative_return_scores = compute_relative_return_scores(adj_close, all_tickers)
 
         for ticker in all_tickers:
             if adj_close.empty or ticker not in adj_close.columns:
@@ -2426,6 +2536,7 @@ def get_stock_data():
             d["BB_Std"] = d["Adj Close"].rolling(20, min_periods=1).std()
             d["BB_Up"] = d["BB_Mid"] + 2 * d["BB_Std"]
             d["BB_Low"] = d["BB_Mid"] - 2 * d["BB_Std"]
+            d["RSI"] = compute_rsi_series(d["Adj Close"])
 
             latest = d.iloc[-1]
             prev = d.iloc[-2] if len(d) > 1 else latest
@@ -2535,16 +2646,25 @@ def get_stock_data():
                             beta = float(cov_matrix[0, 1] / var_sp500)
                             beta_updates.append((ticker, today_str, beta, len(common_idx)))
 
+            ticker_relative_scores = relative_return_scores.get(ticker, {})
+
             row = {
                 "Ticker": ticker,
                 "Name": ticker_names.get(ticker),
                 "Price": float(round(latest["Adj Close"], 2)),
                 "Beta": round(beta, 2) if not pd.isna(beta) else np.nan,
-                "Rel. Momentum": round(float(relative_momentum), 2) if not pd.isna(relative_momentum) else np.nan,
+                "20D Rel%": round(float(ticker_relative_scores.get("20D Rel%")), 2)
+                if pd.notna(ticker_relative_scores.get("20D Rel%", np.nan)) else np.nan,
+                "60D Rel%": round(float(ticker_relative_scores.get("60D Rel%")), 2)
+                if pd.notna(ticker_relative_scores.get("60D Rel%", np.nan)) else np.nan,
+                "120D Rel%": round(float(ticker_relative_scores.get("120D Rel%")), 2)
+                if pd.notna(ticker_relative_scores.get("120D Rel%", np.nan)) else np.nan,
+                RELATIVE_MOMENTUM_COLUMN: round(float(relative_momentum), 2) if not pd.isna(relative_momentum) else np.nan,
                 "1D%": pct(latest["Adj Close"], prev["Adj Close"]),
                 "5D%": pct(latest["Adj Close"], d.iloc[-6]["Adj Close"]) if len(d) > 6 else np.nan,
                 "1M%": pct(latest["Adj Close"], d.iloc[-21]["Adj Close"]) if len(d) > 21 else np.nan,
                 "YTD%": pct(latest["Adj Close"], base_price) if pd.notna(base_price) else np.nan,
+                "RSI": round(float(latest["RSI"]), 2) if pd.notna(latest.get("RSI", np.nan)) else np.nan,
                 "Volume_Ratio": (latest["Volume"] / latest["Volume_EMA5"]) if pd.notna(latest.get("Volume_EMA5")) and latest.get("Volume_EMA5") not in (0, None) else np.nan,
                 "Next Earnings": next_earnings.strftime('%Y-%m-%d') if next_earnings and not pd.isna(next_earnings) else None,
                 "Trailing PE": trailing_PE,
@@ -2815,11 +2935,7 @@ def get_kline_data():
         kdj_j = 3 * kdj_k - 2 * kdj_d
 
         # RSI
-        delta = stock_data['Close'].diff()
-        gain = delta.where(delta > 0, 0).rolling(14).mean()
-        loss = -delta.where(delta < 0, 0).rolling(14).mean()
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs))
+        rsi = compute_rsi_series(stock_data['Close'])
 
         # 移动平均线
         for win in [5, 10, 20, 50, 100, 200]:

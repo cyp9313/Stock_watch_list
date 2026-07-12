@@ -10,6 +10,7 @@ import numpy as np
 import json
 import os
 import requests
+import html
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import datetime
@@ -227,10 +228,34 @@ BROAD_MARKET_TICKERS = list(dict.fromkeys(
 # COLUMNS (EXACTLY matching tkinter version)
 # ════════════════════════════════════════════════════════════
 COLUMNS = (
-    ["Ticker", "Name", "Price", "1D%", "5D%", "1M%", "YTD%", "Rel. Momentum"] +
+    ["Ticker", "Name", "Price", "1D%", "5D%", "1M%", "YTD%", "3/6/12M Rel%"] +
     [f"Diff_EMA{n}%" for n in [5, 10, 20, 50, 100, 200]] +
-    ["Diff_BB_Up%", "Diff_BB_Low%", "Volume_Ratio", "Next Earnings", "Trailing PE", "Forward PE", "PEG Ratio", "Analysts", "Price Target", "Market Cap"]
+    ["Diff_BB_Up%", "Diff_BB_Low%", "RSI", "Volume_Ratio", "Next Earnings", "Trailing PE", "Forward PE", "PEG Ratio", "Analysts", "Price Target", "Market Cap"]
 )
+DEFAULT_COLUMN_WIDTH = 78
+COLUMN_WIDTHS = {
+    "Ticker": 78,
+    "Name": 260,
+    "Price": 86,
+    "1D%": 58,
+    "5D%": 58,
+    "1M%": 58,
+    "YTD%": 62,
+    "3/6/12M Rel%": 98,
+    "Diff_BB_Up%": 88,
+    "Diff_BB_Low%": 92,
+    "RSI": 54,
+    "Volume_Ratio": 86,
+    "Next Earnings": 98,
+    "Trailing PE": 82,
+    "Forward PE": 84,
+    "PEG Ratio": 74,
+    "Analysts": 88,
+    "Price Target": 96,
+    "Market Cap": 96,
+}
+for _ema_column in [f"Diff_EMA{n}%" for n in [5, 10, 20, 50, 100, 200]]:
+    COLUMN_WIDTHS[_ema_column] = 76
 
 
 # ── Color helpers (EXACTLY matching tkinter version) ─────────
@@ -305,6 +330,12 @@ def price_target_color(target_price, current_price):
     return red_green(upside_pct, neg_clip=-50.0, pos_clip=50.0)
 
 
+def rsi_color(value):
+    if value is None or pd.isna(value):
+        return "white"
+    return red_green(50.0 - float(value), neg_clip=-50.0, pos_clip=50.0)
+
+
 def beta_color(beta):
     """Beta color: beta=1 is white, beta>1 red, beta<1 green."""
     if pd.isna(beta) or beta is None:
@@ -374,6 +405,18 @@ def fetch_fear_greed():
 def fetch_crypto_fear_greed():
     try:
         resp = requests.get(f"{API_BASE}/api/fear_greed_crypto", timeout=10)
+        if resp.status_code == 200:
+            return resp.json()
+    except (requests.RequestException, ValueError):
+        pass
+    return None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_vix_kline():
+    params = {"ticker": "^VIX", "period": 10, "interval": "1d"}
+    try:
+        resp = requests.get(f"{API_BASE}/api/kline_data", params=params, timeout=120)
         if resp.status_code == 200:
             return resp.json()
     except (requests.RequestException, ValueError):
@@ -464,9 +507,9 @@ def build_grouped_df(df, groups):
                         disp = tk_
                     elif col == "Name":
                         disp = str(val) if pd.notna(val) and val is not None else ""
-                    elif col == "Rel. Momentum":
+                    elif col == "3/6/12M Rel%":
                         disp = f"{float(val):.2f}" if pd.notna(val) else ""
-                    elif col in ("Price", "Volume_Ratio"):
+                    elif col in ("Price", "RSI", "Volume_Ratio"):
                         disp = f"{float(val):.2f}" if pd.notna(val) else ""
                     elif col == "Next Earnings":
                         disp = val if isinstance(val, str) else val.strftime('%Y-%m-%d') if not pd.isna(val) else ""
@@ -530,7 +573,9 @@ def apply_cell_colors(df_display, df_raw, groups, columns=None):
                 elif pd.notna(val) and df_display.iloc[r][col] != "" and col != "Price":
                     if col == "Volume_Ratio":
                         cell_colors[(r, j)] = blue_color(val)
-                    elif col == "Rel. Momentum":
+                    elif col == "RSI":
+                        cell_colors[(r, j)] = rsi_color(val)
+                    elif col == "3/6/12M Rel%":
                         cell_colors[(r, j)] = red_green(val, neg_clip=-50.0, pos_clip=50.0)
                     elif col == "Next Earnings":
                         if isinstance(val, str):
@@ -579,17 +624,30 @@ def render_grouped_table(df, groups, key_prefix="", dark_mode=False, show_name_c
     
     visible_columns = COLUMNS if show_name_column else [col for col in COLUMNS if col != "Name"]
     theme = get_theme(dark_mode)
+    table_width = sum(COLUMN_WIDTHS.get(col, DEFAULT_COLUMN_WIDTH) for col in visible_columns)
     # Display using HTML table with fixed header using CSS
     html_table = f"""
     <div style="width:100%; max-height:600px; overflow:auto; border:1px solid {theme['table_border']};">
-        <table style="width:100%; border-collapse:collapse; font-family:Arial; font-size:12px; background-color:{theme['table_bg']}; color:{theme['text']};">
+        <table style="width:{table_width}px; min-width:100%; table-layout:fixed; border-collapse:collapse; font-family:Arial; font-size:12px; background-color:{theme['table_bg']}; color:{theme['text']};">
+            <colgroup>
+    """
+
+    for col in visible_columns:
+        html_table += f"<col style='width:{COLUMN_WIDTHS.get(col, DEFAULT_COLUMN_WIDTH)}px;'>"
+
+    html_table += f"""
+            </colgroup>
             <thead style="position:sticky; top:0; z-index:10; background-color:{theme['table_header_bg']};">
                 <tr style="background-color:{theme['table_header_bg']};">
     """
     
     # Header
     for col in visible_columns:
-        html_table += f"<th style='padding:4px; text-align:left; color:{theme['text']}; border:1px solid {theme['table_border']};'>{col}</th>"
+        html_table += (
+            f"<th style='padding:4px; text-align:left; color:{theme['text']}; "
+            f"white-space:nowrap; overflow:hidden; text-overflow:ellipsis; "
+            f"border:1px solid {theme['table_border']};'>{html.escape(col)}</th>"
+        )
     html_table += "</tr></thead><tbody>"
     
     # Apply colors
@@ -611,14 +669,24 @@ def render_grouped_table(df, groups, key_prefix="", dark_mode=False, show_name_c
             
             # Header row styling
             if is_header and j == 0:
-                html_table += f"<td colspan='{len(visible_columns)}' style='padding:4px; color:{theme['text']}; background-color:{bg_color}; font-weight:bold; border:1px solid {theme['table_border']};'>{val}</td>"
+                html_table += f"<td colspan='{len(visible_columns)}' style='padding:4px; color:{theme['text']}; background-color:{bg_color}; font-weight:bold; border:1px solid {theme['table_border']};'>{html.escape(str(val))}</td>"
                 break
             elif is_header:
                 continue
             
             # Data row styling
             align = "right" if isinstance(val, (int, float)) or (isinstance(val, str) and val and val[0] in "+-$0123456789") else "left"
-            html_table += f"<td style='padding:4px; text-align:{align}; color:{text_color}; background-color:{bg_color}; border:1px solid {theme['table_border']};'>{val}</td>"
+            title_attr = (
+                f" title='{html.escape(str(val), quote=True)}'"
+                if col == "Name" and val
+                else ""
+            )
+            html_table += (
+                f"<td{title_attr} style='padding:4px; text-align:{align}; color:{text_color}; "
+                f"background-color:{bg_color}; white-space:nowrap; overflow:hidden; "
+                f"text-overflow:ellipsis; border:1px solid {theme['table_border']};'>"
+                f"{html.escape(str(val))}</td>"
+            )
         
         html_table += "</tr>"
     
@@ -1263,6 +1331,133 @@ def display_fear_greed(fg_data, title, prefix="", dark_mode=False):
     st.plotly_chart(build_fear_greed_gauge(val, desc, title, dark_mode=dark_mode), use_container_width=True)
 
 
+def vix_status(value):
+    if value <= 12:
+        return "Complacent"
+    if value <= 16:
+        return "Calm"
+    if value <= 20:
+        return "Neutral"
+    if value <= 30:
+        return "Caution"
+    if value <= 40:
+        return "Fear"
+    return "Panic"
+
+
+def vix_color(value):
+    if value <= 12:
+        return "#2e7d32"
+    if value <= 16:
+        return "#7cb342"
+    if value <= 20:
+        return "#9ca3af"
+    if value <= 30:
+        return "#f57c00"
+    if value <= 40:
+        return "#d32f2f"
+    return "#7f1d1d"
+
+
+def latest_vix_value(kline_data):
+    if not kline_data or not kline_data.get("success"):
+        return None
+    closes = kline_data.get("ohlc", {}).get("close") or []
+    for value in reversed(closes):
+        try:
+            if value is not None and not pd.isna(value):
+                return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def build_vix_gauge(value, dark_mode=False):
+    theme = get_theme(dark_mode)
+    gauge_value = max(0.0, min(80.0, float(value)))
+    color = vix_color(float(value))
+    description = vix_status(float(value))
+    fig = go.Figure(
+        go.Indicator(
+            mode="gauge",
+            value=gauge_value,
+            title={
+                "text": "<b>VIX Volatility</b>",
+                "font": {"size": 17},
+            },
+            gauge={
+                "axis": {
+                    "range": [0, 80],
+                    "tickwidth": 1,
+                    "tickcolor": theme["muted"],
+                    "tickmode": "array",
+                    "tickvals": [0, 12, 16, 20, 30, 40, 80],
+                },
+                "bar": {"color": color, "thickness": 0.22},
+                "bgcolor": theme["plot_bg"],
+                "borderwidth": 1,
+                "bordercolor": theme["table_border"],
+                "steps": [
+                    {"range": [0, 12], "color": "#c8e6c9"},
+                    {"range": [12, 16], "color": "#dcedc8"},
+                    {"range": [16, 20], "color": "#f3f4f6"},
+                    {"range": [20, 30], "color": "#ffe0b2"},
+                    {"range": [30, 40], "color": "#ffcdd2"},
+                    {"range": [40, 80], "color": "#fecaca"},
+                ],
+                "threshold": {
+                    "line": {"color": color, "width": 5},
+                    "thickness": 0.85,
+                    "value": gauge_value,
+                },
+            },
+        )
+    )
+    fig.update_layout(
+        height=250,
+        margin=dict(l=16, r=16, t=42, b=24),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="Arial, sans-serif", color=theme["text"]),
+        annotations=[
+            dict(
+                text=f"<b>{description}</b>",
+                x=0.5,
+                y=0.28,
+                xref="paper",
+                yref="paper",
+                xanchor="center",
+                yanchor="middle",
+                yshift=42,
+                showarrow=False,
+                font=dict(size=17, color=color),
+            ),
+            dict(
+                text=f"<b>{float(value):.1f}</b>",
+                x=0.5,
+                y=0.28,
+                xref="paper",
+                yref="paper",
+                xanchor="center",
+                yanchor="middle",
+                yshift=-18,
+                showarrow=False,
+                font=dict(size=42, color=color),
+            ),
+        ],
+        uirevision=f"VIX-{float(value):.1f}-{description}",
+    )
+    return fig
+
+
+def display_vix_gauge(kline_data, dark_mode=False):
+    value = latest_vix_value(kline_data)
+    if value is None:
+        st.metric("VIX Volatility", "N/A")
+        return
+    st.plotly_chart(build_vix_gauge(value, dark_mode=dark_mode), use_container_width=True)
+
+
 # ════════════════════════════════════════════════════════════
 # MAIN APP
 # ════════════════════════════════════════════════════════════
@@ -1296,11 +1491,15 @@ st.title("📈 US Stock Watchlist")
 
 # ── Fear & Greed Row ─────────────────────────────────────────
 fg = fetch_fear_greed()
+vix = fetch_vix_kline()
 cfg = fetch_crypto_fear_greed()
-col_fg1, col_fg2 = st.columns(2)
+col_fg1, col_vix, col_fg2 = st.columns(3)
 with col_fg1:
     st.caption("CNN Fear & Greed Index")
     display_fear_greed(fg, "CNN", dark_mode=dark_mode)
+with col_vix:
+    st.caption("^VIX")
+    display_vix_gauge(vix, dark_mode=dark_mode)
 with col_fg2:
     st.caption("Crypto Fear & Greed Index")
     display_fear_greed(cfg, "Crypto", dark_mode=dark_mode)
