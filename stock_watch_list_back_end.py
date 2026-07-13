@@ -60,6 +60,7 @@ BREADTH_PSEUDO_TICKERS = BREADTH_RATIO_TICKERS | BREADTH_DISPLAY_TICKERS
 BREADTH_PSEUDO_TICKERS_UPPER = {ticker.upper() for ticker in BREADTH_PSEUDO_TICKERS}
 NON_EXTENDED_HOURS_TICKERS = BREADTH_PSEUDO_TICKERS
 SP500_MARKET_CAP_WORKERS = 12
+MARKET_BREADTH_MIN_DAILY_COVERAGE = 0.80
 MAX_STOCK_DATA_BODY_SIZE = 2 * 1024 * 1024  # 2 MB — stock_data POST body 上限
 
 
@@ -2038,6 +2039,29 @@ def calculate_market_breadth(data, symbols):
         if close_prices.empty:
             print("Adj Close价格数据为空")
             return pd.DataFrame(columns=["20MA_Ratio", "50MA_Ratio", "200MA_Ratio"])
+
+        # Drop sparse calendar/anomalous rows before rolling MA calculation.
+        # yfinance can occasionally return partial weekend or intraday spillover rows
+        # (for example 2 valid closes out of 503 S&P 500 constituents). Keeping such
+        # rows in the rolling window invalidates MA values for most constituents and
+        # can produce a false neutral 50.00 breadth reading.
+        min_daily_count = max(
+            1,
+            int(np.ceil(close_prices.shape[1] * MARKET_BREADTH_MIN_DAILY_COVERAGE)),
+        )
+        daily_valid_counts = close_prices.notna().sum(axis=1)
+        sparse_rows = daily_valid_counts < min_daily_count
+        if sparse_rows.any():
+            print(
+                "市场宽度过滤低覆盖率日期: "
+                f"{int(sparse_rows.sum())} 行 "
+                f"(min={min_daily_count}/{close_prices.shape[1]})"
+            )
+            close_prices = close_prices.loc[~sparse_rows]
+            print(f"市场宽度覆盖率过滤后形状: {close_prices.shape}")
+        if close_prices.empty:
+            print("市场宽度覆盖率过滤后无可用价格数据")
+            return pd.DataFrame(columns=["20MA_Ratio", "50MA_Ratio", "200MA_Ratio"])
             
         # 确保有足够的数据点
         if len(close_prices) < 20:
@@ -2050,15 +2074,19 @@ def calculate_market_breadth(data, symbols):
         ma50 = close_prices.rolling(window=50).mean()
         ma200 = close_prices.rolling(window=200).mean()
 
+        valid_mask_20 = close_prices.notna() & ma20.notna()
+        valid_mask_50 = close_prices.notna() & ma50.notna()
+        valid_mask_200 = close_prices.notna() & ma200.notna()
+
         # 计算上涨股票数量
-        adv_mask_20 = (close_prices > ma20) & (~ma20.isna())
-        adv_mask_50 = (close_prices > ma50) & (~ma50.isna())
-        adv_mask_200 = (close_prices > ma200) & (~ma200.isna())
+        adv_mask_20 = (close_prices > ma20) & valid_mask_20
+        adv_mask_50 = (close_prices > ma50) & valid_mask_50
+        adv_mask_200 = (close_prices > ma200) & valid_mask_200
 
         # 计算比率（上涨股票数量/总股票数量）
-        valid_stocks_20 = (~ma20.isna()).sum(axis=1)
-        valid_stocks_50 = (~ma50.isna()).sum(axis=1)
-        valid_stocks_200 = (~ma200.isna()).sum(axis=1)
+        valid_stocks_20 = valid_mask_20.sum(axis=1)
+        valid_stocks_50 = valid_mask_50.sum(axis=1)
+        valid_stocks_200 = valid_mask_200.sum(axis=1)
         
         ad_ratio_20 = (adv_mask_20.sum(axis=1) / valid_stocks_20 * 100).replace([np.inf, -np.inf], np.nan)
         ad_ratio_50 = (adv_mask_50.sum(axis=1) / valid_stocks_50 * 100).replace([np.inf, -np.inf], np.nan)
