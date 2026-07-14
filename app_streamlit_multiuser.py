@@ -18,6 +18,7 @@ from plotly.subplots import make_subplots
 import requests
 import streamlit as st
 import yfinance as yf
+from PIL import Image
 
 import stock_watch_list_back_end
 from daily_report.jobs import (
@@ -52,9 +53,12 @@ from multiuser_store import (
 from ticker_mapping import normalize_yfinance_ticker, stockanalysis_overview_url
 
 
+_PAGE_ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "survival_hunter_icon.png")
+_PAGE_ICON = Image.open(_PAGE_ICON_PATH) if os.path.exists(_PAGE_ICON_PATH) else "📈"
+
 st.set_page_config(
     page_title="Stock Watchlist",
-    page_icon="📈",
+    page_icon=_PAGE_ICON,
     layout="wide",
     initial_sidebar_state="expanded",
 )

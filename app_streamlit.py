@@ -17,12 +17,16 @@ import datetime
 import time
 import threading
 import colorsys
+from PIL import Image
 from ticker_mapping import normalize_yfinance_ticker, stockanalysis_overview_url
 
 # ── Page config ──────────────────────────────────────────────
+_PAGE_ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "survival_hunter_icon.png")
+_PAGE_ICON = Image.open(_PAGE_ICON_PATH) if os.path.exists(_PAGE_ICON_PATH) else "📈"
+
 st.set_page_config(
     page_title="US Stock Watchlist",
-    page_icon="📈",
+    page_icon=_PAGE_ICON,
     layout="wide",
     initial_sidebar_state="expanded",
 )
