@@ -1664,7 +1664,7 @@ def get_sp500_symbols():
     print("S&P 500 symbols unavailable from all sources")
     return []
 
-# 计算股票的筹码分布(最近30个交易日)
+# 计算股票的筹码分布(最近约60个交易日/session)
 def get_nasdaq100_symbols():
     """Fetch Nasdaq 100 constituents with a local cache and stale-cache fallback."""
     cached_symbols = _read_symbol_cache(NASDAQ100_SYMBOLS_CACHE_PATH, "Nasdaq 100")
@@ -1889,7 +1889,7 @@ def get_nasdaq100_constituents_metadata(symbols=None):
     return metadata
 
 
-def calculate_chip_distribution(stock_ticker,days="30d",num_bins=20):
+def calculate_chip_distribution(stock_ticker,days="60d",num_bins=20):
     data = yf.Ticker(stock_ticker).history(interval="4h", period=days)
     price_min = data['Low'].min()
     price_max = data['High'].max()
