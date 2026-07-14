@@ -22,6 +22,7 @@ from ticker_mapping import normalize_yfinance_ticker, stockanalysis_overview_url
 # ── Page config ──────────────────────────────────────────────
 st.set_page_config(
     page_title="US Stock Watchlist",
+    page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
 )

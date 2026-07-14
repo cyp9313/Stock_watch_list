@@ -52,7 +52,12 @@ from multiuser_store import (
 from ticker_mapping import normalize_yfinance_ticker, stockanalysis_overview_url
 
 
-st.set_page_config(page_title="Stock Watchlist", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(
+    page_title="Stock Watchlist",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 API_BASE = os.environ.get("STOCK_API_BASE_URL", "http://127.0.0.1:5000")
 RELATIVE_RETURN_COLUMNS = ["20D Rel%", "60D Rel%", "120D Rel%"]
