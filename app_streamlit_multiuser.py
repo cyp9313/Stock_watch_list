@@ -72,6 +72,9 @@ FINANCIAL_COLUMNS = [
     "Next Earnings", "Trailing PE", "Forward PE", "PEG Ratio",
     "Analysts", "Price Target", "Market Cap",
 ]
+PORTFOLIO_EXTRA_COLUMNS = [
+    "Buy Price", "Shares", "Market Value", "P/L", "P/L%",
+]
 COLUMNS = (
     ["Ticker", "Name", "Price", "1D%", "5D%", "1M%", "YTD%"]
     + RELATIVE_RETURN_COLUMNS
@@ -104,6 +107,11 @@ COLUMN_WIDTHS = {
     "Analysts": 88,
     "Price Target": 96,
     "Market Cap": 96,
+    "Buy Price": 96,
+    "Shares": 76,
+    "Market Value": 116,
+    "P/L": 96,
+    "P/L%": 72,
 }
 for _ema_column in EMA_DIFF_COLUMNS:
     COLUMN_WIDTHS[_ema_column] = 76
@@ -132,6 +140,16 @@ SECTION_META = {
         "help": (
             "Use these pages for indices, rates, FX, commodities, crypto, sector ETFs, and other broad-market signals. "
             "They use the same table layout but are meant for macro and cross-asset monitoring."
+        ),
+    },
+    "portfolio_pages": {
+        "tab": "Portfolios",
+        "title": "Portfolio Monitor",
+        "add_label": "Portfolio page",
+        "new_page": "New Portfolio",
+        "help": (
+            "Use these pages for personal holdings. Each row stores ticker, buy price, "
+            "shares and buy currency, while market data is reused from the shared watchlist API."
         ),
     },
 }
@@ -409,10 +427,23 @@ def inject_css(dark_mode=False):
             color: {theme["text"]} !important;
             fill: {theme["text"]} !important;
         }}
+        div[data-baseweb="select"] input {{
+            color: {theme["text"]} !important;
+            -webkit-text-fill-color: {theme["text"]} !important;
+            caret-color: {theme["input_focus"]} !important;
+        }}
         div[data-baseweb="popover"] {{
             background-color: {theme["panel_bg"]} !important;
             color: {theme["text"]} !important;
             border-color: {theme["table_border"]} !important;
+        }}
+        div[data-baseweb="popover"] input,
+        div[data-baseweb="popover"] textarea,
+        div[data-baseweb="popover"] [contenteditable="true"],
+        div[data-baseweb="popover"] span,
+        div[data-baseweb="popover"] div[role="option"] {{
+            color: {theme["text"]} !important;
+            -webkit-text-fill-color: {theme["text"]} !important;
         }}
         ul[role="listbox"],
         div[role="listbox"] {{
@@ -465,6 +496,13 @@ def inject_css(dark_mode=False):
             --gdg-text-dark: {theme["text"]};
             --gdg-text-medium: {theme["text"]};
             --gdg-text-light: {theme["muted"]};
+            --gdg-text-header: {theme["text"]};
+            --gdg-text-group-header: {theme["text"]};
+            --gdg-text-bubble: {theme["text"]};
+            --gdg-bg-bubble: {theme["panel_bg"]};
+            --gdg-bg-search-result: {theme["button_hover"]};
+            --gdg-selection-color: {theme["input_focus"]};
+            --gdg-drilldown-border: {theme["input_focus"]};
             --gdg-border-color: {theme["table_border"]};
             --gdg-horizontal-border-color: {theme["table_border"]};
             --gdg-accent-color: {theme["input_focus"]};
@@ -489,11 +527,25 @@ def inject_css(dark_mode=False):
             background-color: {theme["editor_bg"]} !important;
             color: {theme["text"]} !important;
         }}
+        div[data-testid="stDataEditor"] *,
+        div[data-testid="stDataEditor"] [role="grid"],
+        div[data-testid="stDataEditor"] [role="row"],
+        div[data-testid="stDataEditor"] [role="columnheader"],
+        div[data-testid="stDataEditor"] [role="gridcell"],
+        div[data-testid="stDataEditor"] [aria-colindex],
+        div[data-testid="stDataEditor"] [aria-rowindex] {{
+            color: {theme["text"]} !important;
+        }}
         div[data-testid="stDataEditor"] input,
         div[data-testid="stDataEditor"] textarea,
+        div[data-testid="stDataEditor"] div[data-baseweb="input"],
+        div[data-testid="stDataEditor"] div[data-baseweb="select"] > div,
+        div[data-testid="stDataEditor"] div[data-baseweb="select"] input,
+        div[data-testid="stDataEditor"] div[data-baseweb="select"] span,
         div[data-testid="stDataEditor"] [contenteditable="true"] {{
             background-color: {theme["input_bg"]} !important;
             color: {theme["text"]} !important;
+            -webkit-text-fill-color: {theme["text"]} !important;
             border-color: {theme["input_border"]} !important;
             caret-color: {theme["input_focus"]} !important;
         }}
@@ -548,11 +600,88 @@ def editor_text_to_groups(text):
     return groups
 
 
+def _format_editor_number(value):
+    if value is None or pd.isna(value):
+        return ""
+    try:
+        return f"{float(value):g}"
+    except (TypeError, ValueError):
+        return ""
+
+
+def portfolio_holdings_to_editor_text(page):
+    lines = []
+    for holding in page.get("holdings", []):
+        ticker = normalize_yfinance_ticker(holding.get("ticker"))
+        if not ticker:
+            continue
+        group = str(holding.get("group") or "Portfolio").strip() or "Portfolio"
+        buy_price = _format_editor_number(holding.get("buy_price"))
+        shares = _format_editor_number(holding.get("shares"))
+        buy_currency = normalize_currency_code(holding.get("buy_currency"))
+        lines.append(f"{group} | {ticker} | {buy_price} | {shares} | {buy_currency}")
+    return "\n".join(lines)
+
+
+def portfolio_editor_text_to_holdings(text):
+    holdings = []
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if "|" in line:
+            parts = [part.strip() for part in line.split("|")]
+        elif "\t" in line:
+            parts = [part.strip() for part in line.split("\t")]
+        else:
+            normalized_line = line.replace("，", ",").replace(";", ",")
+            parts = [part.strip() for part in normalized_line.split(",")]
+
+        if len(parts) >= 5:
+            group, ticker_raw, buy_price_raw, shares_raw, buy_currency_raw = parts[:5]
+        elif len(parts) == 4:
+            group = "Portfolio"
+            ticker_raw, buy_price_raw, shares_raw, buy_currency_raw = parts
+        else:
+            continue
+
+        ticker = normalize_yfinance_ticker(ticker_raw)
+        if not ticker:
+            continue
+        try:
+            buy_price = float(buy_price_raw)
+        except (TypeError, ValueError):
+            buy_price = None
+        try:
+            shares = float(shares_raw)
+        except (TypeError, ValueError):
+            shares = None
+        buy_currency = normalize_currency_code(buy_currency_raw)
+
+        holdings.append({
+            "group": str(group or "Portfolio").strip() or "Portfolio",
+            "ticker": ticker,
+            "buy_price": buy_price,
+            "shares": shares,
+            "buy_currency": buy_currency,
+        })
+    return holdings
+
+
 def page_tickers(page):
     tickers = []
     for group_tickers in page.get("groups", {}).values():
         tickers.extend(group_tickers)
     return list(dict.fromkeys(tickers))
+
+
+def portfolio_page_tickers(page):
+    return list(dict.fromkeys(
+        normalize_yfinance_ticker(holding.get("ticker"))
+        for holding in page.get("holdings", [])
+        if normalize_yfinance_ticker(holding.get("ticker"))
+    ))
 
 
 def red_green(value, neg_clip=-10.0, pos_clip=10.0):
@@ -668,6 +797,40 @@ def format_money_value(value, ticker, display_currency="Local"):
         return formatted
     prefix, suffix = CURRENCY_DISPLAY_UNITS.get(currency, (f"{currency} ", ""))
     return f"{prefix}{formatted}{suffix}"
+
+
+def format_currency_value(value, currency):
+    if value is None or pd.isna(value):
+        return ""
+    currency = normalize_currency_code(currency)
+    try:
+        formatted = f"{float(value):,.2f}"
+    except (TypeError, ValueError):
+        return ""
+    if not currency:
+        return formatted
+    prefix, suffix = CURRENCY_DISPLAY_UNITS.get(currency, (f"{currency} ", ""))
+    return f"{prefix}{formatted}{suffix}"
+
+
+def convert_currency_value(value, from_currency, to_currency):
+    if value is None or pd.isna(value):
+        return np.nan
+    from_currency = normalize_currency_code(from_currency)
+    to_currency = normalize_currency_code(to_currency)
+    if not from_currency or not to_currency:
+        return np.nan
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return np.nan
+    if from_currency == to_currency:
+        return amount
+    from_to_eur = currency_to_eur_rate(from_currency)
+    to_to_eur = currency_to_eur_rate(to_currency)
+    if not from_to_eur or not to_to_eur:
+        return np.nan
+    return amount * float(from_to_eur) / float(to_to_eur)
 
 
 def build_grouped_df(df, groups, display_currency="Local"):
@@ -984,6 +1147,379 @@ def render_market_table(
     )
 
 
+def portfolio_groups(page):
+    groups = {}
+    for holding in page.get("holdings", []):
+        ticker = normalize_yfinance_ticker(holding.get("ticker"))
+        if not ticker:
+            continue
+        group_name = str(holding.get("group") or "Portfolio").strip() or "Portfolio"
+        groups.setdefault(group_name, []).append(ticker)
+    return {group: list(dict.fromkeys(tickers)) for group, tickers in groups.items()}
+
+
+def portfolio_editor_df(page):
+    rows = []
+    for holding in page.get("holdings", []):
+        rows.append({
+            "Group": holding.get("group") or "Portfolio",
+            "Ticker": holding.get("ticker") or "",
+            "Buy Price": holding.get("buy_price"),
+            "Shares": holding.get("shares"),
+            "Buy Currency": holding.get("buy_currency") or "",
+        })
+    return pd.DataFrame(rows, columns=["Group", "Ticker", "Buy Price", "Shares", "Buy Currency"])
+
+
+def build_portfolio_enriched_df(raw_df, page):
+    tickers = portfolio_page_tickers(page)
+    if not tickers:
+        return pd.DataFrame(), [], {"mixed_currency": False, "total_row": None}
+
+    stock_rows = raw_df[raw_df["Ticker"].isin(tickers)].copy() if not raw_df.empty else pd.DataFrame()
+    stock_by_ticker = stock_rows.set_index("Ticker") if not stock_rows.empty else pd.DataFrame()
+    enriched_rows = []
+    treemap_rows = []
+    total_cost = 0.0
+    total_market_value = 0.0
+    total_currency = None
+    mixed_currency = False
+    total_ready = True
+
+    for holding in page.get("holdings", []):
+        ticker = normalize_yfinance_ticker(holding.get("ticker"))
+        if not ticker:
+            continue
+
+        if stock_by_ticker is not None and not stock_by_ticker.empty and ticker in stock_by_ticker.index:
+            base_row = stock_by_ticker.loc[ticker].to_dict()
+        else:
+            base_row = {"Ticker": ticker}
+        row = {col: base_row.get(col, np.nan) for col in COLUMNS}
+        row["Ticker"] = ticker
+        row["Beta"] = base_row.get("Beta", np.nan)
+        row["Price Source"] = base_row.get("Price Source", "")
+
+        buy_currency = normalize_currency_code(holding.get("buy_currency"))
+        ticker_currency = get_ticker_currency(ticker) or fallback_currency_from_ticker(ticker)
+        try:
+            buy_price = float(holding.get("buy_price"))
+            shares = float(holding.get("shares"))
+        except (TypeError, ValueError):
+            buy_price = np.nan
+            shares = np.nan
+        current_price = row.get("Price", np.nan)
+
+        market_value_local = (
+            float(current_price) * shares
+            if pd.notna(current_price) and pd.notna(shares)
+            else np.nan
+        )
+        market_value = convert_currency_value(market_value_local, ticker_currency, buy_currency)
+        cost_basis = buy_price * shares if pd.notna(buy_price) and pd.notna(shares) else np.nan
+        pnl_abs = market_value - cost_basis if pd.notna(market_value) and pd.notna(cost_basis) else np.nan
+        pnl_pct = pnl_abs / cost_basis * 100.0 if pd.notna(pnl_abs) and cost_basis not in (0, np.nan) else np.nan
+        market_value_eur = convert_currency_value(market_value, buy_currency, "EUR")
+
+        row.update({
+            "Buy Price": buy_price,
+            "Shares": shares,
+            "Market Value": market_value,
+            "P/L": pnl_abs,
+            "P/L%": pnl_pct,
+            "_buy_currency": buy_currency,
+            "_ticker_currency": ticker_currency,
+            "_market_value_eur": market_value_eur,
+        })
+        enriched_rows.append(row)
+
+        if buy_currency:
+            if total_currency is None:
+                total_currency = buy_currency
+            elif total_currency != buy_currency:
+                mixed_currency = True
+        else:
+            total_ready = False
+        if pd.notna(cost_basis) and pd.notna(market_value):
+            total_cost += float(cost_basis)
+            total_market_value += float(market_value)
+        else:
+            total_ready = False
+
+        if pd.notna(market_value) and float(market_value) > 0:
+            treemap_rows.append({
+                "Ticker": ticker,
+                "Group": holding.get("group") or "Portfolio",
+                "Name": row.get("Name") if pd.notna(row.get("Name", np.nan)) else ticker,
+                "Market Value": market_value,
+                "Market Value EUR": market_value_eur,
+                "Buy Currency": buy_currency,
+                "1D%": row.get("1D%", np.nan),
+            })
+
+    total_row = None
+    if not mixed_currency and total_ready and total_currency and total_cost > 0:
+        total_pnl = total_market_value - total_cost
+        total_row = {
+            "Ticker": "TOTAL",
+            "Market Value": total_market_value,
+            "P/L": total_pnl,
+            "P/L%": total_pnl / total_cost * 100.0,
+            "_buy_currency": total_currency,
+        }
+
+    return pd.DataFrame(enriched_rows), treemap_rows, {
+        "mixed_currency": mixed_currency,
+        "total_row": total_row,
+        "total_currency": total_currency,
+    }
+
+
+def render_portfolio_table(
+    raw_df,
+    page,
+    dark_mode=False,
+    display_currency="Local",
+    show_name_column=False,
+    show_relative_momentum_columns=False,
+    show_ema_columns=False,
+    show_financial_columns=True,
+):
+    groups = portfolio_groups(page)
+    enriched_df, treemap_rows, summary = build_portfolio_enriched_df(raw_df, page)
+    if enriched_df.empty:
+        st.info("No portfolio holdings yet. Use the editor to add ticker, buy price, shares and buy currency.")
+        return treemap_rows
+
+    df_display = build_grouped_df(enriched_df, groups, display_currency=display_currency)
+    if df_display.empty:
+        st.info("No portfolio data available")
+        return treemap_rows
+
+    for col in PORTFOLIO_EXTRA_COLUMNS:
+        df_display[col] = ""
+
+    extra_by_ticker = enriched_df.set_index("Ticker") if "Ticker" in enriched_df else pd.DataFrame()
+    group_names = set(groups.keys())
+    for row_index in range(len(df_display)):
+        ticker = str(df_display.iloc[row_index]["Ticker"])
+        if ticker in group_names or extra_by_ticker.empty or ticker not in extra_by_ticker.index:
+            continue
+        raw_row = extra_by_ticker.loc[ticker]
+        buy_currency = raw_row.get("_buy_currency")
+        df_display.at[row_index, "Buy Price"] = format_currency_value(raw_row.get("Buy Price"), buy_currency)
+        df_display.at[row_index, "Shares"] = f"{float(raw_row.get('Shares')):,.4g}" if pd.notna(raw_row.get("Shares")) else ""
+        df_display.at[row_index, "Market Value"] = format_currency_value(raw_row.get("Market Value"), buy_currency)
+        df_display.at[row_index, "P/L"] = format_currency_value(raw_row.get("P/L"), buy_currency)
+        df_display.at[row_index, "P/L%"] = f"{float(raw_row.get('P/L%')):+.2f}%" if pd.notna(raw_row.get("P/L%")) else ""
+
+    total_row = summary.get("total_row")
+    if summary.get("mixed_currency"):
+        st.warning("Portfolio total is hidden because buy currencies are mixed. Use one buy currency per portfolio page to show total P/L.")
+    elif total_row:
+        display_total = {col: "" for col in df_display.columns}
+        display_total["Ticker"] = "TOTAL"
+        display_total["Name"] = "Portfolio Total"
+        display_total["Market Value"] = format_currency_value(total_row.get("Market Value"), total_row.get("_buy_currency"))
+        display_total["P/L"] = format_currency_value(total_row.get("P/L"), total_row.get("_buy_currency"))
+        display_total["P/L%"] = f"{float(total_row.get('P/L%')):+.2f}%"
+        df_display = pd.concat([df_display, pd.DataFrame([display_total])], ignore_index=True)
+
+    hidden_columns = set()
+    if not show_name_column:
+        hidden_columns.add("Name")
+    if not show_relative_momentum_columns:
+        hidden_columns.update(RELATIVE_MOMENTUM_COLUMNS)
+    if not show_ema_columns:
+        hidden_columns.update(EMA_DIFF_COLUMNS)
+    if not show_financial_columns:
+        hidden_columns.update(FINANCIAL_COLUMNS)
+
+    visible_columns = [col for col in (COLUMNS + PORTFOLIO_EXTRA_COLUMNS) if col not in hidden_columns]
+    theme = get_theme(dark_mode)
+    table_width = sum(COLUMN_WIDTHS.get(col, DEFAULT_COLUMN_WIDTH) for col in visible_columns)
+    cell_colors = apply_cell_colors(df_display, enriched_df, groups, columns=visible_columns)
+
+    for row_index in range(len(df_display)):
+        for col in PORTFOLIO_EXTRA_COLUMNS:
+            if col in visible_columns:
+                cell_colors.pop((row_index, visible_columns.index(col)), None)
+
+    for row_index in range(len(df_display)):
+        ticker = str(df_display.iloc[row_index]["Ticker"])
+        if ticker == "TOTAL":
+            pnl_pct = total_row.get("P/L%") if total_row else np.nan
+        elif not extra_by_ticker.empty and ticker in extra_by_ticker.index:
+            pnl_pct = extra_by_ticker.loc[ticker].get("P/L%")
+        else:
+            pnl_pct = np.nan
+        if pd.notna(pnl_pct):
+            color = red_green(pnl_pct, neg_clip=-50.0, pos_clip=50.0)
+            for col in ("Market Value", "P/L", "P/L%"):
+                if col in visible_columns:
+                    cell_colors[(row_index, visible_columns.index(col))] = color
+
+    html_table = f"""
+    <div style="width:100%; max-height:650px; overflow:auto;
+                border:1px solid {theme['table_border']};">
+        <table style="width:{table_width}px; min-width:100%; table-layout:fixed; border-collapse:collapse;
+                      font-family:Arial; font-size:12px;
+                      background-color:{theme['table_bg']};
+                      color:{theme['text']};">
+            <colgroup>
+    """
+    for col in visible_columns:
+        html_table += f"<col style='width:{COLUMN_WIDTHS.get(col, DEFAULT_COLUMN_WIDTH)}px;'>"
+    html_table += f"""
+            </colgroup>
+            <thead style="position:sticky; top:0; z-index:10;
+                          background-color:{theme['table_header_bg']};">
+                <tr style="background-color:{theme['table_header_bg']};">
+    """
+    for col in visible_columns:
+        html_table += (
+            f"<th style='padding:4px; text-align:left; color:{theme['text']}; "
+            f"white-space:nowrap; overflow:hidden; text-overflow:ellipsis; "
+            f"border:1px solid {theme['table_border']};'>{html.escape(col)}</th>"
+        )
+    html_table += "</tr></thead><tbody>"
+
+    for row_index in range(len(df_display)):
+        row = df_display.iloc[row_index]
+        ticker = str(row["Ticker"])
+        is_header = ticker in group_names
+        is_total = ticker == "TOTAL"
+        html_table += "<tr>"
+        for col_index, col in enumerate(visible_columns):
+            val = "" if pd.isna(row[col]) else str(row[col])
+            bg_color = cell_colors.get(
+                (row_index, col_index),
+                theme["table_group_bg"] if is_header or is_total else theme["table_bg"],
+            )
+            if dark_mode and bg_color.lower() in ("#ffffff", "white", "#cccccc"):
+                bg_color = theme["table_group_bg"] if is_header or is_total else theme["table_bg"]
+            text_color = theme["text"] if bg_color == theme["table_bg"] else readable_text_color(bg_color)
+
+            if is_header and col_index == 0:
+                html_table += (
+                    f"<td colspan='{len(visible_columns)}' style='padding:4px; color:{theme['text']}; "
+                    f"background-color:{bg_color}; font-weight:bold; border:1px solid {theme['table_border']};'>"
+                    f"{html.escape(val)}</td>"
+                )
+                break
+            if is_header:
+                continue
+
+            align = "right" if col in RIGHT_ALIGNED_COLUMNS or col in PORTFOLIO_EXTRA_COLUMNS or (val and val[0] in "+-$€¥0123456789") else "left"
+            font_weight = "font-weight:bold;" if is_total else ""
+            title_attr = f" title='{html.escape(val, quote=True)}'" if col == "Name" and val else ""
+            html_table += (
+                f"<td{title_attr} style='padding:4px; text-align:{align}; {font_weight}"
+                f"color:{text_color}; background-color:{bg_color}; white-space:nowrap; "
+                f"overflow:hidden; text-overflow:ellipsis; border:1px solid {theme['table_border']};'>"
+                f"{html.escape(val)}</td>"
+            )
+        html_table += "</tr>"
+
+    html_table += "</tbody></table></div>"
+    st.markdown(html_table, unsafe_allow_html=True)
+    return treemap_rows
+
+
+def build_portfolio_treemap(treemap_rows, dark_mode=False):
+    rows = pd.DataFrame(treemap_rows)
+    if rows.empty:
+        return None
+    rows["Group"] = rows["Group"].fillna("Portfolio").replace("", "Portfolio")
+    rows["Area"] = pd.to_numeric(rows.get("Market Value EUR", np.nan), errors="coerce")
+    rows["Market Value"] = pd.to_numeric(rows.get("Market Value", np.nan), errors="coerce")
+    rows["1D%"] = pd.to_numeric(rows.get("1D%", np.nan), errors="coerce")
+    rows = rows[(rows["Area"].notna()) & (rows["Area"] > 0)]
+    if rows.empty:
+        return None
+
+    theme = get_theme(dark_mode)
+    labels = ["Portfolio"]
+    ids = ["root"]
+    parents = [""]
+    values = [float(rows["Area"].sum())]
+    colors = [0.0]
+    text = [""]
+    customdata = [["", "", "", ""]]
+
+    for group, group_df in rows.groupby("Group", sort=True):
+        group_id = f"group:{group}"
+        group_value = float(group_df["Area"].sum())
+        valid_mask = group_df["1D%"].notna()
+        group_color = float(np.average(group_df[valid_mask]["1D%"], weights=group_df[valid_mask]["Area"])) if valid_mask.any() else 0.0
+        labels.append(group)
+        ids.append(group_id)
+        parents.append("root")
+        values.append(group_value)
+        colors.append(group_color)
+        text.append(f"{group_color:+.2f}%" if valid_mask.any() else "N/A")
+        customdata.append([group, "", "", ""])
+
+        for _, row in group_df.sort_values("Area", ascending=False).iterrows():
+            pct = float(row["1D%"]) if pd.notna(row["1D%"]) else 0.0
+            pct_text = f"{pct:+.2f}%" if pd.notna(row["1D%"]) else "N/A"
+            buy_currency = normalize_currency_code(row.get("Buy Currency"))
+            labels.append(str(row["Ticker"]))
+            ids.append(f"ticker:{row['Ticker']}")
+            parents.append(group_id)
+            values.append(float(row["Area"]))
+            colors.append(pct)
+            text.append(pct_text)
+            customdata.append([
+                row.get("Name") or row["Ticker"],
+                group,
+                format_currency_value(row.get("Market Value"), buy_currency),
+                pct_text,
+            ])
+
+    fig = go.Figure(go.Treemap(
+        labels=labels,
+        ids=ids,
+        parents=parents,
+        values=values,
+        branchvalues="total",
+        text=text,
+        textinfo="label+text",
+        customdata=customdata,
+        marker=dict(
+            colors=colors,
+            colorscale=[
+                [0.0, "#b91c1c"],
+                [0.35, "#fca5a5"],
+                [0.5, "#f3f4f6"],
+                [0.65, "#86efac"],
+                [1.0, "#15803d"],
+            ],
+            cmin=-3,
+            cmid=0,
+            cmax=3,
+            line=dict(width=1, color=theme["page_bg"]),
+        ),
+        hovertemplate=(
+            "<b>%{label}</b><br>"
+            "Name: %{customdata[0]}<br>"
+            "Group: %{customdata[1]}<br>"
+            "Market Value: %{customdata[2]}<br>"
+            "1D: %{customdata[3]}<extra></extra>"
+        ),
+        maxdepth=2,
+    ))
+    fig.update_layout(
+        title=dict(text="Portfolio Holdings Treemap (area = latest value, color = 1D%)", font=dict(color=theme["text"], size=18)),
+        height=650,
+        margin=dict(l=8, r=8, t=44, b=8),
+        paper_bgcolor=theme["page_bg"],
+        plot_bgcolor=theme["plot_bg"],
+        font=dict(color=theme["text"], size=12),
+    )
+    return fig
+
+
 def render_table_legend(dark_mode=False):
     theme = get_theme(dark_mode)
     st.markdown(
@@ -1172,8 +1708,18 @@ def update_page_from_editor(config, section, page_index, name, edited_groups_tex
     return normalize_config(config)
 
 
+def update_portfolio_page_from_editor(config, page_index, name, edited_text):
+    page = config["portfolio_pages"][page_index]
+    page["name"] = str(name).strip() or page["name"]
+    page["holdings"] = portfolio_editor_text_to_holdings(edited_text)
+    return normalize_config(config)
+
+
 def add_page(config, section, name):
-    config[section].append({"name": name.strip() or "New Page", "groups": {}})
+    if section == "portfolio_pages":
+        config[section].append({"name": name.strip() or "New Portfolio", "holdings": []})
+    else:
+        config[section].append({"name": name.strip() or "New Page", "groups": {}})
     return normalize_config(config)
 
 
@@ -2161,6 +2707,50 @@ def render_page_editor(config, section, page_index, editable, user, dark_mode=Fa
     return config
 
 
+def render_portfolio_page_editor(config, page_index, editable, user):
+    page = config["portfolio_pages"][page_index]
+    st.caption(
+        "One holding per row: Group | Ticker | Buy Price | Shares | Buy Currency. "
+        "Buy Currency is required and should be a code such as USD, EUR, CNY, HKD, GBP or JPY."
+    )
+    if not editable:
+        if not page.get("holdings"):
+            st.caption("Read-only guest view: no portfolio holdings configured.")
+        else:
+            st.dataframe(portfolio_editor_df(page), width="stretch", hide_index=True)
+        return config
+
+    version_key = f"portfolio_pages_{page_index}_editor_version"
+    editor_version = st.session_state.get(version_key, 0)
+    with st.form(f"portfolio_pages_{page_index}_editor_form_{editor_version}"):
+        new_name = st.text_input(
+            "Portfolio page name",
+            page["name"],
+            key=f"portfolio_pages_{page_index}_{editor_version}_name",
+        )
+        edited_text = st.text_area(
+            "Holdings",
+            value=portfolio_holdings_to_editor_text(page),
+            key=f"portfolio_pages_{page_index}_{editor_version}_holdings_text",
+            height=max(180, min(420, 28 * (len(page.get("holdings", [])) + 6))),
+            help=(
+                "Example: Longs | AAPL | 180.50 | 10 | USD. "
+                "You can also omit Group: AAPL | 180.50 | 10 | USD."
+            ),
+        )
+        submitted = st.form_submit_button("Save Portfolio")
+
+    if submitted:
+        updated_config = update_portfolio_page_from_editor(config, page_index, new_name, edited_text)
+        save_active_config(user, updated_config)
+        st.session_state[version_key] = editor_version + 1
+        st.rerun()
+    if page.get("holdings"):
+        with st.expander("Current holdings preview", expanded=False):
+            st.dataframe(portfolio_editor_df(page), width="stretch", hide_index=True)
+    return config
+
+
 def render_section(section_title, section_key, config, raw_df, editable, user, dark_mode=False, display_currency="Local"):
     st.subheader(section_title)
     st.caption(SECTION_META[section_key]["help"])
@@ -2235,6 +2825,83 @@ def render_section(section_title, section_key, config, raw_df, editable, user, d
                 show_ema_columns=show_ema_columns,
                 show_financial_columns=show_financial_columns,
             )
+    return config
+
+
+def render_portfolio_section(config, raw_df, editable, user, dark_mode=False, display_currency="Local"):
+    st.subheader(SECTION_META["portfolio_pages"]["title"])
+    st.caption(SECTION_META["portfolio_pages"]["help"])
+    render_table_legend(dark_mode=dark_mode)
+    pages = config["portfolio_pages"]
+    tabs = st.tabs([page["name"] for page in pages])
+    for i, tab in enumerate(tabs):
+        with tab:
+            with st.expander("Portfolio editor", expanded=False):
+                config = render_portfolio_page_editor(config, i, editable, user)
+                if editable:
+                    c1, c2 = st.columns([1, 5])
+                    with c1:
+                        if st.button("Delete page", key=f"portfolio_pages_{i}_delete", disabled=len(pages) <= 1):
+                            config = delete_page(config, "portfolio_pages", i)
+                            save_active_config(user, config)
+                            st.rerun()
+
+            display_col1, display_col2, display_col3, display_col4 = st.columns(4)
+            with display_col1:
+                show_name_column = st.toggle(
+                    "Show Name column next to Ticker",
+                    value=False,
+                    key=f"portfolio_pages_{i}_show_name_column",
+                    help=(
+                        "Turn this on to insert the cached yfinance "
+                        "display-name column between Ticker and Price."
+                    ),
+                )
+            with display_col2:
+                show_relative_momentum_columns = st.toggle(
+                    "Show relative momentum columns",
+                    value=False,
+                    key=f"portfolio_pages_{i}_show_relative_momentum_columns",
+                    help=(
+                        "Show 20D/60D/120D excess returns versus ^GSPC "
+                        "and the weighted 3/6/12M relative momentum column."
+                    ),
+                )
+            with display_col3:
+                show_financial_columns = st.toggle(
+                    "Show financial columns",
+                    value=True,
+                    key=f"portfolio_pages_{i}_show_financial_columns",
+                    help=(
+                        "Show Next Earnings, PE, PEG, Analysts, Price Target "
+                        "and Market Cap columns."
+                    ),
+                )
+            with display_col4:
+                show_ema_columns = st.toggle(
+                    "Show EMA deviation columns",
+                    value=False,
+                    key=f"portfolio_pages_{i}_show_ema_columns",
+                    help=(
+                        "Show Diff_EMA5%, Diff_EMA10%, Diff_EMA20%, "
+                        "Diff_EMA50%, Diff_EMA100% and Diff_EMA200%."
+                    ),
+                )
+
+            treemap_rows = render_portfolio_table(
+                raw_df,
+                config["portfolio_pages"][i],
+                dark_mode=dark_mode,
+                display_currency=display_currency,
+                show_name_column=show_name_column,
+                show_relative_momentum_columns=show_relative_momentum_columns,
+                show_ema_columns=show_ema_columns,
+                show_financial_columns=show_financial_columns,
+            )
+            treemap_fig = build_portfolio_treemap(treemap_rows, dark_mode=dark_mode)
+            if treemap_fig is not None:
+                st.divider()
+                st.plotly_chart(treemap_fig, width="stretch", key=f"portfolio_treemap_{i}")
     return config
 
 
@@ -2726,10 +3393,10 @@ with st.sidebar:
     st.divider()
     if editable:
         st.header("Customize Pages")
-        st.caption("Add tabs to either your stock watchlists or your broader market dashboard.")
+        st.caption("Add tabs to your stock watchlists, market dashboard, or portfolio monitor.")
         page_kind = st.selectbox(
             "Add page to",
-            ["stocks_pages", "broad_pages"],
+            ["stocks_pages", "broad_pages", "portfolio_pages"],
             format_func=lambda x: SECTION_META[x]["add_label"],
         )
         page_name = st.text_input("New page name", SECTION_META[page_kind]["new_page"])
@@ -2744,7 +3411,7 @@ inject_css(dark_mode)
 st.title("Stock Watchlist")
 st.caption(
     "Stock Watchlists are for custom stock/ETF lists. Market Dashboard is for indices and cross-asset signals. "
-    "Market Breadth is calculated from shared S&P 500 and Nasdaq 100 universes and is not edited manually."
+    "Portfolios track personal holdings. Market Breadth is calculated from shared S&P 500 and Nasdaq 100 universes."
 )
 
 fg1, fg_vix, fg2 = st.columns(3)
@@ -2770,7 +3437,13 @@ if _stock_data_ok:
 else:
     display_df = pd.DataFrame()
 
-main_tabs = st.tabs([SECTION_META["stocks_pages"]["tab"], SECTION_META["broad_pages"]["tab"], "Market Breadth", "AI Agent Reports"])
+main_tabs = st.tabs([
+    SECTION_META["stocks_pages"]["tab"],
+    SECTION_META["broad_pages"]["tab"],
+    "Market Breadth",
+    SECTION_META["portfolio_pages"]["tab"],
+    "AI Agent Reports",
+])
 with main_tabs[0]:
     if not _stock_data_ok:
         st.error(stock_payload.get("error", "Failed to load stock data"))
@@ -2845,6 +3518,19 @@ with main_tabs[2]:
         st.warning(breadth.get("error", "Failed to load market breadth data") if isinstance(breadth, dict) else "Failed to load market breadth data")
 
 with main_tabs[3]:
+    if not _stock_data_ok:
+        st.error(stock_payload.get("error", "Failed to load stock data"))
+    else:
+        config = render_portfolio_section(
+            config,
+            raw_df,
+            editable,
+            user,
+            dark_mode=dark_mode,
+            display_currency=display_currency,
+        )
+
+with main_tabs[4]:
     render_daily_report(user)
 
 st.divider()
