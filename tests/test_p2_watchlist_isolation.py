@@ -5,7 +5,7 @@ Verifies that:
 2. fetch_stock_data handles connection errors gracefully (returns dict, not crash)
 3. fetch_kline_data handles connection errors gracefully (returns None, not crash)
 4. Backend failure shows warning banner, not error + st.stop()
-5. Stock data failure still creates all 4 tabs (including AI Agent Reports)
+5. Stock data failure still creates all tabs (including AI Agent Reports)
 6. AI Agent Reports tab content does not depend on stock data
 7. Backend failure does not block AI Agent Reports tab
 8. fetch_stock_data still returns data on success (no regression)
@@ -156,14 +156,14 @@ class TestStockDataFailureCreatesAllTabs:
         tabs_line_idx = None
         stock_stop_idx = None
         for i, line in enumerate(lines):
-            if "st.tabs(" in line and "AI Agent Reports" in (lines[i] if i < len(lines) else ""):
+            if "main_tabs = st.tabs(" in line:
                 tabs_line_idx = i
             # Look for the old pattern: st.error + st.stop after stock data check
             if "stock_payload.get" in line:
                 for j in range(i, min(i + 5, len(lines))):
                     if "st.stop()" in lines[j]:
                         stock_stop_idx = j
-        assert tabs_line_idx is not None, "Could not find st.tabs() call with AI Agent Reports"
+        assert tabs_line_idx is not None, "Could not find main st.tabs() call"
         assert stock_stop_idx is None, (
             f"st.stop() found near stock_payload check at line {stock_stop_idx + 1} -- "
             "stock data failure must not call st.stop()"
@@ -179,15 +179,15 @@ class TestStockDataFailureCreatesAllTabs:
         )
 
     def test_ai_agent_reports_tab_not_gated_by_stock_data(self):
-        """The AI Agent Reports tab (main_tabs[3]) should not check _stock_data_ok."""
+        """The AI Agent Reports tab (main_tabs[4]) should not check _stock_data_ok."""
         lines = _SOURCE.splitlines()
-        # Find the main_tabs[3] section
+        # Find the main_tabs[4] section
         ai_tab_idx = None
         for i, line in enumerate(lines):
-            if "main_tabs[3]" in line:
+            if "main_tabs[4]" in line:
                 ai_tab_idx = i
                 break
-        assert ai_tab_idx is not None, "Could not find main_tabs[3] (AI Agent Reports tab)"
+        assert ai_tab_idx is not None, "Could not find main_tabs[4] (AI Agent Reports tab)"
         # Check the next few lines -- should NOT contain _stock_data_ok check
         section = "\n".join(lines[ai_tab_idx:ai_tab_idx + 5])
         assert "_stock_data_ok" not in section, (
@@ -198,12 +198,13 @@ class TestStockDataFailureCreatesAllTabs:
             "AI Agent Reports tab should call render_daily_report(user)"
         )
 
-    def test_all_four_tabs_exist(self):
-        """All 4 tabs must be created: Stocks, Broad Market, Market Breadth, AI Agent Reports."""
+    def test_all_five_tabs_exist(self):
+        """All 5 tabs must be created: Stocks, Broad Market, Market Breadth, Portfolios, AI Agent Reports."""
         assert "main_tabs[0]" in _SOURCE, "Tab 0 (Stocks) missing"
         assert "main_tabs[1]" in _SOURCE, "Tab 1 (Broad Market) missing"
         assert "main_tabs[2]" in _SOURCE, "Tab 2 (Market Breadth) missing"
-        assert "main_tabs[3]" in _SOURCE, "Tab 3 (AI Agent Reports) missing"
+        assert "main_tabs[3]" in _SOURCE, "Tab 3 (Portfolios) missing"
+        assert "main_tabs[4]" in _SOURCE, "Tab 4 (AI Agent Reports) missing"
 
 
 # ---------------------------------------------------------------------------

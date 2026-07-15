@@ -52,6 +52,13 @@ DEFAULT_BROAD_PAGES = [
     }
 ]
 
+DEFAULT_PORTFOLIO_PAGES = [
+    {
+        "name": "Portfolio",
+        "holdings": [],
+    }
+]
+
 BREADTH_GROUPS = {
     "S&P 500 Breadth": ["SP500_20MA_Ratio", "SP500_50MA_Ratio", "SP500_200MA_Ratio"],
     "Nasdaq 100 Breadth": ["NDX100_20MA_Ratio", "NDX100_50MA_Ratio", "NDX100_200MA_Ratio"],
@@ -62,6 +69,7 @@ def default_watchlist_config():
     return normalize_config({
         "stocks_pages": DEFAULT_STOCK_PAGES,
         "broad_pages": DEFAULT_BROAD_PAGES,
+        "portfolio_pages": DEFAULT_PORTFOLIO_PAGES,
     })
 
 
@@ -69,6 +77,10 @@ def normalize_config(config):
     return {
         "stocks_pages": _normalize_pages(config.get("stocks_pages") or DEFAULT_STOCK_PAGES, "Core Watchlist"),
         "broad_pages": _normalize_pages(config.get("broad_pages") or DEFAULT_BROAD_PAGES, "Macro Dashboard"),
+        "portfolio_pages": _normalize_portfolio_pages(
+            config.get("portfolio_pages") or DEFAULT_PORTFOLIO_PAGES,
+            "Portfolio",
+        ),
     }
 
 
@@ -88,6 +100,45 @@ def _normalize_pages(pages, fallback_name):
             groups[group_name] = list(dict.fromkeys(normalized_tickers))
         normalized.append({"name": name, "groups": groups})
     return normalized or [{"name": fallback_name, "groups": {}}]
+
+
+def _normalize_portfolio_pages(pages, fallback_name):
+    normalized = []
+    for i, page in enumerate(pages or []):
+        name = str(page.get("name") or f"{fallback_name} {i + 1}").strip()
+        holdings = []
+        raw_holdings = page.get("holdings")
+
+        if raw_holdings is None and page.get("groups"):
+            raw_holdings = []
+            for group_name, tickers in (page.get("groups") or {}).items():
+                for ticker in tickers:
+                    raw_holdings.append({"group": group_name, "ticker": ticker})
+
+        for holding in raw_holdings or []:
+            if not isinstance(holding, dict):
+                continue
+            ticker = normalize_yfinance_ticker(holding.get("ticker"))
+            if not ticker:
+                continue
+            try:
+                buy_price = float(holding.get("buy_price"))
+            except (TypeError, ValueError):
+                buy_price = None
+            try:
+                shares = float(holding.get("shares"))
+            except (TypeError, ValueError):
+                shares = None
+            currency = str(holding.get("buy_currency") or "").strip().upper()
+            holdings.append({
+                "group": str(holding.get("group") or "Portfolio").strip() or "Portfolio",
+                "ticker": ticker,
+                "buy_price": buy_price,
+                "shares": shares,
+                "buy_currency": currency,
+            })
+        normalized.append({"name": name, "holdings": holdings})
+    return normalized or [{"name": fallback_name, "holdings": []}]
 
 
 def init_user_db():
@@ -417,6 +468,15 @@ def config_to_api_groups(config):
         for page in config.get(section, []):
             for group_name, tickers in page.get("groups", {}).items():
                 groups[f"{prefix}:{page['name']}:{group_name}"] = tickers
+    for page in config.get("portfolio_pages", []):
+        portfolio_groups = {}
+        for holding in page.get("holdings", []):
+            group_name = holding.get("group") or "Portfolio"
+            ticker = normalize_yfinance_ticker(holding.get("ticker"))
+            if ticker:
+                portfolio_groups.setdefault(group_name, []).append(ticker)
+        for group_name, tickers in portfolio_groups.items():
+            groups[f"P:{page['name']}:{group_name}"] = list(dict.fromkeys(tickers))
     return groups
 
 
