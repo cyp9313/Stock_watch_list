@@ -8,7 +8,7 @@ Stock Watch List 是一个本地优先的股票观察、市场仪表盘、个人
 
 - 股票和跨市场 watchlist：价格、1D/5D/1M/YTD、RSI、相对 `^GSPC` 的 20D/60D/120D 超额收益、3/6/12M 相对动量、EMA 偏离、布林带、成交量、估值、分析师评级、目标价、市值和 Beta。
 - 顶部市场情绪 gauge：CNN Fear & Greed、`^VIX` volatility gauge、Crypto Fear & Greed。
-- 市场宽度：S&P 500 和 Nasdaq 100 成分股位于 20/50/200 日均线上方的比例、历史曲线和 treemap。
+- 市场宽度：S&P 500 和 Nasdaq 100 成分股位于 20/50/200 日均线上方的比例、历史曲线和 treemap；该重计算只在点击 sidebar 的 `Refresh Breadth` 时触发，页面启动、切换 tab 或刷新 watchlist 不会自动下载和重算。
 - K 线图：K 线、均线、MACD、RSI、KDJ、布林带、成交量、Fibonacci 和 60d 筹码峰。
 - 多用户配置：账号登录、每个用户独立 watchlist、market dashboard、portfolio pages 和 AI 日报任务。
 - Portfolio Monitor：用户可以录入个人持仓，按现有 watchlist 表格模板展示市场数据，并额外显示买入价、股数、持仓现价、绝对盈亏和盈亏百分比。
@@ -411,7 +411,7 @@ python -m pytest path/to/relevant_test.py -q
 ## 当前已知限制
 
 - 外部数据源、模型、搜索 API 和 SMTP 服务受网络、费用、配额和供应商行为影响。
-- 首次加载、大范围 market breadth 和大量 ticker 的 watchlist 请求可能较慢。
+- 大范围 market breadth 和大量 ticker 的 watchlist 请求可能较慢；Market Breadth 已改为手动 `Refresh Breadth` 触发，避免页面启动和切换 tab 时自动重算。
 - yfinance 的盘前/盘后数据依赖供应商返回质量；非美股或不支持盘外交易的 ticker 不会有盘外价格提示。
 - Portfolio 使用最新 FX 做显示和盈亏折算，不重算历史汇率成本；这适合当前持仓监控，不适合作为税务或会计报表。
 - Portfolio 合计行要求同一个 portfolio page 内买入货币一致；混合货币时会隐藏合计数字。
@@ -436,7 +436,7 @@ This project is for research and data observation only. It is not investment adv
 
 - Stock and cross-market watchlists: price, 1D/5D/1M/YTD returns, RSI, 20D/60D/120D excess returns versus `^GSPC`, weighted 3/6/12M relative momentum, EMA deviation, Bollinger Band deviation, volume ratio, valuation metrics, analyst ratings, price targets, market cap, and beta.
 - Top sentiment gauges: CNN Fear & Greed, `^VIX` volatility gauge, and Crypto Fear & Greed.
-- Market breadth: S&P 500 and Nasdaq 100 constituent ratios above their 20/50/200-day moving averages, with charts and treemaps.
+- Market breadth: S&P 500 and Nasdaq 100 constituent ratios above their 20/50/200-day moving averages, with charts and treemaps. This heavy recalculation only runs when the sidebar `Refresh Breadth` button is clicked; app startup, tab switching, and watchlist refreshes do not automatically download or recalculate breadth data.
 - K-line charts: candlesticks, moving averages, MACD, RSI, KDJ, Bollinger Bands, volume, Fibonacci tools, and a 60d volume-by-price profile.
 - Multi-user configuration: account login, per-user watchlists, market dashboards, portfolio pages, and AI report jobs.
 - Portfolio Monitor: users can enter holdings and monitor them with the existing watchlist table style plus buy price, shares, market value, absolute P/L, P/L%, and 1D/5D/1M holding-level changes.
@@ -810,7 +810,7 @@ python -m pytest path/to/relevant_test.py -q
 ## Current known limitations
 
 - External data sources, model providers, search APIs, and SMTP services are affected by network conditions, cost, quotas, and provider behavior.
-- First load, large market breadth calculations, and large ticker lists can be slow.
+- Large market breadth calculations and large ticker lists can be slow. Market Breadth is manually triggered with `Refresh Breadth` to avoid automatic recalculation during app startup or tab switching.
 - yfinance extended-hours data depends on provider availability; non-US or unsupported tickers may not show extended-hours cues.
 - Portfolio uses latest FX rates for display and P/L conversion. It does not reconstruct historical FX cost basis and should not be treated as accounting or tax reporting.
 - The Portfolio total row requires one buy currency per portfolio page. Mixed buy currencies hide total figures.

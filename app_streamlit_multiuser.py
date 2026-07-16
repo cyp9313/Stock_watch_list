@@ -3472,6 +3472,9 @@ with st.sidebar:
     with col_r2:
         if st.button("Refresh Breadth", width="stretch", key="btn_refresh_breadth"):
             fetch_breadth_data.clear()
+            with st.spinner("Refreshing market breadth data..."):
+                st.session_state["breadth_data"] = fetch_breadth_data()
+                st.session_state["breadth_last_refresh"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             st.rerun()
 
     st.divider()
@@ -3560,10 +3563,14 @@ with main_tabs[1]:
 
 with main_tabs[2]:
     st.subheader("Market Breadth")
-    st.caption("Automatically calculates the percentage of S&P 500 and Nasdaq 100 constituents above their 20/50/200-day moving averages. Both universes are refreshed together with one de-duplicated ticker download.")
-    with st.spinner("Loading market breadth data..."):
-        breadth = fetch_breadth_data()
-    if breadth and breadth.get("success"):
+    st.caption("Calculates the percentage of S&P 500 and Nasdaq 100 constituents above their 20/50/200-day moving averages. Use Refresh Breadth in the sidebar to download and recalculate this shared market dataset.")
+    breadth = st.session_state.get("breadth_data")
+    if st.session_state.get("breadth_last_refresh"):
+        st.caption(f"Last refreshed: {st.session_state['breadth_last_refresh']}")
+
+    if not breadth:
+        st.info("Market breadth is not loaded yet. Click Refresh Breadth in the sidebar to load it.")
+    elif breadth.get("success"):
         counts = breadth.get("breadth_universe_counts", {})
         if counts:
             st.caption(

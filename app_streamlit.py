@@ -1485,6 +1485,10 @@ with st.sidebar:
     with col_r2:
         if st.button("📊 Refresh Breadth", width="stretch", key="btn_refresh_breadth"):
             fetch_breadth_data.clear()
+            with st.spinner("Refreshing market breadth data..."):
+                sp500_list = get_sp500_list()
+                st.session_state["breadth_data"] = fetch_breadth_data(sp500_list)
+                st.session_state["breadth_last_refresh"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             st.rerun()
 
     st.divider()
@@ -1556,13 +1560,14 @@ with tab2:
 with tab3:
     st.subheader("Market Breadth")
     show_breadth_names = st.toggle("Show Name column next to Ticker", value=False, key="single_breadth_show_name_column")
-    
-    # Fetch breadth data
-    with st.spinner("Loading market breadth data..."):
-        sp500_list = get_sp500_list()
-        breadth_data = fetch_breadth_data(sp500_list)
-    
-    if breadth_data and breadth_data.get("success"):
+    st.caption("Use Refresh Breadth in the sidebar to download and recalculate this shared market dataset.")
+    breadth_data = st.session_state.get("breadth_data")
+    if st.session_state.get("breadth_last_refresh"):
+        st.caption(f"Last refreshed: {st.session_state['breadth_last_refresh']}")
+
+    if not breadth_data:
+        st.info("Market breadth is not loaded yet. Click Refresh Breadth in the sidebar to load it.")
+    elif breadth_data.get("success"):
         counts = breadth_data.get("breadth_universe_counts", {})
         if counts:
             st.caption(
