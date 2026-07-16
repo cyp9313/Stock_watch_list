@@ -270,6 +270,8 @@ copy .env.example .env
 
 响应数据包含 watchlist 表格需要的价格、收益率、RSI、相对动量、估值、财报日期、分析师评级、市值、Beta 和 `Price Source`。后端会在价格请求中隐式加入 `^GSPC` 用于相对收益计算，并按 ticker 市场为 Beta 额外加入 `^GSPC`、`SXR8.DE` 或 `000001.SS` 等 benchmark；这些 benchmark 不会额外显示为用户 watchlist 行，除非用户自己配置。
 
+Ticker 会先通过 `ticker_mapping.py` 规范化，再用于 yfinance 和 StockAnalysis。StockAnalysis 已覆盖美股、港股、A 股、常见欧洲市场以及韩国 `.KS` 主板股票；例如 `005930.KS` 会映射为 `https://stockanalysis.com/quote/krx/005930/`。`.KQ` 暂未单独映射。
+
 `GET /api/stock_data` 仅为兼容旧客户端保留，并在响应中标记为弃用。市场宽度接口使用 `POST /api/breadth_data`，K 线接口为 `GET /api/kline_data?ticker=...&period=...&interval=...`。
 
 ## SQLite 数据位置
@@ -693,6 +695,8 @@ Recommended market data endpoint. JSON body:
 ```
 
 The response includes price, returns, RSI, relative momentum, valuation fields, earnings date, analyst rating, market cap, beta, and `Price Source`. The backend implicitly adds `^GSPC` for relative-return calculations and adds the market-adapted beta benchmark, such as `^GSPC`, `SXR8.DE`, or `000001.SS`, when needed. These benchmarks are not displayed as user rows unless explicitly configured by the user.
+
+Tickers are normalized through `ticker_mapping.py` before yfinance and StockAnalysis are queried. StockAnalysis mapping covers US stocks, Hong Kong stocks, China A-shares, common European markets, and Korean `.KS` main-board stocks; for example, `005930.KS` maps to `https://stockanalysis.com/quote/krx/005930/`. `.KQ` is not mapped separately yet.
 
 `GET /api/stock_data` is retained only for legacy compatibility. Market breadth uses `POST /api/breadth_data`; K-line data uses `GET /api/kline_data?ticker=...&period=...&interval=...`.
 

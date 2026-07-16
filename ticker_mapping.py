@@ -26,6 +26,7 @@ YF_TO_STOCKANALYSIS_EXCHANGE = {
     ".OL": "osl",
     ".MC": "bme",
     ".LS": "eli",
+    ".KS": "krx",
 }
 
 STOCKANALYSIS_TO_YF_EXCHANGE = {
@@ -46,6 +47,7 @@ STOCKANALYSIS_TO_YF_EXCHANGE = {
     "osl": ".OL",
     "bme": ".MC",
     "eli": ".LS",
+    "krx": ".KS",
 }
 
 US_ETF_TICKERS = {
@@ -89,7 +91,7 @@ def _format_yfinance_symbol(symbol, suffix):
     symbol = symbol.strip().upper()
     if suffix == ".HK" and symbol.isdigit():
         symbol = symbol.zfill(4)
-    elif suffix in (".SS", ".SZ") and symbol.isdigit():
+    elif suffix in (".SS", ".SZ", ".KS") and symbol.isdigit():
         symbol = symbol.zfill(6)
     return f"{symbol}{suffix}"
 
@@ -105,7 +107,7 @@ def stockanalysis_symbol(ticker):
             symbol = yf_ticker[:-len(suffix)]
             if suffix == ".HK" and symbol.isdigit():
                 symbol = symbol.zfill(4)
-            elif suffix in (".SS", ".SZ") and symbol.isdigit():
+            elif suffix in (".SS", ".SZ", ".KS") and symbol.isdigit():
                 symbol = symbol.zfill(6)
             return exchange_slug, symbol
 
