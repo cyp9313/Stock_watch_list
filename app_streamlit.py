@@ -373,6 +373,19 @@ def readable_text_color(bg_color, default="#111827"):
     return "#f9fafb" if luminance < 0.45 else "#111827"
 
 
+def sticky_first_column_style(bg_color, z_index=5):
+    return (
+        "position:sticky; left:0; "
+        f"z-index:{z_index}; "
+        f"background-color:{bg_color}; "
+        "box-shadow:2px 0 3px rgba(0,0,0,0.12); "
+    )
+
+
+def sticky_first_column_header_style(bg_color):
+    return sticky_first_column_style(bg_color, z_index=20)
+
+
 # ── API helpers with caching ─────────────────────────────────
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_stock_data():
@@ -647,9 +660,10 @@ def render_grouped_table(df, groups, key_prefix="", dark_mode=False, show_name_c
     """
     
     # Header
-    for col in visible_columns:
+    for col_index, col in enumerate(visible_columns):
+        sticky_style = sticky_first_column_header_style(theme["table_header_bg"]) if col_index == 0 else ""
         html_table += (
-            f"<th style='padding:4px; text-align:left; color:{theme['text']}; "
+            f"<th style='padding:4px; text-align:left; {sticky_style}color:{theme['text']}; "
             f"white-space:nowrap; overflow:hidden; text-overflow:ellipsis; "
             f"border:1px solid {theme['table_border']};'>{html.escape(col)}</th>"
         )
@@ -686,8 +700,9 @@ def render_grouped_table(df, groups, key_prefix="", dark_mode=False, show_name_c
                 if col == "Name" and val
                 else ""
             )
+            sticky_style = sticky_first_column_style(bg_color) if j == 0 else ""
             html_table += (
-                f"<td{title_attr} style='padding:4px; text-align:{align}; color:{text_color}; "
+                f"<td{title_attr} style='padding:4px; text-align:{align}; {sticky_style}color:{text_color}; "
                 f"background-color:{bg_color}; white-space:nowrap; overflow:hidden; "
                 f"text-overflow:ellipsis; border:1px solid {theme['table_border']};'>"
                 f"{html.escape(str(val))}</td>"

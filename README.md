@@ -62,8 +62,10 @@ Watchlist 表格的主要指标：
 
 - `Show Name column next to Ticker`：显示或隐藏名称列。长名称会截断显示，鼠标悬停可以看到完整名称。
 - `Show relative momentum columns`：统一显示或折叠 `20D Rel%`、`60D Rel%`、`120D Rel%` 和 `3/6/12M Rel%`，默认折叠。
-- `Show financial columns`：统一显示或折叠 `Next Earnings`、`Trailing PE`、`Forward PE`、`PEG Ratio`、`Analysts`、`Price Target` 和 `Market Cap`，默认显示。
+- `Show financial columns`：统一显示或折叠 `Next Earnings`、`Trailing PE`、`Forward PE`、`PEG Ratio`、`Analysts`、`Price Target` 和 `Market Cap`，默认折叠。
 - `Show EMA deviation columns`：显示或折叠 EMA 偏离列，默认折叠。
+
+Watchlist、Market Dashboard、Market Breadth 和 Portfolio 表格的第一列 `Ticker` 会固定在左侧，横向滚动时不会离开可视区域。
 
 Portfolio Monitor 位于多用户版的 `Portfolios` tab，在 `Market Breadth` 和 `AI Agent Reports` 之间。每个用户可以在 Customize Pages 中添加多个 portfolio page。Portfolio 数据会进入同一个 `/api/stock_data` 请求集合，尽量复用 watchlist、market dashboard 和 market breadth 已有缓存。
 
@@ -490,8 +492,10 @@ The multi-user tables include column group toggles:
 
 - `Show Name column next to Ticker`.
 - `Show relative momentum columns`.
-- `Show financial columns`.
+- `Show financial columns`, collapsed by default.
 - `Show EMA deviation columns`.
+
+The first `Ticker` column is frozen on the left side for Watchlist, Market Dashboard, Market Breadth, and Portfolio tables, so it stays visible while horizontally scrolling.
 
 Portfolio Monitor is placed in the multi-user `Portfolios` tab between `Market Breadth` and `AI Agent Reports`. Users can add multiple portfolio pages from Customize Pages. Portfolio tickers are included in the same `/api/stock_data` request so they can reuse the existing market data cache where possible.
 

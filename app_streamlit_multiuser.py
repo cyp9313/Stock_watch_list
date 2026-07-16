@@ -787,6 +787,19 @@ def readable_text_color(bg_color, default="#111827"):
     return "#f9fafb" if luminance < 0.45 else "#111827"
 
 
+def sticky_first_column_style(bg_color, z_index=5):
+    return (
+        "position:sticky; left:0; "
+        f"z-index:{z_index}; "
+        f"background-color:{bg_color}; "
+        "box-shadow:2px 0 3px rgba(0,0,0,0.12); "
+    )
+
+
+def sticky_first_column_header_style(bg_color):
+    return sticky_first_column_style(bg_color, z_index=20)
+
+
 def price_unit_for_ticker(ticker, display_currency="Local"):
     if display_currency == "EUR" and should_convert_price_ticker(ticker):
         return "EUR"
@@ -1046,9 +1059,10 @@ def render_grouped_table(
                 <tr style="background-color:{theme['table_header_bg']};">
     """
 
-    for col in visible_columns:
+    for col_index, col in enumerate(visible_columns):
+        sticky_style = sticky_first_column_header_style(theme["table_header_bg"]) if col_index == 0 else ""
         html_table += (
-            f"<th style='padding:4px; text-align:left; "
+            f"<th style='padding:4px; text-align:left; {sticky_style}"
             f"color:{theme['text']}; "
             f"white-space:nowrap; overflow:hidden; text-overflow:ellipsis; "
             f"border:1px solid {theme['table_border']};'>"
@@ -1121,10 +1135,11 @@ def render_grouped_table(
                 if col == "Name" and val
                 else ""
             )
+            sticky_style = sticky_first_column_style(bg_color) if col_index == 0 else ""
 
             html_table += (
                 f"<td{title_attr} style='padding:4px; text-align:{align}; "
-                f"color:{text_color}; background-color:{bg_color}; "
+                f"{sticky_style}color:{text_color}; background-color:{bg_color}; "
                 f"white-space:nowrap; overflow:hidden; text-overflow:ellipsis; "
                 f"border:1px solid {theme['table_border']};'>"
                 f"{html.escape(val)}</td>"
@@ -1460,9 +1475,10 @@ def render_portfolio_table(
                           background-color:{theme['table_header_bg']};">
                 <tr style="background-color:{theme['table_header_bg']};">
     """
-    for col in visible_columns:
+    for col_index, col in enumerate(visible_columns):
+        sticky_style = sticky_first_column_header_style(theme["table_header_bg"]) if col_index == 0 else ""
         html_table += (
-            f"<th style='padding:4px; text-align:left; color:{theme['text']}; "
+            f"<th style='padding:4px; text-align:left; {sticky_style}color:{theme['text']}; "
             f"white-space:nowrap; overflow:hidden; text-overflow:ellipsis; "
             f"border:1px solid {theme['table_border']};'>{html.escape(col)}</th>"
         )
@@ -1497,9 +1513,10 @@ def render_portfolio_table(
             align = "right" if col in RIGHT_ALIGNED_COLUMNS or col in PORTFOLIO_EXTRA_COLUMNS or (val and val[0] in "+-$€¥0123456789") else "left"
             font_weight = "font-weight:bold;" if is_total else ""
             title_attr = f" title='{html.escape(val, quote=True)}'" if col == "Name" and val else ""
+            sticky_style = sticky_first_column_style(bg_color) if col_index == 0 else ""
             html_table += (
                 f"<td{title_attr} style='padding:4px; text-align:{align}; {font_weight}"
-                f"color:{text_color}; background-color:{bg_color}; white-space:nowrap; "
+                f"{sticky_style}color:{text_color}; background-color:{bg_color}; white-space:nowrap; "
                 f"overflow:hidden; text-overflow:ellipsis; border:1px solid {theme['table_border']};'>"
                 f"{html.escape(val)}</td>"
             )
