@@ -95,10 +95,11 @@ Portfolio 额外列：
 - `Buy Price`：用户录入的单股买入价，使用买入货币显示，默认底色。
 - `Shares`：用户录入股数，默认底色。
 - `Market Value`：股数乘以最新价格。如果 ticker 货币和买入货币不同，会用最新 FX 折算到买入货币；按 `P/L%` 染色。
-- `P/L`：绝对盈亏，按 `P/L%` 染色。
-- `P/L%`：盈亏百分比，盈利越多越绿，0 附近白色，亏损越多越红。
+- `P/L`：绝对历史盈亏，按 `P/L%` 染色。
+- `P/L 1D`、`P/L 5D`、`P/L 1M`：用当前持仓市值和对应 `1D%`、`5D%`、`1M%` 反推的区间绝对变化，使用买入货币显示；如涉及货币不一致，使用最新 FX 折算。
+- `P/L%`：历史盈亏百分比，盈利越多越绿，0 附近白色，亏损越多越红。
 
-Portfolio 底部会显示 treemap：面积按持仓现价，颜色按对应标的的 `1D%`。如果同一个 portfolio page 中所有买入货币一致，会显示总持仓现价、总绝对盈亏和总盈亏百分比；如果买入货币混用，则隐藏合计数字并提示用户。
+Portfolio 底部会显示 treemap：面积按持仓现价，颜色按对应标的的 `1D%`。如果同一个 portfolio page 中所有买入货币一致，会显示总持仓现价、总绝对盈亏、总盈亏百分比、1D/5D/1M 组合绝对变化，并在总结行的 `1D%`、`5D%`、`1M%` 列显示按买入货币结算且考虑各标的持仓比例的组合变化率；总结行的 `Ticker` 单元格显示按当前持仓市值加权的综合 beta。如果买入货币混用，则隐藏合计数字并提示用户。
 
 ## 当前目录结构
 
@@ -422,3 +423,402 @@ python -m pytest path/to/relevant_test.py -q
 ## 许可说明
 
 如无另行说明，请将本项目视为个人研究工具；在分发或部署前请自行确认所使用数据源、模型服务和邮件服务的许可与条款。
+
+---
+
+# Stock Watch List — English Version
+
+Stock Watch List is a local-first stock monitoring, market dashboard, portfolio tracking, and AI daily report application. It includes a Tkinter desktop app, a single-user Streamlit app, a multi-user Streamlit app, a standalone Flask data API, and a background worker for scheduled email reports.
+
+This project is for research and data observation only. It is not investment advice. Yahoo Finance, StockAnalysis, search providers, model providers, and SMTP providers may rate-limit, delay, change fields, or return incomplete data.
+
+## Feature overview
+
+- Stock and cross-market watchlists: price, 1D/5D/1M/YTD returns, RSI, 20D/60D/120D excess returns versus `^GSPC`, weighted 3/6/12M relative momentum, EMA deviation, Bollinger Band deviation, volume ratio, valuation metrics, analyst ratings, price targets, market cap, and beta.
+- Top sentiment gauges: CNN Fear & Greed, `^VIX` volatility gauge, and Crypto Fear & Greed.
+- Market breadth: S&P 500 and Nasdaq 100 constituent ratios above their 20/50/200-day moving averages, with charts and treemaps.
+- K-line charts: candlesticks, moving averages, MACD, RSI, KDJ, Bollinger Bands, volume, Fibonacci tools, and a 60d volume-by-price profile.
+- Multi-user configuration: account login, per-user watchlists, market dashboards, portfolio pages, and AI report jobs.
+- Portfolio Monitor: users can enter holdings and monitor them with the existing watchlist table style plus buy price, shares, market value, absolute P/L, P/L%, and 1D/5D/1M holding-level changes.
+- AI daily reports: market data, search evidence, optional article text, technical indicators, scoring, charts, and HTML output.
+- Email reports: one-off email jobs, weekly schedules, a background worker, retries, queue capacity controls, and expiration controls.
+
+## Architecture
+
+```text
+Tkinter desktop          Single-user Streamlit          Multi-user Streamlit
+app_tkinter.py           app_streamlit.py               app_streamlit_multiuser.py
+      \                         |                                |
+       \------------------------+------------- HTTP -------------+
+                                      |
+                                      v
+                    Flask API: stock_watch_list_back_end.py
+                                      |
+                 SQLite market cache / user cache / external APIs
+                                      |
+              yfinance / StockAnalysis / market breadth data / FX
+
+Multi-user Streamlit, logged-in users only
+      |
+      +-- synchronous AI report download:
+      |      daily_report.service.generate_report()
+      |
+      +-- email jobs and weekly schedules:
+             daily_report.jobs -> daily_report.worker -> SMTP
+                                      |
+                                      v
+                         AI Agent / search / SSRF-protected article fetch
+```
+
+- `app_tkinter.py` is the desktop client and reads market data through the Flask API.
+- `app_streamlit.py` is the single-user web client. It does not manage multi-user accounts, email schedules, or portfolio pages.
+- `app_streamlit_multiuser.py` is the multi-user web client. It includes login, per-user configuration, Portfolio Monitor, AI report downloads, email jobs, and weekly schedule UI.
+- `stock_watch_list_back_end.py` is the Flask market data API. In development, the frontend can try to start a local Flask backend; in production, Flask should run as a standalone service.
+- `daily_report.worker` is an independent process for persistent email report jobs and weekly schedules. It does not depend on browser sessions.
+
+## Watchlist and Portfolio tables
+
+Main watchlist indicators:
+
+- `20D Rel%`, `60D Rel%`, `120D Rel%`: the ticker return over the last 20/60/120 trading days minus the `^GSPC` return over the same window.
+- `3/6/12M Rel%`: weighted 3/6/12-month excess return versus `^GSPC`, using weights `0.2 / 0.3 / 0.5`.
+- `RSI`: 14-day RSI. 50 is neutral white; values above 50 become redder, and values below 50 become greener.
+- `Ticker`: colored by beta versus `^GSPC`.
+- `Price`: if extended-hours data is available, the same latest price is used and `Price Source` marks pre-market or after-hours values with a blue/yellow cue.
+
+The multi-user tables include column group toggles:
+
+- `Show Name column next to Ticker`.
+- `Show relative momentum columns`.
+- `Show financial columns`.
+- `Show EMA deviation columns`.
+
+Portfolio Monitor is placed in the multi-user `Portfolios` tab between `Market Breadth` and `AI Agent Reports`. Users can add multiple portfolio pages from Customize Pages. Portfolio tickers are included in the same `/api/stock_data` request so they can reuse the existing market data cache where possible.
+
+Portfolio editor format:
+
+```text
+Group | Ticker | Buy Price | Shares | Buy Currency
+```
+
+Example:
+
+```text
+Chips | TSM | 165.00 | 5 | USD
+Chips | MU | 95.50 | 10 | USD
+MegaCap | AAPL | 180.50 | 10 | USD
+HK | 0700.HK | 380 | 100 | HKD
+```
+
+The group can be omitted:
+
+```text
+AAPL | 180.50 | 10 | USD
+```
+
+Common currency codes include `USD`, `EUR`, `CNY`, `CNH`, `HKD`, `JPY`, `GBP`, `GBX`, `CAD`, `AUD`, `CHF`, `SEK`, `NOK`, and `DKK`. London `.L` tickers are often quoted in pence in Yahoo Finance and usually use `GBX`.
+
+Portfolio-specific columns:
+
+- `Buy Price`: user-entered per-share buy price in the buy currency; default background.
+- `Shares`: user-entered share count; default background.
+- `Market Value`: shares multiplied by the latest price. If the ticker currency differs from the buy currency, the latest FX rate is used to convert into the buy currency. The cell is colored by `P/L%`.
+- `P/L`: absolute historical P/L, colored by `P/L%`.
+- `P/L 1D`, `P/L 5D`, `P/L 1M`: absolute holding value change inferred from current market value and the corresponding `1D%`, `5D%`, and `1M%`; displayed in the buy currency and converted with the latest FX rate when needed.
+- `P/L%`: historical P/L percentage.
+
+The Portfolio treemap uses current market value for tile area and `1D%` for color. If all holdings in a portfolio page use the same buy currency, the final summary row shows total market value, total absolute P/L, total P/L%, and total 1D/5D/1M absolute changes. The summary-row `1D%`, `5D%`, and `1M%` cells show portfolio-level returns calculated in the buy currency with latest FX conversion and current holding weights. The `Ticker` cell shows market-value-weighted portfolio beta. If buy currencies are mixed, total figures are hidden and a warning is shown.
+
+## Directory structure
+
+```text
+.
+├── app_tkinter.py                    # Tkinter desktop frontend
+├── app_streamlit.py                  # Single-user Streamlit frontend
+├── app_streamlit_multiuser.py        # Multi-user Streamlit, Portfolio, and report UI
+├── stock_watch_list_back_end.py      # Flask market data API
+├── market_data_service.py            # Shared market data access layer
+├── multiuser_store.py                # Users, password hashes, watchlist and portfolio config
+├── ticker_mapping.py                 # Ticker normalization and mapping
+├── config_loader.py                  # Unified .env loader
+├── assets/                           # Static assets such as page icons
+├── daily_report/
+│   ├── service.py                    # Synchronous report subprocess wrapper
+│   ├── jobs.py                       # Email queue, schedules, limits, and capacity controls
+│   ├── worker.py                     # Background email worker
+│   ├── mailer.py                     # SMTP delivery
+│   ├── run_report.py                 # AI report CLI entry point
+│   ├── scripts/                      # Market data, chart, and HTML report scripts
+│   └── src/stock_daily_agent/
+│       ├── cli.py                    # Agent CLI
+│       ├── tools.py                  # Agent tools, evidence, and scoring flow
+│       └── article_fetcher.py        # SSRF-protected article fetcher
+├── deploy/
+│   ├── setup-worker-user.sh          # Dedicated worker-user helper script
+│   └── stock-watchlist-report-worker.service
+├── docs/
+├── tests/
+├── requirements.in
+├── requirements.txt
+├── requirements-dev.in
+├── requirements-dev.txt
+└── .env.example
+```
+
+Runtime files such as SQLite databases, caches, logs, `user_data/`, and `daily_report/runs/` should not be committed.
+
+## Dependency installation
+
+Python 3.10+ is required.
+
+Windows PowerShell:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip install -r requirements-dev.txt
+```
+
+macOS / Linux:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python -m pip install -r requirements-dev.txt
+```
+
+`requirements.txt` is the locked runtime dependency file. Production deployments can skip `requirements-dev.txt` unless tests are run there.
+
+## `.env` loading
+
+Copy the template and fill real values only in the local or deployment environment:
+
+```bash
+cp .env.example .env
+```
+
+Do not commit `.env`.
+
+`config_loader.load_project_env()` applies this precedence:
+
+1. Existing process environment variables.
+2. Explicit env file passed by the caller.
+3. Project-root `.env`.
+4. Code defaults.
+
+Unless `override=True` is explicitly used, `.env` does not override existing process environment variables. Flask, the report worker, and the report CLI follow the same rule.
+
+Common settings:
+
+- `STOCK_API_BASE_URL`: frontend-to-Flask API URL, default `http://127.0.0.1:5000`.
+- `STOCK_DEV_MODE`: `1` allows Streamlit to try starting a local Flask backend in development; `0` expects a standalone backend.
+- `STOCK_CACHE_DB_PATH`: override path for the market cache SQLite database.
+- `REPORT_JOB_DB`: override path for the report queue SQLite database.
+- `REPORT_*`: queue, download, schedule, email, and worker limits.
+- `DASHSCOPE_API_KEY`, `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `SERPER_API_KEY`: provider-specific credentials. Placeholder values in `.env.example` are not real credentials.
+
+## Local development startup order
+
+1. Activate the virtual environment and configure `.env`.
+2. Start the Flask backend:
+
+   ```bash
+   python stock_watch_list_back_end.py
+   ```
+
+3. Verify health:
+
+   ```bash
+   curl http://127.0.0.1:5000/api/health
+   ```
+
+4. Start one frontend in another terminal:
+
+   ```bash
+   streamlit run app_streamlit.py
+   streamlit run app_streamlit_multiuser.py
+   python app_tkinter.py
+   ```
+
+5. Start the email report worker if needed:
+
+   ```bash
+   python -m daily_report.worker
+   ```
+
+In production, set `STOCK_DEV_MODE=0` and manage Flask, Streamlit, and the worker as separate processes.
+
+## Flask API
+
+### `GET /api/health`
+
+Health check endpoint for deployment probes and frontend connection validation. It does not return market data or secrets.
+
+### `POST /api/stock_data`
+
+Recommended market data endpoint. JSON body:
+
+```json
+{
+  "groups": {
+    "Core": ["AAPL", "MSFT"]
+  },
+  "broad_market_tickers": ["^GSPC"],
+  "cache_key": "optional-user-cache-key"
+}
+```
+
+The response includes price, returns, RSI, relative momentum, valuation fields, earnings date, analyst rating, market cap, beta, and `Price Source`. The backend implicitly adds `^GSPC` for benchmark calculations but does not display it as a user row unless configured by the user.
+
+`GET /api/stock_data` is retained only for legacy compatibility. Market breadth uses `POST /api/breadth_data`; K-line data uses `GET /api/kline_data?ticker=...&period=...&interval=...`.
+
+## SQLite data locations
+
+- Market cache: `stock_cache.db` by default; override with `STOCK_CACHE_DB_PATH`.
+- Multi-user data: `watchlist_users.db` by default.
+- Report queue: `daily_report_jobs.db` by default; override with `REPORT_JOB_DB`.
+- Per-user market cache: `user_data/`.
+- Report run directories: `daily_report/runs/`.
+
+Databases, cache files, WAL/SHM files, logs, and user-generated data are runtime data and should not be committed.
+
+## AI reports, worker, schedules, and email flow
+
+CLI example:
+
+```bash
+python daily_report/run_report.py AAPL --months 3 --search-provider auto
+```
+
+Useful options include `--provider`, `--model`, `--search-provider`, `--no-article-fetch`, `--run-dir`, and `--output`.
+
+The multi-user `AI Agent Reports` tab supports:
+
+- logged-in synchronous report generation and download;
+- one-off email report jobs;
+- weekly schedules, one ticker per schedule;
+- selecting any combination of Monday through Sunday in one schedule;
+- one shared Europe/Berlin send time per schedule;
+- up to 7 ticker schedules per account;
+- pause, resume, and delete.
+
+The worker flow:
+
+```text
+weekly schedule due
+        |
+        v
+daily_report.jobs creates persistent email job
+        |
+        v
+daily_report.worker claims job
+        |
+        v
+daily_report.service generates HTML report in subprocess
+        |
+        v
+daily_report.mailer sends via SMTP
+        |
+        v
+job state is updated in SQLite
+```
+
+SMTP success and local state updates are not one atomic transaction, so strict exactly-once delivery cannot be guaranteed.
+
+## systemd deployment with a dedicated user
+
+Do not run the worker as root in production. The repository provides:
+
+- `deploy/setup-worker-user.sh`
+- `deploy/stock-watchlist-report-worker.service`
+
+Before installation, review and adapt `WorkingDirectory`, `ExecStart`, `EnvironmentFile`, and `ReadWritePaths`. Use a dedicated low-privilege user, minimal writable paths, restricted capabilities, private temp directories, and resource limits.
+
+Flask and Streamlit should also be managed as separate services. A reverse proxy such as Nginx can expose Streamlit while keeping local services bound to `127.0.0.1`.
+
+## Security boundaries
+
+### HTML escaping
+
+yfinance metadata, search snippets, article text, and LLM notes are untrusted. The report builder escapes text and constrains CSS classes, colors, and ticker-type values. Only locally generated chart fragments are treated as trusted HTML.
+
+### SSRF
+
+Article fetching only allows HTTP/HTTPS and rejects URL credentials, disallowed ports, loopback, private, link-local, multicast, reserved, unspecified, and cloud metadata addresses. Initial URLs and every redirect target are revalidated. Requests are pinned to validated IPs and constrained by redirect and response-size limits.
+
+This does not replace network-level egress controls.
+
+### Report authorization and rate limits
+
+AI report downloads and email jobs require login. The system applies per-account, active-generation, and global running limits in the database. Public deployments should also use reverse-proxy IP rate limits, authentication, logging, and capacity monitoring.
+
+### Login protection
+
+Passwords use PBKDF2-SHA256, random salts, and constant-time comparison. Failed logins are counted per username and can trigger temporary lockout. Admins should create users with interactive password prompts and avoid putting passwords in shell history, command-line arguments, or documentation.
+
+### Worker least privilege
+
+The worker should run as a dedicated low-privilege user with only the read/write access it needs: project code, required env file, report queue database, run directories, and logs.
+
+### SMTP exactly-once limitation
+
+SMTP cannot provide strict exactly-once semantics. A network timeout or crash can happen after the mail server accepts a message but before local state is updated. UI and operational procedures should treat “possibly sent” states as requiring confirmation.
+
+## Data privacy and files that must not be committed
+
+Do not commit:
+
+- `.env`, API keys, SMTP credentials, passwords, real email addresses, or real server paths;
+- SQLite databases, WAL/SHM files, caches, logs, and report outputs;
+- `user_data/`, `daily_report/runs/`, or any user-generated content;
+- QR codes, screenshots, or exported reports containing private domains, accounts, emails, ticker sets, or other private information.
+
+Only placeholder values should appear in `.env.example`.
+
+## Test commands
+
+Full test suite:
+
+```bash
+python -m pytest -q
+```
+
+Security and report tests:
+
+```bash
+python -m pytest tests/test_report_html_escape.py tests/test_article_url_security.py -q
+python -m pytest tests/test_weekly_schedule_multiday.py tests/test_queue_capacity.py -q
+```
+
+Portfolio and multi-user isolation tests:
+
+```bash
+python -m pytest tests/test_portfolio_config.py tests/test_p2_watchlist_isolation.py -q
+```
+
+After Python changes, run at least syntax checks and relevant tests:
+
+```bash
+python -m compileall -q app_streamlit_multiuser.py multiuser_store.py stock_watch_list_back_end.py daily_report
+python -m pytest path/to/relevant_test.py -q
+```
+
+## Current known limitations
+
+- External data sources, model providers, search APIs, and SMTP services are affected by network conditions, cost, quotas, and provider behavior.
+- First load, large market breadth calculations, and large ticker lists can be slow.
+- yfinance extended-hours data depends on provider availability; non-US or unsupported tickers may not show extended-hours cues.
+- Portfolio uses latest FX rates for display and P/L conversion. It does not reconstruct historical FX cost basis and should not be treated as accounting or tax reporting.
+- The Portfolio total row requires one buy currency per portfolio page. Mixed buy currencies hide total figures.
+- Synchronous AI report generation still exists; public deployments must add reverse-proxy rate limiting and capacity monitoring.
+- SMTP cannot guarantee exactly-once delivery.
+- HTML reports can be viewed offline but may be large because chart scripts are embedded.
+- The project does not provide self-service signup, payments, investment advice, trade execution, or data-source SLA.
+
+## License note
+
+Unless otherwise stated, treat this project as a personal research tool. Before redistribution or deployment, verify the terms of the data sources, model providers, and email providers you use.

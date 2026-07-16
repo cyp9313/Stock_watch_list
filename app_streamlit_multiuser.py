@@ -73,7 +73,14 @@ FINANCIAL_COLUMNS = [
     "Analysts", "Price Target", "Market Cap",
 ]
 PORTFOLIO_EXTRA_COLUMNS = [
-    "Buy Price", "Shares", "Market Value", "P/L", "P/L%",
+    "Buy Price", "Shares", "Market Value",
+    "P/L", "P/L 1D", "P/L 5D", "P/L 1M",
+    "P/L%",
+]
+PORTFOLIO_CHANGE_PERIODS = [
+    ("1D%", "P/L 1D"),
+    ("5D%", "P/L 5D"),
+    ("1M%", "P/L 1M"),
 ]
 COLUMNS = (
     ["Ticker", "Name", "Price", "1D%", "5D%", "1M%", "YTD%"]
@@ -111,6 +118,9 @@ COLUMN_WIDTHS = {
     "Shares": 76,
     "Market Value": 116,
     "P/L": 96,
+    "P/L 1D": 96,
+    "P/L 5D": 96,
+    "P/L 1M": 96,
     "P/L%": 72,
 }
 for _ema_column in EMA_DIFF_COLUMNS:
@@ -833,6 +843,21 @@ def convert_currency_value(value, from_currency, to_currency):
     return amount * float(from_to_eur) / float(to_to_eur)
 
 
+def portfolio_value_change_from_return(current_value, return_pct):
+    if current_value is None or return_pct is None or pd.isna(current_value) or pd.isna(return_pct):
+        return np.nan
+    try:
+        current = float(current_value)
+        pct_value = float(return_pct)
+    except (TypeError, ValueError):
+        return np.nan
+    denominator = 1.0 + pct_value / 100.0
+    if denominator == 0:
+        return np.nan
+    previous = current / denominator
+    return current - previous
+
+
 def build_grouped_df(df, groups, display_currency="Local"):
     if df.empty:
         return pd.DataFrame()
@@ -1182,6 +1207,12 @@ def build_portfolio_enriched_df(raw_df, page):
     treemap_rows = []
     total_cost = 0.0
     total_market_value = 0.0
+    total_beta_weighted = 0.0
+    total_beta_weight = 0.0
+    total_periods = {
+        source_pct_col: {"ready": True, "change": 0.0, "previous": 0.0}
+        for source_pct_col, _ in PORTFOLIO_CHANGE_PERIODS
+    }
     total_currency = None
     mixed_currency = False
     total_ready = True
@@ -1221,12 +1252,30 @@ def build_portfolio_enriched_df(raw_df, page):
         pnl_pct = pnl_abs / cost_basis * 100.0 if pd.notna(pnl_abs) and cost_basis not in (0, np.nan) else np.nan
         market_value_eur = convert_currency_value(market_value, buy_currency, "EUR")
 
+        period_values = {}
+        for source_pct_col, abs_col in PORTFOLIO_CHANGE_PERIODS:
+            source_pct = row.get(source_pct_col, np.nan)
+            abs_change = portfolio_value_change_from_return(market_value, source_pct)
+            period_values[abs_col] = abs_change
+
+            period_total = total_periods[source_pct_col]
+            if pd.notna(abs_change) and pd.notna(market_value):
+                previous_value = float(market_value) - float(abs_change)
+                if previous_value != 0:
+                    period_total["change"] += float(abs_change)
+                    period_total["previous"] += previous_value
+                else:
+                    period_total["ready"] = False
+            else:
+                period_total["ready"] = False
+
         row.update({
             "Buy Price": buy_price,
             "Shares": shares,
             "Market Value": market_value,
             "P/L": pnl_abs,
             "P/L%": pnl_pct,
+            **period_values,
             "_buy_currency": buy_currency,
             "_ticker_currency": ticker_currency,
             "_market_value_eur": market_value_eur,
@@ -1245,6 +1294,9 @@ def build_portfolio_enriched_df(raw_df, page):
             total_market_value += float(market_value)
         else:
             total_ready = False
+        if pd.notna(market_value_eur) and float(market_value_eur) > 0 and pd.notna(row.get("Beta", np.nan)):
+            total_beta_weighted += float(row.get("Beta")) * float(market_value_eur)
+            total_beta_weight += float(market_value_eur)
 
         if pd.notna(market_value) and float(market_value) > 0:
             treemap_rows.append({
@@ -1260,13 +1312,23 @@ def build_portfolio_enriched_df(raw_df, page):
     total_row = None
     if not mixed_currency and total_ready and total_currency and total_cost > 0:
         total_pnl = total_market_value - total_cost
+        total_beta = total_beta_weighted / total_beta_weight if total_beta_weight > 0 else np.nan
         total_row = {
             "Ticker": "TOTAL",
+            "Beta": total_beta,
             "Market Value": total_market_value,
             "P/L": total_pnl,
             "P/L%": total_pnl / total_cost * 100.0,
             "_buy_currency": total_currency,
         }
+        for source_pct_col, abs_col in PORTFOLIO_CHANGE_PERIODS:
+            period_total = total_periods[source_pct_col]
+            if period_total["ready"] and period_total["previous"] != 0:
+                total_row[abs_col] = period_total["change"]
+                total_row[source_pct_col] = period_total["change"] / period_total["previous"] * 100.0
+            else:
+                total_row[abs_col] = np.nan
+                total_row[source_pct_col] = np.nan
 
     return pd.DataFrame(enriched_rows), treemap_rows, {
         "mixed_currency": mixed_currency,
@@ -1311,18 +1373,24 @@ def render_portfolio_table(
         df_display.at[row_index, "Shares"] = f"{float(raw_row.get('Shares')):,.4g}" if pd.notna(raw_row.get("Shares")) else ""
         df_display.at[row_index, "Market Value"] = format_currency_value(raw_row.get("Market Value"), buy_currency)
         df_display.at[row_index, "P/L"] = format_currency_value(raw_row.get("P/L"), buy_currency)
-        df_display.at[row_index, "P/L%"] = f"{float(raw_row.get('P/L%')):+.2f}%" if pd.notna(raw_row.get("P/L%")) else ""
+        df_display.at[row_index, "P/L%"] = f"{float(raw_row.get('P/L%')):+.2f}" if pd.notna(raw_row.get("P/L%")) else ""
+        for _, abs_col in PORTFOLIO_CHANGE_PERIODS:
+            df_display.at[row_index, abs_col] = format_currency_value(raw_row.get(abs_col), buy_currency)
 
     total_row = summary.get("total_row")
     if summary.get("mixed_currency"):
         st.warning("Portfolio total is hidden because buy currencies are mixed. Use one buy currency per portfolio page to show total P/L.")
     elif total_row:
         display_total = {col: "" for col in df_display.columns}
-        display_total["Ticker"] = "TOTAL"
+        total_beta = total_row.get("Beta", np.nan)
+        display_total["Ticker"] = f"TOTAL β {float(total_beta):.2f}" if pd.notna(total_beta) else "TOTAL"
         display_total["Name"] = "Portfolio Total"
         display_total["Market Value"] = format_currency_value(total_row.get("Market Value"), total_row.get("_buy_currency"))
         display_total["P/L"] = format_currency_value(total_row.get("P/L"), total_row.get("_buy_currency"))
-        display_total["P/L%"] = f"{float(total_row.get('P/L%')):+.2f}%"
+        display_total["P/L%"] = f"{float(total_row.get('P/L%')):+.2f}"
+        for source_pct_col, abs_col in PORTFOLIO_CHANGE_PERIODS:
+            display_total[abs_col] = format_currency_value(total_row.get(abs_col), total_row.get("_buy_currency"))
+            display_total[source_pct_col] = f"{float(total_row.get(source_pct_col)):+.2f}" if pd.notna(total_row.get(source_pct_col)) else ""
         df_display = pd.concat([df_display, pd.DataFrame([display_total])], ignore_index=True)
 
     hidden_columns = set()
@@ -1347,7 +1415,8 @@ def render_portfolio_table(
 
     for row_index in range(len(df_display)):
         ticker = str(df_display.iloc[row_index]["Ticker"])
-        if ticker == "TOTAL":
+        is_total_row = str(df_display.iloc[row_index].get("Name", "")) == "Portfolio Total"
+        if is_total_row:
             pnl_pct = total_row.get("P/L%") if total_row else np.nan
         elif not extra_by_ticker.empty and ticker in extra_by_ticker.index:
             pnl_pct = extra_by_ticker.loc[ticker].get("P/L%")
@@ -1358,6 +1427,21 @@ def render_portfolio_table(
             for col in ("Market Value", "P/L", "P/L%"):
                 if col in visible_columns:
                     cell_colors[(row_index, visible_columns.index(col))] = color
+        for source_pct_col, abs_col in PORTFOLIO_CHANGE_PERIODS:
+            if is_total_row:
+                period_pct = total_row.get(source_pct_col) if total_row else np.nan
+            elif not extra_by_ticker.empty and ticker in extra_by_ticker.index:
+                period_pct = extra_by_ticker.loc[ticker].get(source_pct_col)
+            else:
+                period_pct = np.nan
+            if pd.notna(period_pct):
+                color = red_green(period_pct)
+                columns_to_color = (abs_col, source_pct_col) if is_total_row else (abs_col,)
+                for col in columns_to_color:
+                    if col in visible_columns:
+                        cell_colors[(row_index, visible_columns.index(col))] = color
+        if is_total_row and total_row and pd.notna(total_row.get("Beta", np.nan)) and "Ticker" in visible_columns:
+            cell_colors[(row_index, visible_columns.index("Ticker"))] = beta_color(total_row.get("Beta"))
 
     html_table = f"""
     <div style="width:100%; max-height:650px; overflow:auto;
@@ -1388,7 +1472,7 @@ def render_portfolio_table(
         row = df_display.iloc[row_index]
         ticker = str(row["Ticker"])
         is_header = ticker in group_names
-        is_total = ticker == "TOTAL"
+        is_total = str(row.get("Name", "")) == "Portfolio Total"
         html_table += "<tr>"
         for col_index, col in enumerate(visible_columns):
             val = "" if pd.isna(row[col]) else str(row[col])
@@ -2796,7 +2880,7 @@ def render_section(section_title, section_key, config, raw_df, editable, user, d
             with display_col3:
                 show_financial_columns = st.toggle(
                     "Show financial columns",
-                    value=True,
+                    value=False,
                     key=f"{section_key}_{i}_show_financial_columns",
                     help=(
                         "Show Next Earnings, PE, PEG, Analysts, Price Target "
@@ -2870,7 +2954,7 @@ def render_portfolio_section(config, raw_df, editable, user, dark_mode=False, di
             with display_col3:
                 show_financial_columns = st.toggle(
                     "Show financial columns",
-                    value=True,
+                    value=False,
                     key=f"portfolio_pages_{i}_show_financial_columns",
                     help=(
                         "Show Next Earnings, PE, PEG, Analysts, Price Target "
