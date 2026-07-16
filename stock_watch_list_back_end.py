@@ -22,6 +22,14 @@ from stockanalysis_scraper import scrape_batch, should_query_forward_pe
 from ticker_mapping import normalize_yfinance_ticker
 
 RELATIVE_RETURN_BENCHMARK = "^GSPC"
+DEFAULT_BETA_BENCHMARK = "^GSPC"
+EUROPE_BETA_BENCHMARK = "SXR8.DE"
+CHINA_A_BETA_BENCHMARK = "000001.SS"
+EUROPE_BETA_SUFFIXES = (
+    ".DE", ".PA", ".AS", ".MI", ".MC", ".BR", ".SW", ".VI",
+    ".ST", ".CO", ".HE", ".OL", ".LS", ".IR",
+)
+CHINA_A_BETA_SUFFIXES = (".SS", ".SZ")
 RELATIVE_RETURN_WINDOWS = (20, 60, 120)
 RELATIVE_RETURN_COLUMNS = {
     20: "20D Rel%",
@@ -806,6 +814,26 @@ def is_us_extended_hours_candidate(ticker):
     if t.endswith("-USD"):
         return False
     return True
+
+
+def beta_benchmark_for_ticker(ticker):
+    """Return the market-adapted benchmark used for covariance beta."""
+    t = normalize_yfinance_ticker(ticker).upper()
+    if t.endswith(CHINA_A_BETA_SUFFIXES):
+        return CHINA_A_BETA_BENCHMARK
+    if t.endswith(EUROPE_BETA_SUFFIXES):
+        return EUROPE_BETA_BENCHMARK
+    return DEFAULT_BETA_BENCHMARK
+
+
+def beta_benchmarks_for_tickers(tickers):
+    """Return the distinct beta benchmarks required by a ticker universe."""
+    benchmarks = [DEFAULT_BETA_BENCHMARK]
+    for ticker in tickers:
+        benchmark = beta_benchmark_for_ticker(ticker)
+        if benchmark not in benchmarks:
+            benchmarks.append(benchmark)
+    return benchmarks
 
 
 def _extract_intraday_field(df, field, ticker, batch):
@@ -2419,7 +2447,8 @@ def get_stock_data():
                 earnings_df.loc[ticker_symbol] = None
 
         # 获取价格数据（增量更新：已有标的只下载最近几天，新标的全量下载）
-        price_tickers = list(dict.fromkeys(all_tickers + [RELATIVE_RETURN_BENCHMARK]))
+        beta_benchmark_tickers = beta_benchmarks_for_tickers(all_tickers)
+        price_tickers = list(dict.fromkeys(all_tickers + [RELATIVE_RETURN_BENCHMARK] + beta_benchmark_tickers))
         df = get_prices_with_cache(price_tickers, period="2y")
 
         if isinstance(df.columns, pd.MultiIndex):
@@ -2535,6 +2564,10 @@ def get_stock_data():
         beta_cache = get_cached_betas(all_tickers, today_str)
         beta_updates = []
         relative_return_scores = compute_relative_return_scores(adj_close, all_tickers)
+        beta_benchmark_prices = {}
+        for benchmark_ticker in beta_benchmark_tickers:
+            if not adj_close.empty and benchmark_ticker in adj_close.columns:
+                beta_benchmark_prices[benchmark_ticker] = adj_close[benchmark_ticker].dropna()
 
         for ticker in all_tickers:
             if adj_close.empty or ticker not in adj_close.columns:
@@ -2647,32 +2680,35 @@ def get_stock_data():
                     m6m = 0.0
                     m12m = 0.0
 
-            # ===== Beta（相对于 ^GSPC，带 SQLite 缓存，统一用过去1年数据）=====
+            # ===== Beta: market-adapted benchmark, same SQLite cache key, 1Y window =====
             beta = np.nan
             beta_cached = beta_cache.get(ticker)
             if beta_cached is not None:
                 beta = float(beta_cached)
-            elif (sp500_prices is not None and isinstance(sp500_prices, pd.Series) 
-                  and len(sp500_prices) > 1 and len(price_series) > 1):
-                # 统一截断到过去1年（252个交易日）以确保所有标的的计算窗口一致
-                stock_beta = price_series.iloc[-252:] if len(price_series) > 252 else price_series
-                sp500_beta = sp500_prices.iloc[-252:] if len(sp500_prices) > 252 else sp500_prices
-                stock_norm = stock_beta.copy()
-                sp500_norm = sp500_beta.copy()
-                if stock_norm.index.tz is not None:
-                    stock_norm.index = stock_norm.index.tz_localize(None)
-                if sp500_norm.index.tz is not None:
-                    sp500_norm.index = sp500_norm.index.tz_localize(None)
-                common_idx = stock_norm.index.intersection(sp500_norm.index)
-                if len(common_idx) > 2:
-                    stock_ret = stock_norm.loc[common_idx].pct_change().dropna()
-                    sp500_ret = sp500_norm.loc[common_idx].pct_change().dropna()
-                    if len(stock_ret) > 1 and len(sp500_ret) > 1:
-                        cov_matrix = np.cov(stock_ret, sp500_ret)
-                        var_sp500 = cov_matrix[1, 1]
-                        if var_sp500 != 0:
-                            beta = float(cov_matrix[0, 1] / var_sp500)
-                            beta_updates.append((ticker, today_str, beta, len(common_idx)))
+            else:
+                beta_benchmark_ticker = beta_benchmark_for_ticker(ticker)
+                benchmark_prices = beta_benchmark_prices.get(beta_benchmark_ticker)
+                if (benchmark_prices is not None and isinstance(benchmark_prices, pd.Series)
+                        and len(benchmark_prices) > 1 and len(price_series) > 1):
+                    # Use the latest 252 trading days when available.
+                    stock_beta = price_series.iloc[-252:] if len(price_series) > 252 else price_series
+                    benchmark_beta = benchmark_prices.iloc[-252:] if len(benchmark_prices) > 252 else benchmark_prices
+                    stock_norm = stock_beta.copy()
+                    benchmark_norm = benchmark_beta.copy()
+                    if stock_norm.index.tz is not None:
+                        stock_norm.index = stock_norm.index.tz_localize(None)
+                    if benchmark_norm.index.tz is not None:
+                        benchmark_norm.index = benchmark_norm.index.tz_localize(None)
+                    common_idx = stock_norm.index.intersection(benchmark_norm.index)
+                    if len(common_idx) > 2:
+                        stock_ret = stock_norm.loc[common_idx].pct_change().dropna()
+                        benchmark_ret = benchmark_norm.loc[common_idx].pct_change().dropna()
+                        if len(stock_ret) > 1 and len(benchmark_ret) > 1:
+                            cov_matrix = np.cov(stock_ret, benchmark_ret)
+                            benchmark_var = cov_matrix[1, 1]
+                            if benchmark_var != 0:
+                                beta = float(cov_matrix[0, 1] / benchmark_var)
+                                beta_updates.append((ticker, today_str, beta, len(common_idx)))
 
             ticker_relative_scores = relative_return_scores.get(ticker, {})
 

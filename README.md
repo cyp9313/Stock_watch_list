@@ -55,7 +55,7 @@ Watchlist 表格的主要指标：
 - `20D Rel%`、`60D Rel%`、`120D Rel%`：标的过去 20/60/120 个交易日收益率减去 `^GSPC` 同窗口收益率，单位是百分比。
 - `3/6/12M Rel%`：3/6/12 个月相对 `^GSPC` 的加权超额收益，权重为 `0.2 / 0.3 / 0.5`，单位是百分比。
 - `RSI`：14 日 RSI。50 为中性白色，高于 50 越多越红，低于 50 越多越绿。
-- `Ticker`：按相对 `^GSPC` 的 Beta 染色。
+- `Ticker`：按市场适配后的 Beta 染色。美股和默认标的使用 `^GSPC`，欧洲股票/ETF 使用 `SXR8.DE`，A股股票/ETF 使用 `000001.SS`；Beta 仍写入原有按 ticker/date 组织的 SQLite 缓存。
 - `Price`：如果后端拿到盘前/盘后价格，会显示同一份最新价格，并通过 `Price Source` 使用蓝色/黄色提示盘前或盘后来源。
 
 多用户版表格提供列组开关：
@@ -258,7 +258,7 @@ copy .env.example .env
 }
 ```
 
-响应数据包含 watchlist 表格需要的价格、收益率、RSI、相对动量、估值、财报日期、分析师评级、市值、Beta 和 `Price Source`。后端会在价格请求中隐式加入 `^GSPC` 用于基准计算，但不会把它额外显示为用户 watchlist 行，除非用户自己配置了 `^GSPC`。
+响应数据包含 watchlist 表格需要的价格、收益率、RSI、相对动量、估值、财报日期、分析师评级、市值、Beta 和 `Price Source`。后端会在价格请求中隐式加入 `^GSPC` 用于相对收益计算，并按 ticker 市场为 Beta 额外加入 `^GSPC`、`SXR8.DE` 或 `000001.SS` 等 benchmark；这些 benchmark 不会额外显示为用户 watchlist 行，除非用户自己配置。
 
 `GET /api/stock_data` 仅为兼容旧客户端保留，并在响应中标记为弃用。市场宽度接口使用 `POST /api/breadth_data`，K 线接口为 `GET /api/kline_data?ticker=...&period=...&interval=...`。
 
@@ -483,7 +483,7 @@ Main watchlist indicators:
 - `20D Rel%`, `60D Rel%`, `120D Rel%`: the ticker return over the last 20/60/120 trading days minus the `^GSPC` return over the same window.
 - `3/6/12M Rel%`: weighted 3/6/12-month excess return versus `^GSPC`, using weights `0.2 / 0.3 / 0.5`.
 - `RSI`: 14-day RSI. 50 is neutral white; values above 50 become redder, and values below 50 become greener.
-- `Ticker`: colored by beta versus `^GSPC`.
+- `Ticker`: colored by market-adapted beta. US/default tickers use `^GSPC`, European stocks/ETFs use `SXR8.DE`, and China A-share stocks/ETFs use `000001.SS`. Beta still uses the existing ticker/date SQLite cache.
 - `Price`: if extended-hours data is available, the same latest price is used and `Price Source` marks pre-market or after-hours values with a blue/yellow cue.
 
 The multi-user tables include column group toggles:
@@ -672,7 +672,7 @@ Recommended market data endpoint. JSON body:
 }
 ```
 
-The response includes price, returns, RSI, relative momentum, valuation fields, earnings date, analyst rating, market cap, beta, and `Price Source`. The backend implicitly adds `^GSPC` for benchmark calculations but does not display it as a user row unless configured by the user.
+The response includes price, returns, RSI, relative momentum, valuation fields, earnings date, analyst rating, market cap, beta, and `Price Source`. The backend implicitly adds `^GSPC` for relative-return calculations and adds the market-adapted beta benchmark, such as `^GSPC`, `SXR8.DE`, or `000001.SS`, when needed. These benchmarks are not displayed as user rows unless explicitly configured by the user.
 
 `GET /api/stock_data` is retained only for legacy compatibility. Market breadth uses `POST /api/breadth_data`; K-line data uses `GET /api/kline_data?ticker=...&period=...&interval=...`.
 
