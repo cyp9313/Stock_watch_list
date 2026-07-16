@@ -14,9 +14,12 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.offline import get_plotlyjs
 from plotly.subplots import make_subplots
+from plotly.utils import PlotlyJSONEncoder
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 import yfinance as yf
 from PIL import Image
 
@@ -1882,6 +1885,32 @@ def fetch_vix_kline():
         return None
 
 
+def run_auto_refresh_controller(auto_refresh_stocks, auto_refresh_kline, interval_seconds):
+    if not auto_refresh_stocks:
+        return
+
+    @st.fragment(run_every=interval_seconds)
+    def _auto_refresh_tick():
+        now = datetime.datetime.now()
+        should_rerun = False
+
+        if auto_refresh_stocks:
+            last = st.session_state.get("auto_refresh_stocks_last")
+            if last is None:
+                st.session_state["auto_refresh_stocks_last"] = now
+            elif (now - last).total_seconds() >= interval_seconds:
+                fetch_stock_data.clear()
+                currency_to_eur_rate.clear()
+                st.session_state["auto_refresh_stocks_last"] = now
+                st.session_state["auto_refresh_stocks_last_label"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                should_rerun = True
+
+        if should_rerun:
+            st.rerun()
+
+    _auto_refresh_tick()
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_kline_data(ticker, period, interval, cache_key=""):
     params = {"ticker": ticker, "period": period, "interval": interval}
@@ -2351,7 +2380,7 @@ def display_vix_gauge(kline_data, dark_mode=False):
     st.plotly_chart(build_vix_gauge(value, dark_mode=dark_mode), width="stretch")
 
 
-def build_kline_chart(kline_data, ticker, fib_levels=None, dark_mode=False):
+def build_kline_chart(kline_data, ticker, fib_levels=None, dark_mode=False, uirevision=None):
     if not kline_data or not kline_data.get("success"):
         st.warning("K-line data not available")
         return None
@@ -2639,6 +2668,7 @@ def build_kline_chart(kline_data, ticker, fib_levels=None, dark_mode=False):
                 col=1,
             )
 
+    stable_ui_revision = str(uirevision or ticker)
     fig.update_layout(
         title=dict(text=title, x=0.01, xanchor="left", font=dict(color=theme["text"], size=15)),
         height=1100,
@@ -2662,7 +2692,15 @@ def build_kline_chart(kline_data, ticker, fib_levels=None, dark_mode=False):
         font=dict(color=theme["text"]),
         margin=dict(l=40, r=40, t=140, b=30),
         annotations=annotations,
+        uirevision=stable_ui_revision,
     )
+    fig.update_layout(
+        selectionrevision=stable_ui_revision,
+        editrevision=stable_ui_revision,
+        legend=dict(uirevision=stable_ui_revision),
+    )
+    fig.for_each_xaxis(lambda axis: axis.update(uirevision=stable_ui_revision))
+    fig.for_each_yaxis(lambda axis: axis.update(uirevision=stable_ui_revision))
     fig.update_xaxes(gridcolor=theme["grid"], zerolinecolor=theme["grid"])
     fig.update_yaxes(gridcolor=theme["grid"], zerolinecolor=theme["grid"])
 
@@ -2682,6 +2720,111 @@ def build_kline_chart(kline_data, ticker, fib_levels=None, dark_mode=False):
         fig.update_xaxes(showticklabels=False, row=row, col=1)
 
     return fig
+
+
+def render_persistent_kline_chart(fig, storage_key, height=None):
+    """Render K-line Plotly chart while preserving browser-side zoom across reruns."""
+    if fig is None:
+        return
+
+    chart_height = int(height or fig.layout.height or 1100)
+    chart_height = max(chart_height, 400)
+    fig_json = json.dumps(fig.to_plotly_json(), cls=PlotlyJSONEncoder)
+    storage_key_json = json.dumps(f"stock_watchlist:kline_zoom:{storage_key}")
+    html_doc = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+    #kline-chart { width: 100%; height: __HEIGHT__px; }
+  </style>
+  <script>__PLOTLY_JS__</script>
+</head>
+<body>
+  <div id="kline-chart"></div>
+  <script>
+    const chart = document.getElementById("kline-chart");
+    const fig = __FIG_JSON__;
+    const storageKey = __STORAGE_KEY__;
+    const config = { responsive: true, scrollZoom: true, displayModeBar: true };
+
+    function readSavedZoom() {
+      try {
+        const raw = window.localStorage.getItem(storageKey);
+        return raw ? JSON.parse(raw) : null;
+      } catch (err) {
+        return null;
+      }
+    }
+
+    function writeSavedZoom(value) {
+      try {
+        window.localStorage.setItem(storageKey, JSON.stringify(value));
+      } catch (err) {}
+    }
+
+    function clearSavedZoom() {
+      try {
+        window.localStorage.removeItem(storageKey);
+      } catch (err) {}
+    }
+
+    function saveZoom(eventData) {
+      if (!eventData) {
+        return;
+      }
+      let saved = readSavedZoom() || {};
+      let changed = false;
+      let reset = false;
+
+      Object.entries(eventData).forEach(([key, value]) => {
+        if (/^(xaxis\\d*|yaxis\\d*)\\.autorange$/.test(key) && value === true) {
+          reset = true;
+        }
+
+        const indexedRange = key.match(/^(xaxis\\d*|yaxis\\d*)\\.range\\[(0|1)\\]$/);
+        if (indexedRange) {
+          saved[key] = value;
+          changed = true;
+          return;
+        }
+
+        const arrayRange = key.match(/^(xaxis\\d*|yaxis\\d*)\\.range$/);
+        if (arrayRange && Array.isArray(value) && value.length >= 2) {
+          saved[`${arrayRange[1]}.range[0]`] = value[0];
+          saved[`${arrayRange[1]}.range[1]`] = value[1];
+          changed = true;
+        }
+      });
+
+      if (reset) {
+        clearSavedZoom();
+      } else if (changed) {
+        writeSavedZoom(saved);
+      }
+    }
+
+    function restoreZoom() {
+      const saved = readSavedZoom();
+      if (saved && Object.keys(saved).length > 0) {
+        Plotly.relayout(chart, saved);
+      }
+    }
+
+    Plotly.newPlot(chart, fig.data || [], fig.layout || {}, config).then(() => {
+      restoreZoom();
+      chart.on("plotly_relayout", saveZoom);
+    });
+    window.addEventListener("resize", () => Plotly.Plots.resize(chart));
+  </script>
+</body>
+</html>
+""".replace("__PLOTLY_JS__", get_plotlyjs()).replace("__FIG_JSON__", fig_json).replace(
+        "__STORAGE_KEY__", storage_key_json
+    ).replace("__HEIGHT__", str(chart_height))
+    components.html(html_doc, height=chart_height + 10, scrolling=False)
 
 
 def render_auth_panel():
@@ -3027,72 +3170,118 @@ def render_kline(cache_key, display_currency="Local"):
                 st.session_state["kline_data"] = fetch_kline_data(ticker, period, interval, cache_key)
                 st.session_state["kline_cache_key"] = request_key
                 st.session_state["kline_ticker_cache"] = ticker
+                st.session_state["auto_refresh_kline_last"] = datetime.datetime.now()
+                st.session_state["auto_refresh_kline_last_key"] = request_key
         st.session_state["current_ticker"] = ticker
 
-    fib_scope = f"{ticker}_{display_currency}"
-    if st.session_state.get("fib_ticker") != fib_scope:
-        st.session_state.pop("fib_levels", None)
-        st.session_state["fib_ticker"] = fib_scope
+    auto_refresh_enabled = st.session_state.get("auto_refresh_kline", False)
+    auto_refresh_interval_seconds = int(st.session_state.get("auto_refresh_interval_minutes", 5)) * 60
+    kline_run_every = (
+        auto_refresh_interval_seconds
+        if auto_refresh_enabled
+        and st.session_state.get("kline_cache_key") == request_key
+        and "kline_data" in st.session_state
+        else None
+    )
 
-    data = st.session_state.get("kline_data")
-    if not data:
-        st.info("Click 'Plot' to load chart")
-        return
-    if not data.get("success"):
-        st.error(data.get("error", "Failed to load K-line data"))
-        return
+    @st.fragment(run_every=kline_run_every)
+    def _render_kline_body():
+        if (
+            auto_refresh_enabled
+            and st.session_state.get("kline_cache_key") == request_key
+            and "kline_data" in st.session_state
+        ):
+            now = datetime.datetime.now()
+            last = st.session_state.get("auto_refresh_kline_last")
+            last_key = st.session_state.get("auto_refresh_kline_last_key")
+            if last is None or last_key != request_key:
+                st.session_state["auto_refresh_kline_last"] = now
+                st.session_state["auto_refresh_kline_last_key"] = request_key
+            elif (now - last).total_seconds() >= auto_refresh_interval_seconds:
+                fetch_kline_data.clear()
+                st.session_state["kline_data"] = fetch_kline_data(ticker, period, interval, cache_key)
+                st.session_state["kline_cache_key"] = request_key
+                st.session_state["kline_ticker_cache"] = ticker
+                st.session_state["auto_refresh_kline_last"] = now
+                st.session_state["auto_refresh_kline_last_key"] = request_key
+                st.session_state["auto_refresh_kline_last_label"] = now.strftime("%Y-%m-%d %H:%M:%S")
 
-    fib_levels = st.session_state.get("fib_levels")
-    with st.expander("Fibonacci Retracement / Extension", expanded=bool(fib_levels)):
-        st.markdown(
-            """
-            Enter A (swing low), B (swing high), and optionally C (pullback end) prices.
-            - A + B only: retracement lines
-            - A + B + C: extension lines
-            """
-        )
-        with st.form(key="fib_form"):
-            fc1, fc2, fc3 = st.columns(3)
-            with fc1:
-                fib_a = st.number_input("A (Swing Low)", value=0.0, step=0.01, format="%.2f", key="fib_a")
-            with fc2:
-                fib_b = st.number_input("B (Swing High)", value=0.0, step=0.01, format="%.2f", key="fib_b")
-            with fc3:
-                fib_c = st.number_input("C (Pullback End, optional)", value=0.0, step=0.01, format="%.2f", key="fib_c")
+        if auto_refresh_enabled:
+            label = st.session_state.get("auto_refresh_kline_last_label") or "Not yet"
+            st.caption(f"Last K-line auto-refresh: {label}")
 
-            fc_btn1, fc_btn2 = st.columns([1, 1])
-            with fc_btn1:
-                submit_fib = st.form_submit_button(label="Calculate Fibonacci")
-            with fc_btn2:
-                clear_fib = st.form_submit_button(label="Clear Fibonacci")
-
-        if clear_fib:
+        fib_scope = f"{ticker}_{display_currency}"
+        if st.session_state.get("fib_ticker") != fib_scope:
             st.session_state.pop("fib_levels", None)
-            fib_levels = None
+            st.session_state["fib_ticker"] = fib_scope
 
-        if submit_fib and fib_a > 0 and fib_b > 0 and fib_a != fib_b:
-            diff = fib_b - fib_a
-            if fib_c > 0:
-                ratios = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0, 1.272, 1.618, 2.0, 2.618]
-                labels = ["0%", "23.6%", "38.2%", "50%", "61.8%", "78.6%", "100%", "127.2%", "161.8%", "200%", "261.8%"]
-                fib_levels = [(fib_c + diff * ratio, label, "blue" if ratio >= 1.0 else "gray") for ratio, label in zip(ratios, labels)]
-            else:
-                ratios = [0, 0.236, 0.382, 0.5, 0.618, 1.0]
-                labels = ["0%", "23.6%", "38.2%", "50%", "61.8%", "100%"]
-                fib_levels = [(fib_b - diff * ratio, label, "gray") for ratio, label in zip(ratios, labels)]
-            st.session_state["fib_levels"] = fib_levels
+        data = st.session_state.get("kline_data")
+        if not data:
+            st.info("Click 'Plot' to load chart")
+            return
+        if not data.get("success"):
+            st.error(data.get("error", "Failed to load K-line data"))
+            return
 
-        if fib_levels:
-            rows = []
-            for level, label, color in fib_levels:
-                rows.append({"Ratio": label, "Price": f"{level:.2f}", "Type": "Extension" if color == "blue" else "Retracement"})
-            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+        fib_levels = st.session_state.get("fib_levels")
+        with st.expander("Fibonacci Retracement / Extension", expanded=bool(fib_levels)):
+            st.markdown(
+                """
+                Enter A (swing low), B (swing high), and optionally C (pullback end) prices.
+                - A + B only: retracement lines
+                - A + B + C: extension lines
+                """
+            )
+            with st.form(key="fib_form"):
+                fc1, fc2, fc3 = st.columns(3)
+                with fc1:
+                    fib_a = st.number_input("A (Swing Low)", value=0.0, step=0.01, format="%.2f", key="fib_a")
+                with fc2:
+                    fib_b = st.number_input("B (Swing High)", value=0.0, step=0.01, format="%.2f", key="fib_b")
+                with fc3:
+                    fib_c = st.number_input("C (Pullback End, optional)", value=0.0, step=0.01, format="%.2f", key="fib_c")
 
-    dark_mode = st.session_state.get("dark_mode", False)
-    chart_data = convert_kline_data_for_display(data, ticker, display_currency)
-    fig = build_kline_chart(chart_data, ticker, fib_levels=fib_levels, dark_mode=dark_mode)
-    if fig:
-        st.plotly_chart(fig, width="stretch", key="kline_main_chart")
+                fc_btn1, fc_btn2 = st.columns([1, 1])
+                with fc_btn1:
+                    submit_fib = st.form_submit_button(label="Calculate Fibonacci")
+                with fc_btn2:
+                    clear_fib = st.form_submit_button(label="Clear Fibonacci")
+
+            if clear_fib:
+                st.session_state.pop("fib_levels", None)
+                fib_levels = None
+
+            if submit_fib and fib_a > 0 and fib_b > 0 and fib_a != fib_b:
+                diff = fib_b - fib_a
+                if fib_c > 0:
+                    ratios = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0, 1.272, 1.618, 2.0, 2.618]
+                    labels = ["0%", "23.6%", "38.2%", "50%", "61.8%", "78.6%", "100%", "127.2%", "161.8%", "200%", "261.8%"]
+                    fib_levels = [(fib_c + diff * ratio, label, "blue" if ratio >= 1.0 else "gray") for ratio, label in zip(ratios, labels)]
+                else:
+                    ratios = [0, 0.236, 0.382, 0.5, 0.618, 1.0]
+                    labels = ["0%", "23.6%", "38.2%", "50%", "61.8%", "100%"]
+                    fib_levels = [(fib_b - diff * ratio, label, "gray") for ratio, label in zip(ratios, labels)]
+                st.session_state["fib_levels"] = fib_levels
+
+            if fib_levels:
+                rows = []
+                for level, label, color in fib_levels:
+                    rows.append({"Ratio": label, "Price": f"{level:.2f}", "Type": "Extension" if color == "blue" else "Retracement"})
+                st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+        dark_mode = st.session_state.get("dark_mode", False)
+        chart_data = convert_kline_data_for_display(data, ticker, display_currency)
+        fig = build_kline_chart(
+            chart_data,
+            ticker,
+            fib_levels=fib_levels,
+            dark_mode=dark_mode,
+            uirevision=f"{request_key}_{display_currency}",
+        )
+        if fig:
+            render_persistent_kline_chart(fig, f"{request_key}_{display_currency}")
+
+    _render_kline_body()
 
 
 def render_report_form_fields(key_prefix, default_ticker="AAPL", include_email=False):
@@ -3494,6 +3683,34 @@ with st.sidebar:
                 st.session_state["breadth_last_refresh"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             st.rerun()
 
+    if editable:
+        st.caption("Auto-refresh does not refresh Market Breadth.")
+        auto_refresh_stocks = st.toggle("Auto-refresh stocks", value=False, key="auto_refresh_stocks")
+        auto_refresh_kline = st.toggle("Auto-refresh K-line chart", value=False, key="auto_refresh_kline")
+        auto_refresh_interval_minutes = st.selectbox(
+            "Auto-refresh interval",
+            [1, 5, 15, 30, 60],
+            index=1,
+            format_func=lambda minutes: f"{minutes} min",
+            key="auto_refresh_interval_minutes",
+        )
+        if auto_refresh_stocks and st.session_state.get("auto_refresh_stocks_last_label"):
+            st.caption(f"Last stock auto-refresh: {st.session_state['auto_refresh_stocks_last_label']}")
+        if auto_refresh_kline:
+            @st.fragment(run_every=5)
+            def _render_sidebar_kline_auto_status():
+                label = st.session_state.get("auto_refresh_kline_last_label") or "Not yet"
+                st.caption(f"Last K-line auto-refresh: {label}")
+
+            _render_sidebar_kline_auto_status()
+    else:
+        st.caption("Sign in to enable auto-refresh. Market Breadth is never auto-refreshed.")
+        st.session_state["auto_refresh_stocks"] = False
+        st.session_state["auto_refresh_kline"] = False
+        auto_refresh_stocks = False
+        auto_refresh_kline = False
+        auto_refresh_interval_minutes = int(st.session_state.get("auto_refresh_interval_minutes", 5))
+
     st.divider()
     if editable:
         st.header("Customize Pages")
@@ -3510,6 +3727,12 @@ with st.sidebar:
             save_active_config(user, config)
             st.rerun()
     st.caption(f"Last update: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+run_auto_refresh_controller(
+    auto_refresh_stocks,
+    auto_refresh_kline,
+    auto_refresh_interval_minutes * 60,
+)
 
 inject_css(dark_mode)
 st.title("Stock Watchlist")

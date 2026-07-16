@@ -67,6 +67,14 @@ Watchlist 表格的主要指标：
 
 Watchlist、Market Dashboard、Market Breadth 和 Portfolio 表格的第一列 `Ticker` 会固定在左侧，横向滚动时不会离开可视区域。
 
+Sidebar 为多用户版登录用户提供可选的无人值守自动刷新模式；游客视图不会显示或启动自动刷新，以降低公共入口负载：
+
+- `Auto-refresh stocks`：按所选间隔自动刷新 watchlist、market dashboard 和 portfolio 使用的 `/api/stock_data` 数据。
+- `Auto-refresh K-line chart`：按所选间隔自动刷新当前已经绘制的 K 线图；同一 ticker/period/interval/currency 下会通过浏览器端状态保存恢复用户当前的 zoom/pan 视野。
+- `Auto-refresh interval`：多用户版登录用户可选 1、5、15、30 或 60 分钟。
+
+自动刷新不会触发 Market Breadth；Market Breadth 始终只在点击 sidebar 的 `Refresh Breadth` 时下载和重算。
+
 Portfolio Monitor 位于多用户版的 `Portfolios` tab，在 `Market Breadth` 和 `AI Agent Reports` 之间。每个用户可以在 Customize Pages 中添加多个 portfolio page。Portfolio 数据会进入同一个 `/api/stock_data` 请求集合，尽量复用 watchlist、market dashboard 和 market breadth 已有缓存。
 
 Portfolio editor 采用稳定的文本格式，每行一个持仓：
@@ -496,6 +504,14 @@ The multi-user tables include column group toggles:
 - `Show EMA deviation columns`.
 
 The first `Ticker` column is frozen on the left side for Watchlist, Market Dashboard, Market Breadth, and Portfolio tables, so it stays visible while horizontally scrolling.
+
+The sidebar also provides optional unattended auto-refresh for signed-in multi-user sessions. Guest views do not show or start auto-refresh, which reduces public-entry load:
+
+- `Auto-refresh stocks`: refreshes `/api/stock_data` for watchlists, market dashboard, and portfolio pages at the selected interval.
+- `Auto-refresh K-line chart`: refreshes the currently plotted K-line chart at the selected interval. For the same ticker/period/interval/currency, browser-side state restores the current Plotly zoom and pan range.
+- `Auto-refresh interval`: signed-in multi-user sessions can choose 1, 5, 15, 30, or 60 minutes.
+
+Auto-refresh never triggers Market Breadth. Market Breadth is downloaded and recalculated only when the sidebar `Refresh Breadth` button is clicked.
 
 Portfolio Monitor is placed in the multi-user `Portfolios` tab between `Market Breadth` and `AI Agent Reports`. Users can add multiple portfolio pages from Customize Pages. Portfolio tickers are included in the same `/api/stock_data` request so they can reuse the existing market data cache where possible.
 
