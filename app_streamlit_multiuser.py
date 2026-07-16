@@ -1830,7 +1830,7 @@ def delete_page(config, section, page_index):
     return normalize_config(config)
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def fetch_stock_data(config_json, cache_key):
     config = normalize_config(json.loads(config_json))
     payload = {

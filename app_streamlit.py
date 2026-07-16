@@ -387,7 +387,7 @@ def sticky_first_column_header_style(bg_color):
 
 
 # ── API helpers with caching ─────────────────────────────────
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def fetch_stock_data():
     """Fetch stock data for all groups."""
     resp = requests.post(
