@@ -107,23 +107,56 @@ def inject_theme_css(dark_mode=False):
             color: {theme["text"]} !important;
             font-weight: 700 !important;
         }}
-        div[role="switch"] {{
-            background-color: {"#2d3748" if dark_mode else "#e5e7eb"} !important;
-            border: 2px solid {"#94a3b8" if dark_mode else "#64748b"} !important;
-            box-shadow: 0 0 0 1px {"rgba(148, 163, 184, 0.35)" if dark_mode else "rgba(100, 116, 139, 0.25)"};
-            min-width: 2.75rem !important;
-            min-height: 1.45rem !important;
-            transition: background-color 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
+        [data-testid="stSidebar"] div.st-key-dark_mode p,
+        [data-testid="stSidebar"] div.st-key-auto_refresh_stocks p,
+        [data-testid="stSidebar"] div.st-key-auto_refresh_kline p,
+        [data-testid="stSidebar"] div[data-testid="stCheckbox"] p {{
+            color: {theme["text"]} !important;
+            font-weight: 800 !important;
         }}
-        div[role="switch"][aria-checked="true"] {{
+        [data-testid="stSidebar"] div.st-key-dark_mode label,
+        [data-testid="stSidebar"] div.st-key-auto_refresh_stocks label,
+        [data-testid="stSidebar"] div.st-key-auto_refresh_kline label,
+        [data-testid="stSidebar"] div.st-key-dark_mode div[data-testid="stMarkdownContainer"],
+        [data-testid="stSidebar"] div.st-key-auto_refresh_stocks div[data-testid="stMarkdownContainer"],
+        [data-testid="stSidebar"] div.st-key-auto_refresh_kline div[data-testid="stMarkdownContainer"],
+        [data-testid="stSidebar"] div.st-key-dark_mode div[data-testid="stMarkdownContainer"] p,
+        [data-testid="stSidebar"] div.st-key-auto_refresh_stocks div[data-testid="stMarkdownContainer"] p,
+        [data-testid="stSidebar"] div.st-key-auto_refresh_kline div[data-testid="stMarkdownContainer"] p {{
+            background: transparent !important;
+            background-color: transparent !important;
+        }}
+        [data-testid="stSidebar"] div.st-key-dark_mode label[data-baseweb="checkbox"] input + div,
+        [data-testid="stSidebar"] div.st-key-auto_refresh_stocks label[data-baseweb="checkbox"] input + div,
+        [data-testid="stSidebar"] div.st-key-auto_refresh_kline label[data-baseweb="checkbox"] input + div,
+        [data-testid="stSidebar"] div.st-key-dark_mode label[data-baseweb="checkbox"] input + div *,
+        [data-testid="stSidebar"] div.st-key-auto_refresh_stocks label[data-baseweb="checkbox"] input + div *,
+        [data-testid="stSidebar"] div.st-key-auto_refresh_kline label[data-baseweb="checkbox"] input + div * {{
+            background: transparent !important;
+            background-color: transparent !important;
+        }}
+        [data-testid="stSidebar"] div.st-key-dark_mode label[data-baseweb="checkbox"] > div:first-child,
+        [data-testid="stSidebar"] div.st-key-auto_refresh_stocks label[data-baseweb="checkbox"] > div:first-child,
+        [data-testid="stSidebar"] div.st-key-auto_refresh_kline label[data-baseweb="checkbox"] > div:first-child {{
+            background: #0ea5e9 !important;
+            background-color: #0ea5e9 !important;
+            border-color: #0369a1 !important;
+            box-shadow: inset 0 0 0 1px rgba(255,255,255,0.40), 0 0 8px rgba(14,165,233,0.35) !important;
+        }}
+        [data-testid="stSidebar"] div.st-key-dark_mode:has(input:checked) label[data-baseweb="checkbox"] > div:first-child,
+        [data-testid="stSidebar"] div.st-key-auto_refresh_stocks:has(input:checked) label[data-baseweb="checkbox"] > div:first-child,
+        [data-testid="stSidebar"] div.st-key-auto_refresh_kline:has(input:checked) label[data-baseweb="checkbox"] > div:first-child {{
+            background: #ef4444 !important;
             background-color: #ef4444 !important;
             border-color: #fecaca !important;
-            box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.32), 0 0 12px rgba(239, 68, 68, 0.38);
+            box-shadow: inset 0 0 0 1px rgba(255,255,255,0.45), 0 0 12px rgba(239,68,68,0.45) !important;
         }}
-        div[role="switch"] div,
-        div[role="switch"] span {{
+        [data-testid="stSidebar"] div.st-key-dark_mode label[data-baseweb="checkbox"] > div:first-child > div,
+        [data-testid="stSidebar"] div.st-key-auto_refresh_stocks label[data-baseweb="checkbox"] > div:first-child > div,
+        [data-testid="stSidebar"] div.st-key-auto_refresh_kline label[data-baseweb="checkbox"] > div:first-child > div {{
+            background: #ffffff !important;
             background-color: #ffffff !important;
-            box-shadow: 0 1px 4px rgba(15, 23, 42, 0.45);
+            box-shadow: 0 1px 4px rgba(15, 23, 42, 0.45) !important;
         }}
         </style>
         """,
