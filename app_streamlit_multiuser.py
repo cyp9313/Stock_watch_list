@@ -396,13 +396,28 @@ def inject_css(dark_mode=False):
             background-color: {theme["input_bg"]} !important;
             border-color: {theme["input_border"]} !important;
         }}
+        div[data-testid="stToggle"] label p,
+        div[data-testid="stToggle"] label span {{
+            color: {theme["text"]} !important;
+            font-weight: 700 !important;
+        }}
         div[role="switch"] {{
-            background-color: {theme["input_bg"]} !important;
-            border-color: {theme["input_border"]} !important;
+            background-color: {"#2d3748" if dark_mode else "#e5e7eb"} !important;
+            border: 2px solid {"#94a3b8" if dark_mode else "#64748b"} !important;
+            box-shadow: 0 0 0 1px {"rgba(148, 163, 184, 0.35)" if dark_mode else "rgba(100, 116, 139, 0.25)"};
+            min-width: 2.75rem !important;
+            min-height: 1.45rem !important;
+            transition: background-color 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
         }}
         div[role="switch"][aria-checked="true"] {{
-            background-color: {theme["input_focus"]} !important;
-            border-color: {theme["input_focus"]} !important;
+            background-color: #ef4444 !important;
+            border-color: #fecaca !important;
+            box-shadow: 0 0 0 2px rgba(239, 68, 68, 0.32), 0 0 12px rgba(239, 68, 68, 0.38);
+        }}
+        div[role="switch"] div,
+        div[role="switch"] span {{
+            background-color: #ffffff !important;
+            box-shadow: 0 1px 4px rgba(15, 23, 42, 0.45);
         }}
         div[data-testid="stTextInput"] input,
         div[data-testid="stNumberInput"] input,
@@ -3167,15 +3182,29 @@ def render_kline(cache_key, display_currency="Local"):
     if plot:
         if "kline_data" not in st.session_state or st.session_state.get("kline_cache_key") != request_key:
             with st.spinner(f"Loading {ticker} K-line data..."):
+                now = datetime.datetime.now()
                 st.session_state["kline_data"] = fetch_kline_data(ticker, period, interval, cache_key)
                 st.session_state["kline_cache_key"] = request_key
                 st.session_state["kline_ticker_cache"] = ticker
-                st.session_state["auto_refresh_kline_last"] = datetime.datetime.now()
+                st.session_state["auto_refresh_kline_last"] = now
                 st.session_state["auto_refresh_kline_last_key"] = request_key
         st.session_state["current_ticker"] = ticker
 
     auto_refresh_enabled = st.session_state.get("auto_refresh_kline", False)
     auto_refresh_interval_seconds = int(st.session_state.get("auto_refresh_interval_minutes", 5)) * 60
+    if (
+        auto_refresh_enabled
+        and st.session_state.get("kline_cache_key") == request_key
+        and "kline_data" in st.session_state
+    ):
+        active_key = st.session_state.get("auto_refresh_kline_active_key")
+        active_interval = st.session_state.get("auto_refresh_kline_active_interval_seconds")
+        if active_key != request_key or active_interval != auto_refresh_interval_seconds:
+            now = datetime.datetime.now()
+            st.session_state["auto_refresh_kline_active_key"] = request_key
+            st.session_state["auto_refresh_kline_active_interval_seconds"] = auto_refresh_interval_seconds
+            st.session_state["auto_refresh_kline_next_due"] = now + datetime.timedelta(seconds=auto_refresh_interval_seconds)
+
     kline_run_every = (
         auto_refresh_interval_seconds
         if auto_refresh_enabled
@@ -3192,12 +3221,10 @@ def render_kline(cache_key, display_currency="Local"):
             and "kline_data" in st.session_state
         ):
             now = datetime.datetime.now()
-            last = st.session_state.get("auto_refresh_kline_last")
-            last_key = st.session_state.get("auto_refresh_kline_last_key")
-            if last is None or last_key != request_key:
-                st.session_state["auto_refresh_kline_last"] = now
-                st.session_state["auto_refresh_kline_last_key"] = request_key
-            elif (now - last).total_seconds() >= auto_refresh_interval_seconds:
+            next_due = st.session_state.get("auto_refresh_kline_next_due")
+            if next_due is None:
+                st.session_state["auto_refresh_kline_next_due"] = now + datetime.timedelta(seconds=auto_refresh_interval_seconds)
+            elif now >= next_due:
                 fetch_kline_data.clear()
                 st.session_state["kline_data"] = fetch_kline_data(ticker, period, interval, cache_key)
                 st.session_state["kline_cache_key"] = request_key
@@ -3205,10 +3232,13 @@ def render_kline(cache_key, display_currency="Local"):
                 st.session_state["auto_refresh_kline_last"] = now
                 st.session_state["auto_refresh_kline_last_key"] = request_key
                 st.session_state["auto_refresh_kline_last_label"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                st.session_state["auto_refresh_kline_next_due"] = now + datetime.timedelta(seconds=auto_refresh_interval_seconds)
 
         if auto_refresh_enabled:
             label = st.session_state.get("auto_refresh_kline_last_label") or "Not yet"
-            st.caption(f"Last K-line auto-refresh: {label}")
+            next_due = st.session_state.get("auto_refresh_kline_next_due")
+            next_label = next_due.strftime("%Y-%m-%d %H:%M:%S") if isinstance(next_due, datetime.datetime) else "N/A"
+            st.caption(f"Last K-line auto-refresh: {label}; next due: {next_label}")
 
         fib_scope = f"{ticker}_{display_currency}"
         if st.session_state.get("fib_ticker") != fib_scope:
@@ -3700,7 +3730,10 @@ with st.sidebar:
             @st.fragment(run_every=5)
             def _render_sidebar_kline_auto_status():
                 label = st.session_state.get("auto_refresh_kline_last_label") or "Not yet"
+                next_due = st.session_state.get("auto_refresh_kline_next_due")
+                next_label = next_due.strftime("%Y-%m-%d %H:%M:%S") if isinstance(next_due, datetime.datetime) else "N/A"
                 st.caption(f"Last K-line auto-refresh: {label}")
+                st.caption(f"Next K-line auto-refresh: {next_label}")
 
             _render_sidebar_kline_auto_status()
     else:
