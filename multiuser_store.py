@@ -10,6 +10,7 @@ import os
 import re
 import secrets
 import sqlite3
+import uuid
 
 from ticker_mapping import normalize_yfinance_ticker
 
@@ -54,8 +55,20 @@ DEFAULT_BROAD_PAGES = [
 
 DEFAULT_PORTFOLIO_PAGES = [
     {
+        "id": "pf_default",
         "name": "Portfolio",
         "holdings": [],
+        "analysis_settings": {
+            "base_currency": "EUR",
+            "benchmark": "^GSPC",
+            "investment_horizon": "1-3m",
+            "risk_profile": "balanced",
+            "max_position_pct": 20.0,
+            "max_group_pct": 40.0,
+            "allow_add": True,
+            "allow_reduce": True,
+            "research_max_tickers": 5,
+        },
     }
 ]
 
@@ -106,6 +119,10 @@ def _normalize_portfolio_pages(pages, fallback_name):
     normalized = []
     for i, page in enumerate(pages or []):
         name = str(page.get("name") or f"{fallback_name} {i + 1}").strip()
+        page_id = str(page.get("id") or "").strip()
+        if not page_id:
+            page_id = f"pf_{uuid.uuid4().hex[:12]}"
+        settings = _normalize_portfolio_analysis_settings(page.get("analysis_settings") or {})
         holdings = []
         raw_holdings = page.get("holdings")
 
@@ -137,8 +154,45 @@ def _normalize_portfolio_pages(pages, fallback_name):
                 "shares": shares,
                 "buy_currency": currency,
             })
-        normalized.append({"name": name, "holdings": holdings})
-    return normalized or [{"name": fallback_name, "holdings": []}]
+        normalized.append({
+            "id": page_id,
+            "name": name,
+            "holdings": holdings,
+            "analysis_settings": settings,
+        })
+    return normalized or [{
+        "id": f"pf_{uuid.uuid4().hex[:12]}",
+        "name": fallback_name,
+        "holdings": [],
+        "analysis_settings": _normalize_portfolio_analysis_settings({}),
+    }]
+
+
+def _normalize_portfolio_analysis_settings(settings):
+    defaults = DEFAULT_PORTFOLIO_PAGES[0]["analysis_settings"]
+    data = dict(defaults)
+    if isinstance(settings, dict):
+        data.update(settings)
+    data["base_currency"] = str(data.get("base_currency") or "EUR").strip().upper() or "EUR"
+    data["benchmark"] = normalize_yfinance_ticker(data.get("benchmark") or "^GSPC") or "^GSPC"
+    data["investment_horizon"] = str(data.get("investment_horizon") or "1-3m").strip() or "1-3m"
+    if data["investment_horizon"] not in {"1-4w", "1-3m", "3-6m", "6-12m", "12m+"}:
+        data["investment_horizon"] = "1-3m"
+    data["risk_profile"] = str(data.get("risk_profile") or "balanced").strip().lower()
+    if data["risk_profile"] not in {"conservative", "balanced", "growth", "aggressive"}:
+        data["risk_profile"] = "balanced"
+    for key, default in (("max_position_pct", 20.0), ("max_group_pct", 40.0)):
+        try:
+            data[key] = max(0.0, min(100.0, float(data.get(key, default))))
+        except (TypeError, ValueError):
+            data[key] = default
+    data["allow_add"] = bool(data.get("allow_add", True))
+    data["allow_reduce"] = bool(data.get("allow_reduce", True))
+    try:
+        data["research_max_tickers"] = max(1, min(10, int(data.get("research_max_tickers", 5))))
+    except (TypeError, ValueError):
+        data["research_max_tickers"] = 5
+    return data
 
 
 def init_user_db():
@@ -447,6 +501,34 @@ def get_user_config(user_id):
     return config
 
 
+def get_user_config_by_cache_key(owner_key):
+    """Return a normalized config for a signed-in user's stable cache key."""
+    owner_key = user_cache_key(owner_key)
+    conn = init_user_db()
+    rows = conn.execute("SELECT id, username FROM users WHERE is_active=1").fetchall()
+    user_id = None
+    for row in rows:
+        if user_cache_key(row[1]) == owner_key:
+            user_id = row[0]
+            break
+    conn.close()
+    if user_id is None:
+        return None
+    return get_user_config(user_id)
+
+
+def get_portfolio_page_by_id(owner_key, portfolio_page_id):
+    """Load the latest portfolio page for a user cache key and stable page ID."""
+    config = get_user_config_by_cache_key(owner_key)
+    if not config:
+        return None
+    portfolio_page_id = str(portfolio_page_id or "").strip()
+    for page in config.get("portfolio_pages", []):
+        if str(page.get("id") or "") == portfolio_page_id:
+            return page
+    return None
+
+
 def save_user_config(user_id, config):
     conn = init_user_db()
     save_user_config_by_id(conn, user_id, config)
@@ -476,7 +558,7 @@ def config_to_api_groups(config):
             if ticker:
                 portfolio_groups.setdefault(group_name, []).append(ticker)
         for group_name, tickers in portfolio_groups.items():
-            groups[f"P:{page['name']}:{group_name}"] = list(dict.fromkeys(tickers))
+            groups[f"P:{page.get('id', page['name'])}:{page['name']}:{group_name}"] = list(dict.fromkeys(tickers))
     return groups
 
 

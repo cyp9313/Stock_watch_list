@@ -126,6 +126,47 @@ class MarketDataService:
             ]
         return data
 
+    @staticmethod
+    def fetch_adjusted_close_batch(
+        tickers: list[str],
+        *,
+        period: str = "1y",
+        interval: str = "1d",
+    ) -> pd.DataFrame:
+        """Fetch adjusted close prices for a ticker batch.
+
+        The function prefers ``Adj Close`` and falls back to ``Close`` when
+        adjusted prices are unavailable.  Empty columns are removed while the
+        original ticker order is preserved.
+        """
+        tickers = [MarketDataService.normalize_ticker(t) for t in tickers if MarketDataService.normalize_ticker(t)]
+        tickers = list(dict.fromkeys(tickers))
+        if not tickers:
+            return pd.DataFrame()
+        data = yf.download(
+            tickers=tickers,
+            period=period,
+            interval=interval,
+            auto_adjust=False,
+            threads=True,
+            group_by="column",
+            progress=False,
+        )
+        if data is None or data.empty:
+            return pd.DataFrame()
+        if isinstance(data.columns, pd.MultiIndex):
+            fields = list(data.columns.get_level_values(0))
+            field = "Adj Close" if "Adj Close" in fields else "Close"
+            close = data.xs(field, axis=1, level=0)
+        else:
+            field = "Adj Close" if "Adj Close" in data.columns else "Close"
+            close = data[[field]].rename(columns={field: tickers[0]})
+        close = close.copy()
+        close.columns = [MarketDataService.normalize_ticker(c) for c in close.columns]
+        close = close.dropna(axis=1, how="all")
+        ordered = [ticker for ticker in tickers if ticker in close.columns]
+        return close[ordered] if ordered else pd.DataFrame()
+
     # -- Snapshot save / load ------------------------------------------------
 
     @staticmethod

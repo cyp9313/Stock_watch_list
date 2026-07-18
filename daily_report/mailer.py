@@ -68,23 +68,34 @@ def compute_job_message_id(job_id: str) -> str:
 def send_report_email(
     *,
     recipient: str,
-    ticker: str,
+    ticker: str | None = None,
+    report_title: str | None = None,
     report_date: str,
     file_name: str,
     html_bytes: bytes,
+    report_kind: str = "ticker",
     message_id: str | None = None,
 ) -> None:
     config = load_smtp_config()
     message = EmailMessage()
     message["From"] = formataddr(("Stock Watchlist AI Agent", config.sender))
     message["To"] = recipient
-    message["Subject"] = f"{ticker} AI Stock Daily Report - {report_date}"
+    subject_name = report_title or ticker or "Portfolio"
+    if report_kind == "portfolio":
+        message["Subject"] = f"{subject_name} AI Portfolio Report - {report_date}"
+        body = (
+            f"Your AI portfolio analysis report for {subject_name} is attached.\n\n"
+            "This report is for research purposes only and is not investment advice."
+        )
+    else:
+        message["Subject"] = f"{subject_name} AI Stock Daily Report - {report_date}"
+        body = (
+            f"Your AI Agent daily report for {subject_name} is attached.\n\n"
+            "This report is for research purposes only and is not investment advice."
+        )
     message["Date"] = formatdate(localtime=True)
     message["Message-ID"] = message_id or make_msgid(domain=config.sender.split("@")[-1])
-    message.set_content(
-        f"Your AI Agent daily report for {ticker} is attached.\n\n"
-        "This report is for research purposes only and is not investment advice."
-    )
+    message.set_content(body)
     message.add_attachment(
         html_bytes,
         maintype="text",

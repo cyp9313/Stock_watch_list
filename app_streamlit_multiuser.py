@@ -4,9 +4,11 @@ warnings.filterwarnings("ignore", message="Timestamp.utcnow is deprecated")
 import copy
 import datetime
 import colorsys
+import hashlib
 import html
 import json
 import os
+import re
 import threading
 import time
 from zoneinfo import ZoneInfo
@@ -32,7 +34,9 @@ from daily_report.jobs import (
     WEEKDAY_NAMES,
     check_download_generation_limits,
     create_weekly_schedule,
+    create_weekly_portfolio_schedule,
     delete_schedule,
+    enqueue_portfolio_email_job,
     enqueue_email_job,
     finish_download_generation,
     list_owner_jobs,
@@ -41,6 +45,7 @@ from daily_report.jobs import (
     start_download_generation,
 )
 from daily_report.mailer import smtp_configured
+from daily_report.portfolio_service import generate_portfolio_report, portfolio_runtime_available
 from daily_report.service import generate_report, runtime_available
 from multiuser_store import (
     BREADTH_GROUPS,
@@ -1667,6 +1672,358 @@ def build_portfolio_treemap(treemap_rows, dark_mode=False):
     return fig
 
 
+def portfolio_snapshot_hash(page):
+    payload = {
+        "id": page.get("id"),
+        "holdings": page.get("holdings", []),
+        "analysis_settings": page.get("analysis_settings", {}),
+        "date": datetime.date.today().isoformat(),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def portfolio_market_rows(raw_df, page):
+    tickers = set(portfolio_page_tickers(page))
+    if raw_df is None or raw_df.empty or not tickers:
+        return []
+    rows = raw_df[raw_df["Ticker"].isin(tickers)].copy()
+    if "Currency" not in rows.columns:
+        rows["Currency"] = rows["Ticker"].map(lambda ticker: get_ticker_currency(ticker) or fallback_currency_from_ticker(ticker))
+    return rows.where(pd.notna(rows), None).to_dict(orient="records")
+
+
+def portfolio_report_fx_rates(page, base_currency):
+    currencies = {normalize_currency_code(base_currency)}
+    for holding in page.get("holdings", []):
+        buy_currency = normalize_currency_code(holding.get("buy_currency"))
+        ticker = normalize_yfinance_ticker(holding.get("ticker"))
+        ticker_currency = get_ticker_currency(ticker) or fallback_currency_from_ticker(ticker)
+        if buy_currency:
+            currencies.add(buy_currency)
+        if ticker_currency:
+            currencies.add(ticker_currency)
+    eur_rates = {}
+    for currency in currencies:
+        rate = currency_to_eur_rate(currency)
+        if rate:
+            eur_rates[currency] = float(rate)
+    fx_rates = {}
+    for from_currency, from_to_eur in eur_rates.items():
+        for to_currency, to_to_eur in eur_rates.items():
+            if from_currency == to_currency:
+                continue
+            if to_to_eur:
+                fx_rates[f"{from_currency}{to_currency}"] = float(from_to_eur) / float(to_to_eur)
+    return fx_rates
+
+
+def render_portfolio_analysis_settings(config, page_index, editable, user):
+    page = config["portfolio_pages"][page_index]
+    settings = dict(page.get("analysis_settings") or {})
+    with st.expander("AI report settings", expanded=False):
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            base_currency = st.selectbox(
+                "Base currency",
+                ["EUR", "USD", "CNY", "HKD", "GBP", "JPY", "KRW", "CHF", "CAD", "AUD"],
+                index=(["EUR", "USD", "CNY", "HKD", "GBP", "JPY", "KRW", "CHF", "CAD", "AUD"].index(settings.get("base_currency", "EUR")) if settings.get("base_currency", "EUR") in ["EUR", "USD", "CNY", "HKD", "GBP", "JPY", "KRW", "CHF", "CAD", "AUD"] else 0),
+                disabled=not editable,
+                key=f"portfolio_ai_{page_index}_base_currency",
+            )
+        with c2:
+            benchmark = st.text_input(
+                "Benchmark",
+                value=settings.get("benchmark", "^GSPC"),
+                disabled=not editable,
+                key=f"portfolio_ai_{page_index}_benchmark",
+            )
+        with c3:
+            horizon = st.selectbox(
+                "Investment horizon",
+                ["1-4w", "1-3m", "3-6m", "6-12m", "12m+"],
+                index=["1-4w", "1-3m", "3-6m", "6-12m", "12m+"].index(settings.get("investment_horizon", "1-3m")) if settings.get("investment_horizon", "1-3m") in ["1-4w", "1-3m", "3-6m", "6-12m", "12m+"] else 1,
+                disabled=not editable,
+                key=f"portfolio_ai_{page_index}_horizon",
+            )
+        with c4:
+            risk_profile = st.selectbox(
+                "Risk profile",
+                ["conservative", "balanced", "growth", "aggressive"],
+                index=["conservative", "balanced", "growth", "aggressive"].index(settings.get("risk_profile", "balanced")) if settings.get("risk_profile", "balanced") in ["conservative", "balanced", "growth", "aggressive"] else 1,
+                disabled=not editable,
+                key=f"portfolio_ai_{page_index}_risk_profile",
+            )
+        c5, c6, c7, c8 = st.columns(4)
+        with c5:
+            max_position = st.number_input(
+                "Max position %",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(settings.get("max_position_pct", 20.0)),
+                step=1.0,
+                disabled=not editable,
+                key=f"portfolio_ai_{page_index}_max_position",
+            )
+        with c6:
+            max_group = st.number_input(
+                "Max group %",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(settings.get("max_group_pct", 40.0)),
+                step=1.0,
+                disabled=not editable,
+                key=f"portfolio_ai_{page_index}_max_group",
+            )
+        with c7:
+            research_max = st.number_input(
+                "Max research tickers",
+                min_value=1,
+                max_value=10,
+                value=int(settings.get("research_max_tickers", 5)),
+                step=1,
+                disabled=not editable,
+                key=f"portfolio_ai_{page_index}_research_max",
+            )
+        with c8:
+            allow_reduce = st.checkbox(
+                "Allow reduce advice",
+                value=bool(settings.get("allow_reduce", True)),
+                disabled=not editable,
+                key=f"portfolio_ai_{page_index}_allow_reduce",
+            )
+        allow_add = st.checkbox(
+            "Allow add/watch advice",
+            value=bool(settings.get("allow_add", True)),
+            disabled=not editable,
+            key=f"portfolio_ai_{page_index}_allow_add",
+        )
+        if editable and st.button("Save AI report settings", key=f"portfolio_ai_{page_index}_save_settings"):
+            page["analysis_settings"] = {
+                "base_currency": base_currency,
+                "benchmark": normalize_yfinance_ticker(benchmark) or "^GSPC",
+                "investment_horizon": horizon,
+                "risk_profile": risk_profile,
+                "max_position_pct": max_position,
+                "max_group_pct": max_group,
+                "allow_add": allow_add,
+                "allow_reduce": allow_reduce,
+                "research_max_tickers": int(research_max),
+            }
+            config["portfolio_pages"][page_index] = page
+            save_active_config(user, config)
+            st.rerun()
+    return config
+
+
+def render_portfolio_weekly_schedules(user, page, mail_ready, runner_ok):
+    schedules = [
+        schedule
+        for schedule in list_owner_schedules(user["cache_key"])
+        if schedule.get("report_kind") == "portfolio" and schedule.get("subject_key") == page.get("id")
+    ]
+    with st.form(f"portfolio_report_schedule_form_{page.get('id')}"):
+        c_email, c_provider, c_time = st.columns([2, 1, 1])
+        with c_email:
+            recipient = st.text_input("Recipient email", key=f"portfolio_schedule_email_{page.get('id')}")
+        with c_provider:
+            provider = st.selectbox(
+                "Search provider",
+                ["auto", "priority", "serper", "searxng", "both"],
+                key=f"portfolio_schedule_provider_{page.get('id')}",
+            )
+        with c_time:
+            local_time = st.time_input(
+                "Send time (Europe/Berlin)",
+                value=datetime.time(hour=18, minute=0),
+                step=datetime.timedelta(minutes=15),
+                key=f"portfolio_schedule_time_{page.get('id')}",
+            )
+        st.markdown("**Send on**")
+        weekday_cols = st.columns(7)
+        selected_weekdays = []
+        for weekday, weekday_name in enumerate(WEEKDAY_NAMES):
+            with weekday_cols[weekday]:
+                if st.checkbox(weekday_name, value=weekday == 0, key=f"portfolio_schedule_{page.get('id')}_weekday_{weekday}"):
+                    selected_weekdays.append(weekday)
+        submitted = st.form_submit_button("Create Portfolio Weekly Plan", disabled=not mail_ready or not runner_ok)
+    if submitted:
+        try:
+            schedule = create_weekly_portfolio_schedule(
+                owner_key=user["cache_key"],
+                portfolio_page_id=page.get("id"),
+                portfolio_name=page.get("name"),
+                recipient_email=recipient,
+                local_time=local_time,
+                weekdays=selected_weekdays,
+                search_provider=provider,
+                settings=page.get("analysis_settings") or {},
+            )
+            st.success(
+                f"Portfolio weekly plan created for {schedule['recipient_masked']}. "
+                f"Next send: {_format_berlin_datetime(schedule['next_run_at'])}."
+            )
+        except (ValueError, ScheduleLimitError) as exc:
+            st.error(str(exc))
+
+    st.markdown("#### Portfolio Weekly Schedules")
+    if not schedules:
+        st.caption("No weekly portfolio schedules for this page yet.")
+        return
+    rows = []
+    for schedule in schedules:
+        rows.append({
+            "Portfolio": schedule.get("subject_name") or page.get("name"),
+            "Recipient": schedule["recipient_masked"],
+            "Weekly time": f"{', '.join(WEEKDAY_NAMES[day] for day in schedule['weekdays'])} {schedule['local_time']}",
+            "Status": "Active" if schedule["is_active"] else "Paused",
+            "Next send (Berlin)": _format_berlin_datetime(schedule["next_run_at"]),
+        })
+    render_report_status_table(rows, dark_mode=st.session_state.get("dark_mode", False))
+    schedule_map = {schedule["id"]: schedule for schedule in schedules}
+    selected_id = st.selectbox(
+        "Manage portfolio schedule",
+        list(schedule_map),
+        format_func=lambda schedule_id: (
+            f"{schedule_map[schedule_id]['subject_name']} - "
+            f"{', '.join(WEEKDAY_NAMES[day] for day in schedule_map[schedule_id]['weekdays'])} "
+            f"{schedule_map[schedule_id]['local_time']} - "
+            f"{schedule_map[schedule_id]['recipient_masked']}"
+        ),
+        key=f"manage_portfolio_report_schedule_{page.get('id')}",
+    )
+    selected = schedule_map[selected_id]
+    action_col, delete_col = st.columns(2)
+    with action_col:
+        action_label = "Pause Schedule" if selected["is_active"] else "Resume Schedule"
+        if st.button(action_label, key=f"toggle_portfolio_report_schedule_{page.get('id')}", width="stretch"):
+            set_schedule_active(selected_id, owner_key=user["cache_key"], active=not bool(selected["is_active"]))
+            st.rerun()
+    with delete_col:
+        confirm_delete = st.checkbox("Confirm delete", key=f"confirm_delete_portfolio_report_schedule_{page.get('id')}")
+        if st.button("Delete Schedule", key=f"delete_portfolio_report_schedule_{page.get('id')}", width="stretch", disabled=not confirm_delete):
+            delete_schedule(selected_id, owner_key=user["cache_key"])
+            st.rerun()
+
+
+def render_portfolio_ai_report(config, page_index, raw_df, user):
+    page = config["portfolio_pages"][page_index]
+    st.divider()
+    st.markdown("### AI Portfolio Report")
+    st.caption(
+        "Generates a self-contained HTML report with portfolio metrics, risk concentration, top-risk evidence and rule-based action suggestions. "
+        "The fixed research mode is Top-risk news; there is no per-holding daily-report fan-out."
+    )
+    if not user:
+        st.info("Sign in with an administrator-issued account to generate or email Portfolio AI reports.")
+        return config
+    if not page.get("holdings"):
+        st.info("Add holdings before generating a Portfolio AI report.")
+        return config
+
+    runner_ok = portfolio_runtime_available()
+    if not runner_ok:
+        st.warning("Portfolio report runner is unavailable.")
+    config = render_portfolio_analysis_settings(config, page_index, True, user)
+    page = config["portfolio_pages"][page_index]
+    snapshot_hash = portfolio_snapshot_hash(page)
+    result_key = f"portfolio_report_result:{user['cache_key']}:{page.get('id')}"
+    result = st.session_state.get(result_key)
+    if result and result.get("snapshot_hash") != snapshot_hash:
+        st.warning("The current report was generated from an older portfolio snapshot. Please regenerate the report.")
+
+    download_tab, email_tab = st.tabs(["Generate & Download", "Generate & Email"])
+    with download_tab:
+        with st.form(f"portfolio_report_download_form_{page.get('id')}"):
+            search_provider = st.selectbox(
+                "Search provider",
+                ["auto", "priority", "serper", "searxng", "both"],
+                key=f"portfolio_report_download_provider_{page.get('id')}",
+            )
+            submitted = st.form_submit_button("Generate Portfolio Report", disabled=not runner_ok)
+        if submitted:
+            session_id = None
+            result = None
+            try:
+                check_download_generation_limits(user["cache_key"], report_kind="portfolio")
+                session_id = start_download_generation(user["cache_key"], f"portfolio:{page.get('id')}", report_kind="portfolio")
+                with st.spinner(f"Generating {page.get('name')} AI Portfolio report... This can take a few minutes."):
+                    result = generate_portfolio_report(
+                        page,
+                        owner_key=user["cache_key"],
+                        portfolio_page_id=page.get("id"),
+                        portfolio_name=page.get("name"),
+                        search_provider=search_provider,
+                        market_rows=portfolio_market_rows(raw_df, page),
+                        fx_rates=portfolio_report_fx_rates(page, (page.get("analysis_settings") or {}).get("base_currency", "EUR")),
+                    )
+                    result["snapshot_hash"] = snapshot_hash
+                    st.session_state[result_key] = result
+            except (ActiveJobError, DailyLimitError, ValueError) as exc:
+                st.error(str(exc))
+                st.session_state[result_key] = None
+            finally:
+                if session_id:
+                    finish_download_generation(session_id, success=bool(result and result.get("success")))
+
+        result = st.session_state.get(result_key)
+        if result:
+            if result.get("success"):
+                st.success(f"Portfolio report generated in {result.get('elapsed', 0):.1f}s")
+                st.download_button(
+                    "Download HTML Portfolio Report",
+                    data=result["html_bytes"],
+                    file_name=result["file_name"],
+                    mime="text/html",
+                    width="stretch",
+                    key=f"download_portfolio_report_{page.get('id')}_{result['file_name']}",
+                )
+                with st.expander("Generation log", expanded=False):
+                    if result.get("stdout"):
+                        st.code(result["stdout"])
+                    if result.get("stderr"):
+                        st.code(result["stderr"])
+            else:
+                st.error(result.get("error", "Portfolio report generation failed."))
+                with st.expander("Generation log", expanded=True):
+                    if result.get("stdout"):
+                        st.code(result["stdout"])
+                    if result.get("stderr"):
+                        st.code(result["stderr"])
+
+    with email_tab:
+        mail_ready = smtp_configured()
+        if not mail_ready:
+            st.warning("Email delivery is not configured. Set SMTP report variables in .env.")
+        send_once_tab, weekly_tab = st.tabs(["Send Once", "Weekly Schedule"])
+        with send_once_tab:
+            with st.form(f"portfolio_report_email_form_{page.get('id')}"):
+                recipient = st.text_input("Recipient email", key=f"portfolio_report_email_{page.get('id')}")
+                provider = st.selectbox(
+                    "Search provider",
+                    ["auto", "priority", "serper", "searxng", "both"],
+                    key=f"portfolio_report_email_provider_{page.get('id')}",
+                )
+                queued = st.form_submit_button("Queue Portfolio Report Email", disabled=not mail_ready or not runner_ok)
+            if queued:
+                try:
+                    job = enqueue_portfolio_email_job(
+                        owner_key=user["cache_key"],
+                        portfolio_page_id=page.get("id"),
+                        portfolio_name=page.get("name"),
+                        recipient_email=recipient,
+                        search_provider=provider,
+                        settings=page.get("analysis_settings") or {},
+                    )
+                    st.success(f"Portfolio job {job['id'][:8]} queued for {job['recipient_masked']}.")
+                except (ValueError, ActiveJobError, DailyLimitError, QueueFullError) as exc:
+                    st.error(str(exc))
+        with weekly_tab:
+            render_portfolio_weekly_schedules(user, page, mail_ready, runner_ok)
+        render_email_job_status(user["cache_key"], report_kind="portfolio", subject_key=page.get("id"))
+    return config
+
+
 def render_table_legend(dark_mode=False):
     theme = get_theme(dark_mode)
     st.markdown(
@@ -3189,6 +3546,7 @@ def render_portfolio_section(config, raw_df, editable, user, dark_mode=False, di
             if treemap_fig is not None:
                 st.divider()
                 st.plotly_chart(treemap_fig, width="stretch", key=f"portfolio_treemap_{i}")
+            config = render_portfolio_ai_report(config, i, raw_df, user)
     return config
 
 
@@ -3413,13 +3771,18 @@ def render_report_status_table(rows, dark_mode=False):
     st.markdown(table_html, unsafe_allow_html=True)
 
 
-def render_email_job_status(owner_key):
-    jobs = list_owner_jobs(owner_key, limit=10)
+def render_email_job_status(owner_key, report_kind=None, subject_key=None):
+    jobs = list_owner_jobs(owner_key, limit=20)
+    if report_kind:
+        jobs = [job for job in jobs if (job.get("report_kind") or "ticker") == report_kind]
+    if subject_key:
+        jobs = [job for job in jobs if job.get("subject_key") == subject_key]
+    key_suffix = re.sub(r"[^A-Za-z0-9_-]+", "_", f"{report_kind or 'all'}_{subject_key or 'all'}")
     heading_col, refresh_col = st.columns([5, 1])
     with heading_col:
         st.markdown("#### Recent Email Jobs")
     with refresh_col:
-        if st.button("Refresh", key="refresh_report_jobs", width="stretch"):
+        if st.button("Refresh", key=f"refresh_report_jobs_{key_suffix}", width="stretch"):
             st.rerun()
     if not jobs:
         st.caption("No email report jobs yet.")
@@ -3441,7 +3804,8 @@ def render_email_job_status(owner_key):
         if job.get("email_sent_at") and job["status"] != "sent":
             status = "Possibly sent"
         rows.append({
-            "Ticker": job["ticker"],
+            "Kind": "Portfolio" if (job.get("report_kind") == "portfolio") else "Ticker",
+            "Subject": job.get("subject_name") or job["ticker"],
             "Type": "Weekly" if job.get("schedule_id") else "One-time",
             "Status": status,
             "Recipient": job["recipient_masked"],
@@ -3453,7 +3817,7 @@ def render_email_job_status(owner_key):
 
     latest_error = next((job for job in jobs if job.get("last_error")), None)
     if latest_error:
-        with st.expander(f"Latest job message ({latest_error['ticker']})", expanded=False):
+        with st.expander(f"Latest job message ({latest_error.get('subject_name') or latest_error['ticker']})", expanded=False):
             st.code(latest_error["last_error"])
 
 
@@ -3521,7 +3885,10 @@ def render_weekly_report_schedules(user, runner_ok, mail_ready):
         except (ValueError, ScheduleLimitError) as exc:
             st.error(str(exc))
 
-    schedules = list_owner_schedules(user["cache_key"])
+    schedules = [
+        schedule for schedule in list_owner_schedules(user["cache_key"])
+        if (schedule.get("report_kind") or "ticker") == "ticker"
+    ]
     st.markdown("#### Weekly Schedules")
     if not schedules:
         st.caption("No weekly schedules yet.")
@@ -3700,7 +4067,7 @@ def render_daily_report(user):
         with weekly_tab:
             render_weekly_report_schedules(user, runner_ok, mail_ready)
 
-        render_email_job_status(user["cache_key"])
+        render_email_job_status(user["cache_key"], report_kind="ticker")
 
 
 _backend_ok, _backend_msg = ensure_backend()

@@ -25,7 +25,23 @@ from .jobs import (
     store_generated_report,
 )
 from .mailer import compute_job_message_id, send_report_email
+from .portfolio_service import generate_portfolio_report_for_job
 from .service import generate_report, _get_market_date
+
+
+def generate_job_report(job: dict) -> dict:
+    report_kind = (job.get("report_kind") or "ticker").lower()
+    if report_kind == "portfolio":
+        return generate_portfolio_report_for_job(job)
+    if report_kind == "ticker":
+        return generate_report(
+            job["subject_key"] or job["ticker"],
+            user_scope=job["owner_key"],
+            months=int(job["months"]),
+            search_provider=job["search_provider"],
+            no_article_fetch=bool(job["no_article_fetch"]),
+        )
+    raise ValueError(f"Unsupported report kind: {report_kind}")
 
 
 def process_one_job() -> bool:
@@ -34,9 +50,10 @@ def process_one_job() -> bool:
         return False
 
     job_id = job["id"]
-    ticker = job["ticker"]
+    report_kind = job.get("report_kind") or "ticker"
+    subject_name = job.get("subject_name") or job.get("ticker")
     print(
-        f"[ReportWorker] Job {job_id[:8]} started: ticker={ticker}, "
+        f"[ReportWorker] Job {job_id[:8]} started: kind={report_kind}, subject={subject_name}, "
         f"recipient={job['recipient_masked']}, attempt={job['attempts']}/{job['max_attempts']}",
         flush=True,
     )
@@ -44,13 +61,7 @@ def process_one_job() -> bool:
         html_bytes = job.get("report_html")
         file_name = job.get("file_name")
         if html_bytes is None:
-            result = generate_report(
-                ticker,
-                user_scope=job["owner_key"],
-                months=int(job["months"]),
-                search_provider=job["search_provider"],
-                no_article_fetch=bool(job["no_article_fetch"]),
-            )
+            result = generate_job_report(job)
             if not result.get("success"):
                 detail = result.get("stderr") or result.get("stdout") or result.get("error")
                 raise RuntimeError(detail or "Daily report generation failed.")
@@ -83,10 +94,12 @@ def process_one_job() -> bool:
             message_id = compute_job_message_id(job_id)
             send_report_email(
                 recipient=job["recipient_email"],
-                ticker=ticker,
+                ticker=job.get("ticker"),
+                report_title=subject_name,
                 report_date=job.get("report_date") or _get_market_date(),
                 file_name=file_name,
                 html_bytes=bytes(html_bytes),
+                report_kind=report_kind,
                 message_id=message_id,
             )
             mark_email_sent(job_id, message_id)

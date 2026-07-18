@@ -146,6 +146,26 @@ def init_job_db() -> None:
                 conn.execute("ALTER TABLE report_jobs ADD COLUMN smtp_message_id TEXT")
             if "email_sent_at" not in job_columns:
                 conn.execute("ALTER TABLE report_jobs ADD COLUMN email_sent_at TEXT")
+            if "report_kind" not in job_columns:
+                conn.execute("ALTER TABLE report_jobs ADD COLUMN report_kind TEXT NOT NULL DEFAULT 'ticker'")
+            if "subject_key" not in job_columns:
+                conn.execute("ALTER TABLE report_jobs ADD COLUMN subject_key TEXT")
+            if "subject_name" not in job_columns:
+                conn.execute("ALTER TABLE report_jobs ADD COLUMN subject_name TEXT")
+            if "payload_json" not in job_columns:
+                conn.execute("ALTER TABLE report_jobs ADD COLUMN payload_json TEXT")
+            conn.execute(
+                "UPDATE report_jobs SET report_kind='ticker' "
+                "WHERE report_kind IS NULL OR report_kind=''"
+            )
+            conn.execute(
+                "UPDATE report_jobs SET subject_key=ticker "
+                "WHERE subject_key IS NULL OR subject_key=''"
+            )
+            conn.execute(
+                "UPDATE report_jobs SET subject_name=ticker "
+                "WHERE subject_name IS NULL OR subject_name=''"
+            )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_report_jobs_queue "
                 "ON report_jobs(status, next_attempt_at, created_at)"
@@ -185,11 +205,31 @@ def init_job_db() -> None:
             schedule_columns = {row[1] for row in conn.execute("PRAGMA table_info(report_schedules)")}
             if "weekdays_json" not in schedule_columns:
                 conn.execute("ALTER TABLE report_schedules ADD COLUMN weekdays_json TEXT")
+            if "report_kind" not in schedule_columns:
+                conn.execute("ALTER TABLE report_schedules ADD COLUMN report_kind TEXT NOT NULL DEFAULT 'ticker'")
+            if "subject_key" not in schedule_columns:
+                conn.execute("ALTER TABLE report_schedules ADD COLUMN subject_key TEXT")
+            if "subject_name" not in schedule_columns:
+                conn.execute("ALTER TABLE report_schedules ADD COLUMN subject_name TEXT")
+            if "payload_json" not in schedule_columns:
+                conn.execute("ALTER TABLE report_schedules ADD COLUMN payload_json TEXT")
             # Existing schedules were one-row-per-weekday.  Preserve their
             # behaviour by treating the legacy weekday as a one-item set.
             conn.execute(
                 "UPDATE report_schedules SET weekdays_json='[' || weekday || ']' "
                 "WHERE weekdays_json IS NULL OR weekdays_json=''"
+            )
+            conn.execute(
+                "UPDATE report_schedules SET report_kind='ticker' "
+                "WHERE report_kind IS NULL OR report_kind=''"
+            )
+            conn.execute(
+                "UPDATE report_schedules SET subject_key=ticker "
+                "WHERE subject_key IS NULL OR subject_key=''"
+            )
+            conn.execute(
+                "UPDATE report_schedules SET subject_name=ticker "
+                "WHERE subject_name IS NULL OR subject_name=''"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_report_schedules_due "
@@ -325,26 +365,36 @@ def next_scheduled_run_at(
     )
 
 
-def enqueue_email_job(
+def enqueue_report_job(
     *,
     owner_key: str,
-    ticker: str,
+    report_kind: str,
+    subject_key: str,
+    subject_name: str,
     recipient_email: str,
     months: int = 3,
     search_provider: str = "auto",
     no_article_fetch: bool = False,
+    payload: dict | None = None,
 ) -> dict:
     owner_key = str(owner_key or "").strip()
     if not owner_key:
         raise ValueError("A signed-in account is required for email delivery.")
-    ticker = str(ticker or "").strip().upper()
-    if not ticker:
-        raise ValueError("Please enter a ticker.")
+    report_kind = str(report_kind or "ticker").strip().lower()
+    if report_kind not in {"ticker", "portfolio"}:
+        raise ValueError("Unsupported report kind.")
+    subject_key = str(subject_key or "").strip()
+    subject_name = str(subject_name or subject_key).strip() or subject_key
+    if not subject_key:
+        raise ValueError("Report subject is required.")
+    ticker = subject_key.upper() if report_kind == "ticker" else subject_name
     recipient_email = validate_email(recipient_email)
-    daily_limit = max(1, int(os.environ.get("REPORT_DAILY_LIMIT_PER_USER", "3")))
+    limit_env = "PORTFOLIO_EMAIL_DAILY_LIMIT_PER_USER" if report_kind == "portfolio" else "REPORT_DAILY_LIMIT_PER_USER"
+    daily_limit = max(1, int(os.environ.get(limit_env, os.environ.get("REPORT_DAILY_LIMIT_PER_USER", "3"))))
     max_attempts = max(1, int(os.environ.get("REPORT_EMAIL_MAX_ATTEMPTS", "3")))
     now = _now()
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    payload_json = json.dumps(payload or {}, ensure_ascii=False, separators=(",", ":"))
 
     init_job_db()
     conn = _connect()
@@ -386,8 +436,9 @@ def enqueue_email_job(
             INSERT INTO report_jobs (
                 id, owner_key, ticker, recipient_email, recipient_masked,
                 months, search_provider, no_article_fetch, status,
-                max_attempts, created_at, next_attempt_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
+                max_attempts, created_at, next_attempt_at,
+                report_kind, subject_key, subject_name, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job_id,
@@ -401,6 +452,10 @@ def enqueue_email_job(
                 max_attempts,
                 _iso(now),
                 _iso(now),
+                report_kind,
+                subject_key,
+                subject_name,
+                payload_json,
             ),
         )
         conn.commit()
@@ -412,6 +467,62 @@ def enqueue_email_job(
         conn.close()
 
 
+def enqueue_email_job(
+    *,
+    owner_key: str,
+    ticker: str,
+    recipient_email: str,
+    months: int = 3,
+    search_provider: str = "auto",
+    no_article_fetch: bool = False,
+) -> dict:
+    ticker = str(ticker or "").strip().upper()
+    if not ticker:
+        raise ValueError("Please enter a ticker.")
+    return enqueue_report_job(
+        owner_key=owner_key,
+        report_kind="ticker",
+        subject_key=ticker,
+        subject_name=ticker,
+        recipient_email=recipient_email,
+        months=months,
+        search_provider=search_provider,
+        no_article_fetch=no_article_fetch,
+        payload={"ticker": ticker},
+    )
+
+
+def enqueue_portfolio_email_job(
+    *,
+    owner_key: str,
+    portfolio_page_id: str,
+    portfolio_name: str,
+    recipient_email: str,
+    search_provider: str = "auto",
+    settings: dict | None = None,
+) -> dict:
+    portfolio_page_id = str(portfolio_page_id or "").strip()
+    portfolio_name = str(portfolio_name or "Portfolio").strip() or "Portfolio"
+    if not portfolio_page_id:
+        raise ValueError("Portfolio page ID is required.")
+    return enqueue_report_job(
+        owner_key=owner_key,
+        report_kind="portfolio",
+        subject_key=portfolio_page_id,
+        subject_name=portfolio_name,
+        recipient_email=recipient_email,
+        months=3,
+        search_provider=search_provider,
+        no_article_fetch=False,
+        payload={
+            "portfolio_page_id": portfolio_page_id,
+            "portfolio_name": portfolio_name,
+            "search_provider": search_provider or "auto",
+            "settings": settings or {},
+        },
+    )
+
+
 def _public_job(row: sqlite3.Row | None) -> dict | None:
     if row is None:
         return None
@@ -421,6 +532,10 @@ def _public_job(row: sqlite3.Row | None) -> dict | None:
             "id",
             "owner_key",
             "ticker",
+            "report_kind",
+            "subject_key",
+            "subject_name",
+            "payload_json",
             "recipient_masked",
             "months",
             "search_provider",
@@ -652,10 +767,12 @@ def prune_old_jobs(retention_days: int | None = None) -> int:
     return cursor.rowcount
 
 
-def create_weekly_schedule(
+def create_report_schedule(
     *,
     owner_key: str,
-    ticker: str,
+    report_kind: str,
+    subject_key: str,
+    subject_name: str,
     recipient_email: str,
     weekday: int | None = None,
     local_time: str | dt.time,
@@ -663,13 +780,19 @@ def create_weekly_schedule(
     months: int = 3,
     search_provider: str = "auto",
     no_article_fetch: bool = False,
+    payload: dict | None = None,
 ) -> dict:
     owner_key = str(owner_key or "").strip()
     if not owner_key:
         raise ValueError("A signed-in account is required for weekly reports.")
-    ticker = str(ticker or "").strip().upper()
-    if not ticker:
-        raise ValueError("Please enter a ticker.")
+    report_kind = str(report_kind or "ticker").strip().lower()
+    if report_kind not in {"ticker", "portfolio"}:
+        raise ValueError("Unsupported report kind.")
+    subject_key = str(subject_key or "").strip()
+    subject_name = str(subject_name or subject_key).strip() or subject_key
+    if not subject_key:
+        raise ValueError("Report subject is required.")
+    ticker = subject_key.upper() if report_kind == "ticker" else subject_name
     recipient_email = validate_email(recipient_email)
     selected_weekdays = _normalize_weekdays(
         weekdays if weekdays is not None else [weekday]
@@ -679,9 +802,11 @@ def create_weekly_schedule(
     weekday = selected_weekdays[0]
     weekdays_json = json.dumps(selected_weekdays, separators=(",", ":"))
     local_time = _normalize_local_time(local_time)
-    max_schedules = min(7, max(1, int(os.environ.get("REPORT_MAX_SCHEDULES_PER_USER", "7"))))
+    schedule_limit_env = "PORTFOLIO_MAX_SCHEDULES_PER_USER" if report_kind == "portfolio" else "REPORT_MAX_SCHEDULES_PER_USER"
+    max_schedules = min(7, max(1, int(os.environ.get(schedule_limit_env, os.environ.get("REPORT_MAX_SCHEDULES_PER_USER", "7")))))
     now = _now()
     next_run = next_scheduled_run_at(selected_weekdays, local_time, after_utc=now)
+    payload_json = json.dumps(payload or {}, ensure_ascii=False, separators=(",", ":"))
 
     init_job_db()
     conn = _connect()
@@ -696,9 +821,9 @@ def create_weekly_schedule(
         duplicates = conn.execute(
             """
             SELECT id, weekday, weekdays_json FROM report_schedules
-            WHERE owner_key=? AND ticker=? AND recipient_email=? AND local_time=?
+            WHERE owner_key=? AND report_kind=? AND subject_key=? AND recipient_email=? AND local_time=?
             """,
-            (owner_key, ticker, recipient_email, local_time),
+            (owner_key, report_kind, subject_key, recipient_email, local_time),
         ).fetchall()
         if any(_schedule_weekdays(row) == selected_weekdays for row in duplicates):
             raise ValueError("An identical weekly schedule already exists for this account.")
@@ -708,8 +833,9 @@ def create_weekly_schedule(
             INSERT INTO report_schedules (
                 id, owner_key, ticker, recipient_email, recipient_masked,
                 weekday, weekdays_json, local_time, timezone, months, search_provider,
-                no_article_fetch, is_active, created_at, updated_at, next_run_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+                no_article_fetch, is_active, created_at, updated_at, next_run_at,
+                report_kind, subject_key, subject_name, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 schedule_id,
@@ -727,6 +853,10 @@ def create_weekly_schedule(
                 _iso(now),
                 _iso(now),
                 _iso(next_run),
+                report_kind,
+                subject_key,
+                subject_name,
+                payload_json,
             ),
         )
         conn.commit()
@@ -738,6 +868,70 @@ def create_weekly_schedule(
         conn.close()
 
 
+def create_weekly_schedule(
+    *,
+    owner_key: str,
+    ticker: str,
+    recipient_email: str,
+    weekday: int | None = None,
+    local_time: str | dt.time,
+    weekdays: object | None = None,
+    months: int = 3,
+    search_provider: str = "auto",
+    no_article_fetch: bool = False,
+) -> dict:
+    ticker = str(ticker or "").strip().upper()
+    if not ticker:
+        raise ValueError("Please enter a ticker.")
+    return create_report_schedule(
+        owner_key=owner_key,
+        report_kind="ticker",
+        subject_key=ticker,
+        subject_name=ticker,
+        recipient_email=recipient_email,
+        weekday=weekday,
+        local_time=local_time,
+        weekdays=weekdays,
+        months=months,
+        search_provider=search_provider,
+        no_article_fetch=no_article_fetch,
+        payload={"ticker": ticker},
+    )
+
+
+def create_weekly_portfolio_schedule(
+    *,
+    owner_key: str,
+    portfolio_page_id: str,
+    portfolio_name: str,
+    recipient_email: str,
+    weekday: int | None = None,
+    local_time: str | dt.time,
+    weekdays: object | None = None,
+    search_provider: str = "auto",
+    settings: dict | None = None,
+) -> dict:
+    return create_report_schedule(
+        owner_key=owner_key,
+        report_kind="portfolio",
+        subject_key=str(portfolio_page_id or "").strip(),
+        subject_name=str(portfolio_name or "Portfolio").strip() or "Portfolio",
+        recipient_email=recipient_email,
+        weekday=weekday,
+        local_time=local_time,
+        weekdays=weekdays,
+        months=3,
+        search_provider=search_provider,
+        no_article_fetch=False,
+        payload={
+            "portfolio_page_id": str(portfolio_page_id or "").strip(),
+            "portfolio_name": str(portfolio_name or "Portfolio").strip() or "Portfolio",
+            "search_provider": search_provider or "auto",
+            "settings": settings or {},
+        },
+    )
+
+
 def _public_schedule(row: sqlite3.Row | None) -> dict | None:
     if row is None:
         return None
@@ -747,6 +941,10 @@ def _public_schedule(row: sqlite3.Row | None) -> dict | None:
             "id",
             "owner_key",
             "ticker",
+            "report_kind",
+            "subject_key",
+            "subject_name",
+            "payload_json",
             "recipient_masked",
             "weekday",
             "local_time",
@@ -873,8 +1071,9 @@ def materialize_due_schedules(now_utc: dt.datetime | None = None) -> int:
                 INSERT OR IGNORE INTO report_jobs (
                     id, owner_key, ticker, recipient_email, recipient_masked,
                     months, search_provider, no_article_fetch, status,
-                    max_attempts, created_at, next_attempt_at, schedule_id, scheduled_for
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)
+                    max_attempts, created_at, next_attempt_at, schedule_id, scheduled_for,
+                    report_kind, subject_key, subject_name, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -890,6 +1089,10 @@ def materialize_due_schedules(now_utc: dt.datetime | None = None) -> int:
                     now_iso,
                     schedule["id"],
                     scheduled_for,
+                    schedule["report_kind"] or "ticker",
+                    schedule["subject_key"] or schedule["ticker"],
+                    schedule["subject_name"] or schedule["ticker"],
+                    schedule["payload_json"],
                 ),
             )
             if cursor.rowcount > 0:
@@ -945,7 +1148,7 @@ def cleanup_stale_download_generations(now: dt.datetime | None = None) -> int:
     return cursor.rowcount
 
 
-def check_download_generation_limits(owner_key: str) -> None:
+def check_download_generation_limits(owner_key: str, report_kind: str = "ticker") -> None:
     """Raise ActiveJobError or DailyLimitError if the user cannot start a download.
 
     Limits (all configurable via environment variables):
@@ -959,8 +1162,11 @@ def check_download_generation_limits(owner_key: str) -> None:
 
     cleanup_stale_download_generations()
 
-    max_per_user = max(1, int(os.environ.get("REPORT_DOWNLOAD_MAX_ACTIVE_PER_USER", "1")))
-    daily_limit = max(1, int(os.environ.get("REPORT_DOWNLOAD_DAILY_LIMIT_PER_USER", "5")))
+    report_kind = str(report_kind or "ticker").strip().lower()
+    max_per_user_env = "PORTFOLIO_DOWNLOAD_MAX_ACTIVE_PER_USER" if report_kind == "portfolio" else "REPORT_DOWNLOAD_MAX_ACTIVE_PER_USER"
+    daily_limit_env = "PORTFOLIO_DOWNLOAD_DAILY_LIMIT_PER_USER" if report_kind == "portfolio" else "REPORT_DOWNLOAD_DAILY_LIMIT_PER_USER"
+    max_per_user = max(1, int(os.environ.get(max_per_user_env, os.environ.get("REPORT_DOWNLOAD_MAX_ACTIVE_PER_USER", "1"))))
+    daily_limit = max(1, int(os.environ.get(daily_limit_env, os.environ.get("REPORT_DOWNLOAD_DAILY_LIMIT_PER_USER", "5"))))
     max_global = max(1, int(os.environ.get("REPORT_DOWNLOAD_MAX_GLOBAL_ACTIVE", "3")))
 
     now = _now()
@@ -997,7 +1203,7 @@ def check_download_generation_limits(owner_key: str) -> None:
             )
 
 
-def start_download_generation(owner_key: str, ticker: str) -> str:
+def start_download_generation(owner_key: str, ticker: str, report_kind: str = "ticker") -> str:
     """Record the start of a synchronous download generation and return its session ID."""
     owner_key = str(owner_key or "").strip()
     ticker = str(ticker or "").strip().upper()
