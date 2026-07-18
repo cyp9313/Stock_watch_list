@@ -1,15 +1,19 @@
 # -*- coding: utf-8 -*-
 """工具类型识别与元数据层。
 
-解决问题：
-- 搜索词不识别股票 / ETF / ETC / 指数 / 加密资产（修改计划 2.4）；
-- Portfolio 账户分组被错误当作行业（修改计划 2.5、10.3）；
-- 同一资产的欧洲挂牌版本需要同时用 ticker + 全称 + 底层指数识别（修改计划 11.6）。
+解决问题（修改计划第三轮 9）：
+- 真实持仓往往没有 name，必须用 market rows / 缓存 quote_type；
+- BTC-EUR 等 ``BASE-FIAT`` 对要识别为 CRYPTO；
+- long name 必须能覆盖占位 ticker 名；
+- 修改工具类型后必须重算 asset_class / theme / underlying_index / sector / industry；
+- uranium 是主题不是产品法律结构（ETF 仍归 ETF，主题标 Uranium & Nuclear）；
+- 绝不要把账户分组当行业。
 
 设计原则：
 - 默认纯本地启发式，不发起网络请求，保证确定性测试；
-- 可选 ``enrich`` 调用 yfinance ``.info`` 作为补充（项目市场数据优先级最高）；
-- 输出区分 ``account_group``（券商/账户）与 ``sector`` / ``industry`` / ``theme`` / ``asset_class`` / ``underlying_index``。
+- 可选 enrich 调用 yfinance ``.info`` 作为补充（优先级低于 market rows / 缓存）；
+- 输出区分 ``account_group``（券商/账户）与 ``sector`` / ``industry`` / ``theme`` /
+  ``asset_class`` / ``underlying_index``。
 """
 from __future__ import annotations
 
@@ -27,12 +31,16 @@ INSTRUMENT_TYPES = {
     "EQUITY", "ETF", "ETC", "INDEX", "CRYPTO", "FUND", "COMMODITY", "UNKNOWN",
 }
 
+_KNOWN_CRYPTO = {"BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "DOT", "AVAX", "MATIC", "LINK", "LTC", "TRX", "ATOM", "UNI"}
+_KNOWN_FIAT = {"USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD"}
+
 _EXCHANGE_BY_SUFFIX = {
     ".DE": "XETRA", ".PA": "EURONEXT", ".AS": "EURONEXT", ".MI": "Borsa Italiana",
     ".MC": "BME", ".L": "LSE", ".HK": "HKEX", ".SS": "SSE", ".SZ": "SZSE",
     ".KS": "KRX", ".TO": "TSX", ".AX": "ASX", ".SW": "SIX", ".T": "TSE",
 }
 
+# 注意：uranium 已从 ETC 提示词移除——它是主题而非产品法律结构（修改计划第三轮 9）。
 _ETF_HINTS = [
     "etf", "ucits", "ishares", "vanguard", "invesco", "xtrackers", "spdr",
     "lyxor", "amundi", "vanECK", "vaneck", "wisdomtree", "db x-trackers",
@@ -41,7 +49,8 @@ _ETF_HINTS = [
 ]
 _ETC_HINTS = [
     "etc", "physical gold", "physical silver", "gold etc", "silver etc",
-    "xetra-gold", "commodity", "uranium", "platinum etc", "palladium etc",
+    "xetra-gold", "commodity etc", "platinum etc", "palladium etc",
+    "physical palladium", "physical platinum",
 ]
 _INDEX_HINTS = [
     "index", "nasdaq-100", "nasdaq 100", "s&p 500", "s&p500", "msci",
@@ -63,9 +72,6 @@ _UNDERLYING_INDEX_PATTERNS = [
     ("Bitcoin", ["bitcoin", "btc"]),
 ]
 
-_CRYPTO_SUFFIX = "-USD"
-_KNOWN_CRYPTO = {"BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "DOT", "AVAX", "MATIC", "LINK"}
-
 
 def _norm(text: str) -> str:
     return (text or "").lower()
@@ -75,7 +81,10 @@ def _exchange_for(ticker: str) -> str:
     for suffix, exchange in _EXCHANGE_BY_SUFFIX.items():
         if ticker.upper().endswith(suffix):
             return exchange
-    if ticker.upper().endswith(_CRYPTO_SUFFIX):
+    parts = ticker.upper().split("-")
+    if len(parts) == 2 and parts[0] in _KNOWN_CRYPTO:
+        return "CRYPTO"
+    if ticker.upper().endswith("-USD"):
         return "CRYPTO"
     return "UNKNOWN"
 
@@ -104,10 +113,14 @@ def _infer_theme(instrument_type: str, name: str, underlying_index: str | None) 
         return underlying_index
     if instrument_type == "CRYPTO":
         return "加密资产"
+    if "uranium" in low or "nuclear" in low:
+        return "Uranium & Nuclear / 核能与铀"
     if "semiconductor" in low or "chip" in low:
         return "半导体"
     if "technology" in low or "tech" in low:
         return "科技"
+    if "gold" in low or "silver" in low or "precious metal" in low:
+        return "黄金 / 避险商品"
     return None
 
 
@@ -117,47 +130,49 @@ def classify_instrument(
     quote_type: str | None = None,
     category: str | None = None,
 ) -> dict[str, Any]:
-    """返回一个持仓的工具元数据字典（不含 account_group）。"""
+    """返回一个持仓的工具元数据字典（不含 account_group）。
+
+    优先级（修改计划第三轮 9.3）：crypto 对 > equity > ETC > ETF/FUND > INDEX > 默认 EQUITY。
+    """
     ticker_u = normalize_yfinance_ticker(ticker)
     low_name = _norm(name)
     low_qt = _norm(quote_type)
 
-    # 1) 加密资产：ticker 后缀或已知符号
-    if ticker_u.endswith(_CRYPTO_SUFFIX) or ticker_u.split("-")[0] in _KNOWN_CRYPTO and ticker_u.endswith("USD"):
+    # 1) 加密资产对：BASE-FIAT 或 BASE-USD（修改计划第三轮 9.3）
+    parts = ticker_u.split("-")
+    if len(parts) == 2 and parts[0] in _KNOWN_CRYPTO and parts[1] in _KNOWN_FIAT:
         instrument_type = "CRYPTO"
         asset_class = "Crypto"
         underlying_index = _infer_underlying_index(name or ticker_u)
-    elif low_qt == "crypto" or (ticker_u.endswith(_CRYPTO_SUFFIX) and low_qt in {"", "equity"}):
+    elif ticker_u.endswith("-USD") or (low_qt == "crypto"):
         instrument_type = "CRYPTO"
         asset_class = "Crypto"
         underlying_index = _infer_underlying_index(name or ticker_u)
+    elif low_qt == "equity":
+        instrument_type = "EQUITY"
+        asset_class = "Equity"
+        underlying_index = None
+    # ETC / 商品（优先于 ETF：如 Xetra-Gold 同时含 xetra / gold）
+    elif any(h in low_name for h in _ETC_HINTS):
+        instrument_type = "ETC"
+        asset_class = "Commodity ETC"
+        underlying_index = _infer_underlying_index(name or ticker_u)
+    # ETF / 基金
+    elif low_qt in {"etf", "mutualfund"} or any(h in low_name for h in _ETF_HINTS) or any(h in low_name for h in _FUND_HINTS):
+        instrument_type = "ETF" if low_qt != "mutualfund" else "FUND"
+        asset_class = "Equity ETF" if not any(x in low_name for x in ["bond", "treasury", "fixed income", "aggregate"]) else "Bond ETF"
+        underlying_index = _infer_underlying_index(name or ticker_u)
+    # 指数（必须在 ETF 之后，避免把『跟踪某指数的 ETF』误判为指数本身）
+    elif low_qt == "index" or any(h in low_name for h in _INDEX_HINTS):
+        instrument_type = "INDEX"
+        asset_class = "Index"
+        underlying_index = _infer_underlying_index(name or ticker_u) or (name or ticker_u)
     else:
-        # 2) 个股（quote_type 明确为 equity 时优先）
-        if low_qt == "equity":
-            instrument_type = "EQUITY"
-            asset_class = "Equity"
-            underlying_index = None
-        # 3) ETC / 商品（优先于 ETF：如 Xetra-Gold 同时含 xetra / gold）
-        elif any(h in low_name for h in _ETC_HINTS):
-            instrument_type = "ETC"
-            asset_class = "Commodity ETC"
-            underlying_index = _infer_underlying_index(name or ticker_u)
-        # 4) ETF / 基金（ishares / vanguard / ucits / msci world etf ...）
-        elif low_qt in {"etf", "mutualfund"} or any(h in low_name for h in _ETF_HINTS) or any(h in low_name for h in _FUND_HINTS):
-            instrument_type = "ETF" if low_qt != "mutualfund" else "FUND"
-            asset_class = "Equity ETF" if not any(x in low_name for x in ["bond", "treasury", "fixed income", "aggregate"]) else "Bond ETF"
-            underlying_index = _infer_underlying_index(name or ticker_u)
-        # 5) 指数（必须在 ETF 之后，避免把『跟踪某指数的 ETF』误判为指数本身）
-        elif low_qt == "index" or any(h in low_name for h in _INDEX_HINTS):
-            instrument_type = "INDEX"
-            asset_class = "Index"
-            underlying_index = _infer_underlying_index(name or ticker_u) or (name or ticker_u)
-        else:
-            # 未命中任何特殊类型时，组合持仓绝大多数是个股，默认视作 EQUITY，
-            # 以保证后续的 instrument-aware 新闻查询与重复暴露检测能正常工作。
-            instrument_type = "EQUITY"
-            asset_class = "Equity"
-            underlying_index = None
+        # 未命中任何特殊类型时，组合持仓绝大多数是个股，默认视作 EQUITY，
+        # 以保证后续的 instrument-aware 新闻查询与重复暴露检测能正常工作。
+        instrument_type = "EQUITY"
+        asset_class = "Equity"
+        underlying_index = None
 
     theme = _infer_theme(instrument_type, name or ticker_u, underlying_index)
     return {
@@ -175,25 +190,96 @@ def classify_instrument(
     }
 
 
+def _finalize_metadata(meta: dict[str, Any]) -> dict[str, Any]:
+    """在 instrument_type 确定（或经 enrich 修改）后，重算主题 / 底层指数 / 资产类 / 行业。"""
+    instrument_type = str(meta.get("instrument_type") or "UNKNOWN").upper()
+    name = meta.get("name") or meta.get("ticker") or ""
+    if instrument_type == "EQUITY":
+        meta["asset_class"] = "Equity"
+        meta["underlying_index"] = None
+    elif instrument_type == "ETF":
+        meta["asset_class"] = "Equity ETF" if "bond" not in _norm(name) else "Bond ETF"
+    elif instrument_type == "ETC":
+        meta["asset_class"] = "Commodity ETC"
+    elif instrument_type == "CRYPTO":
+        meta["asset_class"] = "Crypto"
+    elif instrument_type == "INDEX":
+        meta["asset_class"] = "Index"
+    elif instrument_type == "FUND":
+        meta["asset_class"] = meta.get("asset_class") or "Fund"
+    meta["underlying_index"] = _infer_underlying_index(name)
+    meta["theme"] = _infer_theme(instrument_type, name, meta.get("underlying_index"))
+    return meta
+
+
+def _name_from_market_row(row: dict[str, Any] | None) -> str | None:
+    if not row:
+        return None
+    for key in ("Name", "name", "LongName", "longName"):
+        v = row.get(key)
+        if v and str(v).strip():
+            return str(v).strip()
+    return None
+
+
 def build_instrument_metadata(
     portfolio_page: dict[str, Any],
     *,
+    market_rows: list[dict[str, Any]] | None = None,
+    cached_ticker_info: dict[str, dict[str, Any]] | None = None,
     enrich: bool = False,
 ) -> dict[str, dict[str, Any]]:
-    """为 portfolio_page 的持仓构建 ticker -> 元数据 映射。
+    """为 portfolio_page 的持仓构建 ticker -> 元数据 映射（修改计划第三轮 9）。
 
-    返回的元数据已包含 ``account_group``（来自原始 group 字段）。
+    名称来源优先级：
+        1) Streamlit/Backend 已有 market rows；
+        2) 项目 ticker info 缓存（cached_ticker_info）；
+        3) yfinance info/fast_info（enrich=True）；
+        4) ticker/name 启发式；
+        5) UNKNOWN。
     """
     meta: dict[str, dict[str, Any]] = {}
+    rows_by_ticker = {
+        normalize_yfinance_ticker(r.get("Ticker")): r
+        for r in (market_rows or []) if r.get("Ticker")
+    }
+    cached_ticker_info = cached_ticker_info or {}
+
     for raw in portfolio_page.get("holdings", []) or []:
         ticker = normalize_yfinance_ticker(raw.get("ticker"))
         if not ticker:
             continue
         group = str(raw.get("group") or "Portfolio")
-        m = classify_instrument(ticker, name=raw.get("name"))
+        row = rows_by_ticker.get(ticker)
+        name = (
+            (raw.get("name") or "").strip()
+            or _name_from_market_row(row)
+            or ticker
+        )
+
+        # 优先级 2：缓存 quote type / longName / category
+        cached = cached_ticker_info.get(ticker) or {}
+        quote_type = cached.get("quoteType") or cached.get("quote_type")
+        category = cached.get("category") or cached.get("fundCategory")
+
+        m = classify_instrument(ticker, name=name, quote_type=quote_type, category=category)
         m["account_group"] = group
+
+        # 应用缓存 longName
+        cached_long = cached.get("longName") or cached.get("shortName")
+        if cached_long and (not m.get("name") or m["name"] == ticker):
+            m["name"] = cached_long
+
+        # 优先级 3：yfinance enrich（低于 market rows / 缓存）
         if enrich:
             m = _enrich_via_yfinance(ticker, m)
+
+        # long name 覆盖占位 ticker 名（修改计划第三轮 9.3）
+        market_long = _name_from_market_row(row)
+        if market_long and (not m.get("name") or m["name"] == ticker):
+            m["name"] = market_long
+
+        m = _finalize_metadata(m)
         meta[ticker] = m
     return meta
 
@@ -213,7 +299,7 @@ def _enrich_via_yfinance(ticker: str, meta: dict[str, Any]) -> dict[str, Any]:
         elif qt == "equity":
             meta["instrument_type"] = "EQUITY"
         long_name = info.get("longName") or info.get("shortName")
-        if long_name and not meta.get("name"):
+        if long_name and (not meta.get("name") or meta["name"] == ticker):
             meta["name"] = long_name
         category = info.get("category") or info.get("fundCategory")
         if category:

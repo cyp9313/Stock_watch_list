@@ -90,16 +90,21 @@ def svg_allocation(group_weights: dict[str, float], title: str, color: str = "#5
 
 def svg_cumulative_returns(
     labels: list[str],
-    portfolio: list[float],
-    benchmark: list[float],
+    portfolio_cumulative_pct: list[float],
+    benchmark_cumulative_pct: list[float],
 ) -> str:
-    if not portfolio or not benchmark:
+    """绘制累计收益图。
+
+    入参已经是百分数（例如 7.31 表示 +7.31%）。不再做任何 ×100 放大，
+    避免与上游 ``_cumulative_returns`` 重复放大（修改计划第三轮 6）。
+    """
+    if not portfolio_cumulative_pct or not benchmark_cumulative_pct:
         return ""
-    n = min(len(portfolio), len(benchmark))
+    n = min(len(portfolio_cumulative_pct), len(benchmark_cumulative_pct))
     if n < 2:
         return ""
-    port = portfolio[:n]
-    bench = benchmark[:n]
+    port = portfolio_cumulative_pct[:n]
+    bench = benchmark_cumulative_pct[:n]
     all_v = port + bench
     lo, hi = min(all_v), max(all_v)
     span = (hi - lo) or 1.0
@@ -113,7 +118,7 @@ def svg_cumulative_returns(
         gy = top + g * (bottom - top) / 4
         gv = hi - g * span / 4
         grid.append(f'<line x1="40" y1="{gy:.1f}" x2="{_W-40}" y2="{gy:.1f}" stroke="{COLOR_TOKENS["border_soft"]}" stroke-width="1"/>')
-        grid.append(f'<text x="{_W-36}" y="{gy+4:.1f}" fill="{COLOR_TOKENS["muted_soft"]}" font-size="10" text-anchor="end">{gv*100:.0f}%</text>')
+        grid.append(f'<text x="{_W-36}" y="{gy+4:.1f}" fill="{COLOR_TOKENS["muted_soft"]}" font-size="10" text-anchor="end">{gv:.1f}%</text>')
     line = lambda series, color: (
         '<polyline fill="none" stroke="' + color + '" stroke-width="2" points="'
         + " ".join(f"{x(i):.1f},{y(v):.1f}" for i, v in enumerate(series)) + '"/>'
@@ -125,7 +130,7 @@ def svg_cumulative_returns(
         xticks.append(f'<text x="{x(i):.1f}" y="{height-8}" fill="{COLOR_TOKENS["muted_soft"]}" font-size="10" text-anchor="middle">{_esc(labels[i] if i < len(labels) else "")}</text>')
     svg = (
         f'<svg viewBox="0 0 {_W} {height}" xmlns="http://www.w3.org/2000/svg" role="img">'
-        f'<text x="10" y="16" fill="{COLOR_TOKENS["text_strong"]}" font-size="14" font-weight="700">组合 vs 基准累计收益</text>'
+        f'<text x="10" y="16" fill="{COLOR_TOKENS["text_strong"]}" font-size="14" font-weight="700">当前持仓静态权重回溯模拟 vs 基准</text>'
         + "".join(grid)
         + line(port, COLOR_TOKENS["brand"])
         + line(bench, COLOR_TOKENS["warn"])

@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import html
@@ -14,10 +15,22 @@ from .report_theme import REPORT_CSS, COLOR_TOKENS, ACTION_COLORS, RISK_COLORS, 
 from .report_i18n import (
     action_zh, risk_level_zh, severity_zh, impact_zh, horizon_zh, instrument_type_zh,
     format_money, format_pct, format_number, pct_color_class,
+    format_ratio_as_pct, format_pct_value, finite_float,
 )
 
 
+@dataclass(frozen=True)
+class SafeHtml:
+    """修改计划第三轮 35：仅允许内部组件生成的 Badge 等 HTML 不经转义输出。
+
+    用户数据与 AI 文本仍必须走 ``esc``。
+    """
+    html: str
+
+
 def esc(value: Any) -> str:
+    if isinstance(value, SafeHtml):
+        return value.html
     return html.escape(str(value if value is not None else ""), quote=True)
 
 
@@ -113,7 +126,7 @@ def render_table(headers: list[str], rows: list[list[Any]], scroll: bool = True)
     head = "".join(f"<th>{esc(h)}</th>" for h in headers)
     body_rows = []
     for r in rows:
-        cells = "".join(f"<td>{esc(c)}</td>" for c in r)
+        cells = "".join(f"<td>{_cell(c)}</td>" for c in r)
         body_rows.append(f"<tr>{cells}</tr>")
     wrapper = '<div class="scroll">' if scroll else ''
     close = '</div>' if scroll else ''
@@ -121,6 +134,13 @@ def render_table(headers: list[str], rows: list[list[Any]], scroll: bool = True)
         f'{wrapper}<table><thead><tr>{head}</tr></thead>\n'
         f'<tbody>{"".join(body_rows)}</tbody></table>{close}\n'
     )
+
+
+def _cell(value: Any) -> str:
+    """单元格渲染：SafeHtml 直接输出（§35），其余统一转义。"""
+    if isinstance(value, SafeHtml):
+        return value.html
+    return esc(value)
 
 
 def render_risk_cards(findings: list[dict[str, Any]]) -> str:
@@ -143,48 +163,91 @@ def render_risk_cards(findings: list[dict[str, Any]]) -> str:
     return f'<div class="risk-grid">\n' + "\n".join(cards) + "\n</div>\n"
 
 
-def render_action_summary_table(actions: list[dict[str, Any]]) -> str:
+def render_action_summary_table(
+    actions: list[dict[str, Any]],
+    risk_contribution_by_ticker: dict[str, float] | None = None,
+) -> str:
     headers = ["标的", "建议", "优先级", "当前权重", "目标区间", "风险贡献", "置信度"]
+    rc_map = risk_contribution_by_ticker or {}
     rows = []
-    rc_map = {a["ticker"]: a for a in actions}
     for a in actions:
         color = ACTION_COLORS.get(a.get("action", "watch"), COLOR_TOKENS["muted"])
-        rng = f"{format_pct(a.get('target_weight_min'))} – {format_pct(a.get('target_weight_max'))}"
+        rng = f"{format_ratio_as_pct(a.get('target_weight_min'))} – {format_ratio_as_pct(a.get('target_weight_max'))}"
+        rc = rc_map.get(a.get("ticker"))
         rows.append([
             a.get("ticker", ""),
-            f'<span class="badge" style="background:{color}22;color:{color};">{esc(action_zh(a.get("action")))}</span>',
+            SafeHtml(f'<span class="badge" style="background:{color}22;color:{color};">{esc(action_zh(a.get("action")))}</span>'),
             a.get("priority", ""),
-            format_pct(a.get("current_weight")),
+            format_ratio_as_pct(a.get("current_weight")),
             rng,
-            format_pct(a.get("risk_contribution")),
-            format_number(a.get("confidence"), 2),
+            format_ratio_as_pct(rc) if rc is not None else "—",
+            format_ratio_as_pct(a.get("confidence")),
         ])
     return render_table(headers, rows)
 
 
-def render_action_detail(a: dict[str, Any], risk_contribution: Any = None) -> str:
+def render_action_detail(a: dict[str, Any], risk_contribution: Any = None, ticker_metrics: dict[str, Any] | None = None) -> str:
     action = a.get("action", "watch")
     color = ACTION_COLORS.get(action, COLOR_TOKENS["muted"])
-    rng = f"{format_pct(a.get('target_weight_min'))} – {format_pct(a.get('target_weight_max'))}"
+    rng = f"{format_ratio_as_pct(a.get('target_weight_min'))} – {format_ratio_as_pct(a.get('target_weight_max'))}"
+    timing = str(a.get("action_timing") or "act_now")
+    timing_zh = {"act_now": "立即执行", "conditional": "条件触发", "monitor": "持续观察"}.get(timing, "立即执行")
     grid = [
-        {"k": "当前权重", "v": format_pct(a.get("current_weight"))},
+        {"k": "当前权重", "v": format_ratio_as_pct(a.get("current_weight"))},
         {"k": "目标区间", "v": rng},
-        {"k": "风险贡献", "v": format_pct(risk_contribution if risk_contribution is not None else a.get("risk_contribution"))},
-        {"k": "置信度", "v": format_number(a.get("confidence"), 2)},
+        {"k": "风险贡献", "v": format_ratio_as_pct(risk_contribution if risk_contribution is not None else a.get("risk_contribution"))},
+        {"k": "置信度", "v": format_ratio_as_pct(a.get("confidence"))},
     ]
     grid_html = "".join(
         f'<div class="cell"><div class="k">{esc(c["k"])}</div><div class="v">{esc(c["v"])}</div></div>'
         for c in grid
     )
-    triggers = "".join(f"<li>{esc(t)}</li>" for t in (a.get("trigger_conditions") or []))
-    inval = "".join(f"<li>{esc(t)}</li>" for t in (a.get("invalidation_conditions") or []))
+    # 修改计划第三轮 26：执行/取消/进一步减仓/观察 四组语义明确分离。
+    execute = "".join(f"<li>{esc(t)}</li>" for t in (a.get("execute_if") or []))
+    cancel = "".join(f"<li>{esc(t)}</li>" for t in (a.get("cancel_or_upgrade_if") or []))
+    further = "".join(f"<li>{esc(t)}</li>" for t in (a.get("further_reduce_if") or []))
+    monitor = "".join(f"<li>{esc(t)}</li>" for t in (a.get("monitoring_items") or []))
+    # 修改计划第三轮 27：阈值必须标注来源/是否为情景假设。
+    th_html = ""
+    for th in (a.get("thresholds") or []):
+        basis = str(th.get("basis") or "scenario_assumption")
+        basis_label = {
+            "evidence": "依据证据", "user_constraint": "用户约束", "scenario_assumption": "情景阈值，非市场一致预期",
+        }.get(basis, "情景阈值，非市场一致预期")
+        val = th.get("value")
+        val_str = f"{val}" if val is not None else "—"
+        th_html += (
+            f'<li><b>{esc(th.get("metric", ""))}</b> = {esc(val_str)} '
+            f'<span class="chip">{esc(basis_label)}</span>'
+            f'{("（" + esc(th.get("note", "")) + "）") if th.get("note") else ""}</li>'
+        )
+    # 修改计划第三轮 21：metric_evidence 由确定性数据渲染，避免模型复制数字出错。
+    me_html = ""
+    tm = ticker_metrics or {}
+    for me in (a.get("metric_evidence") or []):
+        metric = str(me.get("metric") or "")
+        tk = str(me.get("ticker") or a.get("ticker") or "")
+        val = tm.get(tk, {}).get(metric)
+        if val is None:
+            val_disp = "—"
+        elif metric in ("weight", "risk_contribution", "risk_weight_gap"):
+            val_disp = format_ratio_as_pct(val)
+        elif metric in ("profit_loss_pct", "rsi"):
+            val_disp = format_number(val)
+        else:
+            val_disp = format_pct_value(val)
+        me_html += f'<li>{esc(tk)} · {esc(metric)}：{esc(val_disp)}</li>'
     eids = "".join(f'<span class="chip">{esc(e)}</span>' for e in (a.get("evidence_ids") or []))
+    epr = a.get("expected_portfolio_risk_reduction")
+    epr_str = format_ratio_as_pct(epr) if epr is not None else "—"
     return (
         f'<div class="action-detail" style="border-top-color:{color};">\n'
         f'  <div class="action-head">\n'
         f'    <span class="ticker">{esc(a.get("ticker", ""))}</span>\n'
         f'    <span class="action-name" style="background:{color}22;color:{color};">{esc(action_zh(action))}</span>\n'
         f'    <span class="kpi-sub">优先级 {esc(a.get("priority", ""))}</span>\n'
+        f'    <span class="kpi-sub">执行时机：{esc(timing_zh)}</span>\n'
+        f'    <span class="kpi-sub">预计释放组合风险：{esc(epr_str)}</span>\n'
         f'  </div>\n'
         f'  <div class="action-grid">{grid_html}</div>\n'
         f'  <div class="reason-block">\n'
@@ -194,8 +257,12 @@ def render_action_detail(a: dict[str, Any], risk_contribution: Any = None) -> st
         f'    <h5>多头情景</h5><p>{esc(a.get("bull_case") or "—")}</p>\n'
         f'    <h5>空头情景</h5><p>{esc(a.get("bear_case") or "—")}</p>\n'
         f'  </div>\n'
-        f'  <div class="reason-block"><h5>执行触发条件</h5><ul class="trigger-list">{triggers}</ul></div>\n'
-        f'  <div class="reason-block"><h5>建议失效条件</h5><ul class="trigger-list">{inval}</ul></div>\n'
+        f'  <div class="reason-block"><h5>执行条件（execute_if）</h5><ul class="trigger-list">{execute or "<li>当前建议已成立，立即执行</li>"}</ul></div>\n'
+        f'  <div class="reason-block"><h5>取消或升级条件（cancel_or_upgrade_if）</h5><ul class="trigger-list">{cancel or "<li>—</li>"}</ul></div>\n'
+        f'  <div class="reason-block"><h5>进一步减仓条件（further_reduce_if）</h5><ul class="trigger-list">{further or "<li>—</li>"}</ul></div>\n'
+        f'  <div class="reason-block"><h5>持续观察（monitoring_items）</h5><ul class="trigger-list">{monitor or "<li>—</li>"}</ul></div>\n'
+        f'  {("<div class=\"reason-block\"><h5>关键阈值与依据</h5><ul class=\"trigger-list\">" + th_html + "</ul></div>") if th_html else ""}\n'
+        f'  {("<div class=\"reason-block\"><h5>指标证据（确定性数据）</h5><ul class=\"trigger-list\">" + me_html + "</ul></div>") if me_html else ""}\n'
         f'  <div class="risk-meta">证据：{eids or "—"}</div>\n'
         f'</div>\n'
     )

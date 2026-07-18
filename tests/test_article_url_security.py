@@ -2,12 +2,42 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from email.message import Message
+import os
 import socket
 import unittest
 from unittest.mock import Mock, patch
 
 from daily_report.src.stock_daily_agent import article_fetcher
+
+
+@contextmanager
+def env_override(**overrides):
+    """Set environment variables for the duration of the block, restoring only those keys.
+
+    Unlike ``unittest.mock.patch.dict("os.environ", ...)`` this does NOT copy the
+    entire process environment. That copy/restore trips the Windows 32767-character
+    limit on a single variable when the sandbox carries a very large variable
+    (e.g. ``ACC_PRODUCT_CONFIG_V3``), raising
+    ``ValueError: the environment variable is longer than 32767 characters`` on exit.
+    Touching only the specific keys keeps the test robust on Windows.
+    """
+    saved = {}
+    for key, value in overrides.items():
+        saved[key] = os.environ.get(key)
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+    try:
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _addr(address: str, port: int = 80):
@@ -50,7 +80,7 @@ class ArticleUrlSecurityTests(unittest.TestCase):
             "http://user:password@example.com/",
             "http://safe.example:8080/",
         ]
-        with patch.dict("os.environ", {"ARTICLE_FETCH_ALLOWED_PORTS": ""}), patch.object(article_fetcher, "_open_pinned_article_request") as open_request:
+        with env_override(ARTICLE_FETCH_ALLOWED_PORTS=""), patch.object(article_fetcher, "_open_pinned_article_request") as open_request:
             for url in blocked_urls:
                 with self.subTest(url=url), self.assertRaises(article_fetcher.ArticleFetchSecurityError):
                     article_fetcher._fetch_article_text(url)
@@ -120,7 +150,7 @@ class ArticleUrlSecurityTests(unittest.TestCase):
         with (
             patch.object(article_fetcher.socket, "getaddrinfo", return_value=_addr("93.184.216.34")),
             patch.object(article_fetcher, "_open_pinned_article_request", return_value=(too_large, Mock())),
-            patch.dict("os.environ", {"ARTICLE_FETCH_MAX_RESPONSE_BYTES": "1024"}),
+            env_override(ARTICLE_FETCH_MAX_RESPONSE_BYTES="1024"),
             self.assertRaises(article_fetcher.ToolError),
         ):
             article_fetcher._fetch_article_text("https://public.example/large")
@@ -130,7 +160,7 @@ class ArticleUrlSecurityTests(unittest.TestCase):
         with (
             patch.object(article_fetcher.socket, "getaddrinfo", return_value=_addr("93.184.216.34")),
             patch.object(article_fetcher, "_open_pinned_article_request", return_value=(redirect, Mock())) as open_request,
-            patch.dict("os.environ", {"ARTICLE_FETCH_MAX_REDIRECTS": "0"}),
+            env_override(ARTICLE_FETCH_MAX_REDIRECTS="0"),
             self.assertRaises(article_fetcher.ToolError),
         ):
             article_fetcher._fetch_article_text("https://public.example/redirect")

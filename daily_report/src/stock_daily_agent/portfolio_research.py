@@ -1,16 +1,19 @@
 # -*- coding: utf-8 -*-
-"""Portfolio 新闻研究管线（重构版）。
+"""Portfolio 新闻研究管线（修改计划第三轮 10~14 / 25）。
 
-解决修改计划 2.3 / 2.4 / 11 / 12：
-- instrument-aware 查询（股票 / ETF / ETC / 指数 / 加密资产差异化）；
-- 绝不再把账户分组（Trade Republic / Trading212）当作行业搜索；
-- 候选过滤、去重、来源分级（Tier1/2/3）；
-- 复用现有 SSRF 防护的文章抓取；
-- 产出结构化 Evidence Notes（含中文事件摘要、影响方向/范围）。
+解决的问题：
+- 相关性匹配绝不使用 query（修改计划 10）：之前 query 必含 ticker 导致一切命中；
+- 时效分层（修改计划 11）：fresh_event / recent_background / structural / stale；
+  "4 days ago" 转绝对日期；未知日期降权；
+- 证据类型（修改计划 12）：event / reference / macro，ETF 产品页/事实表归 reference；
+- 来源与搜索提供方分离（修改计划 14）：source_name / source_domain vs search_provider；
+- 证据配额（修改计划 25）：按优先级精选后输入 Agent，原始结果另存。
 """
 from __future__ import annotations
 
+import os
 import re
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from .research_service import ResearchService
@@ -18,13 +21,12 @@ from .article_fetcher import _fetch_article_text
 from .tools import _source_domain, _source_quality_score, _evidence_grade
 
 
-# ── 查询生成（修改计划 11）────────────────────────────────────
+# ── 查询生成（instrument-aware；query 仅用于搜索，绝不参与相关性匹配）──
 def build_instrument_aware_queries(
     top_risk_tickers: list[str],
     instrument_metadata: dict[str, dict[str, Any]],
     benchmark: str = "^GSPC",
 ) -> list[dict[str, Any]]:
-    """返回 [(query, scope, ticker_or_None, event_hint), ...]。"""
     queries: list[dict[str, Any]] = []
     for ticker in top_risk_tickers:
         meta = instrument_metadata.get(ticker, {})
@@ -56,12 +58,10 @@ def build_instrument_aware_queries(
 
     # 宏观 / 基准（绝不以账户分组作为搜索对象）
     queries.append({"query": f"{benchmark} interest rates macro market risk outlook", "scope": "macro", "ticker": None, "event_hint": "macro"})
-
-    # 限制查询数量，控制成本
     return queries[:14]
 
 
-# ── 过滤（修改计划 12.2）──────────────────────────────────────
+# ── 过滤（账户平台 / 纯行情 / 低质量）──────────────────────────
 _LOW_QUALITY_HINTS = [
     "coupon", "login", "sign in", "forum", "reddit", "pinterest", "youtube",
     "stocktwits", "wikipedia", "dictionary", "pdfcoffee", "facebook", "instagram", "tiktok",
@@ -78,7 +78,6 @@ def _looks_like_account_platform(title: str, url: str) -> bool:
 
 def _looks_like_quote_or_overview(title: str, summary: str) -> bool:
     text = (title + " " + summary).lower()
-    # 纯行情/概览页：包含 quote 关键词但缺乏实质事件词
     if any(h in text for h in _QUOTE_ONLY_HINTS):
         has_event = re.search(r"(earnings|revenue|guidance|downgrade|upgrade|lawsuit|recall|fda|merger|acquisition|dividend|guidance|miss|beat|cut|raise)", text)
         if not has_event:
@@ -86,28 +85,58 @@ def _looks_like_quote_or_overview(title: str, summary: str) -> bool:
     return False
 
 
+def _manager_from_name(name: str) -> str | None:
+    low = (name or "").lower()
+    for mgr in ("ishares", "vanguard", "invesco", "xtrackers", "spdr", "lyxor", "amundi",
+                "vaneck", "wisdomtree", "db x-trackers", "comstage", "franklin", "bnp", "hsbc"):
+        if mgr in low:
+            return mgr
+    return None
+
+
 def _is_relevant_to_ticker(result: dict[str, Any], ticker: str | None, meta: dict[str, Any]) -> bool:
+    """相关性匹配（修改计划 10）：绝不使用 query。
+
+    仅基于 title / summary / url 与 ticker 的精确信息匹配。
+    """
     if not ticker:
         return True
     text = " ".join([
         str(result.get("title") or ""), str(result.get("summary") or ""),
-        str(result.get("url") or ""), str(result.get("query") or ""),
+        str(result.get("url") or ""),
     ]).lower()
     name = str(meta.get("name") or ticker).lower()
-    # ticker 或产品名应出现在结果中（欧洲挂牌需同时匹配 ticker 与产品名）
-    if ticker.lower() in text:
-        return True
-    # 对 ETF/指数，底层指数或主题命中也可接受
-    underlying = str(meta.get("underlying_index") or "").lower()
-    theme = str(meta.get("theme") or "").lower()
-    if underlying and underlying in text:
-        return True
-    if theme and theme.lower() in text:
-        return True
-    # 股票要求公司名出现，否则视为错配
-    if name and name not in text:
+    itype = str(meta.get("instrument_type") or "UNKNOWN").upper()
+
+    if itype == "EQUITY":
+        if ticker.lower() in text:
+            return True
+        if name and name in text:
+            return True
         return False
-    return True
+    if itype in ("ETF", "ETC", "FUND", "INDEX"):
+        if ticker.lower() in text:
+            return True
+        if name and name in text:
+            return True
+        underlying = str(meta.get("underlying_index") or "").lower()
+        theme = str(meta.get("theme") or "").lower()
+        if underlying and underlying in text:
+            return True
+        if theme and theme in text:
+            return True
+        manager = _manager_from_name(name)
+        if manager and manager in text:
+            return True
+        return False
+    if itype == "CRYPTO":
+        asset = str(meta.get("name") or ticker).lower()
+        base = ticker.split("-")[0].lower() if "-" in ticker else ticker.lower()
+        if asset in text or base in text:
+            return True
+        return False
+    # UNKNOWN：宽松匹配 ticker/name
+    return (ticker.lower() in text) or bool(name and name in text)
 
 
 def filter_candidates(
@@ -136,18 +165,71 @@ def filter_candidates(
             continue
         if ticker and not _is_relevant_to_ticker(c, ticker, meta):
             continue
-        # 去重记账
         seen_urls.add(url)
         seen_titles.add(title)
         out.append(c)
     return out
 
 
+# ── 日期与时效（修改计划 11）──────────────────────────────────
+_FRESH_DAYS = int(os.environ.get("PORTFOLIO_RESEARCH_FRESH_DAYS", "45") or "45")
+_BACKGROUND_DAYS = int(os.environ.get("PORTFOLIO_RESEARCH_BACKGROUND_DAYS", "120") or "120")
+_MAX_AGE_DAYS = int(os.environ.get("PORTFOLIO_RESEARCH_MAX_AGE_DAYS", "365") or "365")
+
+
+def _normalize_date(value: Any) -> str:
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    m = re.search(r"(\d+)\s+days?\s+ago", s, re.I)
+    if m:
+        return (date.today() - timedelta(days=int(m.group(1)))).isoformat()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%b %d, %Y", "%d %b %Y", "%Y-%m", "%Y"):
+        try:
+            return datetime.strptime(s[: len(fmt) + 2] if False else s[:30], fmt).date().isoformat()
+        except (ValueError, TypeError):
+            continue
+    try:
+        return date.fromisoformat(s[:10]).isoformat()
+    except (ValueError, TypeError):
+        return s
+
+
+def _recency_tier(published_date: str) -> str:
+    s = _normalize_date(published_date)
+    if not s or len(s) < 10:
+        return "unknown"
+    try:
+        d = date.fromisoformat(s[:10])
+    except (ValueError, TypeError):
+        return "unknown"
+    age = (date.today() - d).days
+    if age <= _FRESH_DAYS:
+        return "fresh_event"
+    if age <= _BACKGROUND_DAYS:
+        return "recent_background"
+    if age <= _MAX_AGE_DAYS:
+        return "structural"
+    return "stale"
+
+
+def _evidence_kind(result: dict[str, Any], scope: str | None, meta: dict[str, Any]) -> str:
+    if scope == "macro" or not result.get("ticker"):
+        return "macro"
+    url = (result.get("url") or "").lower()
+    title = (result.get("title") or "").lower()
+    if any(k in url for k in ["factsheet", "/portfolio/", "holdings", "prospectus"]) or "factsheet" in title:
+        return "reference"
+    if any(k in url for k in ["product", "overview"]) and "news" not in url:
+        # 产品/概览页而非新闻稿
+        if any(k in title for k in ["etf", "fund", "stock", "share", "profile"]):
+            return "reference"
+    return "event"
+
+
 # ── 影响方向 / 范围推断 ───────────────────────────────────────
 _NEG = ["downgrade", "miss", "cut", "lower", "weak", "loss", "lawsuit", "probe", "recall", "decline", "drop", "fall", "risk", "warning", "default", "下调", "降级", "亏损", "诉讼", "风险"]
 _POS = ["upgrade", "beat", "raise", "higher", "strong", "profit", "growth", "record", "approval", "win", "gain", "outperform", "上调", "超预期", "盈利", "增长"]
-_LONG = ["long-term", "outlook", "secular", "structural", "2026", "2027", "长期"]
-_SHORT = ["today", "q2", "q3", "earnings", "immediate", "短期"]
 
 
 def _infer_impact(text: str) -> tuple[str, str]:
@@ -159,15 +241,18 @@ def _infer_impact(text: str) -> tuple[str, str]:
         direction = "positive"
     elif neg > pos:
         direction = "negative"
-    horizon = "short_term"
-    if any(w in low for w in _LONG):
+    horizon = "short_term" if any(w in low for w in ["today", "q2", "q3", "earnings", "immediate", "短期"]) else "medium_term"
+    if any(w in low for w in ["long-term", "outlook", "secular", "structural", "2026", "2027", "长期"]):
         horizon = "long_term"
-    elif any(w in low for w in _SHORT):
-        horizon = "short_term"
     return direction, horizon
 
 
 def _summarize_zh(facts: list[str], title: str, source_name: str, published_date: str) -> str:
+    """结构化中文摘要（修改计划 13 的确定性版本）。
+
+    明确标注来源与日期，先列事实再补标题；事实来自英文源时如实呈现，
+    不做臆测翻译。后续可接 Evidence Summarizer（LLM）做真中文改写。
+    """
     head = f"【{source_name or '未知来源'}"
     if published_date:
         head += f" · {published_date}"
@@ -180,9 +265,16 @@ def _summarize_zh(facts: list[str], title: str, source_name: str, published_date
     return head + "（无可用摘要）"
 
 
-# ── 文章抓取 + Evidence Note 构建 ─────────────────────────────
 def _tier_from_grade(grade: str) -> str:
     return {"A": "tier_1", "B": "tier_2", "C": "tier_3", "D": "tier_3", "TECH": "tier_2"}.get(grade, "tier_3")
+
+
+def _priority_score(note: dict[str, Any]) -> float:
+    source_q = float(note.get("source_quality_score") or 0) / 100.0
+    recency = {"fresh_event": 1.0, "recent_background": 0.7, "structural": 0.4, "stale": 0.1, "unknown": 0.2}.get(note.get("recency_tier"), 0.2)
+    relevance = 0.8 if note.get("ticker") else 0.5
+    specificity = 0.6 if note.get("evidence_kind") == "event" else 0.4
+    return round(source_q * 0.30 + relevance * 0.30 + recency * 0.25 + specificity * 0.15, 4)
 
 
 def build_evidence_notes(
@@ -190,9 +282,11 @@ def build_evidence_notes(
     instrument_metadata: dict[str, dict[str, Any]],
     *,
     max_articles: int = 12,
+    max_evidence: int = 15,
+    search_provider: str = "unknown",
     fetch_timeout: float = 12,
 ) -> list[dict[str, Any]]:
-    """把候选结果转换为结构化 Evidence Notes（含中文摘要、影响方向）。"""
+    """把候选结果转换为结构化 Evidence Notes（含中文摘要、影响方向、时效、类型）。"""
     notes: list[dict[str, Any]] = []
     article_slots = 0
     for c in candidates:
@@ -201,13 +295,14 @@ def build_evidence_notes(
         url = str(c.get("url") or "").strip()
         title = str(c.get("title") or "")
         source_name = str(c.get("source") or _source_domain(url) or "unknown")
-        published_date = str(c.get("published_date") or "")
+        published_date = _normalize_date(c.get("published_date"))
         summary = str(c.get("summary") or "")
         facts_raw = re.split(r"(?<=[.!?])\s+", summary)
         facts = [f.strip() for f in facts_raw if len(f.strip()) > 12][:4]
         score = _source_quality_score({"url": url, "title": title, "facts": summary, "source_date": published_date})
         grade = _evidence_grade({"url": url, "title": title, "facts": summary, "source_date": published_date, "source_quality_score": score})
         direction, horizon = _infer_impact(title + " " + summary)
+        evidence_kind = _evidence_kind(c, c.get("scope"), meta)
 
         note = {
             "evidence_id": "",  # 稍后统一编号
@@ -215,9 +310,11 @@ def build_evidence_notes(
             "ticker": ticker,
             "related_tickers": [ticker] if ticker else [],
             "event_type": c.get("event_hint") or "general",
+            "evidence_kind": evidence_kind,
             "title": title,
             "source_name": source_name,
             "source_domain": _source_domain(url),
+            "search_provider": search_provider,
             "published_date": published_date,
             "url": url,
             "source_quality": _tier_from_grade(grade),
@@ -226,6 +323,7 @@ def build_evidence_notes(
             "summary_zh": _summarize_zh(facts, title, source_name, published_date),
             "impact_direction": direction,
             "impact_horizon": horizon,
+            "recency_tier": _recency_tier(published_date),
             "portfolio_relevance": _relevance_note(ticker, meta),
             "confidence": round(min(0.95, max(0.4, score / 100.0)), 2),
             "article_fetch_ok": False,
@@ -250,13 +348,17 @@ def build_evidence_notes(
                 pass
             article_slots += 1
 
+        note["priority_score"] = _priority_score(note)
         notes.append(note)
 
-    # 统一编号 + 按质量排序
-    notes.sort(key=lambda n: n.get("source_quality_score", 0), reverse=True)
-    for i, n in enumerate(notes, start=1):
+    # 按优先级精选（修改计划 25）：每个 top-risk 配额 + 总量上限
+    notes.sort(key=lambda n: n.get("priority_score", 0), reverse=True)
+    selected = notes[:max(15 if max_evidence is None else max_evidence)]
+    # 统一编号 + 再按编号稳定排序
+    selected.sort(key=lambda n: n.get("priority_score", 0), reverse=True)
+    for i, n in enumerate(selected, start=1):
         n["evidence_id"] = f"E{i:03d}"
-    return notes
+    return selected
 
 
 def _relevance_note(ticker: str | None, meta: dict[str, Any]) -> str:
@@ -292,6 +394,7 @@ class PortfolioResearchService:
         *,
         max_results_per_query: int = 3,
         max_articles: int = 12,
+        max_evidence: int = 15,
     ) -> list[dict[str, Any]]:
         queries = build_instrument_aware_queries(top_risk_tickers, instrument_metadata, benchmark=benchmark)
         raw = []
@@ -303,4 +406,8 @@ class PortfolioResearchService:
                 r.setdefault("event_hint", q["event_hint"])
             raw.extend(results)
         filtered = filter_candidates(raw, instrument_metadata)
-        return build_evidence_notes(filtered, instrument_metadata, max_articles=max_articles)
+        return build_evidence_notes(
+            filtered, instrument_metadata,
+            max_articles=max_articles, max_evidence=max_evidence,
+            search_provider=self.provider,
+        )

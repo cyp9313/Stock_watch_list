@@ -88,14 +88,17 @@ def generate_portfolio_rule_findings(
             "metric_refs": ["effective_holdings", "hhi"],
         })
 
-    # 账户组集中度（修改计划 2.5：区分 account_group 与行业）
+    # 账户组集中度（修改计划第三轮 32：账户分组是券商/账户维度，不是行业或市场风险因子）
+    # 默认仅作信息展示，不计入市场风险评分；仅当用户显式启用 custody_risk 且某券商 >80% 时提示托管集中风险。
+    custody_risk_enabled = bool(settings.get("custody_risk"))
     acct = _group_weights(snapshot, lambda h: (meta.get(h["ticker"], {}) or {}).get("account_group") or h.get("group"))
     for g, w in sorted(acct.items(), key=lambda x: -x[1]):
-        if w > max_group and g:
+        if custody_risk_enabled and w > 0.80 and g:
             findings.append({
-                "risk_id": f"CONCENTRATION_ACCOUNT_{_slug(g)}", "severity": "medium",
-                "title": f"账户分组「{g}」权重偏高",
-                "description": f"账户分组 {g} 合计权重 {w:.1%}，高于 {max_group:.1%}。注意：这是券商/账户分组，不是行业风险。",
+                "risk_id": f"CONCENTRATION_ACCOUNT_{_slug(g)}", "severity": "low",
+                "title": f"券商账户「{g}」托管集中（>80%）",
+                "description": f"账户分组 {g} 合计权重 {w:.1%}。注意：这是券商/账户托管维度，不是行业风险；"
+                               f"仅在启用 custody_risk 时作为托管集中风险提示。",
                 "affected_tickers": _tickers_in_group(snapshot, meta, g),
                 "metric_refs": ["account_group_weight"],
             })

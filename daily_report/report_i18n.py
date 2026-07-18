@@ -9,7 +9,20 @@
 """
 from __future__ import annotations
 
+import math
 from typing import Any
+
+
+def finite_float(value: Any) -> float | None:
+    """返回有限浮点数；None / 非数字 / NaN / ±Inf 一律返回 None。
+
+    用于阻断 NaN / Inf 进入报告（修改计划第三轮 3）。
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 # ── 操作动作中文名 ─────────────────────────────────────────────
@@ -123,10 +136,12 @@ _CURRENCY_SUFFIXES = {"GBX": "p"}
 
 
 def format_money(value: Any, currency: str = "USD", digits: int = 0) -> str:
-    """带货币符号的金额格式化。未知货币使用代码本身作为前缀，避免误导性的 $。"""
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
+    """带货币符号的金额格式化。未知货币使用代码本身作为前缀，避免误导性的 $。
+
+    非有限值返回 N/A（修改计划第三轮 3）。
+    """
+    number = finite_float(value)
+    if number is None:
         return "N/A"
     currency = str(currency or "USD").upper()
     symbol = CURRENCY_SYMBOLS.get(currency)
@@ -136,14 +151,47 @@ def format_money(value: Any, currency: str = "USD", digits: int = 0) -> str:
     return currency + " " + text
 
 
-def format_pct(value: Any, digits: int = 2, with_sign: bool = False) -> str:
-    """把 0~1 的小数或已乘 100 的数值格式化为百分比。
+def format_ratio_as_pct(value: Any, digits: int = 2, with_sign: bool = False) -> str:
+    """把 0~1 比例格式化为百分数。例如 0.0646 -> 6.46%。
 
-    约定：小于 2 的绝对值视为比例（0.0626 -> 6.26%）；否则视为已乘 100 的百分比值。
+    禁止对已经是百分数的输入使用本函数（修改计划第三轮 2.2）。
     """
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
+    number = finite_float(value)
+    if number is None:
+        return "N/A"
+    text = f"{number * 100.0:,.{digits}f}%"
+    if with_sign and number > 0:
+        return "+" + text
+    return text
+
+
+def format_pct_value(value: Any, digits: int = 2, with_sign: bool = False) -> str:
+    """把已经是百分数的数值格式化（输入已乘 100）。例如 -1.3381 -> -1.34%。
+
+    禁止对 0~1 比例使用本函数（修改计划第三轮 2.2）。
+    """
+    number = finite_float(value)
+    if number is None:
+        return "N/A"
+    text = f"{number:,.{digits}f}%"
+    if with_sign and number > 0:
+        return "+" + text
+    return text
+
+
+def format_number(value: Any, digits: int = 2) -> str:
+    """普通数字格式化；非有限值返回 N/A（修改计划第三轮 3）。"""
+    number = finite_float(value)
+    if number is None:
+        return "N/A"
+    return f"{number:,.{digits}f}"
+
+
+# 兼容旧调用点：仍按绝对值猜测单位（禁止在新代码中使用）。
+def format_pct(value: Any, digits: int = 2, with_sign: bool = False) -> str:
+    """[已弃用] 按绝对值猜测单位。新代码必须改用 ``format_ratio_as_pct`` / ``format_pct_value``。"""
+    number = finite_float(value)
+    if number is None:
         return "N/A"
     if abs(number) <= 1.5:
         number = number * 100.0
@@ -153,22 +201,14 @@ def format_pct(value: Any, digits: int = 2, with_sign: bool = False) -> str:
     return text
 
 
-def format_number(value: Any, digits: int = 2) -> str:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return "N/A"
-    return f"{number:,.{digits}f}"
-
-
 def pct_color_class(value: Any) -> str:
-    """根据数值正负返回涨跌颜色 class（项目既有风格：绿涨红跌）。"""
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
+    """根据数值正负返回涨跌颜色 class（项目既有风格：绿涨红跌）。
+
+    仅看符号，不猜测单位、不做任何 ×100 放大。
+    """
+    number = finite_float(value)
+    if number is None:
         return ""
-    if abs(number) <= 1.5:
-        number = number * 100.0
     if number > 0:
         return "up"
     if number < 0:

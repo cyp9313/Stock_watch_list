@@ -14,12 +14,28 @@ def _value(value: Any, default: float = 0.0) -> float:
 
 
 def _percentiles(values: dict[str, float]) -> dict[str, float]:
+    """Tie-aware percentile（修改计划第三轮 31）。
+
+    相同数值获得相同百分位（平均排名 / n），不再按顺序给不同排名。
+    等价于 pandas Series.rank(method="average", pct=True)。
+    """
     if not values:
         return {}
     ordered = sorted(values.items(), key=lambda item: item[1])
-    if len(ordered) == 1:
-        return {ordered[0][0]: 1.0}
-    return {ticker: rank / (len(ordered) - 1) for rank, (ticker, _) in enumerate(ordered)}
+    n = len(ordered)
+    if n == 1:
+        return {ordered[0][0]: 0.5}
+    ranks: dict[str, float] = {}
+    i = 0
+    while i < n:
+        j = i
+        while j < n and ordered[j][1] == ordered[i][1]:
+            j += 1
+        avg_rank = (i + 1 + j) / 2.0
+        for k in range(i, j):
+            ranks[ordered[k][0]] = avg_rank / n
+        i = j
+    return ranks
 
 
 def rank_portfolio_risks(snapshot: dict[str, Any], metrics: dict[str, Any]) -> dict[str, Any]:
@@ -47,11 +63,11 @@ def rank_portfolio_risks(snapshot: dict[str, Any], metrics: dict[str, Any]) -> d
     for holding in holdings:
         ticker = holding["ticker"]
         score = 0.0
-        if _value(holding.get("diff_ema20")) < 0:
+        if _value(holding.get("price_vs_ema20_pct")) < 0:
             score += 0.25
-        if _value(holding.get("diff_ema50")) < 0:
+        if _value(holding.get("price_vs_ema50_pct")) < 0:
             score += 0.25
-        if _value(holding.get("diff_ema200")) < 0:
+        if _value(holding.get("price_vs_ema200_pct")) < 0:
             score += 0.15
         rsi = _value(holding.get("rsi"), 50.0)
         if rsi > 70 or rsi < 30:

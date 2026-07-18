@@ -76,8 +76,8 @@ def _compact_holdings(ctx: PortfolioRunContext) -> list[dict]:
             "profit_loss_pct": h.get("profit_loss_pct"),
             "return_1d": h.get("return_1d"), "return_5d": h.get("return_5d"),
             "return_1m": h.get("return_1m"), "return_ytd": h.get("return_ytd"),
-            "diff_ema20": h.get("diff_ema20"), "diff_ema50": h.get("diff_ema50"), "diff_ema200": h.get("diff_ema200"),
-            "rsi": h.get("rsi"), "volume_ratio": h.get("volume_ratio"), "beta": h.get("beta"),
+            "price_vs_ema20_pct": h.get("price_vs_ema20_pct"), "price_vs_ema50_pct": h.get("price_vs_ema50_pct"), "price_vs_ema200_pct": h.get("price_vs_ema200_pct"),
+            "rsi": h.get("rsi"), "rsi_regime": h.get("rsi_regime"), "volume_ratio": h.get("volume_ratio"), "beta": h.get("beta"),
             "annualized_volatility": (ctx.metrics.get("holdings_detail", {}) or {}).get(t, {}).get("annualized_volatility"),
             "max_drawdown_63d": (ctx.metrics.get("holdings_detail", {}) or {}).get(t, {}).get("max_drawdown_63d"),
             "risk_contribution": (rc.get(t) or {}).get("risk_contribution"),
@@ -137,6 +137,10 @@ class ReadPortfolioMetricsTool(BaseTool):
             "high_correlation_pairs": m.get("high_correlation_pairs"),
             "technical_breadth": m.get("technical_breadth"),
             "risk_contributions": m.get("risk_contributions"),
+            "aggregates": m.get("aggregates"),
+            "portfolio_risk_score": m.get("portfolio_risk_score"),
+            "portfolio_risk_level": m.get("portfolio_risk_level"),
+            "risk_score_components": m.get("risk_score_components"),
             "holdings_detail": m.get("holdings_detail"),
         })
 

@@ -35,9 +35,14 @@ from portfolio_analysis import (
     rank_portfolio_risks,
     validate_portfolio_advice,
 )
+from portfolio_analysis.validators import PortfolioAdviceValidationError
 from portfolio_analysis.rules import generate_portfolio_rule_findings
 from portfolio_analysis.instrument_metadata import build_instrument_metadata
 from portfolio_analysis.snapshot import infer_ticker_currency
+from portfolio_analysis.metric_contracts import (
+    scan_non_finite, data_quality_score, metadata_coverage_score,
+    evidence_coverage_score, evidence_freshness_score,
+)
 from daily_report.src.stock_daily_agent.research_service import ResearchService
 from daily_report.src.stock_daily_agent.portfolio_research import PortfolioResearchService
 from daily_report.src.stock_daily_agent.portfolio_context import PortfolioRunContext
@@ -150,7 +155,7 @@ def _cumulative_returns(close: pd.DataFrame, tickers: list[str], weights: dict[s
     return labels, port_list, bench_list
 
 
-def _allocation_weights(snapshot: dict, meta: dict, key_fn) -> dict[str, float]:
+def _allocation_weights(snapshot: dict, meta: dict, key_fn) -> dict[str, float]:  # noqa: E302
     weights = {h["ticker"]: float(h.get("weight") or 0.0) for h in snapshot.get("holdings", [])}
     out: dict[str, float] = {}
     for h in snapshot.get("holdings", []):
@@ -159,6 +164,37 @@ def _allocation_weights(snapshot: dict, meta: dict, key_fn) -> dict[str, float]:
         if k:
             out[k] = out.get(k, 0.0) + weights.get(t, 0.0)
     return out
+
+
+def _apply_confidence_cap(
+    advice: dict,
+    snapshot: dict,
+    metrics: dict,
+    instrument_metadata: dict,
+    evidence: list[dict],
+    ranking: dict,
+    non_finite: list[str],
+) -> dict:
+    """置信度上限（修改计划第三轮 23）：min(模型, 数据完整度, 元数据覆盖, 证据覆盖, 证据新鲜度)。"""
+    model_conf = max(0.0, min(1.0, float(advice.get("confidence", 0.5))))
+    anomaly_w = (metrics.get("return_anomalies") or {}).get("anomaly_weight", 0.0) or 0.0
+    dq = data_quality_score(len(non_finite), anomaly_w)
+    tickers = [h["ticker"] for h in snapshot.get("holdings", [])]
+    meta_cov = metadata_coverage_score(instrument_metadata, tickers)
+    ev_cov = evidence_coverage_score(evidence, ranking.get("top_risk_tickers") or [])
+    ev_fresh = evidence_freshness_score(evidence)
+    final = min(model_conf, dq, meta_cov, ev_cov, ev_fresh)
+    advice["final_confidence"] = round(final, 3)
+    advice["confidence_components"] = {
+        "model_confidence": round(model_conf, 3),
+        "data_quality": dq,
+        "metadata_coverage": meta_cov,
+        "evidence_coverage": ev_cov,
+        "evidence_freshness": ev_fresh,
+    }
+    if str(advice.get("report_mode")) == "ai":
+        advice["confidence"] = round(final, 3)
+    return advice
 
 
 def run_pipeline(
@@ -216,7 +252,9 @@ def run_pipeline(
 
     # 工具类型元数据（区分账户分组与行业/主题）
     enrich = os.environ.get("PORTFOLIO_ENRICH_YFINANCE", "false").strip().lower() in {"1", "true", "yes"}
-    instrument_metadata = build_instrument_metadata(portfolio_page, enrich=enrich)
+    instrument_metadata = build_instrument_metadata(
+        portfolio_page, market_rows=market_rows, enrich=enrich,
+    )
 
     snapshot = build_portfolio_snapshot(
         portfolio_page,
@@ -229,8 +267,18 @@ def run_pipeline(
     )
     snapshot["analysis_settings"] = settings
     snapshot["report_date"] = dt.date.today().isoformat()
+    # 修改计划第三轮 40：行情/基准数据截止 = 最近一个有效交易日。
+    try:
+        snapshot["as_of_prices"] = str(close.index[-1].date())
+    except Exception:
+        snapshot["as_of_prices"] = snapshot["report_date"]
     metrics = calculate_portfolio_metrics(snapshot, close, benchmark=benchmark)
     ranking = rank_portfolio_risks(snapshot, metrics)
+
+    # 非有限值扫描（修改计划第三轮 3）：阻断 NaN/Inf 流入报告，并降低置信度。
+    non_finite = scan_non_finite({"metrics": metrics, "summary": snapshot.get("summary", {})})
+    snapshot.setdefault("data_quality", {})
+    snapshot["data_quality"]["non_finite_metrics"] = non_finite
 
     # instrument-aware 新闻研究
     fallback_reason = ""
@@ -266,21 +314,48 @@ def run_pipeline(
         advice_json_path=run_dir / "portfolio_advice.json",
     )
 
+    allow_quant_fallback = os.environ.get("PORTFOLIO_REPORT_ALLOW_QUANT_FALLBACK", "false").strip().lower() in {"1", "true", "yes"}
     runner = agent_runner if agent_runner is not None else run_portfolio_agent
     try:
         advice = runner(ctx, model=model, provider=provider, verbose=verbose)
         advice["report_mode"] = "ai"
     except (PortfolioAgentUnavailable, PortfolioAgentOutputError) as exc:
+        if not allow_quant_fallback:
+            raise
         fallback_reason = f"AI Agent 未参与：{exc}"
         print(f"[WARN] {fallback_reason}；生成量化降级报告。", flush=True)
         advice = default_fallback_advice(snapshot, metrics, ranking, reason=fallback_reason)
     except Exception as exc:  # noqa: BLE001
+        if not allow_quant_fallback:
+            raise
         fallback_reason = f"AI Agent 异常：{exc}"
         print(f"[WARN] {fallback_reason}；生成量化降级报告。", flush=True)
         advice = default_fallback_advice(snapshot, metrics, ranking, reason=fallback_reason)
 
-    # 最终 Python 校验（兜底 sanitize，不翻转动作）
-    advice = validate_portfolio_advice(advice, snapshot, evidence, mode="fallback")
+    # 最终 Python 校验：AI 报告走 strict（不得静默修正）；降级报告走 fallback（修改计划第三轮 30）。
+    final_mode = "strict" if str(advice.get("report_mode")) == "ai" else "fallback"
+    try:
+        advice = validate_portfolio_advice(advice, snapshot, evidence, mode=final_mode)
+    except PortfolioAdviceValidationError as exc:
+        if final_mode == "strict":
+            print(f"[WARN] 最终 strict 校验未通过，降级为 fallback 模式：{'; '.join(exc.errors)}", flush=True)
+            advice = validate_portfolio_advice(advice, snapshot, evidence, mode="fallback")
+        else:
+            raise
+
+    # 置信度上限（修改计划第三轮 23）：取模型置信度与各质量因子的最小值。
+    advice = _apply_confidence_cap(
+        advice, snapshot, metrics, instrument_metadata, evidence, ranking, non_finite,
+    )
+
+    # 修改计划第三轮 20：Python 预计算「计划减仓释放权重」聚合值（需 AI 操作建议）。
+    red_w = 0.0
+    for a in advice.get("actions") or []:
+        if str(a.get("action")) in {"reduce", "trim", "exit"}:
+            cur = float(a.get("current_weight") or 0.0)
+            tgt = float(a.get("target_weight_min") or cur)
+            red_w += max(0.0, cur - tgt)
+    metrics.setdefault("aggregates", {})["recommended_reduction_weight"] = round(red_w, 4)
 
     # 图表
     weights = {h["ticker"]: float(h.get("weight") or 0.0) for h in snapshot.get("holdings", [])}
@@ -297,9 +372,9 @@ def run_pipeline(
             "主题/底层指数权重分布", "#bc8cff",
         ),
     }
-    labels, port_cum, bench_cum = _cumulative_returns(close, tickers, weights, benchmark)
+    labels, portfolio_cumulative_pct, benchmark_cumulative_pct = _cumulative_returns(close, tickers, weights, benchmark)
     if labels:
-        charts["cumulative"] = svg_cumulative_returns(labels, port_cum, bench_cum)
+        charts["cumulative"] = svg_cumulative_returns(labels, portfolio_cumulative_pct, benchmark_cumulative_pct)
 
     # 确定性风险发现（供降级或风险诊断补充展示）
     risk_findings = generate_portfolio_rule_findings(snapshot, metrics, settings, instrument_metadata=instrument_metadata)

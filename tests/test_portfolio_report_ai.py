@@ -290,6 +290,7 @@ class _FakeResearch:
                 "summary_zh": f"{t} 最新季度营收超预期，但指引偏谨慎。",
                 "impact_direction": "positive", "impact_horizon": "short_term",
                 "portfolio_relevance": "直接影响个股。", "confidence": 0.9,
+                "recency_tier": "fresh_event",
                 "article_fetch_ok": False,
             })
         notes.append({
@@ -302,6 +303,7 @@ class _FakeResearch:
             "summary_zh": "宏观利率环境边际收紧，影响全部持仓的贴现率。",
             "impact_direction": "negative", "impact_horizon": "long_term",
             "portfolio_relevance": "系统性因素。", "confidence": 0.85,
+            "recency_tier": "recent_background",
             "article_fetch_ok": False,
         })
         for i, n in enumerate(notes, start=1):
@@ -312,6 +314,14 @@ class _FakeResearch:
 def _fake_agent(ctx, model, provider, *, verbose=True):
     weights = ctx.weights()
     tickers = list(weights.keys())
+    # 证据按 ticker 归位（修改计划第三轮 15：跨 ticker 绑定，action 只能引用属于自己
+    # 的证据；宏观/组合级证据（ticker=None）不被任何单 tick action 引用）。
+    ev_by_ticker: dict[str, list[str]] = {}
+    for e in (ctx.evidence or []):
+        et = str(e.get("ticker") or "").upper()
+        for t in [et] + [str(x).upper() for x in (e.get("related_tickers") or [])]:
+            if t:
+                ev_by_ticker.setdefault(t, []).append(e["evidence_id"])
     actions = []
     for i, t in enumerate(tickers, start=1):
         w = float(weights[t])
@@ -319,14 +329,21 @@ def _fake_agent(ctx, model, provider, *, verbose=True):
             action, lo, hi = "trim", max(0.0, w * 0.6), max(0.0, w * 0.8)
         else:
             action, lo, hi = "hold", w * 0.95, w * 1.05
+        eids = ev_by_ticker.get(t.upper(), [])
+        if eids:
+            news_reason = f"近期有财报与监管事项（见 {eids[0]}）。"
+        elif i == 1:
+            news_reason = "近期无新增重大事件，主要依据组合层面集中度。"
+        else:
+            news_reason = "近期无新增重大事件。"
         actions.append({
             "ticker": t, "action": action, "priority": i,
             "current_weight": w, "target_weight_min": lo, "target_weight_max": hi,
             "confidence": 0.8,
             "portfolio_reason": f"{t} 组合层面占比偏高，建议适度减仓以控制集中度。",
             "technical_reason": f"{t} 技术面跌破 EMA20。",
-            "news_reason": "近期有财报与监管事项（见 E001）。",
-            "evidence_ids": ["E001"],
+            "news_reason": news_reason,
+            "evidence_ids": eids,
         })
     return {
         "report_mode": "ai", "portfolio_stance": "谨慎偏多", "risk_level": "medium",
@@ -386,7 +403,8 @@ def test_run_pipeline_ai_mode_contains_real_analysis(tmp_path):
         assert (tmp_path / name).exists()
 
 
-def test_run_pipeline_fallback_mode_is_clearly_labeled(tmp_path):
+def test_run_pipeline_fallback_mode_is_clearly_labeled(tmp_path, monkeypatch):
+    monkeypatch.setenv("PORTFOLIO_REPORT_ALLOW_QUANT_FALLBACK", "true")
     payload, close, market_rows, fx = _fixture()
 
     def _failing_agent(ctx, model, provider, *, verbose=True):

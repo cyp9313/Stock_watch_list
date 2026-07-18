@@ -31,10 +31,18 @@ try:
 except ImportError:
     ZoneInfo = None  # type: ignore[assignment]
 
+# 修改计划第三轮 41：个股日报复用 Portfolio 共享主题的色彩 token，避免两套硬编码色值漂移。
+try:
+    from ..report_theme import COLOR_TOKENS as _SHARED_COLOR_TOKENS
+except Exception:  # pragma: no cover - 直接以脚本方式运行时回退
+    _SHARED_COLOR_TOKENS = None
 
 _ALLOWED_SIGNAL_CLASSES = {"signal-bull", "signal-bear", "signal-neutral"}
 _ALLOWED_RATING_CLASSES = {"buy", "hold", "avoid"}
-_ALLOWED_PRICE_COLORS = {"#3fb950", "#f85149"}
+_ALLOWED_PRICE_COLORS = {
+    (_SHARED_COLOR_TOKENS or {}).get("up", "#3fb950"),
+    (_SHARED_COLOR_TOKENS or {}).get("down", "#f85149"),
+}
 _ALLOWED_INSTRUMENT_TYPES = {"EQUITY", "ETF", "INDEX", "CRYPTO", "OTHER"}
 
 # ── 货币符号映射 ──────────────────────────────────────────────────

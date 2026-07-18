@@ -17,7 +17,9 @@ from .portfolio_context import PortfolioRunContext
 from .portfolio_prompts import build_portfolio_system_prompt, build_portfolio_user_task
 from .portfolio_schema import normalize_advice
 from .portfolio_tools import build_portfolio_tools, set_portfolio_context
-from portfolio_analysis.validators import validate_portfolio_advice, PortfolioAdviceValidationError
+from portfolio_analysis.validators import (
+    validate_portfolio_advice, PortfolioAdviceValidationError, validate_portfolio_claims,
+)
 
 
 class PortfolioAgentUnavailable(RuntimeError):
@@ -160,11 +162,17 @@ def run_portfolio_agent(
     if advice is None:
         raise PortfolioAgentOutputError("Agent 未返回可解析的建议 JSON。")
 
+    def _validate(norm: dict) -> dict:
+        validated = validate_portfolio_advice(norm, ctx.snapshot, ctx.evidence, mode="strict")
+        c_err, c_warn = validate_portfolio_claims(validated, ctx.snapshot, ctx.metrics, ctx.evidence)
+        if c_warn:
+            validated.setdefault("validation_warnings", []).extend(c_warn)
+        if c_err:
+            raise PortfolioAdviceValidationError(c_err)
+        return validated
+
     try:
-        return validate_portfolio_advice(
-            normalize_advice(advice, snapshot=ctx.snapshot, metrics=ctx.metrics, ranking=ctx.ranking),
-            ctx.snapshot, ctx.evidence, mode="strict",
-        )
+        return _validate(normalize_advice(advice, snapshot=ctx.snapshot, metrics=ctx.metrics, ranking=ctx.ranking))
     except PortfolioAdviceValidationError as exc:
         retry_msg = (
             f"你的建议校验未通过，请修正后再次调用 save_portfolio_advice：\n"
@@ -183,7 +191,4 @@ def run_portfolio_agent(
             advice = _extract_advice_from_text(last_text)
         if advice is None:
             raise PortfolioAgentOutputError("重试后 Agent 仍未返回可校验的建议。")
-        return validate_portfolio_advice(
-            normalize_advice(advice, snapshot=ctx.snapshot, metrics=ctx.metrics, ranking=ctx.ranking),
-            ctx.snapshot, ctx.evidence, mode="strict",
-        )
+        return _validate(normalize_advice(advice, snapshot=ctx.snapshot, metrics=ctx.metrics, ranking=ctx.ranking))

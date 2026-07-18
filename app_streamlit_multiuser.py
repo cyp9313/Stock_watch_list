@@ -1613,8 +1613,13 @@ def build_portfolio_treemap(treemap_rows, dark_mode=False):
         customdata.append([group, "", "", ""])
 
         for _, row in group_df.sort_values("Area", ascending=False).iterrows():
-            pct = float(row["1D%"]) if pd.notna(row["1D%"]) else 0.0
-            pct_text = f"{pct:+.2f}%" if pd.notna(row["1D%"]) else "N/A"
+            pct_raw = row["1D%"]
+            if pd.notna(pct_raw):
+                pct = float(pct_raw)
+                pct_text = f"{pct:+.2f}%"
+            else:
+                pct = 0.0
+                pct_text = "N/A"
             buy_currency = normalize_currency_code(row.get("Buy Currency"))
             labels.append(str(row["Ticker"]))
             ids.append(f"ticker:{row['Ticker']}")

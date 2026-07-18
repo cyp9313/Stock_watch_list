@@ -60,6 +60,27 @@ def _finite_float(value: Any) -> float | None:
     return number
 
 
+def _rsi_regime(value: Any) -> str:
+    """由 Python 预计算 RSI 区间（修改计划第三轮 18）。"""
+    if value is None:
+        return "unknown"
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "unknown"
+    if not math.isfinite(v):
+        return "unknown"
+    if v < 30:
+        return "oversold"
+    if v < 40:
+        return "weak"
+    if v <= 60:
+        return "neutral"
+    if v <= 70:
+        return "strong"
+    return "overbought"
+
+
 def _convert(value: float | None, from_currency: str, to_currency: str, fx_rates: dict[str, float], missing_fx: list[str]) -> float | None:
     if value is None:
         return None
@@ -175,14 +196,17 @@ def build_portfolio_snapshot(
             "name": market.get("Name") or ticker,
             "beta": _finite_float(market.get("Beta")),
             "rsi": _finite_float(market.get("RSI")),
+            "rsi_regime": _rsi_regime(market.get("RSI")),
             "volume_ratio": _finite_float(market.get("Volume_Ratio")),
             "return_1d": _finite_float(market.get("1D%")),
             "return_5d": _finite_float(market.get("5D%")),
             "return_1m": _finite_float(market.get("1M%")),
             "return_ytd": _finite_float(market.get("YTD%")),
-            "diff_ema20": _finite_float(market.get("Diff_EMA20%")),
-            "diff_ema50": _finite_float(market.get("Diff_EMA50%")),
-            "diff_ema200": _finite_float(market.get("Diff_EMA200%")),
+            # 修改计划第三轮 19：字段明确为「价格相对 EMA 的偏离百分比」（已×100），
+            # 不是均线之间的交叉；模型不得将其解释为 EMA20 与 EMA200 交叉。
+            "price_vs_ema20_pct": _finite_float(market.get("Diff_EMA20%")),
+            "price_vs_ema50_pct": _finite_float(market.get("Diff_EMA50%")),
+            "price_vs_ema200_pct": _finite_float(market.get("Diff_EMA200%")),
         })
 
         # 附加工具类型元数据（account_group 之外区分 sector/industry/theme/asset_class）
