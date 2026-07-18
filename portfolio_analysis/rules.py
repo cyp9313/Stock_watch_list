@@ -304,7 +304,7 @@ def _flatten_pairs(pairs: list[dict[str, Any]]) -> list[str]:
     for p in pairs:
         out.append(p.get("ticker_a"))
         out.append(p.get("ticker_b"))
-    return [t for t in out if t]
+    return list(dict.fromkeys(t for t in out if t))
 
 
 def _duplicate_exposure(snapshot: dict[str, Any], meta: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
@@ -325,7 +325,13 @@ def _duplicate_exposure(snapshot: dict[str, Any], meta: dict[str, dict[str, Any]
         if itype in {"ETF", "INDEX", "FUND"}:
             theme = str(m.get("theme") or "").lower()
             underlying = str(m.get("underlying_index") or "").lower()
-            overlap = [t for t in equity_themes if t and (t in theme or theme in t or t in underlying or underlying in t)]
+            overlap = [
+                t for t in equity_themes
+                if t and (
+                    (theme and (t in theme or theme in t))
+                    or (underlying and (t in underlying or underlying in t))
+                )
+            ]
             if overlap:
                 results.append({
                     "etf": h["ticker"],

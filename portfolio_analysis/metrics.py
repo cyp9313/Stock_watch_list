@@ -8,6 +8,15 @@ import pandas as pd
 
 
 RETURN_WINDOWS = {"5D": 5, "1M": 21, "3M": 63, "6M": 126, "1Y": 252}
+RISK_COMPONENT_WEIGHTS = {
+    "concentration": 15,
+    "beta": 15,
+    "volatility": 15,
+    "drawdown": 15,
+    "correlation": 10,
+    "breadth": 15,
+    "risk_contribution": 15,
+}
 
 
 def _safe_float(value: Any) -> float | None:
@@ -76,33 +85,43 @@ def calculate_relative_window_return(
     if w.sum() <= 0:
         return {"portfolio": None, "benchmark": None, "relative": None, "status": "insufficient_data"}
 
-    valid = close_window.dropna(how="any")
-    common = valid.index.intersection(benchmark_series.dropna().index)
-    if len(common) < periods + 1:
+    benchmark_valid = benchmark_series.dropna().sort_index()
+    if len(benchmark_valid) < periods + 1:
         return {
             "portfolio": None, "benchmark": None, "relative": None,
             "start_date": None, "end_date": None,
             "weight_coverage": None, "status": "insufficient_data",
         }
-    window_idx = common[-(periods + 1):]
-    p0 = close_window.loc[window_idx[0]]
-    p1 = close_window.loc[window_idx[-1]]
-    ret = (p1 / p0 - 1.0).replace([np.inf, -np.inf], np.nan)
+    end_date = benchmark_valid.index[-1]
+    start_date = benchmark_valid.index[-(periods + 1)]
+    ticker_returns: dict[str, float] = {}
+    for ticker in tickers:
+        series = close_window[ticker].dropna().sort_index()
+        before_start = series.loc[series.index <= start_date]
+        before_end = series.loc[series.index <= end_date]
+        if before_start.empty or before_end.empty:
+            continue
+        p0 = _safe_float(before_start.iloc[-1])
+        p1 = _safe_float(before_end.iloc[-1])
+        if p0 is None or p1 is None or p0 <= 0:
+            continue
+        ticker_returns[ticker] = p1 / p0 - 1.0
+    ret = pd.Series(ticker_returns, dtype=float).reindex(tickers)
     covered = float(w[ret.notna()].sum())
     coverage = covered / float(w.sum())
     if coverage < minimum_weight_coverage:
         return {
             "portfolio": None, "benchmark": None, "relative": None,
-            "start_date": str(window_idx[0].date()), "end_date": str(window_idx[-1].date()),
+            "start_date": str(pd.Timestamp(start_date).date()), "end_date": str(pd.Timestamp(end_date).date()),
             "weight_coverage": round(coverage, 3), "status": "insufficient_coverage",
         }
-    portfolio_return = float((ret * w).sum() * 100.0)
-    b0 = float(benchmark_series.loc[window_idx[0]])
-    b1 = float(benchmark_series.loc[window_idx[-1]])
+    portfolio_return = float((ret * w).sum() / covered * 100.0)
+    b0 = float(benchmark_valid.loc[start_date])
+    b1 = float(benchmark_valid.loc[end_date])
     if not (math.isfinite(b0) and math.isfinite(b1) and b0 != 0):
         return {
             "portfolio": portfolio_return, "benchmark": None, "relative": None,
-            "start_date": str(window_idx[0].date()), "end_date": str(window_idx[-1].date()),
+            "start_date": str(pd.Timestamp(start_date).date()), "end_date": str(pd.Timestamp(end_date).date()),
             "weight_coverage": round(coverage, 3), "status": "benchmark_missing",
         }
     benchmark_return = float((b1 / b0 - 1.0) * 100.0)
@@ -110,11 +129,62 @@ def calculate_relative_window_return(
         "portfolio": portfolio_return,
         "benchmark": benchmark_return,
         "relative": portfolio_return - benchmark_return,
-        "start_date": str(window_idx[0].date()),
-        "end_date": str(window_idx[-1].date()),
+        "start_date": str(pd.Timestamp(start_date).date()),
+        "end_date": str(pd.Timestamp(end_date).date()),
         "weight_coverage": round(coverage, 3),
         "status": "actual",
     }
+
+
+def calculate_portfolio_beta(
+    portfolio_returns: pd.Series,
+    benchmark_returns: pd.Series,
+    *,
+    min_observations: int = 60,
+) -> dict[str, Any]:
+    """Calculate historical portfolio beta on common finite benchmark trading days."""
+    aligned = pd.concat(
+        [portfolio_returns.rename("portfolio"), benchmark_returns.rename("benchmark")],
+        axis=1,
+        join="inner",
+    ).replace([np.inf, -np.inf], np.nan).dropna()
+    observations = len(aligned)
+    result = {
+        "value": None,
+        "observations": observations,
+        "start_date": str(pd.Timestamp(aligned.index[0]).date()) if observations else None,
+        "end_date": str(pd.Timestamp(aligned.index[-1]).date()) if observations else None,
+        "status": "insufficient_data",
+        "method": "historical_covariance_local_currency_approximation",
+    }
+    if observations < min_observations:
+        return result
+    variance = float(aligned["benchmark"].var())
+    if not math.isfinite(variance) or variance <= 0:
+        result["status"] = "zero_benchmark_variance"
+        return result
+    covariance = float(aligned["portfolio"].cov(aligned["benchmark"]))
+    value = covariance / variance
+    if math.isfinite(value):
+        result.update({"value": value, "status": "actual"})
+    return result
+
+
+def drawdown_score(drawdown_pct: float | None) -> int | None:
+    """Score negative drawdown by absolute severity; missing data remains missing."""
+    value = _safe_float(drawdown_pct)
+    if value is None:
+        return None
+    severity = abs(min(value, 0.0))
+    if severity < 10:
+        return 0
+    if severity < 20:
+        return 5
+    if severity < 30:
+        return 9
+    if severity < 45:
+        return 13
+    return 15
 
 
 # 不同工具类型的单日异常阈值（修改计划第三轮 5）。
@@ -199,6 +269,10 @@ def calculate_portfolio_metrics(
         "hhi_10000": hhi * 10000.0 if hhi is not None else None,
         "effective_holdings": 1.0 / hhi if hhi else None,
         "portfolio_beta": None,
+        "portfolio_beta_historical": None,
+        "portfolio_beta_weighted_snapshot": None,
+        "portfolio_beta_status": "insufficient_data",
+        "portfolio_beta_observations": 0,
         "annualized_volatility": None,
         "max_drawdown_63d": None,
         "max_drawdown_252d": None,
@@ -249,6 +323,12 @@ def calculate_portfolio_metrics(
     # 不再用 `if b0:` 这类对 NaN 为真值的判定。
     bench_series = close[benchmark].dropna() if benchmark in close.columns else pd.Series(dtype=float)
     if not bench_series.empty:
+        benchmark_returns = bench_series.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan).dropna()
+        beta_result = calculate_portfolio_beta(portfolio_returns, benchmark_returns)
+        metrics["portfolio_beta"] = beta_result["value"]
+        metrics["portfolio_beta_historical"] = beta_result
+        metrics["portfolio_beta_status"] = beta_result["status"]
+        metrics["portfolio_beta_observations"] = beta_result["observations"]
         for name, periods in RETURN_WINDOWS.items():
             if len(close) > periods + 1:
                 metrics["relative_returns"][name] = calculate_relative_window_return(
@@ -256,7 +336,20 @@ def calculate_portfolio_metrics(
                     minimum_weight_coverage=0.90,
                 )
 
-    corr = returns[ticker_cols].dropna(how="all").corr()
+    holding_betas = [
+        (float(h["weight"]), _safe_float(h.get("beta")))
+        for h in holdings if _safe_float(h.get("beta")) is not None
+    ]
+    covered_beta_weight = sum(weight for weight, _ in holding_betas)
+    if covered_beta_weight > 0:
+        metrics["portfolio_beta_weighted_snapshot"] = {
+            "value": sum(weight * float(beta) for weight, beta in holding_betas) / covered_beta_weight,
+            "weight_coverage": covered_beta_weight,
+            "status": "approximate",
+        }
+
+    corr_source = returns[ticker_cols].dropna(how="all")
+    corr = corr_source.corr(min_periods=60)
     if corr.shape[0] >= 2:
         mask = np.triu(np.ones(corr.shape), k=1).astype(bool)
         values = corr.where(mask).stack().dropna()
@@ -264,13 +357,28 @@ def calculate_portfolio_metrics(
             metrics["average_pairwise_correlation"] = float(values.mean())
             metrics["max_pairwise_correlation"] = float(values.max())
             metrics["high_correlation_pairs"] = [
-                {"ticker_a": a, "ticker_b": b, "correlation": float(v)}
+                {
+                    "ticker_a": a,
+                    "ticker_b": b,
+                    "correlation": float(v),
+                    "observations": int(corr_source[[a, b]].dropna().shape[0]),
+                    "combined_weight": float(aligned_weights.get(a, 0.0) + aligned_weights.get(b, 0.0)),
+                    "pair_exposure": float(min(aligned_weights.get(a, 0.0), aligned_weights.get(b, 0.0)) * max(0.0, float(v))),
+                }
                 for (a, b), v in values.sort_values(ascending=False).head(5).items()
                 if v >= 0.75
             ]
+            metrics["weighted_high_correlation_exposure"] = float(sum(
+                pair["pair_exposure"] for pair in metrics["high_correlation_pairs"]
+            ))
 
     cov = returns[ticker_cols].dropna(how="all").cov()
     if cov.shape[0] and aligned_weights.sum() > 0:
+        metrics["covariance_tickers"] = list(cov.index)
+        metrics["covariance_matrix_daily"] = [
+            [float(value) if math.isfinite(float(value)) else None for value in row]
+            for row in cov.to_numpy()
+        ]
         w = aligned_weights.reindex(cov.index).fillna(0.0).to_numpy()
         cov_matrix = cov.to_numpy()
         variance = float(w.T @ cov_matrix @ w)
@@ -317,18 +425,21 @@ def calculate_portfolio_metrics(
     }
 
     # 修改计划第三轮 20：Python 预计算聚合值，禁止模型自行求和/平均/推导数值。
+    _technical_breadth_from_snapshot(metrics, holdings)
     metrics["aggregates"] = _compute_aggregates(holdings, metrics)
     # 修改计划第三轮 22：Python 风险评分，AI 只负责解释（最多凭新鲜证据上调一级）。
     risk_score = compute_portfolio_risk_score(metrics)
     metrics["portfolio_risk_score"] = risk_score["score"]
     metrics["portfolio_risk_level"] = risk_score["level"]
     metrics["risk_score_components"] = risk_score["components"]
-
-    _technical_breadth_from_snapshot(metrics, holdings)
+    metrics["risk_score_component_max"] = risk_score["component_max"]
+    metrics["risk_score_available_components"] = risk_score["available_components"]
+    metrics["risk_score_missing_components"] = risk_score["missing_components"]
+    metrics["risk_score_confidence"] = risk_score["score_confidence"]
     return metrics
 
 
-def _compute_aggregates(holdings: list[dict[str, Any]], metrics: dict[str, Any]) -> dict[str, float | None]:
+def _compute_aggregates(holdings: list[dict[str, Any]], metrics: dict[str, Any]) -> dict[str, Any]:
     """修改计划第三轮 20：所有聚合数字由 Python 预计算，模型只能引用，不得自行算术。"""
     top_risk = sorted(
         metrics.get("risk_contributions", []) or [],
@@ -336,10 +447,15 @@ def _compute_aggregates(holdings: list[dict[str, Any]], metrics: dict[str, Any])
     )[:5]
     top_risk_contribution_sum = float(sum(float(x.get("risk_contribution") or 0.0) for x in top_risk))
     top_risk_weight_sum = float(sum(float(x.get("weight") or 0.0) for x in top_risk))
-    high_beta_weight = float(sum(
+    beta_gt_1_5_weight = float(sum(
         float(h.get("weight") or 0.0)
         for h in holdings
         if (_safe_float(h.get("beta")) or 0.0) > 1.5
+    ))
+    beta_gt_2_0_weight = float(sum(
+        float(h.get("weight") or 0.0)
+        for h in holdings
+        if (_safe_float(h.get("beta")) or 0.0) > 2.0
     ))
     below_ema50_weight = float(sum(
         float(h.get("weight") or 0.0)
@@ -349,7 +465,13 @@ def _compute_aggregates(holdings: list[dict[str, Any]], metrics: dict[str, Any])
     return {
         "top_risk_contribution_sum": round(top_risk_contribution_sum, 4),
         "top_risk_weight_sum": round(top_risk_weight_sum, 4),
-        "high_beta_weight": round(high_beta_weight, 4),
+        "top5_risk_contributors": [
+            {"ticker": x.get("ticker"), "risk_contribution": round(float(x.get("risk_contribution") or 0.0), 6)}
+            for x in top_risk
+        ],
+        "high_beta_weight": {"threshold": 1.5, "weight": round(beta_gt_1_5_weight, 4)},
+        "beta_gt_1_5_weight": round(beta_gt_1_5_weight, 4),
+        "beta_gt_2_0_weight": round(beta_gt_2_0_weight, 4),
         "below_ema50_weight": round(below_ema50_weight, 4),
         # 计划减仓释放的权重需结合 AI 操作建议，延后在主流程计算并回填。
         "recommended_reduction_weight": None,
@@ -377,20 +499,27 @@ def compute_portfolio_risk_score(metrics: dict[str, Any]) -> dict[str, Any]:
     beta = _safe_float(metrics.get("portfolio_beta"))
     vol = _safe_float(metrics.get("annualized_volatility"))
     dd = _safe_float(metrics.get("max_drawdown_252d"))
-    corr = _safe_float(metrics.get("max_pairwise_correlation"))
+    corr_exposure = _safe_float(metrics.get("weighted_high_correlation_exposure"))
     breadth = _safe_float((metrics.get("technical_breadth", {}) or {}).get("below_ema50_weight"))
     top_risk_sum = _safe_float((metrics.get("aggregates", {}) or {}).get("top_risk_contribution_sum"))
 
-    components = {
-        "concentration": _score_band(top1, [(0.05, 0), (0.10, 4), (0.20, 9), (0.30, 13), (1e9, 15)]),
-        "beta": _score_band(beta, [(0.8, 0), (1.0, 3), (1.25, 7), (1.5, 11), (1e9, 15)]),
-        "volatility": _score_band(vol, [(10, 0), (15, 5), (20, 9), (30, 13), (1e9, 15)]),
-        "drawdown": _score_band(dd, [(-10, 0), (-20, 5), (-30, 9), (-45, 13), (-1e9, 15)]),
-        "correlation": _score_band(corr, [(0.5, 0), (0.7, 4), (0.85, 9), (0.95, 13), (1e9, 15)]),
-        "breadth": _score_band(breadth, [(0.3, 0), (0.5, 4), (0.7, 9), (0.85, 13), (1e9, 15)]),
-        "risk_contribution": _score_band(top_risk_sum, [(0.3, 0), (0.5, 4), (0.65, 9), (0.8, 13), (1e9, 15)]),
+    def optional_band(value: float | None, bands: list[tuple[float, int]]) -> int | None:
+        return None if value is None else _score_band(value, bands)
+
+    raw_components = {
+        "concentration": optional_band(top1, [(0.05, 0), (0.10, 4), (0.20, 9), (0.30, 13), (1e9, 15)]),
+        "beta": optional_band(beta, [(0.8, 0), (1.0, 3), (1.25, 7), (1.5, 11), (1e9, 15)]),
+        "volatility": optional_band(vol, [(10, 0), (15, 5), (20, 9), (30, 13), (1e9, 15)]),
+        "drawdown": drawdown_score(dd),
+        "correlation": optional_band(corr_exposure, [(0.01, 0), (0.03, 3), (0.07, 6), (0.12, 8), (1e9, 10)]),
+        "breadth": optional_band(breadth, [(0.3, 0), (0.5, 4), (0.7, 9), (0.85, 13), (1e9, 15)]),
+        "risk_contribution": optional_band(top_risk_sum, [(0.3, 0), (0.5, 4), (0.65, 9), (0.8, 13), (1e9, 15)]),
     }
-    score = int(round(sum(components.values())))
+    missing = [name for name, value in raw_components.items() if value is None]
+    available = {name: value for name, value in raw_components.items() if value is not None}
+    available_max = sum(RISK_COMPONENT_WEIGHTS[name] for name in available)
+    score = int(round(sum(float(v) for v in available.values()) / available_max * 100.0)) if available_max else 0
+    components = {name: raw_components[name] for name in RISK_COMPONENT_WEIGHTS}
     if score < 30:
         level = "low"
     elif score < 50:
@@ -399,7 +528,15 @@ def compute_portfolio_risk_score(metrics: dict[str, Any]) -> dict[str, Any]:
         level = "medium_high"
     else:
         level = "high"
-    return {"score": score, "level": level, "components": components}
+    return {
+        "score": score,
+        "level": level,
+        "components": components,
+        "component_max": dict(RISK_COMPONENT_WEIGHTS),
+        "available_components": len(available),
+        "missing_components": missing,
+        "score_confidence": round(available_max / 100.0, 3),
+    }
 
 
 def _holdings_detail(close: pd.DataFrame, tickers: list[str]) -> dict[str, dict[str, float | None]]:
@@ -439,9 +576,11 @@ def _technical_breadth_from_snapshot(metrics: dict[str, Any], holdings: list[dic
         if total_weight <= 0:
             return None
         return sum(float(h.get("weight") or 0.0) for h in holdings if predicate(h)) / total_weight
+    above_ema50 = weight_sum(lambda h: _safe_float(h.get("price_vs_ema50_pct")) is not None and _safe_float(h.get("price_vs_ema50_pct")) >= 0)
     metrics["technical_breadth"] = {
         "above_ema20_weight": weight_sum(lambda h: _safe_float(h.get("price_vs_ema20_pct")) is not None and _safe_float(h.get("price_vs_ema20_pct")) >= 0),
-        "above_ema50_weight": weight_sum(lambda h: _safe_float(h.get("price_vs_ema50_pct")) is not None and _safe_float(h.get("price_vs_ema50_pct")) >= 0),
+        "above_ema50_weight": above_ema50,
+        "below_ema50_weight": (1.0 - above_ema50) if above_ema50 is not None else None,
         "above_ema200_weight": weight_sum(lambda h: _safe_float(h.get("price_vs_ema200_pct")) is not None and _safe_float(h.get("price_vs_ema200_pct")) >= 0),
         "rsi_over_70_weight": weight_sum(lambda h: _safe_float(h.get("rsi")) is not None and _safe_float(h.get("rsi")) > 70),
         "rsi_under_30_weight": weight_sum(lambda h: _safe_float(h.get("rsi")) is not None and _safe_float(h.get("rsi")) < 30),

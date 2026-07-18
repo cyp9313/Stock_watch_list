@@ -695,7 +695,7 @@ def mark_job_sent(job_id: str) -> None:
         )
 
 
-def mark_job_failure(job_id: str, error: str) -> str:
+def mark_job_failure(job_id: str, error: str, *, retry: bool = True) -> str:
     error = str(error or "Unknown error")[-4000:]
     with _connection() as conn:
         row = conn.execute(
@@ -704,7 +704,7 @@ def mark_job_failure(job_id: str, error: str) -> str:
         ).fetchone()
         if row is None:
             return "missing"
-        if int(row["attempts"]) < int(row["max_attempts"]):
+        if retry and int(row["attempts"]) < int(row["max_attempts"]):
             delay = min(900, 60 * (2 ** max(0, int(row["attempts"]) - 1)))
             retry_at = _now() + dt.timedelta(seconds=delay)
             conn.execute(

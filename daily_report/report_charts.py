@@ -135,10 +135,10 @@ def svg_cumulative_returns(
         + line(port, COLOR_TOKENS["brand"])
         + line(bench, COLOR_TOKENS["warn"])
         + "".join(xticks)
-        + f'<rect x="40" y="6" width="12" height="10" fill="{COLOR_TOKENS["brand"]}"/>'
-        + f'<text x="56" y="15" fill="{COLOR_TOKENS["muted"]}" font-size="10">组合</text>'
-        + f'<rect x="110" y="6" width="12" height="10" fill="{COLOR_TOKENS["warn"]}"/>'
-        + f'<text x="126" y="15" fill="{COLOR_TOKENS["muted"]}" font-size="10">基准</text>'
+        + f'<rect x="700" y="6" width="12" height="10" fill="{COLOR_TOKENS["brand"]}"/>'
+        + f'<text x="716" y="15" fill="{COLOR_TOKENS["muted"]}" font-size="10">组合</text>'
+        + f'<rect x="770" y="6" width="12" height="10" fill="{COLOR_TOKENS["warn"]}"/>'
+        + f'<text x="786" y="15" fill="{COLOR_TOKENS["muted"]}" font-size="10">基准</text>'
         + "</svg>"
     )
     return svg

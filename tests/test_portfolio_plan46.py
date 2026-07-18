@@ -173,7 +173,10 @@ def test_evidence_recency_blocks_stale_high_confidence():
     assert any("新鲜" in w or "fresh" in w.lower() for w in warnings)
 
     # 反例：新鲜证据不应触发该警告
-    fresh = [dict(evidence[0], published_date="2026-07-10", recency_tier="fresh_event")]
+    fresh = [dict(
+        evidence[0], published_date="2026-07-10", recency_tier="fresh_event",
+        article_fetch_ok=True,
+    )]
     _, warnings2 = validate_portfolio_claims(
         {"actions": [{"ticker": "AAA", "action": "trim", "confidence": 0.9, "evidence_ids": ["E001"]}]},
         snapshot, {}, fresh,
@@ -313,14 +316,14 @@ def test_confidence_cap_when_quality_insufficient():
     good_evidence = [{
         "evidence_id": "E001", "ticker": "AAA", "related_tickers": ["AAA"],
         "scope": "ticker", "source_quality": "tier_1", "published_date": "2026-07-15",
-        "recency_tier": "fresh_event",
+        "recency_tier": "fresh_event", "article_fetch_ok": True,
     }]
     advice_high = {"confidence": 0.9, "report_mode": "ai"}
     capped2 = _apply_confidence_cap(
         advice_high, snapshot, metrics, good_meta, good_evidence, ranking, [],
     )
     assert capped2["final_confidence"] > 0.55
-    # final = min(模型, 数据质量, 元数据, 证据覆盖, 证据新鲜)
+    # final = min(模型, 数据质量, 元数据, 证据覆盖, 证据新鲜, 正文验证)
     assert capped2["final_confidence"] == pytest.approx(0.9, abs=1e-6)
 
 

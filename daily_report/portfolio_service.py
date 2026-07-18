@@ -26,6 +26,33 @@ def _safe_name(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "Portfolio")).strip("_") or "Portfolio"
 
 
+def _extract_runner_failure(combined_output: str) -> tuple[str | None, bool]:
+    """Return a concise user-facing subprocess failure and whether it is a quality failure."""
+    markers = (
+        (
+            "Portfolio report quality gate failed:",
+            "报告生成失败：Top-risk 新闻研究或报告质量未达到发布要求。",
+            True,
+        ),
+        (
+            "Portfolio Agent validation failed:",
+            "报告生成失败：AI 输出在修复重试后仍未通过严格校验。",
+            True,
+        ),
+        (
+            "最终 strict 校验未通过：",
+            "报告生成失败：AI 输出未通过最终严格校验。",
+            True,
+        ),
+    )
+    for marker, prefix, quality_failure in markers:
+        if marker not in combined_output:
+            continue
+        detail = combined_output.split(marker, 1)[1].splitlines()[0].strip()
+        return prefix + (f" {detail}" if detail else ""), quality_failure
+    return None, False
+
+
 def generate_portfolio_report(
     portfolio_page: dict,
     *,
@@ -97,10 +124,21 @@ def generate_portfolio_report(
         stdout = _tail(completed.stdout, 4000)
         stderr = _tail(completed.stderr, 4000)
         if completed.returncode != 0:
+            combined = f"{completed.stderr}\n{completed.stdout}"
+            failure_message, quality_failure = _extract_runner_failure(combined)
+            diagnostics = {}
+            diagnostics_path = run_dir / "portfolio_research_diagnostics.json"
+            if diagnostics_path.is_file():
+                try:
+                    diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    diagnostics = {}
             return {
                 "success": False,
                 "report_kind": "portfolio",
-                "error": f"Portfolio report command failed with exit code {completed.returncode}.",
+                "error": failure_message or f"Portfolio report command failed with exit code {completed.returncode}.",
+                "quality_gate_failed": quality_failure,
+                "research_diagnostics": diagnostics,
                 "stdout": stdout,
                 "stderr": stderr,
             }

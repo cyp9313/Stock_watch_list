@@ -15,6 +15,7 @@ import os
 import re
 from datetime import date, datetime, timedelta
 from typing import Any
+from urllib.parse import urlparse
 
 from .research_service import ResearchService
 from .article_fetcher import _fetch_article_text
@@ -94,6 +95,21 @@ def _manager_from_name(name: str) -> str | None:
     return None
 
 
+def _entity_aliases(ticker: str, name: str) -> list[str]:
+    aliases = [ticker, name]
+    shortened = re.sub(
+        r"\b(incorporated|inc\.?|corporation|corp\.?|plc|ltd\.?|limited|se|ag|class\s+[a-z])\b",
+        " ", name, flags=re.I,
+    )
+    shortened = re.sub(r"[,\s]+", " ", shortened).strip()
+    if shortened:
+        aliases.append(shortened)
+    first = shortened.split()[0] if shortened else ""
+    if len(first) >= 4:
+        aliases.append(first)
+    return list(dict.fromkeys(a.strip().lower() for a in aliases if a and a.strip()))
+
+
 def _is_relevant_to_ticker(result: dict[str, Any], ticker: str | None, meta: dict[str, Any]) -> bool:
     """相关性匹配（修改计划 10）：绝不使用 query。
 
@@ -105,19 +121,19 @@ def _is_relevant_to_ticker(result: dict[str, Any], ticker: str | None, meta: dic
         str(result.get("title") or ""), str(result.get("summary") or ""),
         str(result.get("url") or ""),
     ]).lower()
-    name = str(meta.get("name") or ticker).lower()
+    name = str(meta.get("name") or ticker)
     itype = str(meta.get("instrument_type") or "UNKNOWN").upper()
 
     if itype == "EQUITY":
-        if ticker.lower() in text:
-            return True
-        if name and name in text:
-            return True
+        for alias in _entity_aliases(ticker, name):
+            cleaned = re.sub(rf"\bunrelated\s+to\s+{re.escape(alias)}\b", "", text, flags=re.I)
+            if alias in cleaned:
+                return True
         return False
     if itype in ("ETF", "ETC", "FUND", "INDEX"):
         if ticker.lower() in text:
             return True
-        if name and name in text:
+        if name and name.lower() in text:
             return True
         underlying = str(meta.get("underlying_index") or "").lower()
         theme = str(meta.get("theme") or "").lower()
@@ -126,7 +142,11 @@ def _is_relevant_to_ticker(result: dict[str, Any], ticker: str | None, meta: dic
         if theme and theme in text:
             return True
         manager = _manager_from_name(name)
-        if manager and manager in text:
+        product_tokens = [
+            token for token in re.findall(r"[a-z0-9]{4,}", f"{underlying} {theme}")
+            if token not in {"index", "fund", "ucits", "equity"}
+        ]
+        if manager and manager in text and any(token in text for token in product_tokens):
             return True
         return False
     if itype == "CRYPTO":
@@ -136,13 +156,17 @@ def _is_relevant_to_ticker(result: dict[str, Any], ticker: str | None, meta: dic
             return True
         return False
     # UNKNOWN：宽松匹配 ticker/name
-    return (ticker.lower() in text) or bool(name and name in text)
+    return (ticker.lower() in text) or bool(name and name.lower() in text)
 
 
-def filter_candidates(
+def filter_candidates_with_diagnostics(
     candidates: list[dict[str, Any]],
     instrument_metadata: dict[str, dict[str, Any]],
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    reasons = {
+        "missing_url": 0, "duplicate": 0, "account_platform": 0,
+        "quote_only": 0, "low_quality": 0, "entity_mismatch": 0,
+    }
     seen_urls: set[str] = set()
     seen_titles: set[str] = set()
     out: list[dict[str, Any]] = []
@@ -152,29 +176,42 @@ def filter_candidates(
         summary = str(c.get("summary") or "")
         ticker = c.get("ticker")
         meta = instrument_metadata.get(ticker, {}) if ticker else {}
-
+        reason = None
         if not url or url.lower().startswith("javascript:"):
-            continue
-        if url in seen_urls or title in seen_titles:
-            continue
-        if _looks_like_account_platform(title, url):
-            continue
-        if _looks_like_quote_or_overview(title, summary):
-            continue
-        if any(h in (title + " " + url).lower() for h in _LOW_QUALITY_HINTS):
-            continue
-        if ticker and not _is_relevant_to_ticker(c, ticker, meta):
+            reason = "missing_url"
+        elif url in seen_urls or title in seen_titles:
+            reason = "duplicate"
+        elif _looks_like_account_platform(title, url):
+            reason = "account_platform"
+        elif _looks_like_quote_or_overview(title, summary):
+            reason = "quote_only"
+        elif any(h in (title + " " + url).lower() for h in _LOW_QUALITY_HINTS):
+            reason = "low_quality"
+        elif ticker and not _is_relevant_to_ticker(c, ticker, meta):
+            reason = "entity_mismatch"
+        if reason:
+            reasons[reason] += 1
             continue
         seen_urls.add(url)
         seen_titles.add(title)
         out.append(c)
-    return out
+    return out, reasons
+
+
+def filter_candidates(
+    candidates: list[dict[str, Any]],
+    instrument_metadata: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return filter_candidates_with_diagnostics(candidates, instrument_metadata)[0]
 
 
 # ── 日期与时效（修改计划 11）──────────────────────────────────
 _FRESH_DAYS = int(os.environ.get("PORTFOLIO_RESEARCH_FRESH_DAYS", "45") or "45")
 _BACKGROUND_DAYS = int(os.environ.get("PORTFOLIO_RESEARCH_BACKGROUND_DAYS", "120") or "120")
 _MAX_AGE_DAYS = int(os.environ.get("PORTFOLIO_RESEARCH_MAX_AGE_DAYS", "365") or "365")
+_REQUIRE_VERIFIED_ARTICLE = os.environ.get(
+    "PORTFOLIO_RESEARCH_REQUIRE_VERIFIED_ARTICLE", "false",
+).strip().lower() in {"1", "true", "yes"}
 
 
 def _normalize_date(value: Any) -> str:
@@ -218,6 +255,14 @@ def _evidence_kind(result: dict[str, Any], scope: str | None, meta: dict[str, An
         return "macro"
     url = (result.get("url") or "").lower()
     title = (result.get("title") or "").lower()
+    path = urlparse(url).path.rstrip("/").lower()
+    if (
+        path in {"", "/news"}
+        or any(k in title for k in ["investor relations", "quarterly results", "financials - quarterly"])
+        or path.endswith("/quarterly-results/default.aspx")
+        or "/quote/" in path and path.endswith("/news")
+    ):
+        return "reference"
     if any(k in url for k in ["factsheet", "/portfolio/", "holdings", "prospectus"]) or "factsheet" in title:
         return "reference"
     if any(k in url for k in ["product", "overview"]) and "news" not in url:
@@ -277,6 +322,26 @@ def _priority_score(note: dict[str, Any]) -> float:
     return round(source_q * 0.30 + relevance * 0.30 + recency * 0.25 + specificity * 0.15, 4)
 
 
+def _dated_snippet_fallback_ok(note: dict[str, Any]) -> bool:
+    """Allow a concrete, dated search snippet as explicitly unverified evidence.
+
+    Generic/reference pages are removed before this point.  This fallback is
+    intentionally limited to recent event/macro results from non-tier-3 sources
+    with enough concrete snippet text to be useful.  It never upgrades a search
+    snippet to verified article content.
+    """
+    if note.get("recency_tier") not in {"fresh_event", "recent_background"}:
+        return False
+    if note.get("evidence_kind") not in {"event", "macro"}:
+        return False
+    if str(note.get("source_quality") or "tier_3") == "tier_3":
+        return False
+    if float(note.get("source_quality_score") or 0.0) < 60.0:
+        return False
+    facts_text = " ".join(str(fact).strip() for fact in (note.get("facts") or []) if str(fact).strip())
+    return len(facts_text) >= 40
+
+
 def build_evidence_notes(
     candidates: list[dict[str, Any]],
     instrument_metadata: dict[str, dict[str, Any]],
@@ -288,7 +353,6 @@ def build_evidence_notes(
 ) -> list[dict[str, Any]]:
     """把候选结果转换为结构化 Evidence Notes（含中文摘要、影响方向、时效、类型）。"""
     notes: list[dict[str, Any]] = []
-    article_slots = 0
     for c in candidates:
         ticker = c.get("ticker")
         meta = instrument_metadata.get(ticker, {}) if ticker else {}
@@ -327,33 +391,85 @@ def build_evidence_notes(
             "portfolio_relevance": _relevance_note(ticker, meta),
             "confidence": round(min(0.95, max(0.4, score / 100.0)), 2),
             "article_fetch_ok": False,
+            "content_basis": "search_snippet_unverified",
+            "verification_status": "search_snippet_unverified",
         }
-
-        # 对高质量且与 top-risk 相关的来源尝试抓取正文
-        if url and article_slots < max_articles and (score >= 60 or grade in {"A", "B"}):
-            try:
-                art = _fetch_article_text(url, timeout=fetch_timeout, max_chars=4000)
-                if art.get("ok"):
-                    note["article_fetch_ok"] = True
-                    art_text = str(art.get("text") or "")
-                    if len(art_text) > 40:
-                        facts2 = [s.strip() for s in re.split(r"(?<=[.!?])\s+", art_text) if len(s.strip()) > 30][:4]
-                        if facts2:
-                            note["facts"] = facts2
-                        note["summary_zh"] = _summarize_zh(note["facts"], title, source_name, published_date)
-                        d2, h2 = _infer_impact(title + " " + art_text)
-                        note["impact_direction"] = d2
-                        note["impact_horizon"] = h2
-            except Exception:  # noqa: BLE001
-                pass
-            article_slots += 1
 
         note["priority_score"] = _priority_score(note)
         notes.append(note)
 
-    # 按优先级精选（修改计划 25）：每个 top-risk 配额 + 总量上限
+    # 先按元数据打分和每 ticker 配额精选，再抓正文，避免低价值候选耗尽抓取预算。
     notes.sort(key=lambda n: n.get("priority_score", 0), reverse=True)
-    selected = notes[:max(15 if max_evidence is None else max_evidence)]
+    limit = 15 if max_evidence is None else max(1, int(max_evidence))
+    selected: list[dict[str, Any]] = []
+    ticker_counts: dict[str, int] = {}
+    macro_count = 0
+    # 第一轮保证每个有候选的 top-risk ticker 至少一条。
+    for note in notes:
+        ticker = str(note.get("ticker") or "")
+        if ticker and ticker_counts.get(ticker, 0) == 0:
+            selected.append(note)
+            ticker_counts[ticker] = 1
+            if len(selected) >= limit:
+                break
+    # 第二轮按分数填充：单 ticker 最多 3 条，宏观最多 3 条。
+    for note in notes:
+        if note in selected or len(selected) >= limit:
+            continue
+        ticker = str(note.get("ticker") or "")
+        if ticker:
+            if ticker_counts.get(ticker, 0) >= 3:
+                continue
+            ticker_counts[ticker] = ticker_counts.get(ticker, 0) + 1
+        else:
+            if macro_count >= 3:
+                continue
+            macro_count += 1
+        selected.append(note)
+
+    article_slots = 0
+    for note in selected:
+        url = str(note.get("url") or "")
+        ticker = note.get("ticker")
+        note_meta = instrument_metadata.get(ticker, {}) if ticker else {}
+        if not url or article_slots >= max_articles or float(note.get("source_quality_score") or 0) < 60:
+            continue
+        try:
+            art = _fetch_article_text(url, timeout=fetch_timeout, max_chars=4000)
+            if art.get("ok") and art.get("article_text_quality_ok"):
+                art_text = str(art.get("text") or "")
+                if ticker and not _is_relevant_to_ticker(
+                    {"title": "", "summary": art_text, "url": ""}, ticker, note_meta,
+                ):
+                    note["article_fetch_error"] = "content_entity_mismatch"
+                    article_slots += 1
+                    continue
+                facts2 = [s.strip() for s in re.split(r"(?<=[.!?])\s+", art_text) if len(s.strip()) > 30][:4]
+                if facts2:
+                    note["article_fetch_ok"] = True
+                    note["content_basis"] = "article_body"
+                    note["verification_status"] = "article_body_verified"
+                    note["facts"] = facts2
+                final_url = str(art.get("final_url") or "").strip()
+                if final_url:
+                    note["url"] = final_url
+                    note["source_domain"] = _source_domain(final_url)
+                article_date = _normalize_date(art.get("published_date"))
+                if article_date and not note.get("published_date"):
+                    note["published_date"] = article_date
+                    note["recency_tier"] = _recency_tier(article_date)
+                if facts2:
+                    note["summary_zh"] = _summarize_zh(
+                        note["facts"], note.get("title", ""), note.get("source_name", ""),
+                        note.get("published_date", ""),
+                    )
+                # 关键词推断只保留为初步提示，最终方向由 Evidence Summarizer 覆盖。
+                note["preliminary_impact_hint"] = _infer_impact(str(note.get("title") or "") + " " + art_text)[0]
+            elif art.get("ok"):
+                note["article_fetch_error"] = str(art.get("quality_reason") or "article_text_quality_failed")
+        except Exception as exc:  # noqa: BLE001
+            note["article_fetch_error"] = type(exc).__name__
+        article_slots += 1
     # 统一编号 + 再按编号稳定排序
     selected.sort(key=lambda n: n.get("priority_score", 0), reverse=True)
     for i, n in enumerate(selected, start=1):
@@ -393,21 +509,123 @@ class PortfolioResearchService:
         benchmark: str = "^GSPC",
         *,
         max_results_per_query: int = 3,
-        max_articles: int = 12,
+        max_articles: int = 15,
         max_evidence: int = 15,
-    ) -> list[dict[str, Any]]:
+    ) -> dict[str, Any]:
         queries = build_instrument_aware_queries(top_risk_tickers, instrument_metadata, benchmark=benchmark)
-        raw = []
+        raw: list[dict[str, Any]] = []
+        query_stats: list[dict[str, Any]] = []
+        provider_errors: list[str] = []
+        provider_used = None
         for q in queries:
-            results = self._service.search([q["query"]], provider=self.provider, max_results=max_results_per_query)
+            search_result = self._service.search(
+                [q["query"]], provider=self.provider, max_results=max_results_per_query,
+                recency_days=_BACKGROUND_DAYS,
+            )
+            results = list(search_result.get("results") or [])
+            diag = search_result.get("diagnostics") or {}
+            provider_used = provider_used or diag.get("provider_used")
+            provider_errors.extend(diag.get("errors") or [])
             for r in results:
                 r.setdefault("scope", q["scope"])
                 r.setdefault("ticker", q["ticker"])
                 r.setdefault("event_hint", q["event_hint"])
             raw.extend(results)
-        filtered = filter_candidates(raw, instrument_metadata)
-        return build_evidence_notes(
-            filtered, instrument_metadata,
+            query_stats.append({
+                "ticker": q["ticker"], "scope": q["scope"], "query": q["query"],
+                "raw_count": len(results), "accepted_count": 0, "rejected": {},
+            })
+        filtered, rejected = filter_candidates_with_diagnostics(raw, instrument_metadata)
+        accepted_by_query: dict[str, int] = {}
+        for item in filtered:
+            query = str(item.get("query") or "")
+            accepted_by_query[query] = accepted_by_query.get(query, 0) + 1
+        for stat in query_stats:
+            stat["accepted_count"] = accepted_by_query.get(str(stat.get("query") or ""), 0)
+        recent_filtered: list[dict[str, Any]] = []
+        reference_count = outside_window_count = 0
+        for candidate in filtered:
+            ticker = candidate.get("ticker")
+            meta = instrument_metadata.get(ticker, {}) if ticker else {}
+            if _evidence_kind(candidate, candidate.get("scope"), meta) == "reference":
+                reference_count += 1
+                continue
+            tier = _recency_tier(candidate.get("published_date"))
+            if tier not in {"fresh_event", "recent_background", "unknown"}:
+                outside_window_count += 1
+                continue
+            recent_filtered.append(candidate)
+        selected = build_evidence_notes(
+            recent_filtered, instrument_metadata,
             max_articles=max_articles, max_evidence=max_evidence,
             search_provider=self.provider,
         )
+        unresolved_date_count = sum(1 for item in selected if item.get("recency_tier") == "unknown")
+        selected_recent = [
+            item for item in selected
+            if item.get("recency_tier") in {"fresh_event", "recent_background"}
+        ]
+        unverified_count = sum(1 for item in selected_recent if not item.get("article_fetch_ok"))
+        if _REQUIRE_VERIFIED_ARTICLE:
+            evidence = [item for item in selected_recent if item.get("article_fetch_ok")]
+        else:
+            evidence = [
+                item for item in selected_recent
+                if item.get("article_fetch_ok") or _dated_snippet_fallback_ok(item)
+            ]
+            for item in evidence:
+                if not item.get("article_fetch_ok"):
+                    item["content_basis"] = "search_snippet_unverified"
+                    item["verification_status"] = "search_snippet_unverified"
+                    item["confidence"] = round(min(0.60, float(item.get("confidence") or 0.40)), 2)
+        snippet_fallback_count = sum(1 for item in evidence if not item.get("article_fetch_ok"))
+        snippet_too_weak_count = sum(
+            1 for item in selected_recent
+            if not item.get("article_fetch_ok") and not _dated_snippet_fallback_ok(item)
+        )
+        raw_count = len(raw)
+        filtered_count = len(recent_filtered)
+        covered = {str(e.get("ticker")) for e in evidence if e.get("ticker")}
+        coverage = len(set(top_risk_tickers) & covered) / len(top_risk_tickers) if top_risk_tickers else 1.0
+        if not raw_count:
+            status = "not_configured" if any("not configured" in e for e in provider_errors) else ("provider_error" if provider_errors else "no_raw_results")
+        elif not filtered:
+            status = "all_filtered"
+        elif not recent_filtered:
+            status = "no_recent_evidence"
+        elif not evidence:
+            status = "all_filtered"
+        elif coverage < float(os.environ.get("PORTFOLIO_REPORT_MIN_NEWS_COVERAGE", "0.60")):
+            status = "insufficient_coverage"
+        else:
+            status = "success"
+        diagnostics = {
+            "status": status,
+            "provider_requested": self.provider,
+            "provider_used": provider_used,
+            "queries_count": len(queries),
+            "raw_results_count": raw_count,
+            "filtered_results_count": filtered_count,
+            "selected_evidence_count": len(evidence),
+            "top_risk_coverage": round(coverage, 3),
+            "errors": list(dict.fromkeys(provider_errors)),
+            "rejected": {
+                **rejected,
+                "reference_page": reference_count,
+                "unknown_date": unresolved_date_count,
+                "outside_recent_window": outside_window_count,
+                "article_unverified": unverified_count,
+                "snippet_too_weak": snippet_too_weak_count,
+            },
+            "verified_article_count": sum(1 for item in evidence if item.get("article_fetch_ok")),
+            "snippet_fallback_count": snippet_fallback_count,
+            "strict_article_verification": _REQUIRE_VERIFIED_ARTICLE,
+            "query_stats": query_stats,
+        }
+        return {
+            "status": status,
+            "evidence": evidence,
+            "diagnostics": diagnostics,
+            "raw_results": raw,
+            "filtered_results": recent_filtered,
+        }

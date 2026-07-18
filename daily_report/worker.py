@@ -29,6 +29,10 @@ from .portfolio_service import generate_portfolio_report_for_job
 from .service import generate_report, _get_market_date
 
 
+class PermanentReportFailure(RuntimeError):
+    """A deterministic quality failure that should not be retried unchanged."""
+
+
 def generate_job_report(job: dict) -> dict:
     report_kind = (job.get("report_kind") or "ticker").lower()
     if report_kind == "portfolio":
@@ -64,6 +68,8 @@ def process_one_job() -> bool:
             result = generate_job_report(job)
             if not result.get("success"):
                 detail = result.get("stderr") or result.get("stdout") or result.get("error")
+                if result.get("quality_gate_failed"):
+                    raise PermanentReportFailure(result.get("error") or "Portfolio report quality gate failed.")
                 raise RuntimeError(detail or "Daily report generation failed.")
             html_bytes = result["html_bytes"]
             file_name = result["file_name"]
@@ -106,7 +112,9 @@ def process_one_job() -> bool:
             mark_job_sent(job_id)
             print(f"[ReportWorker] Job {job_id[:8]} sent successfully", flush=True)
     except Exception as exc:
-        next_status = mark_job_failure(job_id, f"{type(exc).__name__}: {exc}")
+        next_status = mark_job_failure(
+            job_id, f"{type(exc).__name__}: {exc}", retry=not isinstance(exc, PermanentReportFailure)
+        )
         print(
             f"[ReportWorker] Job {job_id[:8]} failed; status={next_status}: {type(exc).__name__}: {exc}",
             flush=True,

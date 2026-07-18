@@ -72,6 +72,17 @@ _UNDERLYING_INDEX_PATTERNS = [
     ("Bitcoin", ["bitcoin", "btc"]),
 ]
 
+INSTRUMENT_OVERRIDES: dict[str, dict[str, Any]] = {
+    "PPFB.DE": {
+        "instrument_type": "ETC",
+        "asset_class": "Precious Metal ETC",
+        "theme": "Gold / Precious Metals",
+        "classification_source": "manual",
+        "classification_confidence": 1.0,
+        "needs_review": False,
+    },
+}
+
 
 def _norm(text: str) -> str:
     return (text or "").lower()
@@ -187,6 +198,9 @@ def classify_instrument(
         "exchange": _exchange_for(ticker_u),
         "currency": None,
         "account_group": None,
+        "classification_source": "heuristic" if instrument_type != "EQUITY" else "default",
+        "classification_confidence": 0.75 if instrument_type != "EQUITY" else 0.4,
+        "needs_review": instrument_type == "EQUITY" and not low_qt,
     }
 
 
@@ -264,6 +278,14 @@ def build_instrument_metadata(
 
         m = classify_instrument(ticker, name=name, quote_type=quote_type, category=category)
         m["account_group"] = group
+        if row and _name_from_market_row(row):
+            m["classification_source"] = "market_row"
+            m["classification_confidence"] = max(float(m.get("classification_confidence") or 0.0), 0.8)
+            m["needs_review"] = False
+        if quote_type:
+            m["classification_source"] = "cache"
+            m["classification_confidence"] = 0.95
+            m["needs_review"] = False
 
         # 应用缓存 longName
         cached_long = cached.get("longName") or cached.get("shortName")
@@ -280,6 +302,9 @@ def build_instrument_metadata(
             m["name"] = market_long
 
         m = _finalize_metadata(m)
+        override = INSTRUMENT_OVERRIDES.get(ticker)
+        if override:
+            m.update(override)
         meta[ticker] = m
     return meta
 
@@ -306,6 +331,10 @@ def _enrich_via_yfinance(ticker: str, meta: dict[str, Any]) -> dict[str, Any]:
             meta["asset_class"] = category
         if info.get("currency"):
             meta["currency"] = str(info["currency"]).upper()
+        if qt:
+            meta["classification_source"] = "yfinance"
+            meta["classification_confidence"] = 0.95
+            meta["needs_review"] = False
     except Exception:
         pass
     return meta

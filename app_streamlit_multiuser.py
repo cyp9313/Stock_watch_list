@@ -1990,6 +1990,16 @@ def render_portfolio_ai_report(config, page_index, raw_df, user):
                         st.code(result["stderr"])
             else:
                 st.error(result.get("error", "Portfolio report generation failed."))
+                diagnostics = result.get("research_diagnostics") or {}
+                if diagnostics:
+                    st.info(
+                        "Research diagnostics: "
+                        f"status={diagnostics.get('status', 'unknown')}, "
+                        f"raw={diagnostics.get('raw_results_count', 0)}, "
+                        f"filtered={diagnostics.get('filtered_results_count', 0)}, "
+                        f"selected={diagnostics.get('selected_evidence_count', 0)}, "
+                        f"top-risk coverage={float(diagnostics.get('top_risk_coverage') or 0):.0%}."
+                    )
                 with st.expander("Generation log", expanded=True):
                     if result.get("stdout"):
                         st.code(result["stdout"])

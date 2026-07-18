@@ -124,14 +124,21 @@ def data_quality_score(non_finite_count: int, anomaly_weight: float) -> float:
 
 
 def metadata_coverage_score(instrument_metadata: dict[str, dict[str, Any]], tickers: list[str]) -> float:
-    """工具类型覆盖度：正确识别类型（非 UNKNOWN）的比例。"""
+    """工具类型覆盖度：按分类置信度加权，默认猜测不能获得满分。"""
     if not tickers:
         return 0.5
-    recognized = sum(
-        1 for t in tickers
-        if str((instrument_metadata.get(t) or {}).get("instrument_type") or "UNKNOWN").upper() != "UNKNOWN"
-    )
-    return round(max(0.1, recognized / len(tickers)), 3)
+    confidence = 0.0
+    for ticker in tickers:
+        item = instrument_metadata.get(ticker) or {}
+        if str(item.get("instrument_type") or "UNKNOWN").upper() == "UNKNOWN":
+            continue
+        try:
+            score = float(item.get("classification_confidence"))
+        except (TypeError, ValueError):
+            # Legacy callers without provenance are treated as explicitly supplied metadata.
+            score = 0.4 if item.get("classification_source") == "default" else 1.0
+        confidence += max(0.0, min(1.0, score))
+    return round(max(0.1, confidence / len(tickers)), 3)
 
 
 def evidence_coverage_score(evidence: list[dict[str, Any]], top_risk_tickers: list[str]) -> float:
@@ -165,6 +172,14 @@ def evidence_freshness_score(evidence: list[dict[str, Any]], fresh_days: int = 4
     return round(max(0.1, min(1.0, fresh / len(evidence))), 3)
 
 
+def evidence_verification_score(evidence: list[dict[str, Any]]) -> float:
+    """正文验证度：已验证正文计 1，合格但未验证的搜索摘要计 0.5。"""
+    if not evidence:
+        return 0.3
+    score = sum(1.0 if item.get("article_fetch_ok") else 0.5 for item in evidence)
+    return round(max(0.1, min(1.0, score / len(evidence))), 3)
+
+
 def _today():
     from datetime import date
     return date.today()
@@ -184,4 +199,3 @@ def _parse_date(value):
         return _dt.date.fromisoformat(str(value)[:10])
     except (ValueError, TypeError):
         return None
-

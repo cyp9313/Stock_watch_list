@@ -112,6 +112,19 @@ def rank_portfolio_risks(snapshot: dict[str, Any], metrics: dict[str, Any]) -> d
             "risk_priority_score": score,
         })
     ranked.sort(key=lambda item: item["risk_priority_score"], reverse=True)
+    risk_priority_rank = {item["ticker"]: i for i, item in enumerate(ranked, start=1)}
+    contribution_order = sorted(ranked, key=lambda item: -_value(item.get("risk_contribution")))
+    contribution_rank = {item["ticker"]: i for i, item in enumerate(contribution_order, start=1)}
+    weight_order = sorted(ranked, key=lambda item: -_value(item.get("weight")))
+    weight_rank = {item["ticker"]: i for i, item in enumerate(weight_order, start=1)}
+    volatility_order = sorted(ranked, key=lambda item: -_value(item.get("annualized_volatility")))
+    volatility_rank = {item["ticker"]: i for i, item in enumerate(volatility_order, start=1)}
+    for item in ranked:
+        ticker = item["ticker"]
+        item["risk_priority_rank"] = risk_priority_rank[ticker]
+        item["risk_contribution_rank"] = contribution_rank[ticker]
+        item["weight_rank"] = weight_rank[ticker]
+        item["volatility_rank"] = volatility_rank[ticker]
 
     max_tickers = int(os.environ.get("PORTFOLIO_RESEARCH_MAX_TICKERS", "5") or "5")
     min_tickers = int(os.environ.get("PORTFOLIO_RESEARCH_MIN_TICKERS", "3") or "3")

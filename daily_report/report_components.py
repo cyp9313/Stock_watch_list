@@ -191,7 +191,10 @@ def render_action_detail(a: dict[str, Any], risk_contribution: Any = None, ticke
     color = ACTION_COLORS.get(action, COLOR_TOKENS["muted"])
     rng = f"{format_ratio_as_pct(a.get('target_weight_min'))} – {format_ratio_as_pct(a.get('target_weight_max'))}"
     timing = str(a.get("action_timing") or "act_now")
-    timing_zh = {"act_now": "立即执行", "conditional": "条件触发", "monitor": "持续观察"}.get(timing, "立即执行")
+    timing_zh = {
+        "act_now": "立即执行", "conditional": "条件触发", "monitor": "持续观察",
+        "trim_on_rebound": "反弹减仓", "reduce_on_breakdown": "跌破后减仓",
+    }.get(timing, "持续观察")
     grid = [
         {"k": "当前权重", "v": format_ratio_as_pct(a.get("current_weight"))},
         {"k": "目标区间", "v": rng},
@@ -209,6 +212,14 @@ def render_action_detail(a: dict[str, Any], risk_contribution: Any = None, ticke
     monitor = "".join(f"<li>{esc(t)}</li>" for t in (a.get("monitoring_items") or []))
     # 修改计划第三轮 27：阈值必须标注来源/是否为情景假设。
     th_html = ""
+    metric_labels = {
+        "uranium_price": "铀现货价格", "us_10y_yield": "美国10年期国债收益率",
+        "btc_price": "比特币价格", "risk_contribution": "风险贡献", "weight": "权重",
+        "annualized_volatility": "年化波动率", "price_vs_ema20_pct": "价格相对EMA20偏离",
+        "price_vs_ema50_pct": "价格相对EMA50偏离", "price_vs_ema200_pct": "价格相对EMA200偏离",
+        "max_drawdown_63d": "63日最大回撤", "max_drawdown_252d": "252日最大回撤",
+        "distance_from_52w_high": "距52周高点",
+    }
     for th in (a.get("thresholds") or []):
         basis = str(th.get("basis") or "scenario_assumption")
         basis_label = {
@@ -217,7 +228,7 @@ def render_action_detail(a: dict[str, Any], risk_contribution: Any = None, ticke
         val = th.get("value")
         val_str = f"{val}" if val is not None else "—"
         th_html += (
-            f'<li><b>{esc(th.get("metric", ""))}</b> = {esc(val_str)} '
+            f'<li><b>{esc(metric_labels.get(str(th.get("metric") or ""), str(th.get("metric") or "")))}</b> = {esc(val_str)} '
             f'<span class="chip">{esc(basis_label)}</span>'
             f'{("（" + esc(th.get("note", "")) + "）") if th.get("note") else ""}</li>'
         )
@@ -227,7 +238,7 @@ def render_action_detail(a: dict[str, Any], risk_contribution: Any = None, ticke
     for me in (a.get("metric_evidence") or []):
         metric = str(me.get("metric") or "")
         tk = str(me.get("ticker") or a.get("ticker") or "")
-        val = tm.get(tk, {}).get(metric)
+        val = tm.get(metric)
         if val is None:
             val_disp = "—"
         elif metric in ("weight", "risk_contribution", "risk_weight_gap"):
@@ -236,10 +247,18 @@ def render_action_detail(a: dict[str, Any], risk_contribution: Any = None, ticke
             val_disp = format_number(val)
         else:
             val_disp = format_pct_value(val)
-        me_html += f'<li>{esc(tk)} · {esc(metric)}：{esc(val_disp)}</li>'
+        me_html += f'<li>{esc(tk)} · {esc(metric_labels.get(metric, metric))}：{esc(val_disp)}</li>'
     eids = "".join(f'<span class="chip">{esc(e)}</span>' for e in (a.get("evidence_ids") or []))
     epr = a.get("expected_portfolio_risk_reduction")
     epr_str = format_ratio_as_pct(epr) if epr is not None else "—"
+    risk_change = a.get("expected_risk_change") or {}
+    risk_change_html = ""
+    if epr is not None:
+        risk_change_html = (
+            f'<span class="kpi-sub">Python 风险估算：方差降低 {esc(epr_str)}；'
+            f'年化波动 {esc(format_pct_value(risk_change.get("current_annualized_volatility")))} → '
+            f'{esc(format_pct_value(risk_change.get("new_annualized_volatility")))}</span>'
+        )
     return (
         f'<div class="action-detail" style="border-top-color:{color};">\n'
         f'  <div class="action-head">\n'
@@ -247,7 +266,7 @@ def render_action_detail(a: dict[str, Any], risk_contribution: Any = None, ticke
         f'    <span class="action-name" style="background:{color}22;color:{color};">{esc(action_zh(action))}</span>\n'
         f'    <span class="kpi-sub">优先级 {esc(a.get("priority", ""))}</span>\n'
         f'    <span class="kpi-sub">执行时机：{esc(timing_zh)}</span>\n'
-        f'    <span class="kpi-sub">预计释放组合风险：{esc(epr_str)}</span>\n'
+        f'    {risk_change_html}\n'
         f'  </div>\n'
         f'  <div class="action-grid">{grid_html}</div>\n'
         f'  <div class="reason-block">\n'
@@ -257,10 +276,10 @@ def render_action_detail(a: dict[str, Any], risk_contribution: Any = None, ticke
         f'    <h5>多头情景</h5><p>{esc(a.get("bull_case") or "—")}</p>\n'
         f'    <h5>空头情景</h5><p>{esc(a.get("bear_case") or "—")}</p>\n'
         f'  </div>\n'
-        f'  <div class="reason-block"><h5>执行条件（execute_if）</h5><ul class="trigger-list">{execute or "<li>当前建议已成立，立即执行</li>"}</ul></div>\n'
-        f'  <div class="reason-block"><h5>取消或升级条件（cancel_or_upgrade_if）</h5><ul class="trigger-list">{cancel or "<li>—</li>"}</ul></div>\n'
-        f'  <div class="reason-block"><h5>进一步减仓条件（further_reduce_if）</h5><ul class="trigger-list">{further or "<li>—</li>"}</ul></div>\n'
-        f'  <div class="reason-block"><h5>持续观察（monitoring_items）</h5><ul class="trigger-list">{monitor or "<li>—</li>"}</ul></div>\n'
+        f'  <div class="reason-block"><h5>执行条件</h5><ul class="trigger-list">{execute or "<li>等待条件确认，不立即执行</li>"}</ul></div>\n'
+        f'  <div class="reason-block"><h5>取消或调整条件</h5><ul class="trigger-list">{cancel or "<li>—</li>"}</ul></div>\n'
+        f'  <div class="reason-block"><h5>进一步减仓条件</h5><ul class="trigger-list">{further or "<li>—</li>"}</ul></div>\n'
+        f'  <div class="reason-block"><h5>持续观察</h5><ul class="trigger-list">{monitor or "<li>—</li>"}</ul></div>\n'
         f'  {("<div class=\"reason-block\"><h5>关键阈值与依据</h5><ul class=\"trigger-list\">" + th_html + "</ul></div>") if th_html else ""}\n'
         f'  {("<div class=\"reason-block\"><h5>指标证据（确定性数据）</h5><ul class=\"trigger-list\">" + me_html + "</ul></div>") if me_html else ""}\n'
         f'  <div class="risk-meta">证据：{eids or "—"}</div>\n'
@@ -276,6 +295,7 @@ def render_news_group(title: str, items: list[dict[str, Any]]) -> str:
         imp = str(e.get("impact_direction") or "neutral").lower()
         imp_cls = {"positive": "imp-positive", "negative": "imp-negative", "neutral": "imp-neutral"}.get(imp, "imp-neutral")
         imp_color = IMPACT_COLORS.get(imp, COLOR_TOKENS["warn"])
+        verification_color = _color("up") if e.get("article_fetch_ok") else _color("warn")
         tier = str(e.get("source_quality") or "tier_3").replace("_", "-")
         url = str(e.get("url") or "")
         title_html = (
@@ -284,6 +304,8 @@ def render_news_group(title: str, items: list[dict[str, Any]]) -> str:
         )
         tags = (
             f'<span class="tier-badge {esc(tier)}">{esc(e.get("source_quality", ""))}</span>'
+            f'<span class="tier-badge" style="background:{verification_color}22;color:{verification_color};">'
+            f'{"正文已验证" if e.get("article_fetch_ok") else "搜索摘要·未验证"}</span>'
             f'<span class="tier-badge" style="background:{imp_color}22;color:{imp_color};">{esc(impact_zh(imp))}</span>'
             f'<span class="tier-badge" style="background:{COLOR_TOKENS["info"]}22;color:{COLOR_TOKENS["info"]};">{esc(horizon_zh(e.get("impact_horizon")))}</span>'
             f'<span class="chip">{esc(e.get("evidence_id", ""))}</span>'
@@ -306,8 +328,7 @@ def render_news_group(title: str, items: list[dict[str, Any]]) -> str:
 def render_disclaimer(text: str) -> str:
     return (
         f'<div class="footer">\n'
-        f'  <p>{esc(text)}</p>\n'
-        f'  <p>本报告由 Stock Watch List 自动生成，仅供研究参考，不构成任何投资建议。市场有风险，投资需谨慎。</p>\n'
+        f'  <p>本报告仅供研究参考，不构成投资建议。由 Stock Watch List 自动生成；市场有风险，投资需谨慎。</p>\n'
         f'</div>\n'
     )
 

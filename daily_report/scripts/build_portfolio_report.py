@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import datetime as _dt
+from datetime import datetime as _dt, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -27,7 +27,7 @@ from ..report_components import (
 )
 from ..report_i18n import (
     action_zh, risk_level_zh, format_money, format_pct, format_number, pct_color_class,
-    format_ratio_as_pct, format_pct_value,
+    format_ratio_as_pct, format_pct_value, finite_float,
 )
 from portfolio_analysis.metric_contracts import fmt_metric
 from ..report_charts import (
@@ -48,7 +48,7 @@ def _to_berlin(iso: str | None) -> str:
     try:
         d = _dt.fromisoformat(str(iso))
         if d.tzinfo is None:
-            d = d.replace(tzinfo=_dt.timezone.utc)
+            d = d.replace(tzinfo=timezone.utc)
         return d.astimezone(ZoneInfo("Europe/Berlin")).strftime("%Y-%m-%d %H:%M Europe/Berlin")
     except Exception:
         return str(iso)
@@ -67,17 +67,25 @@ def build_html(
     risk_findings: list[dict[str, Any]] | None = None,
     cumulative_labels: list[str] | None = None,
     fallback_reason: str = "",
+    research_diagnostics: dict[str, Any] | None = None,
+    report_quality: dict[str, Any] | None = None,
 ) -> str:
     settings = settings or {}
     instrument_metadata = instrument_metadata or snapshot.get("instrument_metadata") or {}
     charts = charts or {}
+    research_diagnostics = research_diagnostics or {}
+    report_quality = report_quality or {}
     base = snapshot.get("base_currency", "EUR")
     summary = snapshot.get("summary", {})
     portfolio_name = snapshot.get("portfolio_name", "Portfolio")
     report_date = str(snapshot.get("report_date") or "")
     as_of = _to_berlin(snapshot.get("as_of"))
-    price_cutoff = str(snapshot.get("as_of_prices") or report_date)
-    news_cutoff = as_of or _to_berlin(snapshot.get("as_of"))
+    cutoffs = snapshot.get("data_cutoffs") or {}
+    price_cutoff = str(cutoffs.get("equity") or cutoffs.get("etf") or snapshot.get("as_of_prices") or report_date)
+    etf_cutoff = str(cutoffs.get("etf") or price_cutoff)
+    crypto_cutoff = str(cutoffs.get("crypto") or "—")
+    benchmark_cutoff = str(cutoffs.get("benchmark") or "—")
+    news_cutoff = str(cutoffs.get("news") or as_of or "—")
 
     risk_level = advice.get("risk_level", "medium")
     stance = advice.get("portfolio_stance", "balanced")
@@ -102,7 +110,8 @@ def build_html(
     cutoff_html = (
         '<div class="data-cutoff">'
         f'报告生成时间：{esc(as_of)}　|　股票行情截止：{esc(price_cutoff)} 收盘　|　'
-        f'基准截止：{esc(price_cutoff)}　|　新闻检索截止：{esc(news_cutoff)}'
+        f'ETF/ETC 截止：{esc(etf_cutoff)} 收盘　|　加密资产截止：{esc(crypto_cutoff)}　|　'
+        f'基准截止：{esc(benchmark_cutoff)} 收盘　|　新闻检索截止：{esc(news_cutoff)}'
         '</div>'
     )
     parts.append(cutoff_html)
@@ -113,7 +122,7 @@ def build_html(
     # ── AI 核心结论（修改计划 17.2）──
     stance_pill = f'<span class="pill info">组合态度：{esc(stance)}</span>'
     risk_pill = f'<span class="pill warn">风险等级：{esc(risk_level_zh(risk_level))}</span>'
-    conf_pill = f'<span class="pill">AI 置信度：{format_ratio_as_pct(advice.get("confidence"))}</span>'
+    conf_pill = f'<span class="pill">报告最终置信度：{format_ratio_as_pct(advice.get("final_confidence") or advice.get("confidence"))}</span>'
     core_html = (
         f'<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;">{stance_pill}{risk_pill}{conf_pill}</div>'
     )
@@ -128,18 +137,68 @@ def build_html(
     pa = advice.get("portfolio_analysis", {}) or {}
     rr = metrics.get("relative_returns", {}) or {}
     rel_5d = rr.get("5D", {}) if isinstance(rr.get("5D"), dict) else {}
+    confidence_components = advice.get("confidence_components") or {}
+    confidence_labels = {
+        "model_confidence": "模型输出",
+        "data_quality": "行情数据质量",
+        "metadata_coverage": "工具元数据覆盖",
+        "evidence_coverage": "Top-risk 证据覆盖",
+        "evidence_freshness": "证据新鲜度",
+        "evidence_verification": "证据正文验证",
+    }
+    finite_confidence = {
+        key: finite_float(value)
+        for key, value in confidence_components.items()
+        if key in confidence_labels and finite_float(value) is not None
+    }
+    confidence_limiter = min(finite_confidence, key=finite_confidence.get) if finite_confidence else None
+    confidence_sub = (
+        f"限制项：{confidence_labels[confidence_limiter]} "
+        f"{format_ratio_as_pct(finite_confidence[confidence_limiter])}"
+        if confidence_limiter else "未提供置信度分解"
+    )
     cards = [
         {"label": "总市值", "value": format_money(summary.get("total_market_value_base"), base), "sub": f"成本 {format_money(summary.get('total_cost_basis_base'), base)}"},
         {"label": "总盈亏", "value": format_money(summary.get("profit_loss_base"), base), "sub": fmt_metric("profit_loss_pct", summary.get('profit_loss_pct')), "value_cls": pct_color_class(summary.get("profit_loss_pct"))},
         {"label": "Top 1 / Top 3", "value": f"{fmt_metric('top1_weight', metrics.get('top1_weight'))} / {fmt_metric('top3_weight', metrics.get('top3_weight'))}", "sub": f"HHI×1e4 {format_number(metrics.get('hhi_10000'), 0)}"},
         {"label": "有效持仓数", "value": format_number(metrics.get("effective_holdings"), 1), "sub": f"持仓 {len(snapshot.get('holdings', []))} 只"},
-        {"label": "Portfolio Beta", "value": format_number(metrics.get("portfolio_beta"), 2), "sub": f"年化波动 {fmt_metric('annualized_volatility', metrics.get('annualized_volatility'))}"},
+        {"label": "历史组合 Beta", "value": format_number(metrics.get("portfolio_beta"), 2), "sub": f"样本 {metrics.get('portfolio_beta_observations') or 0} 日 · 本地货币近似"},
         {"label": "63D 回撤", "value": fmt_metric("max_drawdown_63d", metrics.get("max_drawdown_63d")), "sub": f"252D {fmt_metric('max_drawdown_252d', metrics.get('max_drawdown_252d'))}", "value_cls": pct_color_class(metrics.get("max_drawdown_63d"))},
         {"label": "相对基准(5D)", "value": fmt_metric("relative", rel_5d.get("relative")), "sub": f"组合 {fmt_metric('portfolio_return', rel_5d.get('portfolio'))} / 基准 {fmt_metric('benchmark_return', rel_5d.get('benchmark'))}", "value_cls": pct_color_class(rel_5d.get("relative"))},
-        {"label": "Python 风险评分", "value": format_number(metrics.get("portfolio_risk_score"), 0), "sub": f"等级 {risk_level_zh(metrics.get('portfolio_risk_level') or 'medium')}（确定性）"},
-        {"label": "AI 置信度", "value": format_ratio_as_pct(advice.get("confidence")), "sub": f"最终 {format_ratio_as_pct(advice.get('final_confidence'))}（受数据质量约束）"},
+        {"label": "Python 风险评分", "value": format_number(metrics.get("portfolio_risk_score"), 0), "sub": f"评分可信度 {format_ratio_as_pct(metrics.get('risk_score_confidence'))}"},
+        {"label": "AI 置信度", "value": format_ratio_as_pct(advice.get("confidence")), "sub": confidence_sub},
     ]
     parts.append(render_section("Portfolio 概览", "📊", render_kpi_cards(cards, cols=4)))
+
+    if finite_confidence:
+        confidence_rows = []
+        limiting_value = finite_confidence.get(confidence_limiter) if confidence_limiter else None
+        for key in confidence_labels:
+            if key not in finite_confidence:
+                continue
+            marker = "限制项" if limiting_value is not None and finite_confidence[key] == limiting_value else ""
+            confidence_rows.append([
+                confidence_labels[key], format_ratio_as_pct(finite_confidence[key]), marker,
+            ])
+        confidence_html = render_table(["置信度分量", "得分上限", "说明"], confidence_rows, scroll=False)
+        confidence_html += (
+            '<p class="kpi-sub">最终置信度取上述分量中的最小值；新闻数量多并不等于证据新鲜或已经正文验证。</p>'
+        )
+        parts.append(render_section("报告置信度分解", "🔎", confidence_html))
+
+    component_labels = {
+        "concentration": "集中度", "beta": "Beta", "volatility": "波动率", "drawdown": "回撤",
+        "correlation": "相关性", "breadth": "技术广度", "risk_contribution": "风险贡献集中",
+    }
+    component_rows = []
+    for key, maximum in (metrics.get("risk_score_component_max") or {}).items():
+        value = (metrics.get("risk_score_components") or {}).get(key)
+        component_rows.append([component_labels.get(key, key), "缺失" if value is None else f"{value}/{maximum}"])
+    if component_rows:
+        missing_components = "、".join(component_labels.get(x, x) for x in metrics.get("risk_score_missing_components") or []) or "无"
+        score_html = render_table(["风险分项", "得分"], component_rows)
+        score_html += f'<p class="kpi-sub">评分可信度：{format_ratio_as_pct(metrics.get("risk_score_confidence"))}；缺失分项：{esc(missing_components)}</p>'
+        parts.append(render_section("组合风险评分分项", "🧮", score_html))
 
     # ── 组合配置与风险图表（修改计划 17.4）──
     chart_html = ""
@@ -156,6 +215,9 @@ def build_html(
             charts["cumulative"],
             "当前持仓静态权重回溯模拟 vs 基准 · 非真实账户收益（未含买卖日期/现金流/交易成本/税务）",
         )
+        methodology = metrics.get("performance_methodology") or {}
+        if not methodology.get("historical_fx_aligned"):
+            chart_html += '<p class="kpi-sub warn-text">历史回溯使用各标的本地货币收益近似，未进行逐日基础货币汇率转换，不适合作为精确 Alpha。</p>'
     if chart_html:
         parts.append(render_section("组合配置与风险图表", "📈", chart_html))
     else:
@@ -187,11 +249,11 @@ def build_html(
             reloc_html = (
                 '<div class="reason-block"><p>'
                 f'计划减仓预计释放组合权重：<b>{format_ratio_as_pct(red_w) if red_w is not None else "—"}</b>　|　'
-                f'资金去向：{esc(realloc.get("destination") or "cash_unspecified")}　|　'
+                f'计算口径：目标区间中点转为现金　|　资金去向：暂留现金，具体再配置未指定　|　'
                 f'{esc(realloc.get("note") or "")}'
                 '</p></div>'
             )
-            parts.append(reloc_html)
+            parts.append(render_section("Portfolio 再平衡摘要", "⚖️", reloc_html))
 
     # ── AI 操作建议详情（修改计划 17.7）──
     if actions:
@@ -211,6 +273,11 @@ def build_html(
                 "profit_loss_pct": h.get("profit_loss_pct"),
                 "annualized_volatility": (metrics.get("holdings_detail", {}) or {}).get(t, {}).get("annualized_volatility"),
                 "max_drawdown_63d": (metrics.get("holdings_detail", {}) or {}).get(t, {}).get("max_drawdown_63d"),
+                "max_drawdown_252d": (metrics.get("holdings_detail", {}) or {}).get(t, {}).get("max_drawdown_252d"),
+                "distance_from_52w_high": (metrics.get("holdings_detail", {}) or {}).get(t, {}).get("distance_from_52w_high"),
+                "price_vs_ema20_pct": h.get("price_vs_ema20_pct"),
+                "price_vs_ema50_pct": h.get("price_vs_ema50_pct"),
+                "price_vs_ema200_pct": h.get("price_vs_ema200_pct"),
             }
         for a in actions:
             detail_html += render_action_detail(a, rc_map.get(a.get("ticker")), detail_by_ticker.get(a.get("ticker"), {}))
@@ -233,17 +300,23 @@ def build_html(
         fresh_events = sum(1 for e in evidence if str(e.get("recency_tier")) == "fresh_event")
         tier12 = sum(1 for e in evidence if str(e.get("source_quality") or "").startswith("tier_1") or str(e.get("source_quality") or "").startswith("tier_2"))
         unknown_dates = sum(1 for e in evidence if not e.get("published_date"))
+        verified_articles = sum(1 for e in evidence if e.get("article_fetch_ok"))
+        unverified_snippets = len(evidence) - verified_articles
         quality_html = (
             '<div class="evidence-quality">'
             f'<span>Top-risk 覆盖：{len(covered)}/{len(top_risk_set)}</span>'
             f'<span>新鲜事件：{fresh_events}</span>'
             f'<span>Tier 1/2 来源：{tier12}</span>'
             f'<span>未知日期：{unknown_dates}</span>'
+            f'<span>正文已验证：{verified_articles}</span>'
+            f'<span>未验证摘要：{unverified_snippets}</span>'
             f'<span>证据总数：{len(evidence)}</span>'
             '</div>'
         )
         if len(covered) < len(top_risk_set):
             quality_html += '<p class="kpi-sub warn-text">新闻结论可信度有限：部分 Top-risk 标的缺少新闻证据支撑。</p>'
+        if unverified_snippets:
+            quality_html += '<p class="kpi-sub warn-text">“搜索摘要·未验证”仅作为研究线索，可能与落地页正文存在差异，不能支撑高置信度操作。</p>'
 
         # 修改计划第三轮 37：新闻综合每 ticker 仅保留优先级最高的 2~3 条，避免与来源附录重复堆叠。
         def _top(items: list[dict], n: int = 3) -> list[dict]:
@@ -256,7 +329,7 @@ def build_html(
             news_html += render_news_group("宏观 / 系统性因素", _top(macro_items))
         parts.append(render_section("Top-risk 新闻综合", "📰", news_html))
     else:
-        parts.append(render_section("Top-risk 新闻综合", "📰", '<p class="kpi-sub">（未配置新闻搜索或未返回证据）</p>'))
+        parts.append(render_section("Top-risk 新闻综合", "📰", '<p class="kpi-sub">（新闻研究未返回可发布证据；正式报告质量门槛会阻止操作建议发布。）</p>'))
 
     # ── 行业、主题与宏观分析（修改计划 17.9）──
     macro_html = ""
@@ -307,7 +380,9 @@ def build_html(
         ])
     headers = ["标的", "类型", "账户组", "主题", "权重", "盈亏%", "1D", "5D", "1M", "YTD",
                "EMA20偏离", "EMA50偏离", "EMA200偏离", "RSI", "量比", "Beta", "风险贡献", "风险分"]
-    parts.append(render_section("所有持仓技术快照（按风险优先级降序）", "🧮", render_table(headers, rows)))
+    holdings_html = render_table(headers, rows)
+    holdings_html += '<p class="kpi-sub">风险贡献采用正边际贡献归一化口径；负边际风险贡献被归零，因此 0% 不代表该资产本身没有波动或风险。</p>'
+    parts.append(render_section("所有持仓技术快照（按风险优先级降序）", "🧮", holdings_html))
 
     # ── 来源附录（修改计划 17.11）──
     if evidence:
@@ -321,7 +396,8 @@ def build_html(
             appendix += (
                 f'<div class="source-card"><div class="sc-head"><div class="sc-title">{title_html}</div></div>'
                 f'<div class="sc-meta"><span>{esc(e.get("evidence_id", ""))}</span><span>来源：{esc(e.get("source_name", ""))}</span>'
-                f'<span>日期：{esc(e.get("published_date", ""))}</span><span>关联：{esc(e.get("ticker") or "—")}</span></div>'
+                f'<span>日期：{esc(e.get("published_date", ""))}</span><span>关联：{esc(e.get("ticker") or "—")}</span>'
+                f'<span>正文：{"已验证" if e.get("article_fetch_ok") else "仅搜索摘要"}</span></div>'
                 f'<div class="sc-summary">{esc(e.get("summary_zh") or e.get("title") or "")}</div></div>'
             )
         parts.append(render_section("来源附录（完整 Evidence）", "🔗", appendix))
@@ -333,12 +409,30 @@ def build_html(
         vals = quality.get(field) or []
         if vals:
             missing.append(f"{label}：{esc(', '.join(map(str, vals[:12])))}")
-    limitations = advice.get("data_limitations") or []
+    limitations = [str(x).rstrip("；。 ") for x in (advice.get("data_limitations") or []) if str(x).strip()]
     dq_html = ""
     if missing:
         dq_html += "<p>" + "；".join(missing) + "</p>"
     if limitations:
         dq_html += "<p>AI/数据限制：" + "；".join(esc(x) for x in limitations) + "</p>"
+    status_labels = {
+        "success": "成功", "not_configured": "未配置", "provider_error": "提供方请求失败",
+        "no_raw_results": "未返回原始结果", "all_filtered": "全部候选被过滤",
+        "no_recent_evidence": "没有近期证据", "insufficient_coverage": "Top-risk 覆盖不足",
+    }
+    if research_diagnostics:
+        rejected = research_diagnostics.get("rejected") or {}
+        reasons = "、".join(f"{esc(k)} {v}" for k, v in rejected.items() if v) or "无"
+        dq_html += (
+            f'<p>新闻研究状态：{esc(status_labels.get(str(research_diagnostics.get("status")), str(research_diagnostics.get("status") or "未知")))}；'
+            f'原始结果：{research_diagnostics.get("raw_results_count", 0)}；过滤后：{research_diagnostics.get("filtered_results_count", 0)}；'
+            f'入选证据：{research_diagnostics.get("selected_evidence_count", 0)}；主要过滤原因：{reasons}</p>'
+        )
+    if report_quality:
+        dq_html += f'<p>报告质量评分：{format_ratio_as_pct(report_quality.get("quality_score"))}；可操作：{"是" if report_quality.get("actionable") else "否"}</p>'
+        quality_warnings = [str(item) for item in (report_quality.get("warnings") or []) if str(item).strip()]
+        if quality_warnings:
+            dq_html += '<p class="kpi-sub warn-text">质量提示：' + '；'.join(esc(item) for item in quality_warnings) + '</p>'
     if not dq_html:
         dq_html = '<p class="kpi-sub">数据完整。</p>'
     dq_html += f'<p class="kpi-sub">搜索提供方：{esc(str(settings.get("search_provider") or "auto"))}；AI 模型：{esc(str(settings.get("model") or "未配置"))}</p>'

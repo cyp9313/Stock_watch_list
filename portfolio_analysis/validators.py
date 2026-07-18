@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 from typing import Any
+import re
 
 ALLOWED_ACTIONS = {"add", "hold", "trim", "reduce", "exit", "watch"}
 FORBIDDEN_SHARE_KEYS = {"shares_to_buy", "shares_to_sell", "exact_share_count"}
@@ -214,7 +215,8 @@ def validate_portfolio_advice(
 # 机构减持、资金流出、流动性折价等）。出现即视为需要证据支撑的软性问题。
 _BANNED_METRIC_HINTS = [
     "夏普比率", "夏普", "隐含波动率", "机构减持", "机构持续减持",
-    "资金流出", "流动性折价", "volatility smile", "implied volatility",
+    "资金流出", "流动性折价", "流动性枯竭", "隐性流动性风险",
+    "相关性套利", "套利机会", "volatility smile", "implied volatility",
 ]
 # 高置信度操作必须引用的「新鲜」证据层级。
 _FRESH_TIERS = {"fresh_event", "recent_background"}
@@ -274,14 +276,16 @@ def validate_portfolio_claims(
                 errors.append("缺少可用的基准收益（status != actual），不得给出基准数字比较或「跑赢/跑输大盘」结论。")
                 break
 
-    # 3. 未注册指标（伪指标）
+    # 3. 未注册指标或无数据支撑的因果表述
     for t in texts:
         for hint in _BANNED_METRIC_HINTS:
             if hint.lower() in (t or "").lower():
-                warnings.append(f"出现系统未提供的指标表述「{hint}」，若无 Evidence 明确支撑应删除。")
+                message = f"出现系统未提供或无证据支撑的表述「{hint}」，必须删除。"
+                warnings.append(message)
+                errors.append(message)
                 break
 
-    # 4. 高置信度操作必须有新鲜证据支撑
+    # 4. 高置信度操作必须有新鲜且正文已验证的证据支撑
     ev_by_id = {str(e.get("evidence_id")): e for e in (evidence or []) if e.get("evidence_id")}
     for a in advice.get("actions") or []:
         if not isinstance(a, dict):
@@ -292,24 +296,58 @@ def validate_portfolio_claims(
             conf = 0.0
         if conf >= 0.7:
             eids = a.get("evidence_ids") or []
-            fresh = [eid for eid in eids if str((ev_by_id.get(str(eid)) or {}).get("recency_tier")) in _FRESH_TIERS]
-            if eids and not fresh:
-                warnings.append(f"{a.get('ticker')} 高置信度操作（{conf}）引用的证据均非新鲜事件，建议下调置信度或补充新鲜证据。")
+            fresh_verified = [
+                eid for eid in eids
+                if str((ev_by_id.get(str(eid)) or {}).get("recency_tier")) in _FRESH_TIERS
+                and bool((ev_by_id.get(str(eid)) or {}).get("article_fetch_ok"))
+            ]
+            if not fresh_verified:
+                message = f"{a.get('ticker')} 高置信度操作（{conf}）没有新鲜且正文已验证的证据支撑。"
+                warnings.append(message)
+                errors.append(message)
 
     # 5. RSI / EMA 描述一致性（基于确定性 rsi_regime 与 price_vs_ema*）
     holdings = {h["ticker"]: h for h in snapshot.get("holdings", [])}
-    for a in advice.get("actions") or []:
-        if not isinstance(a, dict):
-            continue
-        tk = str(a.get("ticker") or "").upper()
-        h = holdings.get(tk, {})
+    all_text = "\n".join(texts)
+    for tk, h in holdings.items():
         regime = str(h.get("rsi_regime") or "")
-        for t in (str(a.get("technical_reason") or ""), str(a.get("news_reason") or "")):
-            if ("超卖" in t or "oversold" in t.lower()) and regime not in ("oversold", "weak"):
-                warnings.append(f"{tk} 被描述为「超卖」，但确定性 RSI 区间为 {regime}。")
-            if ("超买" in t or "overbought" in t.lower()) and regime not in ("overbought", "strong", "neutral"):
-                warnings.append(f"{tk} 被描述为「超买」，但确定性 RSI 区间为 {regime}。")
+        ticker_texts = [t for t in texts if tk and tk in t]
+        for t in ticker_texts:
+            bad = False
+            if ("深度超卖" in t or "超卖" in t or "oversold" in t.lower()) and regime not in ("oversold",):
+                bad = True
+            if ("超买" in t or "overbought" in t.lower()) and regime != "overbought":
+                bad = True
+            if bad:
+                message = f"{tk} 的 RSI 文案与确定性区间 {regime} 不一致。"
+                warnings.append(message)
+                errors.append(message)
+            if re.search(r"strong[^。；\n]{0,20}>\s*70|>\s*70[^。；\n]{0,20}strong", t, re.I):
+                message = f"{tk} 错把 RSI>70 描述为 strong；该区间应为超买。"
+                warnings.append(message)
+                errors.append(message)
             if "ema20" in t.lower() and "ema200" in t.lower() and ("跌破" in t or "交叉" in t or "cross" in t.lower()):
                 warnings.append(f"{tk} 出现「EMA20 与 EMA200 交叉」描述，但 price_vs_ema* 仅表示价格相对 EMA 的偏离。")
 
-    return errors, warnings
+    for action in advice.get("actions") or []:
+        if not isinstance(action, dict):
+            continue
+        ticker = str(action.get("ticker") or "")
+        for text in (str(action.get("technical_reason") or ""), str(action.get("news_reason") or "")):
+            if "ema20" in text.lower() and "ema200" in text.lower() and ("跌破" in text or "交叉" in text or "cross" in text.lower()):
+                warnings.append(f"{ticker} 出现「EMA20 与 EMA200 交叉」描述，但 price_vs_ema* 仅表示价格相对 EMA 的偏离。")
+
+    if "相关性套利" in all_text or "套利机会" in all_text:
+        errors.append("仅凭相关性不得描述为套利机会。")
+    internal_tokens = [
+        "portfolio_risk_score", "evidence_count", "cash_unspecified", "execute_if",
+        "cancel_or_upgrade_if", "further_reduce_if", "monitoring_items",
+        "uranium_price", "us_10y_yield", "btc_price",
+    ]
+    for token in internal_tokens:
+        if token in all_text:
+            errors.append(f"中文正文暴露内部字段名 {token}。")
+    if re.search(r"\b(weak|neutral|oversold|overbought)\b", all_text, re.I):
+        errors.append("中文正文暴露 RSI 内部英文枚举。")
+
+    return list(dict.fromkeys(errors)), list(dict.fromkeys(warnings))

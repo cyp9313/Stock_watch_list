@@ -41,10 +41,17 @@ from portfolio_analysis.instrument_metadata import build_instrument_metadata
 from portfolio_analysis.snapshot import infer_ticker_currency
 from portfolio_analysis.metric_contracts import (
     scan_non_finite, data_quality_score, metadata_coverage_score,
-    evidence_coverage_score, evidence_freshness_score,
+    evidence_coverage_score, evidence_freshness_score, evidence_verification_score,
+)
+from portfolio_analysis.action_targets import (
+    apply_deterministic_action_targets, calculate_reallocation_summary,
+)
+from portfolio_analysis.report_quality import (
+    evaluate_report_quality, PortfolioReportQualityError,
 )
 from daily_report.src.stock_daily_agent.research_service import ResearchService
 from daily_report.src.stock_daily_agent.portfolio_research import PortfolioResearchService
+from daily_report.src.stock_daily_agent.evidence_summarizer import summarize_evidence_zh
 from daily_report.src.stock_daily_agent.portfolio_context import PortfolioRunContext
 from daily_report.src.stock_daily_agent.portfolio_agent_runner import (
     run_portfolio_agent,
@@ -175,7 +182,7 @@ def _apply_confidence_cap(
     ranking: dict,
     non_finite: list[str],
 ) -> dict:
-    """置信度上限（修改计划第三轮 23）：min(模型, 数据完整度, 元数据覆盖, 证据覆盖, 证据新鲜度)。"""
+    """置信度上限：取模型、数据、覆盖、新鲜度和正文验证度的最小值。"""
     model_conf = max(0.0, min(1.0, float(advice.get("confidence", 0.5))))
     anomaly_w = (metrics.get("return_anomalies") or {}).get("anomaly_weight", 0.0) or 0.0
     dq = data_quality_score(len(non_finite), anomaly_w)
@@ -183,7 +190,8 @@ def _apply_confidence_cap(
     meta_cov = metadata_coverage_score(instrument_metadata, tickers)
     ev_cov = evidence_coverage_score(evidence, ranking.get("top_risk_tickers") or [])
     ev_fresh = evidence_freshness_score(evidence)
-    final = min(model_conf, dq, meta_cov, ev_cov, ev_fresh)
+    ev_verified = evidence_verification_score(evidence)
+    final = min(model_conf, dq, meta_cov, ev_cov, ev_fresh, ev_verified)
     advice["final_confidence"] = round(final, 3)
     advice["confidence_components"] = {
         "model_confidence": round(model_conf, 3),
@@ -191,10 +199,92 @@ def _apply_confidence_cap(
         "metadata_coverage": meta_cov,
         "evidence_coverage": ev_cov,
         "evidence_freshness": ev_fresh,
+        "evidence_verification": ev_verified,
     }
     if str(advice.get("report_mode")) == "ai":
         advice["confidence"] = round(final, 3)
+    evidence_by_ticker: dict[str, list[dict]] = {}
+    for item in evidence:
+        ticker = str(item.get("ticker") or "").upper()
+        if ticker:
+            evidence_by_ticker.setdefault(ticker, []).append(item)
+    for action in advice.get("actions") or []:
+        ticker = str(action.get("ticker") or "").upper()
+        try:
+            action_model = max(0.0, min(1.0, float(action.get("confidence", model_conf))))
+        except (TypeError, ValueError):
+            action_model = model_conf
+        ticker_evidence = evidence_by_ticker.get(ticker, [])
+        has_verified_fresh = any(
+            item.get("recency_tier") in {"fresh_event", "recent_background"}
+            and item.get("article_fetch_ok")
+            for item in ticker_evidence
+        )
+        has_unverified_fresh = any(
+            item.get("recency_tier") in {"fresh_event", "recent_background"}
+            for item in ticker_evidence
+        )
+        ticker_evidence_score = 1.0 if has_verified_fresh else (0.6 if has_unverified_fresh else 0.3)
+        action_final = min(action_model, final, dq, meta_cov, ticker_evidence_score)
+        action["model_confidence"] = round(action_model, 3)
+        action["final_confidence"] = round(action_final, 3)
+        action["confidence"] = round(action_final, 3)
     return advice
+
+
+def _guard_actions(advice: dict, evidence: list[dict], settings: dict) -> dict:
+    fresh_by_ticker = {
+        str(item.get("ticker") or "").upper()
+        for item in evidence
+        if item.get("ticker") and item.get("recency_tier") in {"fresh_event", "recent_background"}
+    }
+    allow_exit = bool(settings.get("allow_exit_advice", False))
+    for action in advice.get("actions") or []:
+        ticker = str(action.get("ticker") or "").upper()
+        current = float(action.get("current_weight") or 0.0)
+        if action.get("action") == "exit" and not (allow_exit and ticker in fresh_by_ticker):
+            action["action"] = "reduce"
+            action["validation_note"] = "退出建议缺少明确用户约束或新鲜 thesis 证伪证据，已降级为减仓。"
+        if ticker not in fresh_by_ticker and action.get("action") in {"add", "trim", "reduce", "exit"}:
+            action["action_timing"] = "monitor"
+            action.setdefault("validation_note", "缺少该标的新鲜证据，不能作为立即交易建议。")
+    return advice
+
+
+def _enforce_observation_mode(advice: dict) -> dict:
+    """Turn directional actions into watch items when the report is not actionable."""
+    for action in advice.get("actions") or []:
+        if action.get("action") in {"hold", "watch"}:
+            continue
+        current = float(action.get("current_weight") or 0.0)
+        action["action"] = "watch"
+        action["action_timing"] = "monitor"
+        action["target_weight_min"] = current
+        action["target_weight_max"] = current
+        action["expected_portfolio_risk_reduction"] = None
+        action["expected_risk_change"] = None
+        action["validation_note"] = "报告最终置信度未达到可操作门槛，已转换为观察项。"
+    return advice
+
+
+def _data_cutoffs(close: pd.DataFrame, metadata: dict[str, dict], benchmark: str) -> dict[str, Any]:
+    groups: dict[str, list[pd.Timestamp]] = {"equity": [], "etf": [], "crypto": []}
+    for ticker, item in metadata.items():
+        if ticker not in close.columns:
+            continue
+        series = close[ticker].dropna()
+        if series.empty:
+            continue
+        itype = str(item.get("instrument_type") or "UNKNOWN").upper()
+        key = "crypto" if itype == "CRYPTO" else ("etf" if itype in {"ETF", "ETC", "FUND", "INDEX"} else "equity")
+        groups[key].append(pd.Timestamp(series.index[-1]))
+    result = {key: str(max(values).date()) if values else None for key, values in groups.items()}
+    if benchmark in close.columns and not close[benchmark].dropna().empty:
+        result["benchmark"] = str(pd.Timestamp(close[benchmark].dropna().index[-1]).date())
+    else:
+        result["benchmark"] = None
+    result["news"] = None
+    return result
 
 
 def run_pipeline(
@@ -267,11 +357,8 @@ def run_pipeline(
     )
     snapshot["analysis_settings"] = settings
     snapshot["report_date"] = dt.date.today().isoformat()
-    # 修改计划第三轮 40：行情/基准数据截止 = 最近一个有效交易日。
-    try:
-        snapshot["as_of_prices"] = str(close.index[-1].date())
-    except Exception:
-        snapshot["as_of_prices"] = snapshot["report_date"]
+    snapshot["data_cutoffs"] = _data_cutoffs(close, instrument_metadata, benchmark)
+    snapshot["as_of_prices"] = snapshot["data_cutoffs"].get("equity") or snapshot["data_cutoffs"].get("etf") or snapshot["report_date"]
     metrics = calculate_portfolio_metrics(snapshot, close, benchmark=benchmark)
     ranking = rank_portfolio_risks(snapshot, metrics)
 
@@ -283,15 +370,71 @@ def run_pipeline(
     # instrument-aware 新闻研究
     fallback_reason = ""
     evidence: list[dict] = []
+    research_result: dict = {"status": "unknown", "evidence": [], "diagnostics": {}}
     try:
         svc = research_service if research_service is not None else PortfolioResearchService(provider=search_provider)
-        evidence = svc.research(
+        raw_research = svc.research(
             ranking.get("top_risk_tickers") or [],
             instrument_metadata,
             benchmark=benchmark,
         )
+        if isinstance(raw_research, dict):
+            research_result = raw_research
+            evidence = list(raw_research.get("evidence") or [])
+        else:
+            evidence = list(raw_research or [])
+            covered = {str(x.get("ticker")) for x in evidence if x.get("ticker")}
+            top = set(ranking.get("top_risk_tickers") or [])
+            coverage = len(top & covered) / len(top) if top else 1.0
+            min_coverage = float(os.environ.get("PORTFOLIO_REPORT_MIN_NEWS_COVERAGE", "0.60"))
+            normalized_status = "success" if evidence and coverage >= min_coverage else ("insufficient_coverage" if evidence else "no_raw_results")
+            research_result = {
+                "status": normalized_status,
+                "evidence": evidence,
+                "diagnostics": {
+                    "status": normalized_status,
+                    "raw_results_count": len(evidence), "filtered_results_count": len(evidence),
+                    "selected_evidence_count": len(evidence), "top_risk_coverage": coverage,
+                },
+                "raw_results": evidence, "filtered_results": evidence,
+            }
     except Exception as exc:  # noqa: BLE001
         fallback_reason += f" 新闻研究失败：{exc}"
+        research_result = {
+            "status": "provider_error", "evidence": [],
+            "diagnostics": {"status": "provider_error", "errors": [f"{type(exc).__name__}: {exc}"], "top_risk_coverage": 0.0},
+            "raw_results": [], "filtered_results": [],
+        }
+
+    summary_result = summarize_evidence_zh(
+        evidence, instrument_metadata, model=model, provider=provider,
+    )
+    evidence = list(summary_result.get("evidence") or evidence)
+    research_result["evidence"] = evidence
+    research_result.setdefault("diagnostics", {})["summarizer_status"] = summary_result.get("status")
+    research_result["diagnostics"]["summarizer_errors"] = summary_result.get("errors") or []
+    if evidence:
+        news_dates = [str(x.get("published_date")) for x in evidence if x.get("published_date")]
+        snapshot["data_cutoffs"]["news"] = max(news_dates) if news_dates else snapshot.get("as_of")
+
+    # Top-risk news is a precondition: fail before invoking the main Portfolio Agent.
+    preflight_quality = evaluate_report_quality(
+        snapshot, metrics, research_result,
+        {"final_confidence": 1.0, "confidence": 1.0, "actions": []}, {},
+    )
+    if not preflight_quality["publishable"]:
+        for name, value in {
+            "portfolio_report_quality.json": preflight_quality,
+            "portfolio_research_diagnostics.json": research_result.get("diagnostics") or {},
+            "portfolio_raw_search_results.json": research_result.get("raw_results") or [],
+            "portfolio_filtered_search_results.json": research_result.get("filtered_results") or [],
+            "portfolio_snapshot.json": snapshot,
+            "portfolio_metrics.json": metrics,
+        }.items():
+            (run_dir / name).write_text(
+                json.dumps(value, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+            )
+        raise PortfolioReportQualityError(preflight_quality)
 
     # 真正调用 Portfolio AI Agent；不可用时生成明确标记的量化降级报告
     ctx = PortfolioRunContext(
@@ -332,30 +475,52 @@ def run_pipeline(
         print(f"[WARN] {fallback_reason}；生成量化降级报告。", flush=True)
         advice = default_fallback_advice(snapshot, metrics, ranking, reason=fallback_reason)
 
-    # 最终 Python 校验：AI 报告走 strict（不得静默修正）；降级报告走 fallback（修改计划第三轮 30）。
+    advice = _guard_actions(advice, evidence, settings)
+    advice = apply_deterministic_action_targets(advice, metrics, settings)
+
+    # 最终 Python 校验：AI 报告走 strict，失败必须阻断，不得静默修正同一份 AI 建议。
     final_mode = "strict" if str(advice.get("report_mode")) == "ai" else "fallback"
     try:
         advice = validate_portfolio_advice(advice, snapshot, evidence, mode=final_mode)
     except PortfolioAdviceValidationError as exc:
-        if final_mode == "strict":
-            print(f"[WARN] 最终 strict 校验未通过，降级为 fallback 模式：{'; '.join(exc.errors)}", flush=True)
-            advice = validate_portfolio_advice(advice, snapshot, evidence, mode="fallback")
-        else:
-            raise
+        raise PortfolioAgentOutputError("最终 strict 校验未通过：" + "; ".join(exc.errors)) from exc
 
     # 置信度上限（修改计划第三轮 23）：取模型置信度与各质量因子的最小值。
     advice = _apply_confidence_cap(
         advice, snapshot, metrics, instrument_metadata, evidence, ranking, non_finite,
     )
 
-    # 修改计划第三轮 20：Python 预计算「计划减仓释放权重」聚合值（需 AI 操作建议）。
-    red_w = 0.0
-    for a in advice.get("actions") or []:
-        if str(a.get("action")) in {"reduce", "trim", "exit"}:
-            cur = float(a.get("current_weight") or 0.0)
-            tgt = float(a.get("target_weight_min") or cur)
-            red_w += max(0.0, cur - tgt)
-    metrics.setdefault("aggregates", {})["recommended_reduction_weight"] = round(red_w, 4)
+    reallocation = calculate_reallocation_summary(advice)
+    advice["portfolio_reallocation"] = reallocation
+    metrics.setdefault("aggregates", {})["recommended_reduction_weight"] = reallocation["estimated_weight_reduction"]
+
+    from portfolio_analysis.validators import validate_portfolio_claims
+    hard_errors, soft_warnings = validate_portfolio_claims(advice, snapshot, metrics, evidence)
+    advice.setdefault("validation_warnings", []).extend(soft_warnings)
+    quality = evaluate_report_quality(
+        snapshot, metrics, research_result, advice,
+        {"hard_errors": hard_errors, "soft_warnings": soft_warnings},
+    )
+    if not quality["actionable"]:
+        advice = _enforce_observation_mode(advice)
+        reallocation = calculate_reallocation_summary(advice)
+        advice["portfolio_reallocation"] = reallocation
+        metrics.setdefault("aggregates", {})["recommended_reduction_weight"] = reallocation["estimated_weight_reduction"]
+    if not quality["publishable"]:
+        debug_payloads = {
+            "portfolio_report_quality.json": quality,
+            "portfolio_research_diagnostics.json": research_result.get("diagnostics") or {},
+            "portfolio_raw_search_results.json": research_result.get("raw_results") or [],
+            "portfolio_filtered_search_results.json": research_result.get("filtered_results") or [],
+            "portfolio_snapshot.json": snapshot,
+            "portfolio_metrics.json": metrics,
+            "portfolio_advice.json": advice,
+        }
+        for name, value in debug_payloads.items():
+            (run_dir / name).write_text(
+                json.dumps(value, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+            )
+        raise PortfolioReportQualityError(quality)
 
     # 图表
     weights = {h["ticker"]: float(h.get("weight") or 0.0) for h in snapshot.get("holdings", [])}
@@ -386,9 +551,17 @@ def run_pipeline(
         "ranking": run_dir / "portfolio_risk_ranking.json",
         "evidence": run_dir / "portfolio_evidence.json",
         "advice": run_dir / "portfolio_advice.json",
+        "research_diagnostics": run_dir / "portfolio_research_diagnostics.json",
+        "raw_search": run_dir / "portfolio_raw_search_results.json",
+        "filtered_search": run_dir / "portfolio_filtered_search_results.json",
+        "quality": run_dir / "portfolio_report_quality.json",
     }
     for key, value in (("snapshot", snapshot), ("metrics", metrics), ("ranking", ranking), ("evidence", evidence), ("advice", advice)):
         paths[key].write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    paths["research_diagnostics"].write_text(json.dumps(research_result.get("diagnostics") or {}, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    paths["raw_search"].write_text(json.dumps(research_result.get("raw_results") or [], ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    paths["filtered_search"].write_text(json.dumps(research_result.get("filtered_results") or [], ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    paths["quality"].write_text(json.dumps(quality, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
 
     # 中文 HTML
     html_text = build_html(
@@ -399,6 +572,8 @@ def run_pipeline(
         risk_findings=risk_findings,
         cumulative_labels=labels,
         fallback_reason=fallback_reason,
+        research_diagnostics=research_result.get("diagnostics") or {},
+        report_quality=quality,
     )
     output.write_text(html_text, encoding="utf-8")
 

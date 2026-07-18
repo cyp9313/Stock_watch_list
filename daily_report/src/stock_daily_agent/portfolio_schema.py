@@ -71,7 +71,7 @@ def normalize_action(raw: dict[str, Any], weights: dict[str, float]) -> dict[str
     current = weights.get(ticker, _as_float(raw.get("current_weight"), 0.0))
     # 修改计划第三轮 26：重构触发/失效条件语义。
     timing = str(raw.get("action_timing") or "act_now").lower()
-    if timing not in {"act_now", "conditional", "monitor"}:
+    if timing not in {"act_now", "conditional", "monitor", "trim_on_rebound", "reduce_on_breakdown"}:
         timing = "act_now"
     thresholds = []
     for th in _as_list(raw.get("thresholds")):
@@ -257,7 +257,7 @@ ADVICE_SCHEMA_GUIDE = """\
   ],
   "actions": [
     {"ticker":"SOFI","action":"trim|add|hold|reduce|exit|watch",
-     "action_zh":"适度减仓","priority":1,"action_timing":"act_now|conditional|monitor",
+     "action_zh":"适度减仓","priority":1,"action_timing":"act_now|trim_on_rebound|reduce_on_breakdown|monitor",
      "current_weight":0.0646,"target_weight_min":0.045,"target_weight_max":0.055,
      "confidence":0.82,
      "portfolio_reason":"...","technical_reason":"...","news_reason":"...",
