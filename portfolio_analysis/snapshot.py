@@ -95,6 +95,7 @@ def build_portfolio_snapshot(
     base_currency: str = "EUR",
     benchmark: str = "^GSPC",
     as_of: dt.datetime | None = None,
+    instrument_metadata: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build a deterministic portfolio snapshot from holdings and market data.
 
@@ -156,7 +157,9 @@ def build_portfolio_snapshot(
 
         holdings.append({
             "ticker": ticker,
+            # 修改计划 2.5 / 10.3：原始 group 视为账户分组，不再误当作行业。
             "group": str(raw.get("group") or "Portfolio"),
+            "account_group": str(raw.get("group") or "Portfolio"),
             "shares": shares,
             "buy_price": buy_price,
             "buy_currency": buy_currency,
@@ -182,6 +185,20 @@ def build_portfolio_snapshot(
             "diff_ema200": _finite_float(market.get("Diff_EMA200%")),
         })
 
+        # 附加工具类型元数据（account_group 之外区分 sector/industry/theme/asset_class）
+        if instrument_metadata:
+            m = instrument_metadata.get(ticker)
+            if m:
+                holdings[-1].update({
+                    "instrument_type": m.get("instrument_type"),
+                    "asset_class": m.get("asset_class"),
+                    "sector": m.get("sector"),
+                    "industry": m.get("industry"),
+                    "theme": m.get("theme"),
+                    "underlying_index": m.get("underlying_index"),
+                    "exchange": m.get("exchange"),
+                })
+
     for holding in holdings:
         value = holding.get("market_value_base")
         holding["weight"] = value / total_value if value is not None and total_value > 0 else 0.0
@@ -204,6 +221,7 @@ def build_portfolio_snapshot(
             "missing_fx": sorted(set(missing_fx)),
             "missing_history": [],
         },
+        "instrument_metadata": instrument_metadata or {},
     }
 
 

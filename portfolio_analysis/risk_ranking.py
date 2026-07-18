@@ -29,10 +29,23 @@ def rank_portfolio_risks(snapshot: dict[str, Any], metrics: dict[str, Any]) -> d
         for item in metrics.get("risk_contributions", []) or []
     }
     weights = {h["ticker"]: _value(h.get("weight")) for h in holdings}
-    volatility = {h["ticker"]: abs(_value(h.get("beta"))) for h in holdings}
-    drawdown = {h["ticker"]: abs(min(0.0, _value(h.get("return_1m")))) for h in holdings}
+    detail = metrics.get("holdings_detail", {}) or {}
+
+    # 修改计划 13.1 / 13.2：优先使用基于历史日收益的真实波动率与回撤；
+    # 数据缺失时降级为 |Beta| 或 |1M 收益| 近似，保证排名始终可计算。
+    volatility = {}
+    drawdown = {}
+    for holding in holdings:
+        ticker = holding["ticker"]
+        d = detail.get(ticker, {}) or {}
+        vol = d.get("annualized_volatility")
+        dd = d.get("max_drawdown_63d")
+        volatility[ticker] = _value(vol) if vol is not None else abs(_value(holding.get("beta")))
+        drawdown[ticker] = abs(_value(dd)) if dd is not None else abs(min(0.0, _value(holding.get("return_1m"))))
+
     technical = {}
     for holding in holdings:
+        ticker = holding["ticker"]
         score = 0.0
         if _value(holding.get("diff_ema20")) < 0:
             score += 0.25
@@ -45,7 +58,11 @@ def rank_portfolio_risks(snapshot: dict[str, Any], metrics: dict[str, Any]) -> d
             score += 0.15
         if _value(holding.get("return_5d")) < -5:
             score += 0.20
-        technical[holding["ticker"]] = min(1.0, score)
+        # 距离 52 周高点越远（越负）技术面越弱
+        dist = _value((detail.get(ticker, {}) or {}).get("distance_from_52w_high"))
+        if dist < -10:
+            score += 0.10
+        technical[ticker] = min(1.0, score)
 
     rc_pct = _percentiles(risk_contrib or weights)
     weight_pct = _percentiles(weights)
@@ -53,21 +70,28 @@ def rank_portfolio_risks(snapshot: dict[str, Any], metrics: dict[str, Any]) -> d
     drawdown_pct = _percentiles(drawdown)
     technical_pct = _percentiles(technical)
 
+    # 修改计划 13.5：风险优先级评分权重。news_risk_pre_score 在搜索前为 0。
+    news_risk_pre = {h["ticker"]: 0.0 for h in holdings}
+    news_risk_pct = _percentiles(news_risk_pre)
+
     ranked = []
     for holding in holdings:
         ticker = holding["ticker"]
         score = (
-            0.35 * rc_pct.get(ticker, 0.0)
-            + 0.25 * weight_pct.get(ticker, 0.0)
-            + 0.20 * technical_pct.get(ticker, 0.0)
-            + 0.10 * drawdown_pct.get(ticker, 0.0)
-            + 0.10 * vol_pct.get(ticker, 0.0)
+            0.30 * rc_pct.get(ticker, 0.0)
+            + 0.20 * weight_pct.get(ticker, 0.0)
+            + 0.15 * vol_pct.get(ticker, 0.0)
+            + 0.15 * drawdown_pct.get(ticker, 0.0)
+            + 0.15 * technical_pct.get(ticker, 0.0)
+            + 0.05 * news_risk_pct.get(ticker, 0.0)
         )
         ranked.append({
             "ticker": ticker,
             "group": holding.get("group"),
             "weight": weights.get(ticker, 0.0),
             "risk_contribution": risk_contrib.get(ticker),
+            "annualized_volatility": volatility.get(ticker),
+            "max_drawdown_63d": drawdown.get(ticker),
             "technical_risk_score": technical.get(ticker, 0.0),
             "risk_priority_score": score,
         })

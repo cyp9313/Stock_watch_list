@@ -96,7 +96,10 @@ def calculate_portfolio_metrics(
 
     if benchmark in close.columns and len(portfolio_returns) >= 20:
         bench_returns = close[benchmark].pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
-        joined = pd.concat([portfolio_returns.rename("portfolio"), bench_returns.rename("benchmark")], axis=1).dropna()
+        joined = pd.concat(
+            [portfolio_returns.rename("portfolio"), bench_returns.rename("benchmark")],
+            axis=1, sort=False,
+        ).dropna()
         if len(joined) >= 20 and joined["benchmark"].var() != 0:
             metrics["portfolio_beta"] = float(joined["portfolio"].cov(joined["benchmark"]) / joined["benchmark"].var())
         for name, periods in RETURN_WINDOWS.items():
@@ -138,19 +141,60 @@ def calculate_portfolio_metrics(
             component = w * marginal
             total_component = float(component.sum())
             if total_component != 0:
-                rc = component / total_component
+                # 修改计划 13.3：采用方案 B（仅展示正风险预算并重新归一化），
+                # 避免直接 max(0, x) 后不归一化导致风险贡献之和漂移。
+                raw_rc = {ticker: float(value) for ticker, value in zip(cov.index, component / total_component)}
+                positive = {t: max(0.0, v) for t, v in raw_rc.items()}
+                pos_sum = sum(positive.values())
+                if pos_sum > 0:
+                    positive = {t: v / pos_sum for t, v in positive.items()}
                 metrics["risk_contributions"] = [
                     {
                         "ticker": ticker,
                         "weight": float(weights_by_ticker.get(ticker, 0.0)),
-                        "risk_contribution": float(max(0.0, value)),
-                        "risk_weight_gap": float(max(0.0, value) - weights_by_ticker.get(ticker, 0.0)),
+                        "risk_contribution": positive.get(ticker, 0.0),
+                        "risk_weight_gap": positive.get(ticker, 0.0) - float(weights_by_ticker.get(ticker, 0.0)),
                     }
-                    for ticker, value in zip(cov.index, rc)
+                    for ticker in (raw_rc.keys() if False else cov.index)
                 ]
+
+    # 修改计划 13.1 / 13.2：基于历史日收益计算每个持仓的真实波动率与回撤，
+    # 不再用 Beta 或 1M 收益近似。
+    metrics["holdings_detail"] = _holdings_detail(close, tickers)
 
     _technical_breadth_from_snapshot(metrics, holdings)
     return metrics
+
+
+def _holdings_detail(close: pd.DataFrame, tickers: list[str]) -> dict[str, dict[str, float | None]]:
+    detail: dict[str, dict[str, float | None]] = {}
+    if close is None or close.empty:
+        return detail
+    cols = [c for c in tickers if c in close.columns]
+    if not cols:
+        return detail
+    prices = close[cols]
+    for ticker in cols:
+        series = prices[ticker].dropna()
+        rec: dict[str, float | None] = {
+            "annualized_volatility": None,
+            "max_drawdown_63d": None,
+            "max_drawdown_252d": None,
+            "distance_from_52w_high": None,
+        }
+        if len(series) >= 5:
+            rets = series.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan).dropna()
+            if len(rets) >= 2:
+                rec["annualized_volatility"] = float(rets.std() * math.sqrt(252) * 100.0)
+                rec["max_drawdown_63d"] = _max_drawdown(rets, 63)
+                rec["max_drawdown_252d"] = _max_drawdown(rets, 252)
+        if len(series) >= 20:
+            high = float(series.tail(252).max())
+            last = float(series.iloc[-1])
+            if high > 0:
+                rec["distance_from_52w_high"] = float((last / high - 1.0) * 100.0)
+        detail[ticker] = rec
+    return detail
 
 
 def _technical_breadth_from_snapshot(metrics: dict[str, Any], holdings: list[dict[str, Any]]) -> None:

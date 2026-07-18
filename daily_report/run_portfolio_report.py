@@ -1,3 +1,15 @@
+# -*- coding: utf-8 -*-
+"""Portfolio 报告主流程（修改计划二次修改）。
+
+新流程：
+    snapshot -> metrics -> 风险发现 -> 工具类型元数据 -> 风险排名 ->
+    instrument-aware 新闻研究 -> 结构化 Evidence Notes -> 真正调用 Portfolio AI Agent
+    -> 校验（或量化降级兜底）-> 中文 HTML（与个股日报统一视觉）。
+
+保留与 portfolio_service.py 的子进程契约：--portfolio-input / --portfolio-id /
+--portfolio-name / --owner-scope / --search-provider / --run-dir / --output，
+并新增可选 --model / --provider（默认读取环境变量）。仍然写出中间 JSON 便于调试与测试。
+"""
 from __future__ import annotations
 
 import argparse
@@ -5,10 +17,10 @@ import datetime as dt
 import json
 import math
 import os
-import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import yfinance as yf
 
@@ -24,9 +36,24 @@ from portfolio_analysis import (
     validate_portfolio_advice,
 )
 from portfolio_analysis.rules import generate_portfolio_rule_findings
+from portfolio_analysis.instrument_metadata import build_instrument_metadata
 from portfolio_analysis.snapshot import infer_ticker_currency
 from daily_report.src.stock_daily_agent.research_service import ResearchService
+from daily_report.src.stock_daily_agent.portfolio_research import PortfolioResearchService
+from daily_report.src.stock_daily_agent.portfolio_context import PortfolioRunContext
+from daily_report.src.stock_daily_agent.portfolio_agent_runner import (
+    run_portfolio_agent,
+    PortfolioAgentUnavailable,
+    PortfolioAgentOutputError,
+)
+from daily_report.src.stock_daily_agent.portfolio_schema import default_fallback_advice
 from ticker_mapping import normalize_yfinance_ticker
+
+# 在文件末尾导入 HTML 构建器，避免循环依赖。
+from daily_report.scripts.build_portfolio_report import build_html  # noqa: E402
+from daily_report.report_charts import (  # noqa: E402
+    svg_weight_bars, svg_weight_vs_risk, svg_allocation, svg_cumulative_returns,
+)
 
 
 def _safe_name(value: str) -> str:
@@ -101,51 +128,211 @@ def _market_rows_from_close(close: pd.DataFrame, portfolio_page: dict) -> list[d
     return rows
 
 
-def _build_rule_advice(snapshot: dict, metrics: dict, ranking: dict, evidence: list[dict], settings: dict) -> dict:
-    findings = generate_portfolio_rule_findings(snapshot, metrics, settings)
-    rc = {item.get("ticker"): item for item in metrics.get("risk_contributions", [])}
-    actions = []
-    max_position = float(settings.get("max_position_pct", 20.0) or 20.0) / 100.0
-    for priority, item in enumerate(ranking.get("items", [])[: max(1, min(8, len(ranking.get("items", []))))], start=1):
-        ticker = item["ticker"]
-        weight = float(item.get("weight") or 0.0)
-        risk_contribution = (rc.get(ticker) or {}).get("risk_contribution")
-        action = "hold"
-        if weight > max_position * 1.15 or (risk_contribution is not None and risk_contribution > weight * 1.5):
-            action = "trim" if settings.get("allow_reduce", True) else "watch"
-        elif weight < max_position * 0.45 and settings.get("allow_add", True):
-            action = "watch"
-        actions.append({
-            "ticker": ticker,
-            "action": action,
-            "priority": priority,
-            "current_weight": weight,
-            "target_weight_min": max(0.0, min(weight, max_position * 0.85)),
-            "target_weight_max": min(max_position, max(weight, max_position)),
-            "confidence": 0.55 if not evidence else 0.68,
-            "portfolio_reason": "Risk priority score is high relative to the rest of the portfolio.",
-            "technical_reason": "Technical indicators and recent returns were scored by deterministic Python rules.",
-            "news_reason": "See evidence section; if evidence is empty, search providers were unavailable or returned no results.",
-            "trigger_conditions": [
-                "Review if the position's risk contribution rises further or price weakens below key moving averages."
-            ],
-            "invalidation_conditions": [
-                "Reassess after material earnings upgrades, lower volatility, or improved diversification."
-            ],
-            "evidence_ids": [e["evidence_id"] for e in evidence if e.get("ticker") == ticker][:3],
-        })
-    stance = "constructive_watch" if metrics.get("top3_weight", 0) and metrics.get("top3_weight", 0) < 0.6 else "risk_control_first"
-    return {
-        "portfolio_stance": stance,
-        "risk_level": "medium_high" if findings else "medium",
-        "confidence": 0.62 if evidence else 0.48,
-        "summary": "This portfolio report combines deterministic portfolio risk metrics with top-risk evidence where search providers are configured.",
-        "key_risks": findings,
-        "actions": actions,
-        "watch_items": [{"title": "Top-risk holdings", "reason": ", ".join(ranking.get("top_risk_tickers") or [])}],
-        "data_limitations": snapshot.get("data_quality", {}),
-        "disclaimer": "This report is for research purposes only and is not investment advice.",
+def _cumulative_returns(close: pd.DataFrame, tickers: list[str], weights: dict[str, float], benchmark: str):
+    """返回 (labels, portfolio_cum, benchmark_cum) 用于累计收益图。"""
+    cols = [c for c in tickers if c in close.columns]
+    if not cols:
+        return [], [], []
+    aligned = pd.Series({t: float(weights.get(t, 0.0)) for t in cols}).sort_index()
+    aligned = aligned / aligned.sum() if aligned.sum() > 0 else aligned
+    rets = close[cols].pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
+    port_ret = (rets[cols] * aligned).sum(axis=1, min_count=1).dropna()
+    port_cum = ((1 + port_ret).cumprod() - 1).mul(100.0)
+    labels = [str(d.date()) for d in port_cum.index]
+    port_list = [float(v) for v in port_cum.tolist()]
+    bench_list = []
+    if benchmark in close.columns:
+        b = close[benchmark].pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan).dropna()
+        b_cum = ((1 + b).cumprod() - 1).mul(100.0).reindex(port_cum.index).ffill()
+        bench_list = [float(v) if pd.notna(v) else 0.0 for v in b_cum.tolist()]
+    else:
+        bench_list = [0.0] * len(port_list)
+    return labels, port_list, bench_list
+
+
+def _allocation_weights(snapshot: dict, meta: dict, key_fn) -> dict[str, float]:
+    weights = {h["ticker"]: float(h.get("weight") or 0.0) for h in snapshot.get("holdings", [])}
+    out: dict[str, float] = {}
+    for h in snapshot.get("holdings", []):
+        t = h["ticker"]
+        k = key_fn(t, h)
+        if k:
+            out[k] = out.get(k, 0.0) + weights.get(t, 0.0)
+    return out
+
+
+def run_pipeline(
+    payload: dict,
+    *,
+    run_dir,
+    output,
+    portfolio_name: str,
+    portfolio_id: str,
+    owner_scope: str,
+    model: str,
+    provider: str,
+    search_provider: str,
+    close: "pd.DataFrame | None" = None,
+    market_rows: list[dict] | None = None,
+    fx_rates: dict | None = None,
+    research_service=None,
+    agent_runner=None,
+    verbose: bool = True,
+) -> dict:
+    """端到端生成 Portfolio 报告。
+
+    网络边界（行情 / 新闻 / Agent）均可注入，便于确定性测试：
+    - close / market_rows / fx_rates：直接给定，跳过下载；
+    - research_service：提供 .research(...) 的对象，跳过真实搜索；
+    - agent_runner：提供 (ctx, model, provider, *, verbose) 的 callable，
+      跳过真实 LLM。默认 run_portfolio_agent。
+    """
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    output = Path(output)
+
+    portfolio_page = payload["portfolio_page"]
+    settings = dict(portfolio_page.get("analysis_settings") or {})
+    settings.setdefault("search_provider", search_provider)
+    settings.setdefault("model", model)
+    settings.setdefault("provider", provider)
+    base_currency = settings.get("base_currency", "EUR")
+    benchmark = normalize_yfinance_ticker(settings.get("benchmark") or "^GSPC")
+    tickers = list(dict.fromkeys(
+        normalize_yfinance_ticker(h.get("ticker"))
+        for h in portfolio_page.get("holdings", [])
+        if normalize_yfinance_ticker(h.get("ticker"))
+    ))
+
+    if close is None:
+        close = MarketDataService.fetch_adjusted_close_batch(tickers + [benchmark], period="1y", interval="1d")
+    latest_prices = _latest_prices(close)
+    market_rows = payload.get("market_rows") or market_rows or _market_rows_from_close(close, portfolio_page)
+
+    currencies = {infer_ticker_currency(t, "") for t in tickers}
+    currencies.update(str(h.get("buy_currency") or "").upper() for h in portfolio_page.get("holdings", []))
+    if fx_rates is None:
+        fx_rates = dict(payload.get("fx_rates") or {}) or _fx_rates(currencies, base_currency)
+
+    # 工具类型元数据（区分账户分组与行业/主题）
+    enrich = os.environ.get("PORTFOLIO_ENRICH_YFINANCE", "false").strip().lower() in {"1", "true", "yes"}
+    instrument_metadata = build_instrument_metadata(portfolio_page, enrich=enrich)
+
+    snapshot = build_portfolio_snapshot(
+        portfolio_page,
+        market_rows,
+        latest_prices=latest_prices,
+        fx_rates=fx_rates,
+        base_currency=base_currency,
+        benchmark=benchmark,
+        instrument_metadata=instrument_metadata,
+    )
+    snapshot["analysis_settings"] = settings
+    snapshot["report_date"] = dt.date.today().isoformat()
+    metrics = calculate_portfolio_metrics(snapshot, close, benchmark=benchmark)
+    ranking = rank_portfolio_risks(snapshot, metrics)
+
+    # instrument-aware 新闻研究
+    fallback_reason = ""
+    evidence: list[dict] = []
+    try:
+        svc = research_service if research_service is not None else PortfolioResearchService(provider=search_provider)
+        evidence = svc.research(
+            ranking.get("top_risk_tickers") or [],
+            instrument_metadata,
+            benchmark=benchmark,
+        )
+    except Exception as exc:  # noqa: BLE001
+        fallback_reason += f" 新闻研究失败：{exc}"
+
+    # 真正调用 Portfolio AI Agent；不可用时生成明确标记的量化降级报告
+    ctx = PortfolioRunContext(
+        run_dir=run_dir,
+        portfolio_name=portfolio_name,
+        portfolio_id=portfolio_id,
+        owner_scope=owner_scope,
+        base_currency=base_currency,
+        benchmark=benchmark,
+        model=model,
+        provider=provider,
+        search_provider=search_provider,
+        snapshot=snapshot,
+        metrics=metrics,
+        ranking=ranking,
+        evidence=evidence,
+        instrument_metadata=instrument_metadata,
+        settings=settings,
+        output_html=output,
+        advice_json_path=run_dir / "portfolio_advice.json",
+    )
+
+    runner = agent_runner if agent_runner is not None else run_portfolio_agent
+    try:
+        advice = runner(ctx, model=model, provider=provider, verbose=verbose)
+        advice["report_mode"] = "ai"
+    except (PortfolioAgentUnavailable, PortfolioAgentOutputError) as exc:
+        fallback_reason = f"AI Agent 未参与：{exc}"
+        print(f"[WARN] {fallback_reason}；生成量化降级报告。", flush=True)
+        advice = default_fallback_advice(snapshot, metrics, ranking, reason=fallback_reason)
+    except Exception as exc:  # noqa: BLE001
+        fallback_reason = f"AI Agent 异常：{exc}"
+        print(f"[WARN] {fallback_reason}；生成量化降级报告。", flush=True)
+        advice = default_fallback_advice(snapshot, metrics, ranking, reason=fallback_reason)
+
+    # 最终 Python 校验（兜底 sanitize，不翻转动作）
+    advice = validate_portfolio_advice(advice, snapshot, evidence, mode="fallback")
+
+    # 图表
+    weights = {h["ticker"]: float(h.get("weight") or 0.0) for h in snapshot.get("holdings", [])}
+    rc_map = {item.get("ticker"): item.get("risk_contribution") for item in metrics.get("risk_contributions", [])}
+    charts = {
+        "weight_bars": svg_weight_bars(snapshot.get("holdings", [])),
+        "weight_vs_risk": svg_weight_vs_risk(snapshot.get("holdings", []), rc_map),
+        "allocation_group": svg_allocation(
+            _allocation_weights(snapshot, instrument_metadata, lambda t, h: (instrument_metadata.get(t, {}) or {}).get("account_group") or h.get("group")),
+            "账户分组权重分布", "#58a6ff",
+        ),
+        "allocation_theme": svg_allocation(
+            _allocation_weights(snapshot, instrument_metadata, lambda t, h: (instrument_metadata.get(t, {}) or {}).get("theme") or (instrument_metadata.get(t, {}) or {}).get("underlying_index")),
+            "主题/底层指数权重分布", "#bc8cff",
+        ),
     }
+    labels, port_cum, bench_cum = _cumulative_returns(close, tickers, weights, benchmark)
+    if labels:
+        charts["cumulative"] = svg_cumulative_returns(labels, port_cum, bench_cum)
+
+    # 确定性风险发现（供降级或风险诊断补充展示）
+    risk_findings = generate_portfolio_rule_findings(snapshot, metrics, settings, instrument_metadata=instrument_metadata)
+
+    # 中间 JSON（保持兼容）
+    paths = {
+        "snapshot": run_dir / "portfolio_snapshot.json",
+        "metrics": run_dir / "portfolio_metrics.json",
+        "ranking": run_dir / "portfolio_risk_ranking.json",
+        "evidence": run_dir / "portfolio_evidence.json",
+        "advice": run_dir / "portfolio_advice.json",
+    }
+    for key, value in (("snapshot", snapshot), ("metrics", metrics), ("ranking", ranking), ("evidence", evidence), ("advice", advice)):
+        paths[key].write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+    # 中文 HTML
+    html_text = build_html(
+        snapshot, metrics, ranking, advice, evidence,
+        instrument_metadata=instrument_metadata,
+        settings=settings,
+        charts=charts,
+        risk_findings=risk_findings,
+        cumulative_labels=labels,
+        fallback_reason=fallback_reason,
+    )
+    output.write_text(html_text, encoding="utf-8")
+
+    print(f"Portfolio report generated: {output}")
+    print(f"Report mode: {advice.get('report_mode')}")
+    print(f"Top-risk tickers: {', '.join(ranking.get('top_risk_tickers') or [])}")
+    print(f"Evidence count: {len(evidence)}")
+    print(f"Actions: {len(advice.get('actions') or [])}")
+    return advice
 
 
 def main() -> int:
@@ -157,92 +344,22 @@ def main() -> int:
     parser.add_argument("--search-provider", default="auto")
     parser.add_argument("--output", required=True)
     parser.add_argument("--run-dir", required=True)
+    parser.add_argument("--model", default=os.environ.get("PORTFOLIO_REPORT_MODEL") or "qwen-plus")
+    parser.add_argument("--provider", default=os.environ.get("PORTFOLIO_REPORT_PROVIDER") or "dashscope")
     args = parser.parse_args()
 
-    run_dir = Path(args.run_dir)
-    run_dir.mkdir(parents=True, exist_ok=True)
     payload = json.loads(Path(args.portfolio_input).read_text(encoding="utf-8"))
-    portfolio_page = payload["portfolio_page"]
-    settings = dict(portfolio_page.get("analysis_settings") or {})
-    base_currency = settings.get("base_currency", "EUR")
-    benchmark = normalize_yfinance_ticker(settings.get("benchmark") or "^GSPC")
-    tickers = list(dict.fromkeys(
-        normalize_yfinance_ticker(h.get("ticker"))
-        for h in portfolio_page.get("holdings", [])
-        if normalize_yfinance_ticker(h.get("ticker"))
-    ))
-    close = MarketDataService.fetch_adjusted_close_batch(tickers + [benchmark], period="1y", interval="1d")
-    latest_prices = _latest_prices(close)
-    market_rows = payload.get("market_rows") or _market_rows_from_close(close, portfolio_page)
-    currencies = {infer_ticker_currency(t, "") for t in tickers}
-    currencies.update(str(h.get("buy_currency") or "").upper() for h in portfolio_page.get("holdings", []))
-    fx_rates = dict(payload.get("fx_rates") or {})
-    if not fx_rates:
-        fx_rates = _fx_rates(currencies, base_currency)
-
-    snapshot = build_portfolio_snapshot(
-        portfolio_page,
-        market_rows,
-        latest_prices=latest_prices,
-        fx_rates=fx_rates,
-        base_currency=base_currency,
-        benchmark=benchmark,
+    run_pipeline(
+        payload,
+        run_dir=args.run_dir,
+        output=args.output,
+        portfolio_name=args.portfolio_name,
+        portfolio_id=args.portfolio_id,
+        owner_scope=args.owner_scope,
+        model=args.model,
+        provider=args.provider,
+        search_provider=args.search_provider,
     )
-    snapshot["analysis_settings"] = settings
-    snapshot["report_date"] = dt.date.today().isoformat()
-    metrics = calculate_portfolio_metrics(snapshot, close, benchmark=benchmark)
-    ranking = rank_portfolio_risks(snapshot, metrics)
-
-    queries = []
-    for ticker in ranking.get("top_risk_tickers", []):
-        queries.append(f"{ticker} latest earnings guidance analyst rating risk stock news")
-    top_groups = {}
-    for holding in snapshot.get("holdings", []):
-        top_groups[holding["group"]] = top_groups.get(holding["group"], 0.0) + float(holding.get("weight") or 0.0)
-    for group, _ in sorted(top_groups.items(), key=lambda item: item[1], reverse=True)[:2]:
-        queries.append(f"{group} sector latest market risks stocks")
-    queries.append(f"{benchmark} interest rates macro market risk outlook")
-    try:
-        evidence = ResearchService().search(queries, provider=args.search_provider, max_results=3)
-    except Exception as exc:
-        evidence = [{"evidence_id": "E000", "scope": "research", "title": "Research unavailable", "source": "system", "summary": str(exc), "url": ""}]
-    ticker_set = set(ranking.get("top_risk_tickers", []))
-    for item in evidence:
-        for ticker in ticker_set:
-            if ticker in (item.get("query") or "") or ticker in (item.get("title") or ""):
-                item["ticker"] = ticker
-                break
-        item.setdefault("scope", "portfolio")
-
-    advice = validate_portfolio_advice(_build_rule_advice(snapshot, metrics, ranking, evidence, settings), snapshot, evidence)
-
-    paths = {
-        "snapshot": run_dir / "portfolio_snapshot.json",
-        "metrics": run_dir / "portfolio_metrics.json",
-        "ranking": run_dir / "portfolio_risk_ranking.json",
-        "evidence": run_dir / "portfolio_evidence.json",
-        "advice": run_dir / "portfolio_advice.json",
-    }
-    for key, value in (("snapshot", snapshot), ("metrics", metrics), ("ranking", ranking), ("evidence", evidence), ("advice", advice)):
-        paths[key].write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-
-    builder = Path(__file__).resolve().parent / "scripts" / "build_portfolio_report.py"
-    subprocess.run(
-        [
-            sys.executable,
-            str(builder),
-            "--snapshot", str(paths["snapshot"]),
-            "--metrics", str(paths["metrics"]),
-            "--risk-ranking", str(paths["ranking"]),
-            "--advice", str(paths["advice"]),
-            "--evidence", str(paths["evidence"]),
-            "--output", str(Path(args.output)),
-        ],
-        check=True,
-    )
-    print(f"Portfolio report generated: {args.output}")
-    print(f"Top-risk tickers: {', '.join(ranking.get('top_risk_tickers') or [])}")
-    print(f"Evidence count: {len(evidence)}")
     return 0
 
 
