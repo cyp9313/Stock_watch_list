@@ -116,6 +116,8 @@ def _build_gap_prompt(
 def _compute_ticker_gaps(
     plan: dict[str, Any],
     evidence: list[dict[str, Any]],
+    *,
+    first_pass: bool = False,
 ) -> list[dict[str, Any]]:
     """确定性计算每个 ticker 的 planned_needs 与 found_events 缺口（供 LLM 输入）。
 
@@ -135,12 +137,15 @@ def _compute_ticker_gaps(
         for ev in evidence:
             if str(ev.get("ticker") or "").upper() != ticker:
                 continue
-            # §16 修复：跳过未被 materiality 接受或被 reject 的 evidence
-            if not ev.get("materiality_accepted"):
-                continue
-            if ev.get("accept") is False:
-                continue
-            en = str(ev.get("event_hint") or ev.get("event_need") or "")
+            # P0-4: first_pass 模式使用轻量判断；正式模式检查 materiality
+            if first_pass:
+                en = str(ev.get("event_hint") or ev.get("event_need") or "")
+            else:
+                if not ev.get("materiality_accepted"):
+                    continue
+                if ev.get("accept") is False:
+                    continue
+                en = str(ev.get("event_hint") or ev.get("event_need") or "")
             found_events.append({
                 "event_need": en,
                 "date": ev.get("published_date") or ev.get("event_date"),
@@ -186,8 +191,12 @@ def analyze_research_gap(
         "errors": [],
     }
 
-    # 确定性计算缺口（无论 LLM 是否可用都先算）
-    ticker_gaps = _compute_ticker_gaps(plan, evidence)
+    # P0-4: first_pass=True — raw results 无 materiality 字段，使用轻量匹配
+    ticker_gaps = _compute_ticker_gaps(plan, evidence, first_pass=True)
+    # P0-4: 记录 Gap 诊断
+    diagnostics["planned_needs"] = sum(len(g.get("planned_needs") or []) for g in ticker_gaps)
+    diagnostics["first_pass_found_needs"] = sum(len(g.get("found_needs") or []) for g in ticker_gaps)
+    diagnostics["missing_needs"] = sum(len(g.get("missing_needs") or []) for g in ticker_gaps)
     diagnostics["ticker_gaps"] = ticker_gaps
     has_missing = any(g.get("missing_needs") for g in ticker_gaps)
     if not has_missing:
@@ -239,13 +248,19 @@ def analyze_research_gap(
                 if not is_valid_lookback_days(lookback):
                     lookback = 30
                 language = str(q.get("language") or "en").strip()
+                # P0-5: 优先使用 LLM 返回的 event_need，缺失时 fallback 到对应的 missing need
+                q_event_need = str(q.get("event_need") or "").strip()
+                if not is_valid_event_need(q_event_need):
+                    # 尝试匹配对应的 missing_need（按 query 索引）
+                    idx = min(len(ticker_queries), len(missing) - 1) if missing else -1
+                    q_event_need = missing[idx] if idx >= 0 else "general_event"
                 ticker_queries.append({
                     "query": qtext,
                     "lookback_days": int(lookback),
                     "language": language,
                     "reason_zh": str(q.get("reason_zh") or ""),
                     "ticker": ticker,
-                    "event_need": missing[0] if missing else "general",
+                    "event_need": q_event_need,
                 })
                 total += 1
             validated_queries.extend(ticker_queries)

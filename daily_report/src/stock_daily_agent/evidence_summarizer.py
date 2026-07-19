@@ -39,15 +39,9 @@ def summarize_evidence_zh(
     *,
     model: str,
     provider: str,
+    report_date: str = "",
 ) -> dict[str, Any]:
-    """Decision Evidence Summarizer（修改计划第六轮第 19 节）。
-
-    升级为决策证据摘要器：支持 reject、what_changed、why_it_matters、
-    supports_action、does_not_prove、verification_level。
-
-    The model may translate and classify supplied facts only. It is explicitly
-    prohibited from creating portfolio actions or adding facts.
-    """
+    """Decision Evidence Summarizer（修改计划第六轮第 19 节 + §19 report_date）。"""
     if not evidence:
         return {"status": "no_evidence", "evidence": evidence, "errors": []}
     provider = (provider or "dashscope").lower()
@@ -108,7 +102,8 @@ def summarize_evidence_zh(
         })
     prompt = (
         "你是决策证据摘要器，只能基于输入事实做忠实中文摘要，不得生成投资或交易建议，不得补充输入中没有的事实。\n"
-        "article_fetch_ok=false 或 verification_level=search_snippet 表示内容仅来自搜索结果摘要，必须按未验证线索表述。\n\n"
+        + (f"报告日期：{report_date}。日期早晚判断必须以报告日期为准，不得使用模型自身认知的当前日期。\n" if report_date else "")
+        + "article_fetch_ok=false 或 verification_level=search_snippet 表示内容仅来自搜索结果摘要，必须按未验证线索表述。\n\n"
         "对每条证据返回严格 JSON：\n"
         "{\"items\":[{\"evidence_uid\":\"ev_...\",\"accept\":true|false,\"reject_reason\":null|\"incidental_entity_mention\"|\"quote_page\"|\"stale\"|\"low_materiality\",\n"
         "\"event_title_zh\":\"事件标题中文\",\"what_happened_zh\":\"发生了什么\",\"what_changed_zh\":\"本轮新增变化\",\n"
@@ -171,23 +166,43 @@ def _apply_summaries_by_uid(
 ) -> list[str]:
     """按 evidence_uid 应用 LLM 摘要结果，返回错误列表（确定性，可单测）。
 
-    - 重复 UID / 未知 UID / 遗漏 UID：记录错误，跳过该条，不覆盖原值；
-    - 篡改原始身份字段：记录错误并跳过（不覆盖）。
+    P0-3 修复：Fail-closed — 重复 UID / 未知 UID / 遗漏 UID 全部记录错误。
+    - 重复 UID（LLM 返回重复）→ 错误，不应用任何一条；
+    - 未知 UID（LLM 返回不在证据中的 UID）→ 错误；
+    - 遗漏 UID（证据有但 LLM 未返回）→ 错误，该证据保持 accept=缺失→默认 reject。
     """
     errors: list[str] = []
-    by_uid = {
-        str(x.get("evidence_uid")): x
-        for x in items
-        if isinstance(x, dict) and x.get("evidence_uid")
-    }
+    input_uids = {str(x.get("evidence_uid")) for x in evidence if x.get("evidence_uid")}
+    output_uids: list[str] = [str(x.get("evidence_uid")) for x in items if isinstance(x, dict) and x.get("evidence_uid")]
+
+    # P0-3: 检测 LLM 返回的重复 UID
+    seen_out: set[str] = set()
+    dup_uids: set[str] = set()
+    for uid in output_uids:
+        if uid in seen_out:
+            dup_uids.add(uid)
+        seen_out.add(uid)
+    if dup_uids:
+        errors.append(f"summarizer_duplicate_uids:{','.join(sorted(dup_uids))}")
+
+    # P0-3: 检测 LLM 返回的未知 UID
+    unknown_uids = [uid for uid in seen_out if uid not in input_uids]
+    if unknown_uids:
+        errors.append(f"summarizer_unknown_uids:{','.join(sorted(unknown_uids))}")
+
+    # P0-3: 检测遗漏 UID（证据有但 LLM 未返回）
+    missing_uids = [uid for uid in sorted(input_uids) if uid not in seen_out]
+    if missing_uids:
+        errors.append(f"summarizer_missing_uids:{','.join(missing_uids)}")
+
+    by_uid = {uid: item for uid, item in zip(output_uids, items) if isinstance(item, dict)}
     seen_uids: set[str] = set()
     for item in evidence:
         uid = str(item.get("evidence_uid") or "")
         summary = by_uid.get(uid)
         if not summary:
             continue
-        if uid in seen_uids:
-            errors.append(f"duplicate_evidence_uid_in_summary:{uid}")
+        if uid in seen_uids or uid in dup_uids:
             continue
         seen_uids.add(uid)
         try:
@@ -198,7 +213,6 @@ def _apply_summaries_by_uid(
         item["accept"] = bool(summary.get("accept", True))
         item["reject_reason"] = summary.get("reject_reason")
         if not item["accept"]:
-            # 被拒绝的证据标记但不删除（保留供诊断）
             item["decision_rejected"] = True
         item["event_title_zh"] = str(summary.get("event_title_zh") or item.get("title") or "")
         item["what_happened_zh"] = str(summary.get("what_happened_zh") or "")
@@ -209,7 +223,6 @@ def _apply_summaries_by_uid(
         item["does_not_prove_zh"] = str(summary.get("does_not_prove_zh") or "")
         item["impact_direction"] = str(summary.get("impact_direction") or "unknown")
         item["impact_horizon"] = str(summary.get("impact_horizon") or "medium")
-        # 保留旧字段兼容
         item["facts_zh"] = [str(summary.get("what_happened_zh") or "")]
         item["summary_zh"] = str(summary.get("event_title_zh") or item.get("summary_zh") or "")
         item["relevance_reason"] = str(summary.get("why_it_matters_to_ticker_zh") or "")

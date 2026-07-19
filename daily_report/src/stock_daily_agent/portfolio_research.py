@@ -198,12 +198,13 @@ def filter_candidates_with_diagnostics(
     exclude_terms: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     reasons = {
-        "missing_url": 0, "duplicate": 0, "account_platform": 0,
+        "missing_url": 0, "duplicate": 0, "merged_duplicate": 0, "account_platform": 0,
         "quote_only": 0, "low_quality": 0, "entity_mismatch": 0,
         "excluded_term": 0,
     }
     seen_urls: set[str] = set()
     seen_titles: set[str] = set()
+    url_map: dict[str, dict] = {}  # §22: URL→entry for merging related_tickers
     out: list[dict[str, Any]] = []
     exclude_lower = [e.lower() for e in (exclude_terms or []) if e]
     for c in candidates:
@@ -216,6 +217,20 @@ def filter_candidates_with_diagnostics(
         if not url or url.lower().startswith("javascript:"):
             reason = "missing_url"
         elif url in seen_urls or title in seen_titles:
+            # §22: 如果是同一 URL 但不同 ticker，合并 related_tickers 而非直接删除
+            if url and url in url_map:
+                existing = url_map[url]
+                existing_ticker = existing.get("ticker")
+                if ticker and ticker != existing_ticker:
+                    related = list(existing.get("related_tickers") or [])
+                    if existing_ticker and existing_ticker not in related:
+                        related.append(existing_ticker)
+                    if ticker not in related:
+                        related.append(ticker)
+                    existing["related_tickers"] = related
+                    existing.setdefault("matched_questions", []).extend(c.get("matched_questions") or [])
+                    reasons["merged_duplicate"] += 1
+                    continue
             reason = "duplicate"
         elif _looks_like_account_platform(title, url):
             reason = "account_platform"
@@ -223,7 +238,6 @@ def filter_candidates_with_diagnostics(
             reason = "quote_only"
         elif any(h in (title + " " + url).lower() for h in _LOW_QUALITY_HINTS):
             reason = "low_quality"
-        # §11 修复：exclude_terms 匹配（在 entity check 之前）
         elif exclude_lower and any(ex in (title + " " + summary).lower() for ex in exclude_lower):
             reason = "excluded_term"
         elif ticker and not _is_relevant_to_ticker(c, ticker, meta):
@@ -234,6 +248,8 @@ def filter_candidates_with_diagnostics(
         seen_urls.add(url)
         seen_titles.add(title)
         out.append(c)
+        if url:
+            url_map[url] = c
     return out, reasons
 
 

@@ -48,6 +48,7 @@ class PortfolioReturnModel:
     max_drawdown_252d: float | None
     portfolio_beta: float | None
     cumulative_returns: pd.Series
+    benchmark_cumulative_returns: pd.Series  # P0-8
     invalid_date_count: int
     total_date_count: int
 
@@ -136,6 +137,7 @@ def build_portfolio_return_model(
 
     # Beta（相对 benchmark）
     beta: float | None = None
+    bench_cum: pd.Series = pd.Series(dtype=float)
     if benchmark in close.columns:
         bench_ret = close[benchmark].pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan).dropna()
         aligned = portfolio_returns.to_frame("port").join(bench_ret.to_frame("bench"), how="inner").dropna()
@@ -144,6 +146,9 @@ def build_portfolio_return_model(
             var = float(aligned["bench"].var(ddof=1))
             if var > 0:
                 beta = cov / var
+        # P0-8: benchmark cumulative returns（对齐到共同日期）
+        bench_cum = ((1 + bench_ret).cumprod() - 1)
+        bench_cum = bench_cum.reindex(portfolio_returns.index).ffill()
 
     # 协方差矩阵（用于 risk contribution 和 scenario）
     cov_matrix: pd.DataFrame | None = None
@@ -160,6 +165,7 @@ def build_portfolio_return_model(
         max_drawdown_252d=dd_252,
         portfolio_beta=beta,
         cumulative_returns=cumulative,
+        benchmark_cumulative_returns=bench_cum,
         invalid_date_count=invalid_count,
         total_date_count=total_count,
     )

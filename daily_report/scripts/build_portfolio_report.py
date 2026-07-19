@@ -69,12 +69,16 @@ def build_html(
     fallback_reason: str = "",
     research_diagnostics: dict[str, Any] | None = None,
     report_quality: dict[str, Any] | None = None,
+    rejected_evidence: list[dict[str, Any]] | None = None,
+    reference_evidence: list[dict[str, Any]] | None = None,
 ) -> str:
     settings = settings or {}
     instrument_metadata = instrument_metadata or snapshot.get("instrument_metadata") or {}
     charts = charts or {}
     research_diagnostics = research_diagnostics or {}
     report_quality = report_quality or {}
+    rej_count = len(rejected_evidence or [])
+    ref_count = len(reference_evidence or [])
     base = snapshot.get("base_currency", "EUR")
     summary = snapshot.get("summary", {})
     portfolio_name = snapshot.get("portfolio_name", "Portfolio")
@@ -109,12 +113,12 @@ def build_html(
     # 修改计划第三轮 40：明确数据截止口径与时间。
     # 修改计划第六轮第 27 节：新闻时间字段拆分（检索时间 vs 最新事件日期）。
     news_exec_at = research_diagnostics.get("news_search_executed_at") if research_diagnostics else None
-    latest_event_date = research_diagnostics.get("latest_selected_event_date") if research_diagnostics else None
-    news_time_html = f'新闻检索截止：{esc(news_cutoff)}'
-    if news_exec_at:
-        news_time_html += f'　|　新闻检索时间：{esc(str(news_exec_at)[:19])}'
+    latest_event_date = research_diagnostics.get("latest_accepted_event_date") or research_diagnostics.get("latest_selected_event_date") if research_diagnostics else None
+    news_time_html = f'新闻搜索完成时间：{esc(news_exec_at or news_cutoff or "—")}'
     if latest_event_date:
-        news_time_html += f'　|　最新入选事件日期：{esc(str(latest_event_date))}'
+        news_time_html += f'　|　最新 Accepted Event：{esc(str(latest_event_date))}'
+    elif research_diagnostics and research_diagnostics.get("accepted_evidence_count", 0) == 0:
+        news_time_html += '　|　最新 Accepted Event：—'
     cutoff_html = (
         '<div class="data-cutoff">'
         f'报告生成时间：{esc(as_of)}　|　股票行情截止：{esc(price_cutoff)} 收盘　|　'
@@ -127,19 +131,28 @@ def build_html(
     if is_fallback:
         parts.append(render_fallback_banner(fallback_reason))
 
-    # ── AI 核心结论（修改计划 17.2）──
+    # ── 核心结论（P0-6 + §23: observation_only 时改变标题）──
+    is_observation = report_quality.get("observation_only") or (advice.get("observation_only"))
+    section_title = "量化风险观察结论" if is_observation else "AI 核心结论"
+    section_icon = "📊" if is_observation else "🧭"
     stance_pill = f'<span class="pill info">组合态度：{esc(stance)}</span>'
     risk_pill = f'<span class="pill warn">风险等级：{esc(risk_level_zh(risk_level))}</span>'
     conf_pill = f'<span class="pill">报告最终置信度：{format_ratio_as_pct(advice.get("final_confidence") or advice.get("confidence"))}</span>'
     core_html = (
         f'<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;">{stance_pill}{risk_pill}{conf_pill}</div>'
     )
+    if is_observation and rej_count > 0:
+        core_html += (
+            '<div class="banner warn">'
+            f'本轮新闻研究返回了 {rej_count} 条候选但未通过研究质量门槛。'
+            '以下结论主要来自价格、风险贡献和技术指标，不包含基本面新闻判断。</div>'
+        )
     exec_summary = advice.get("executive_summary") or []
     if exec_summary:
         core_html += '<ul class="summary-list">' + "".join(f"<li>{esc(s)}</li>" for s in exec_summary) + "</ul>"
     else:
         core_html += '<p class="kpi-sub">（AI 未生成核心结论；详见下方量化指标与风险诊断。）</p>'
-    parts.append(render_section("AI 核心结论", "🧭", core_html))
+    parts.append(render_section(section_title, section_icon, core_html))
 
     # ── Portfolio 概览卡片（修改计划 17.3）──
     pa = advice.get("portfolio_analysis", {}) or {}
@@ -152,7 +165,7 @@ def build_html(
         "metadata_coverage": "工具元数据覆盖",
         "evidence_coverage": "Top-risk 证据覆盖",
         "evidence_freshness": "证据新鲜度",
-        "evidence_verification": "证据正文验证",
+        "evidence_verification": "正文已提取比例",
     }
     finite_confidence = {
         key: finite_float(value)
@@ -190,7 +203,7 @@ def build_html(
             ])
         confidence_html = render_table(["置信度分量", "得分上限", "说明"], confidence_rows, scroll=False)
         confidence_html += (
-            '<p class="kpi-sub">最终置信度取上述分量中的最小值；新闻数量多并不等于证据新鲜或已经正文验证。</p>'
+            '<p class="kpi-sub">最终置信度取上述分量中的最小值；新闻数量多并不等于证据新鲜或已经正文提取。</p>'
         )
         parts.append(render_section("报告置信度分解", "🔎", confidence_html))
 
@@ -231,9 +244,31 @@ def build_html(
     else:
         parts.append(render_section("组合配置与风险图表", "📈", '<p class="kpi-sub">（暂无图表数据）</p>'))
 
-    # ── 风险诊断（修改计划第三轮 33：确定性规则与 AI 解读分开展示，AI 不得覆盖 Python 风险）──
+    # ── 风险诊断（修改计划第三轮 33 + §12 Python Top5 渲染）──
     key_risks = advice.get("key_risks") or []
     risk_parts = []
+
+    # §12: Python 预计算 Top5 风险贡献者，AI 只能解释不能列成员
+    rc_list = sorted(
+        (metrics.get("risk_contributions") or []),
+        key=lambda x: -(float(x.get("risk_contribution") or 0.0)),
+    )[:5]
+    if rc_list:
+        top5_rows = "".join(
+            f"<tr><td>{esc(r.get('ticker',''))}</td>"
+            f"<td>{format_ratio_as_pct(r.get('risk_contribution'))}</td></tr>"
+            for r in rc_list
+        )
+        top5_sum = sum(float(r.get("risk_contribution") or 0.0) for r in rc_list)
+        top5_html = (
+            f'<p class="kpi-sub">Top 5 风险贡献者（Python 确定性计算，已按风险贡献降序排列）：</p>'
+            f'<table class="simple-table"><tr><th>Ticker</th><th>风险贡献</th></tr>'
+            f'{top5_rows}'
+            f'<tr><td><b>合计</b></td><td><b>{format_ratio_as_pct(top5_sum)}</b></td></tr>'
+            f'</table>'
+        )
+        risk_parts.append(render_section("Python 风险集中度", "📊", top5_html))
+
     if risk_findings:
         risk_parts.append(render_section("确定性风险指标（Python 规则）", "⚠️", render_risk_cards(risk_findings)))
     if key_risks:
@@ -392,23 +427,29 @@ def build_html(
     holdings_html += '<p class="kpi-sub">风险贡献采用正边际贡献归一化口径；负边际风险贡献被归零，因此 0% 不代表该资产本身没有波动或风险。</p>'
     parts.append(render_section("所有持仓技术快照（按风险优先级降序）", "🧮", holdings_html))
 
-    # ── 来源附录（修改计划 17.11）──
+    # ── 来源附录（§35 简化：仅列表格，不重复新闻区完整摘要）──
     if evidence:
-        appendix = ""
-        for e in evidence:
+        appendix = (
+            '<table class="simple-table"><tr>'
+            '<th>ID</th><th>Ticker</th><th>日期</th><th>来源</th><th>标题</th><th>正文</th>'
+            '</tr>'
+        )
+        for e in evidence[:20]:  # 最多 20 条
             url = str(e.get("url") or "")
             title_html = (
-                f'<a href="{esc(url)}" target="_blank" rel="noopener noreferrer">{esc(e.get("title", ""))}</a>'
-                if url else esc(e.get("title", ""))
+                f'<a href="{esc(url)}" target="_blank" rel="noopener noreferrer">{esc(str(e.get("title", ""))[:60])}</a>'
+                if url else esc(str(e.get("title", ""))[:60])
             )
             appendix += (
-                f'<div class="source-card"><div class="sc-head"><div class="sc-title">{title_html}</div></div>'
-                f'<div class="sc-meta"><span>{esc(e.get("evidence_id", ""))}</span><span>来源：{esc(e.get("source_name", ""))}</span>'
-                f'<span>日期：{esc(e.get("published_date", ""))}</span><span>关联：{esc(e.get("ticker") or "—")}</span>'
-                f'<span>正文：{"已验证" if e.get("article_fetch_ok") else "仅搜索摘要"}</span></div>'
-                f'<div class="sc-summary">{esc(e.get("summary_zh") or e.get("title") or "")}</div></div>'
+                f'<tr><td>{esc(e.get("evidence_id") or "—")}</td>'
+                f'<td>{esc(e.get("ticker") or "—")}</td>'
+                f'<td>{esc(str(e.get("published_date") or "")[:10])}</td>'
+                f'<td>{esc(str(e.get("source_name") or "")[:20])}</td>'
+                f'<td>{title_html}</td>'
+                f'<td>{"已提取" if e.get("article_fetch_ok") else "摘要"}</td></tr>'
             )
-        parts.append(render_section("来源附录（完整 Evidence）", "🔗", appendix))
+        appendix += '</table>'
+        parts.append(render_section("来源附录（Accepted Evidence）", "🔗", appendix))
 
     # ── 数据质量与免责声明（修改计划 17.12）──
     quality = snapshot.get("data_quality", {})
@@ -436,20 +477,16 @@ def build_html(
             f'原始结果：{research_diagnostics.get("raw_results_count", 0)}；过滤后：{research_diagnostics.get("filtered_results_count", 0)}；'
             f'入选证据：{research_diagnostics.get("selected_evidence_count", 0)}；主要过滤原因：{reasons}</p>'
         )
-        # 第六轮：Risk-weighted Coverage（修改计划第 21 节）
-        rwc = research_diagnostics.get("risk_weighted_coverage")
+        # P0-2: 使用 accepted 口径的覆盖率和最新事件日期
+        rwc = research_diagnostics.get("accepted_risk_weighted_coverage") or research_diagnostics.get("risk_weighted_coverage")
+        top_cov = research_diagnostics.get("accepted_top_risk_coverage") or research_diagnostics.get("top_risk_coverage") or 0
         if rwc is not None:
-            dq_html += f'<p class="kpi-sub">风险加权覆盖率：{format_ratio_as_pct(rwc)}；Top-risk 覆盖率：{format_ratio_as_pct(research_diagnostics.get("top_risk_coverage") or 0)}</p>'
-        # 第六轮：新闻时间字段拆分（修改计划第 27 节）
-        news_exec_at = research_diagnostics.get("news_search_executed_at")
-        latest_event = research_diagnostics.get("latest_selected_event_date")
-        if news_exec_at or latest_event:
-            dq_html += '<p class="kpi-sub">'
-            if news_exec_at:
-                dq_html += f'新闻检索时间：{esc(str(news_exec_at)[:19])}；'
-            if latest_event:
-                dq_html += f'最新入选事件日期：{esc(str(latest_event))}；'
-            dq_html += '</p>'
+            dq_html += f'<p class="kpi-sub">风险加权覆盖率：{format_ratio_as_pct(rwc)}；Top-risk 覆盖率：{format_ratio_as_pct(top_cov)}</p>'
+        latest_event = research_diagnostics.get("latest_accepted_event_date") or research_diagnostics.get("latest_selected_event_date")
+        if latest_event:
+            dq_html += f'<p class="kpi-sub">最新 Accepted 事件日期：{esc(str(latest_event))}</p>'
+        elif research_diagnostics.get("latest_accepted_event_date") is None and research_diagnostics.get("accepted_evidence_count", 0) == 0:
+            dq_html += '<p class="kpi-sub">最新 Accepted 事件日期：—</p>'
         # 第六轮：Materiality 统计（修改计划第 16 节）
         mat_stats = research_diagnostics.get("materiality_stats") or {}
         if mat_stats:
@@ -461,7 +498,16 @@ def build_html(
                 f'拒绝原因：' + "、".join(f"{esc(k)} {v}" for k, v in (mat_stats.get("rejected_reasons") or {}).items() if v) + '</p>'
             )
     if report_quality:
-        dq_html += f'<p>报告质量评分：{format_ratio_as_pct(report_quality.get("quality_score"))}；可操作：{"是" if report_quality.get("actionable") else "否"}</p>'
+        # §24: 质量评分为分项展示
+        final_conf = report_quality.get("final_confidence") or advice.get("final_confidence") or advice.get("confidence") or 0
+        fresh_count = research_diagnostics.get("accepted_fresh_count", 0)
+        top_cov2 = research_diagnostics.get("accepted_top_risk_coverage") or 0
+        dq_html += (
+            f'<p>报告质量评分：{format_ratio_as_pct(report_quality.get("quality_score"))}'
+            f'（数据完整性 100% · 研究充分性 {format_ratio_as_pct(top_cov2)}'
+            f' · 决策置信度 {format_ratio_as_pct(final_conf)}'
+            f' · 可操作：{"是" if report_quality.get("actionable") else "否"}）</p>'
+        )
         quality_warnings = [str(item) for item in (report_quality.get("warnings") or []) if str(item).strip()]
         if quality_warnings:
             dq_html += '<p class="kpi-sub warn-text">质量提示：' + '；'.join(esc(item) for item in quality_warnings) + '</p>'

@@ -340,9 +340,11 @@ def calculate_portfolio_metrics(
     portfolio_returns = (returns * aligned_weights).sum(axis=1, min_count=1).dropna()
 
     if len(portfolio_returns) >= 20:
-        metrics["annualized_volatility"] = float(portfolio_returns.std() * math.sqrt(252) * 100.0)
-        metrics["max_drawdown_63d"] = _max_drawdown(portfolio_returns, 63)
-        metrics["max_drawdown_252d"] = _max_drawdown(portfolio_returns, 252)
+        # P0-7: 仅在 return_model 未提供时使用旧计算
+        if return_model is None:
+            metrics["annualized_volatility"] = float(portfolio_returns.std() * math.sqrt(252) * 100.0)
+            metrics["max_drawdown_63d"] = _max_drawdown(portfolio_returns, 63)
+            metrics["max_drawdown_252d"] = _max_drawdown(portfolio_returns, 252)
 
     # 相对收益（修改计划第三轮 4）：使用基准有效日期与共同有效起止日，
     # 不再用 `if b0:` 这类对 NaN 为真值的判定。
@@ -350,16 +352,41 @@ def calculate_portfolio_metrics(
     if not bench_series.empty:
         benchmark_returns = bench_series.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan).dropna()
         beta_result = calculate_portfolio_beta(portfolio_returns, benchmark_returns)
-        metrics["portfolio_beta"] = beta_result["value"]
-        metrics["portfolio_beta_historical"] = beta_result
-        metrics["portfolio_beta_status"] = beta_result["status"]
-        metrics["portfolio_beta_observations"] = beta_result["observations"]
+        # P0-7: 仅在 return_model 未提供时使用旧 beta 计算
+        if return_model is None:
+            metrics["portfolio_beta"] = beta_result["value"]
+            metrics["portfolio_beta_historical"] = beta_result
+            metrics["portfolio_beta_status"] = beta_result["status"]
+            metrics["portfolio_beta_observations"] = beta_result["observations"]
         for name, periods in RETURN_WINDOWS.items():
             if len(close) > periods + 1:
                 metrics["relative_returns"][name] = calculate_relative_window_return(
                     close[ticker_cols], aligned_weights, bench_series, periods,
                     minimum_weight_coverage=0.90,
                 )
+
+    # §17: 简单 Return Contribution（static_weight × ticker_window_return）
+    if close_prices is not None and not close_prices.empty and ticker_cols:
+        contrib_periods = 5  # 5 日窗口
+        if len(close_prices) > contrib_periods:
+            ticker_ret = close_prices[ticker_cols].iloc[-contrib_periods:].pct_change(
+                fill_method=None
+            ).replace([np.inf, -np.inf], np.nan).dropna()
+            if len(ticker_ret) > 0:
+                contribs = []
+                for h in holdings:
+                    t = h["ticker"]
+                    w = float(h.get("weight") or 0.0)
+                    if t in ticker_ret.columns:
+                        cum_ret = float((1 + ticker_ret[t]).prod() - 1)
+                        contribs.append({
+                            "ticker": t,
+                            "static_weight": round(w, 4),
+                            f"return_{contrib_periods}d": round(cum_ret * 100, 2),
+                            "contribution_pct_points": round(w * cum_ret * 100, 4),
+                        })
+                contribs.sort(key=lambda x: x["contribution_pct_points"])
+                metrics["relative_return_contributions"] = contribs
 
     holding_betas = [
         (float(h["weight"]), _safe_float(h.get("beta")))
@@ -404,25 +431,25 @@ def calculate_portfolio_metrics(
             [float(value) if math.isfinite(float(value)) else None for value in row]
             for row in cov.to_numpy()
         ]
-        w = aligned_weights.reindex(cov.index).fillna(0.0).to_numpy()
-        cov_matrix = cov.to_numpy()
-        variance = float(w.T @ cov_matrix @ w)
-        if variance > 0:
-            volatility = math.sqrt(variance)
-            marginal = cov_matrix @ w / volatility
-            component = w * marginal
-            total_component = float(component.sum())
-            if total_component != 0:
-                # 修改计划 13.3：采用方案 B（仅展示正风险预算并重新归一化），
-                # 避免直接 max(0, x) 后不归一化导致风险贡献之和漂移。
-                raw_rc = {ticker: float(value) for ticker, value in zip(cov.index, component / total_component)}
-                positive = {t: max(0.0, v) for t, v in raw_rc.items()}
-                pos_sum = sum(positive.values())
-                if pos_sum > 0:
-                    positive = {t: v / pos_sum for t, v in positive.items()}
-                metrics["risk_contributions"] = [
-                    {
-                        "ticker": ticker,
+        # P0-7: 仅在 return_model 未提供风险贡献时使用旧计算
+        if return_model is None:
+            w = aligned_weights.reindex(cov.index).fillna(0.0).to_numpy()
+            cov_matrix = cov.to_numpy()
+            variance = float(w.T @ cov_matrix @ w)
+            if variance > 0:
+                volatility = math.sqrt(variance)
+                marginal = cov_matrix @ w / volatility
+                component = w * marginal
+                total_component = float(component.sum())
+                if total_component != 0:
+                    raw_rc = {ticker: float(value) for ticker, value in zip(cov.index, component / total_component)}
+                    positive = {t: max(0.0, v) for t, v in raw_rc.items()}
+                    pos_sum = sum(positive.values())
+                    if pos_sum > 0:
+                        positive = {t: v / pos_sum for t, v in positive.items()}
+                    metrics["risk_contributions"] = [
+                        {
+                            "ticker": ticker,
                         "weight": float(weights_by_ticker.get(ticker, 0.0)),
                         "risk_contribution": positive.get(ticker, 0.0),
                         "risk_weight_gap": positive.get(ticker, 0.0) - float(weights_by_ticker.get(ticker, 0.0)),

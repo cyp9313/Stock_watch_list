@@ -477,6 +477,12 @@ def test_apply_summaries_by_uid():
          "event_title_zh": "Summarized A",
          "what_happened_zh": "Something happened",
          "impact_direction": "positive"},
+        # P0-3: 必须返回所有 evidence 的 UID，ev_bbb 也返回摘要以避免 missing UID 报错
+        {"evidence_uid": "ev_bbb",
+         "accept": True, "ticker": "MSFT",
+         "event_title_zh": "Summarized B",
+         "what_happened_zh": "Something else",
+         "impact_direction": "neutral"},
     ]
 
     errors = _apply_summaries_by_uid(evidence, items)
@@ -485,12 +491,11 @@ def test_apply_summaries_by_uid():
     assert evidence[0]["impact_direction"] == "positive"
     assert evidence[0]["accept"] is True
     assert evidence[0]["summary_method"] == "llm_decision_summarizer"
-    # ev_bbb 不受影响
-    assert evidence[1]["summary_zh"] == ""
+    assert evidence[1]["summary_zh"] == "Summarized B"
 
 
 def test_apply_summaries_by_uid_duplicate():
-    """LLM 返回重复 UID → by_uid dict last-wins（不抛错，行为可预测）。"""
+    """P0-3: LLM 返回重复 UID → 记录错误，不应用任何一条（fail-closed）。"""
     from daily_report.src.stock_daily_agent.evidence_summarizer import _apply_summaries_by_uid
 
     evidence = [
@@ -500,19 +505,20 @@ def test_apply_summaries_by_uid_duplicate():
         {"evidence_uid": "ev_aaa",
          "accept": True, "ticker": "AAPL",
          "event_title_zh": "First"},
-        {"evidence_uid": "ev_aaa",  # 重复 — last wins
+        {"evidence_uid": "ev_aaa",  # 重复
          "accept": False, "ticker": "AAPL",
          "event_title_zh": "Second"},
     ]
 
     errors = _apply_summaries_by_uid(evidence, items)
-    # LLM 返回重复 UID → dict last-wins，不会记录为错误
-    assert evidence[0]["summary_zh"] == "Second"  # last wins
-    assert evidence[0]["accept"] is False
+    assert errors  # P0-3: 重复 UID → 错误
+    assert any("duplicate" in e for e in errors)
+    # 重复 UID 时不应应用任何一条
+    assert evidence[0]["summary_zh"] == ""  # 未被覆盖
 
 
 def test_apply_summaries_by_uid_unknown():
-    """LLM 返回未知 UID → 跳过，不崩溃（不记录错误，因循环以 evidence 为轴）。"""
+    """P0-3: LLM 返回未知 UID → 记录错误。"""
     from daily_report.src.stock_daily_agent.evidence_summarizer import _apply_summaries_by_uid
 
     evidence = [
@@ -520,14 +526,66 @@ def test_apply_summaries_by_uid_unknown():
     ]
     items = [
         {"evidence_uid": "ev_unknown",
-         "accept": True, "ticker": "AAPL", "entity_role": "primary",
-         "is_quote_page": False, "summary_zh": "Unknown summary"},
+         "accept": True, "ticker": "AAPL",
+         "event_title_zh": "Unknown summary"},
+        # ev_aaa missing from output → missing UID error
     ]
 
     errors = _apply_summaries_by_uid(evidence, items)
-    # LLM 返回未知 UID — 因为循环以 evidence 为轴，未匹配项被跳过
-    # 不抛错，但证据项也未被更新
-    assert evidence[0]["summary_zh"] == ""
+    assert errors
+    assert any("unknown" in e for e in errors)
+    assert any("missing" in e for e in errors)
+
+
+def test_apply_summaries_by_uid_missing():
+    """P0-3: LLM 遗漏 evidence UID → 记录错误，该证据保持 reject。"""
+    from daily_report.src.stock_daily_agent.evidence_summarizer import _apply_summaries_by_uid
+
+    evidence = [
+        {"evidence_uid": "ev_aaa", "ticker": "AAPL", "title": "Orig A", "accept": True},
+        {"evidence_uid": "ev_bbb", "ticker": "MSFT", "title": "Orig B"},
+    ]
+    items = [
+        {"evidence_uid": "ev_aaa",
+         "accept": True, "ticker": "AAPL",
+         "event_title_zh": "Only A returned"},
+        # ev_bbb missing → missing UID error
+    ]
+
+    errors = _apply_summaries_by_uid(evidence, items)
+    assert any("missing" in e for e in errors)
+    # ev_bbb 保持 accept=缺失 → is_accepted_evidence 会 reject (fail-closed)
+    assert "summary_method" not in evidence[1]  # 未被 LLM 处理
+
+
+def test_is_accepted_requires_explicit_accept():
+    """P0-3: accept 缺失默认 reject（而非默认接受）。"""
+    from daily_report.src.stock_daily_agent.research_core.evidence_id import is_accepted_evidence
+
+    # accept=False → reject
+    assert not is_accepted_evidence({"materiality_accepted": True, "accept": False,
+                                      "entity_role": "primary", "is_quote_page": False,
+                                      "is_reference_page": False, "recency_tier": "fresh_event",
+                                      "article_fetch_ok": True, "snippet_fallback_ok": False,
+                                      "chronology_conflict": False})
+    # accept 缺失 → reject
+    assert not is_accepted_evidence({"materiality_accepted": True,
+                                      "entity_role": "primary", "is_quote_page": False,
+                                      "is_reference_page": False, "recency_tier": "fresh_event",
+                                      "article_fetch_ok": True, "snippet_fallback_ok": False,
+                                      "chronology_conflict": False})
+    # accept=True → accept
+    assert is_accepted_evidence({"materiality_accepted": True, "accept": True,
+                                  "entity_role": "primary", "is_quote_page": False,
+                                  "is_reference_page": False, "recency_tier": "fresh_event",
+                                  "article_fetch_ok": True, "snippet_fallback_ok": False,
+                                  "chronology_conflict": False})
+    # chronology_conflict → reject
+    assert not is_accepted_evidence({"materiality_accepted": True, "accept": True,
+                                      "entity_role": "primary", "is_quote_page": False,
+                                      "is_reference_page": False, "recency_tier": "fresh_event",
+                                      "article_fetch_ok": True, "snippet_fallback_ok": False,
+                                      "chronology_conflict": True})
 
 
 def test_validate_summary_identity():

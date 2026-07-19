@@ -250,14 +250,10 @@ def _apply_confidence_cap(
 
 
 def _guard_actions(advice: dict, evidence: list[dict], settings: dict) -> dict:
-    """修改计划第六轮第 22 节：Action Evidence Gate。
+    """修改计划第六轮第 22 节：Action Evidence Gate + P0-6 完整 Observation 展示。
 
-    - 无 Material Evidence 的 directional action 强制转 Watch；
-    - exit 缺少新鲜 thesis 证伪证据 → 降级 reduce；
-    - 缺少新鲜证据的 directional action → monitor。
-
-    §19 修复：被降级的 Action 清除 AI 原始文案，替换为确定性说明。
-    原始 AI 文案保留在 raw_ai_reason / raw_ai_risk_narrative 供 debug。
+    - 无 Material Evidence 的 directional action → 完整重写全部展示字段；
+    - raw_ai_* 保留原始 AI 输出供 debug。
     """
     fresh_by_ticker = {
         str(item.get("ticker") or "").upper()
@@ -278,28 +274,41 @@ def _guard_actions(advice: dict, evidence: list[dict], settings: dict) -> dict:
         current = float(action.get("current_weight") or 0.0)
         action_type = str(action.get("action") or "watch").lower()
 
-        # 第 22.1 节：无 Material Evidence 的 directional action → watch
         if action_type in {"add", "trim", "reduce", "exit"} and ticker not in material_tickers:
-            # §19 修复：保留原始 AI 文案到 debug 字段
-            action["raw_ai_action"] = action_type
-            action["raw_ai_reason"] = action.get("reason")
-            action["raw_ai_risk_narrative"] = action.get("risk_narrative")
+            # P0-6: 保存所有原始 AI 字段
+            for field in ("action", "reason", "risk_narrative", "portfolio_reason",
+                          "technical_reason", "news_reason", "bull_case", "bear_case",
+                          "execute_if", "cancel_or_upgrade_if", "further_reduce_if",
+                          "monitoring_items", "thresholds"):
+                raw_val = action.get(field)
+                if raw_val is not None or field == "action":
+                    action[f"raw_ai_{field}"] = raw_val
             action["quantitative_candidate_action"] = action_type
             action["action"] = "watch"
             action["action_timing"] = "monitor"
             action["target_weight_min"] = current
             action["target_weight_max"] = current
-            action["execute_if"] = []
-            action["expected_portfolio_risk_reduction"] = None
-            action["expected_risk_change"] = None
+            # P0-6: 完整重写展示字段
             action["reason"] = (
-                f"量化减仓候选，等待事件确认。\n\n"
+                f"该标的风险贡献高于其权重，因此列入重点观察。\n\n"
                 f"量化原因：风险贡献或回撤信号触发了方向性操作候选。\n\n"
-                f"为何暂不执行：当前缺少符合 Materiality 与主体匹配要求的事件证据。\n\n"
-                f"下一步：等待指定事件或价格条件确认后重新评估。"
+                f"为何暂不执行：当前缺少符合 Materiality 与主体匹配要求的事件证据。"
             )
             action["risk_narrative"] = None
-            action["validation_note"] = "无 material evidence 支撑，已转为观察项（量化候选保留为内部字段）。"
+            action["portfolio_reason"] = "该标的风险贡献显著高于其权重，列入重点观察。"
+            action["technical_reason"] = "当前技术指标仅用于识别风险，不构成交易触发。"
+            action["news_reason"] = "本轮没有通过研究质量门槛的事件证据。"
+            action["bull_case"] = "等待新的、可验证的正面事件信号。"
+            action["bear_case"] = "等待新的、可验证的负面事件信号。"
+            action["execute_if"] = []
+            action["cancel_or_upgrade_if"] = []
+            action["further_reduce_if"] = []
+            action["monitoring_items"] = [f"{ticker} 风险贡献变化", "价格关键技术位"]
+            action["thresholds"] = []
+            action["expected_portfolio_risk_reduction"] = None
+            action["expected_risk_change"] = None
+            action["evidence_ids"] = []
+            action["validation_note"] = "无 material evidence 支撑，已转为观察项。"
             continue
 
         if action_type == "exit" and not (allow_exit and ticker in fresh_by_ticker):
@@ -313,30 +322,88 @@ def _guard_actions(advice: dict, evidence: list[dict], settings: dict) -> dict:
     return advice
 
 
-def _enforce_observation_mode(advice: dict) -> dict:
-    """Turn directional actions into watch items when the report is not actionable.
+# P0-2: 收口后基于 accepted_evidence 重算所有研究指标
+def _recompute_accepted_coverage(
+    research_result: dict,
+    ranking: dict,
+    metrics: dict,
+    accepted_evidence: list[dict],
+) -> None:
+    """收口后基于 Accepted Evidence 重算覆盖率、风险加权覆盖、新鲜度等。
 
-    §19 修复：保留原始 AI 文案到 debug 字段。
+    写入 research_result["diagnostics"] 并覆盖旧字段。
     """
+    top_risk_tickers = [str(t).upper() for t in (ranking.get("top_risk_tickers") or [])]
+    acc = accepted_evidence or []
+    diag = research_result.setdefault("diagnostics", {})
+
+    # Accepted ticker 覆盖
+    covered = {str(e.get("ticker") or "").upper() for e in acc if e.get("ticker")}
+    top_risk_set = {t for t in top_risk_tickers}
+    accepted_top_risk = top_risk_set & covered
+    coverage = len(accepted_top_risk) / len(top_risk_set) if top_risk_set else 0.0
+
+    # Accepted Risk-weighted Coverage
+    rc_map = {str(item.get("ticker") or "").upper(): float(item.get("risk_contribution") or 0.0)
+              for item in (metrics.get("risk_contributions") or [])}
+    total_rc = sum(rc_map.get(t, 0.0) for t in top_risk_tickers)
+    covered_rc = sum(rc_map.get(t, 0.0) for t in accepted_top_risk)
+    rwc = (covered_rc / total_rc) if total_rc > 0 else 0.0
+
+    # Accepted Fresh Count
+    fresh_count = sum(1 for e in acc if str(e.get("recency_tier") or "") in {"fresh_event", "recent_background"})
+    verified_count = sum(1 for e in acc if e.get("article_fetch_ok"))
+    tier12_count = sum(1 for e in acc if str(e.get("source_quality") or "").startswith(("tier_1", "tier_2")))
+    event_count = len({str(e.get("event_key") or e.get("evidence_uid")) for e in acc if e.get("event_key")})
+    latest_date = max((str(e.get("published_date") or "") for e in acc if e.get("published_date")), default=None)
+
+    diag["accepted_top_risk_coverage"] = round(coverage, 3)
+    diag["accepted_risk_weighted_coverage"] = round(rwc, 3)
+    diag["accepted_fresh_count"] = fresh_count
+    diag["accepted_verified_body_count"] = verified_count
+    diag["accepted_tier12_count"] = tier12_count
+    diag["accepted_unique_event_count"] = event_count
+    diag["latest_accepted_event_date"] = latest_date
+    diag["accepted_top_risk_ticker_count"] = len(accepted_top_risk)
+
+    # 同时更新旧字段以保持兼容（P0-2: 用 accepted 值覆盖候选值）
+    diag["top_risk_coverage"] = round(coverage, 3)
+    diag["risk_weighted_coverage"] = round(rwc, 3)
+
+
+def _enforce_observation_mode(advice: dict) -> dict:
+    """Turn directional actions into watch items — P0-6: 完整清空方向性展示字段。"""
     for action in advice.get("actions") or []:
         if action.get("action") in {"hold", "watch"}:
             continue
         current = float(action.get("current_weight") or 0.0)
-        action["raw_ai_action"] = action.get("action")
-        action["raw_ai_reason"] = action.get("reason")
-        action["raw_ai_risk_narrative"] = action.get("risk_narrative")
+        # P0-6: 保存原始 AI
+        for field in ("action", "reason", "risk_narrative", "portfolio_reason",
+                      "technical_reason", "news_reason", "bull_case", "bear_case",
+                      "execute_if", "cancel_or_upgrade_if", "further_reduce_if",
+                      "monitoring_items", "thresholds"):
+            raw_val = action.get(field)
+            if raw_val is not None or field == "action":
+                action[f"raw_ai_{field}"] = raw_val
         action["action"] = "watch"
         action["action_timing"] = "monitor"
         action["target_weight_min"] = current
         action["target_weight_max"] = current
+        action["reason"] = "报告最终置信度未达到可操作门槛，已转换为观察项。"
+        action["risk_narrative"] = None
+        action["portfolio_reason"] = "该标的被量化模型识别为风险候选，但当前无足够证据执行操作。"
+        action["technical_reason"] = "技术指标仅供参考，不构成交易信号。"
+        action["news_reason"] = "本轮新闻研究未产生可操作的事件证据。"
+        action["bull_case"] = "等待新的可验证正面事件。"
+        action["bear_case"] = "等待新的可验证负面事件。"
+        action["execute_if"] = []
+        action["cancel_or_upgrade_if"] = []
+        action["further_reduce_if"] = []
+        action["monitoring_items"] = [f"{action.get('ticker', '')} 风险贡献变化"]
+        action["thresholds"] = []
         action["expected_portfolio_risk_reduction"] = None
         action["expected_risk_change"] = None
-        action["reason"] = (
-            f"报告最终置信度未达到可操作门槛，已转换为观察项。\n\n"
-            f"该标的的量化信号触发了方向性操作候选，但当前证据质量不足以支撑立即执行。\n\n"
-            f"下一步：等待更多材料事件确认后重新评估。"
-        )
-        action["risk_narrative"] = None
+        action["evidence_ids"] = []
         action["validation_note"] = "报告最终置信度未达到可操作门槛，已转换为观察项。"
     return advice
 
@@ -521,6 +588,7 @@ def run_pipeline(
 
     summary_result = summarize_evidence_zh(
         evidence, instrument_metadata, model=model, provider=provider,
+        report_date=str(snapshot.get("report_date") or ""),
     )
     evidence = list(summary_result.get("evidence") or evidence)
 
@@ -546,6 +614,9 @@ def run_pipeline(
     if evidence:
         news_dates = [str(x.get("published_date")) for x in evidence if x.get("published_date")]
         snapshot["data_cutoffs"]["news"] = max(news_dates) if news_dates else snapshot.get("as_of")
+
+    # P0-2: 收口后基于 accepted_evidence 重算覆盖率和新鲜度
+    _recompute_accepted_coverage(research_result, ranking, metrics, accepted_evidence)
 
     # Top-risk news is a precondition: fail before invoking the main Portfolio Agent.
     preflight_quality = evaluate_report_quality(
@@ -670,16 +741,16 @@ def run_pipeline(
         ),
     }
     labels, portfolio_cumulative_pct, benchmark_cumulative_pct = _cumulative_returns(close, tickers, weights, benchmark)
-    # §22 修复：优先使用 Return Model 的统一累计收益（包含权重覆盖归一化）
+    # P0-8: 优先使用 Return Model 统一日期索引（Portfolio + Benchmark 对齐）
     if not return_model.cumulative_returns.empty:
         port_cum = (return_model.cumulative_returns * 100).tolist()
+        bench_cum = (return_model.benchmark_cumulative_returns * 100).tolist() if not return_model.benchmark_cumulative_returns.empty else []
         dates = [str(d) for d in return_model.cumulative_returns.index]
-        if labels and len(port_cum) > 0:
-            # 只更新 portfolio 部分，benchmark 仍用单独计算（保持兼容）
+        if len(dates) > 0:
+            labels = dates
             portfolio_cumulative_pct = port_cum
-            if len(port_cum) != len(labels):
-                # 日期对齐：取交集
-                pass  # 保持现有标签，允许少量不匹配
+            if bench_cum and len(bench_cum) == len(dates):
+                benchmark_cumulative_pct = bench_cum
     if labels:
         charts["cumulative"] = svg_cumulative_returns(labels, portfolio_cumulative_pct, benchmark_cumulative_pct)
 
@@ -730,9 +801,9 @@ def run_pipeline(
         except Exception:  # noqa: BLE001
             pass
 
-    # 中文 HTML
+    # 中文 HTML（P0-1: 仅传入 accepted_evidence）
     html_text = build_html(
-        snapshot, metrics, ranking, advice, evidence,
+        snapshot, metrics, ranking, advice, accepted_evidence,
         instrument_metadata=instrument_metadata,
         settings=settings,
         charts=charts,
@@ -741,6 +812,8 @@ def run_pipeline(
         fallback_reason=fallback_reason,
         research_diagnostics=research_result.get("diagnostics") or {},
         report_quality=quality,
+        rejected_evidence=rejected_evidence,
+        reference_evidence=reference_evidence,
     )
     output.write_text(html_text, encoding="utf-8")
 

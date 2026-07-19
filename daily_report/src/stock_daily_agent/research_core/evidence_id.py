@@ -35,11 +35,17 @@ _ACCEPTED_RECENCY_TIERS = {"fresh_event", "recent_background"}
 
 
 def is_accepted_evidence(item: dict[str, Any]) -> bool:
-    """判断一条证据是否满足"进入正式报告"的全部硬条件。"""
+    """判断一条证据是否满足"进入正式报告"的全部硬条件。
+
+    P0-3 修复：accept 缺失默认 reject（fail-closed），chronology_conflict 强制 reject。
+    """
     if not item.get("materiality_accepted"):
         return False
-    # 摘要器拒绝（Decision Summarizer）。缺失 accept 时默认 True（与既有行为一致）。
-    if item.get("accept") is False:
+    # P0-3: 显式接受 — 缺失 accept 或 accept!=True → reject
+    if item.get("accept") is not True:
+        return False
+    # P0-3: 时序冲突 → 直接 reject
+    if item.get("chronology_conflict"):
         return False
     if item.get("entity_role") not in _ACCEPTED_ENTITY_ROLES:
         return False

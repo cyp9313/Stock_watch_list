@@ -227,10 +227,14 @@ def render_action_detail(a: dict[str, Any], risk_contribution: Any = None, ticke
         }.get(basis, "情景阈值，非市场一致预期")
         val = th.get("value")
         val_str = f"{val}" if val is not None else "—"
+        th_note = str(th.get("note") or "")
+        # §29: 去重 - 若 note 与 basis_label 内容相同，不重复显示
+        if th_note.strip() == basis_label.strip():
+            th_note = ""
         th_html += (
             f'<li><b>{esc(metric_labels.get(str(th.get("metric") or ""), str(th.get("metric") or "")))}</b> = {esc(val_str)} '
             f'<span class="chip">{esc(basis_label)}</span>'
-            f'{("（" + esc(th.get("note", "")) + "）") if th.get("note") else ""}</li>'
+            f'{("（" + esc(th_note) + "）") if th_note else ""}</li>'
         )
     # 修改计划第三轮 21：metric_evidence 由确定性数据渲染，避免模型复制数字出错。
     me_html = ""
@@ -309,8 +313,13 @@ def render_news_group(title: str, items: list[dict[str, Any]]) -> str:
         verification_level_zh = e.get("verification_level_zh")
         if not verification_level_zh:
             verification_level_zh = "正文已提取" if e.get("article_fetch_ok") else "搜索摘要"
-        # 第六轮第 32 节：事件类型/事件日期
+        # §18: 分离 Planned Need 与 Detected Content Type
+        content_type = e.get("content_type") or ""
         event_type = e.get("event_type") or e.get("event_hint") or ""
+        # 若实际内容为 opinion/forecast 但 event_hint 是 earnings_results，显示为"财报前瞻"而非"财报结果"
+        _CONTENT_TYPE_LABELS = {"forecast": "前瞻", "opinion": "分析观点", "news_report": "新闻报道", "press_release": "新闻稿"}
+        if content_type in ("opinion", "forecast") and "results" in str(e.get("event_hint") or "") and "preview" not in str(e.get("event_hint") or ""):
+            event_type = f"{event_type}_preview"
         event_date = e.get("event_date") or e.get("published_date") or ""
         tags = (
             f'<span class="tier-badge {esc(tier)}">{esc(tier_display)}</span>'

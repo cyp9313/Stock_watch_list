@@ -526,8 +526,57 @@ def validate_portfolio_claims(
         registered_aggs = (metrics.get("aggregates") or {}).get("top_risk_contribution_sum")
         if registered_aggs is None:
             warnings.append(
-                f"中文正文出现 AI 自行计算的聚合值：「{tickers_str} {pct}%」"
-                "——Python 未提供该组合的注册聚合字段，该数值可能不可靠。"
+                f"中文正文出现 AI 自行计算的聚合值：「{tickers_str} {pct}%」——Python 未提供该组合的注册聚合字段。"
             )
+
+    # §14: 零 Accepted Evidence 时禁止基本面/流动性/投资者心理结论
+    accepted_count = sum(1 for e in (evidence or []) if e.get("evidence_id"))
+    if accepted_count == 0:
+        _ZERO_EVIDENCE_BANNED = [
+            r"基本面(承压|恶化|风险|走弱|改善)",
+            r"流动(性|资金).*(抛压|收紧|枯竭|折价|压力)",
+            r"机构.*(减持|减仓|流出|抛售)",
+            r"(市场|投资者).*(担忧|恐慌|认为|预期.*恶化)",
+            r"增长质量.*存疑",
+            r"经营.*(恶化|承压|风险)",
+        ]
+        for pattern in _ZERO_EVIDENCE_BANNED:
+            if re.search(pattern, all_text):
+                warnings.append(f"零 Accepted Evidence 时出现未证实结论「{pattern}」，系统只能确定技术面与风险贡献。")
+
+    # §13: 禁止单个 ticker 被归因为风险评分子项得分
+    ticker_risk_score_claim = re.compile(
+        r"([A-Z]{1,5})\s*(?:对|为).*?(?:风险评分|risk score).*?(?:贡献|得?分).*?(\d+)",
+        re.I,
+    )
+    for m in ticker_risk_score_claim.finditer(all_text):
+        warnings.append(
+            f"{m.group(1)} 被错误归因为风险评分子项得分（{m.group(2)} 分），"
+            f"该分数属于全组合风险贡献集中度子项，非单标的贡献。"
+        )
+
+    # §16: 相关性/重合语义分离
+    if re.search(r"科技股.*(超配|过度.*暴露|隐性.*持仓)", all_text):
+        warnings.append("未验证 ETF 底层持仓重合度，不得得出持仓重叠/隐性超配结论。仅能表述为价格相关性。")
+
+    # §15: 禁止无数据流动性/情绪结论
+    _NO_LIQUIDITY_DATA_CLAIMS = [
+        r"流动性.*(驱动|抛压|折价|枯竭|收紧|压力)",
+        r"情绪.*(驱动|抛售|恐慌)",
+        r"隐含.*流动性",
+        r"资金.*(流出|流入|撤出).*ETF",
+    ]
+    has_liquidity_data = any(
+        h.get("avg_volume") or h.get("bid_ask_spread") or h.get("aum")
+        for h in (snapshot.get("holdings") or [])
+    )
+    if not has_liquidity_data:
+        for pattern in _NO_LIQUIDITY_DATA_CLAIMS:
+            if re.search(pattern, all_text):
+                warnings.append(
+                    f"出现无数据支撑的流动性/情绪结论（{pattern}）。系统缺少成交额、Bid-ask、AUM 数据，"
+                    f"只能表述为回撤和风险贡献较高，不能归因于流动性或情绪。"
+                )
+                break  # 每个报告仅报一次
 
     return list(dict.fromkeys(errors)), list(dict.fromkeys(warnings))

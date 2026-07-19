@@ -50,6 +50,17 @@ _DISPLAY_TERM_REPLACEMENTS = {
     "portfolio_risk_score": "风险评分",
     "cash_unspecified": "现金（未指定）",
     "uranium_price": "铀价",
+    # P1 §30: 枚举中文化
+    "medium": "中等",
+    "actual\":": "数据有效\":",
+    "'actual'": "'数据有效'",
+    "earnings_results": "财报结果",
+    "earnings_preview": "财报前瞻",
+    "general_event": "一般事件",
+    "unknown": "未知",
+    "short": "短期",
+    "mixed": "影响混合",
+    "add": "加仓候选",
 }
 
 
@@ -224,6 +235,10 @@ def _validate_agent_advice(advice: dict[str, Any], ctx: PortfolioRunContext) -> 
     normalized = _sanitize_user_facing_language(normalized)
     normalized = _sanitize_evidence_references(normalized, ctx)
     normalized = _apply_python_owned_action_controls(normalized, ctx)
+    # Pre-guard: 无 accepted evidence 时 exit→reduce，避免 strict 模式硬报错
+    for action in normalized.get("actions") or []:
+        if str(action.get("action") or "").lower() == "exit" and not (action.get("evidence_ids") or []):
+            action["action"] = "reduce"
     validated = validate_portfolio_advice(normalized, ctx.snapshot, ctx.evidence, mode="strict")
     claim_errors, claim_warnings = validate_portfolio_claims(
         validated, ctx.snapshot, ctx.metrics, ctx.evidence,
