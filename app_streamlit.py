@@ -21,6 +21,8 @@ import time
 import threading
 import colorsys
 from PIL import Image
+from kline_indicator_controls import render_indicator_settings_panel
+from kline_indicators import calculate_configurable_indicators, default_indicator_settings, normalize_indicator_settings
 from ticker_mapping import normalize_yfinance_ticker, stockanalysis_overview_url
 
 # ── Page config ──────────────────────────────────────────────
@@ -808,7 +810,7 @@ def render_grouped_table(df, groups, key_prefix="", dark_mode=False, show_name_c
 
 
 # ── K-line chart builder ─────────────────────────────────────
-def build_kline_chart(kline_data, ticker, fib_levels=None, dark_mode=False, uirevision=None):
+def build_kline_chart(kline_data, ticker, fib_levels=None, dark_mode=False, uirevision=None, indicator_settings=None, interval="1d"):
     """Build a Plotly candlestick chart with all indicators.
     fib_levels: optional list of (price, label, color) tuples for Fibonacci lines.
     """
@@ -825,6 +827,8 @@ def build_kline_chart(kline_data, ticker, fib_levels=None, dark_mode=False, uire
     # Parse dates
     date_fmt = "%Y-%m-%d %H:%M" if ":" in str(dates_raw[0]) else "%Y-%m-%d"
     dates = [datetime.datetime.strptime(d[:19] if " " in d else d[:10], date_fmt) for d in dates_raw]
+    indicator_settings = normalize_indicator_settings(indicator_settings)
+    calculated = calculate_configurable_indicators(dates_raw, ohlc, indicator_settings, interval)
 
     n = len(dates)
 
@@ -906,15 +910,20 @@ def build_kline_chart(kline_data, ticker, fib_levels=None, dark_mode=False, uire
     )
 
     # MAs
-    ma_colors = {"ma5": "blue", "ma10": "orange", "ma20": "purple",
-                 "ma50": "brown", "ma100": "pink", "ma200": "gray"}
-    for key, color in ma_colors.items():
-        if ind.get(key):
-            fig.add_trace(
-                go.Scatter(x=dates, y=ind[key], name=key.upper(), line=dict(color=color, width=1, dash="dash"),
-                           showlegend=True),
-                row=1, col=1,
-            )
+    ma_colors = ["blue", "orange", "purple", "brown", "pink", "gray"]
+    for ma, values, color in zip(indicator_settings["moving_averages"], calculated["moving_averages"], ma_colors):
+        fig.add_trace(
+            go.Scatter(
+                x=dates, y=values, name=f"{ma['type']}({ma['period']})",
+                line=dict(color=color, width=1, dash="dash"), showlegend=True,
+            ),
+            row=1, col=1,
+        )
+    if any(pd.notna(calculated["vwap"])):
+        fig.add_trace(
+            go.Scatter(x=dates, y=calculated["vwap"], name="VWAP", line=dict(color="teal", width=1.5)),
+            row=1, col=1,
+        )
 
     # Bollinger Bands
     if ind.get("bollinger_upper"):
@@ -985,28 +994,28 @@ def build_kline_chart(kline_data, ticker, fib_levels=None, dark_mode=False, uire
     fig.update_xaxes(row=2, col=1, showgrid=True)
 
     # ── Row 3: MACD ───────────────────────────────────────────
-    if ind.get("macd"):
-        fig.add_trace(go.Scatter(x=dates, y=ind["macd"], name="MACD", line=dict(color="blue", width=1)),
+    if calculated.get("macd"):
+        fig.add_trace(go.Scatter(x=dates, y=calculated["macd"], name="MACD", line=dict(color="blue", width=1)),
                        row=3, col=1)
-    if ind.get("signal"):
-        fig.add_trace(go.Scatter(x=dates, y=ind["signal"], name="Signal", line=dict(color="red", width=1)),
+    if calculated.get("signal"):
+        fig.add_trace(go.Scatter(x=dates, y=calculated["signal"], name="Signal", line=dict(color="red", width=1)),
                        row=3, col=1)
-    if ind.get("hist"):
-        hist_colors = ["#26a69a" if v >= 0 else "#ef5350" for v in ind["hist"]]
-        fig.add_trace(go.Bar(x=dates, y=ind["hist"], name="Hist", marker_color=hist_colors,
+    if calculated.get("hist"):
+        hist_colors = ["#26a69a" if v >= 0 else "#ef5350" for v in calculated["hist"]]
+        fig.add_trace(go.Bar(x=dates, y=calculated["hist"], name="Hist", marker_color=hist_colors,
                               showlegend=False), row=3, col=1)
     fig.update_yaxes(title_text="MACD", row=3, col=1, showgrid=True)
     fig.update_xaxes(row=3, col=1, showgrid=True)
 
     # ── Row 4: KDJ ────────────────────────────────────────────
-    if ind.get("kdj_k"):
-        fig.add_trace(go.Scatter(x=dates, y=ind["kdj_k"], name="K", line=dict(color="blue", width=1)),
+    if calculated.get("kdj_k"):
+        fig.add_trace(go.Scatter(x=dates, y=calculated["kdj_k"], name="K", line=dict(color="blue", width=1)),
                        row=4, col=1)
-    if ind.get("kdj_d"):
-        fig.add_trace(go.Scatter(x=dates, y=ind["kdj_d"], name="D", line=dict(color="orange", width=1)),
+    if calculated.get("kdj_d"):
+        fig.add_trace(go.Scatter(x=dates, y=calculated["kdj_d"], name="D", line=dict(color="orange", width=1)),
                        row=4, col=1)
-    if ind.get("kdj_j"):
-        fig.add_trace(go.Scatter(x=dates, y=ind["kdj_j"], name="J", line=dict(color="green", width=1)),
+    if calculated.get("kdj_j"):
+        fig.add_trace(go.Scatter(x=dates, y=calculated["kdj_j"], name="J", line=dict(color="green", width=1)),
                        row=4, col=1)
     fig.add_hline(y=20, line_dash="dash", line_color="gray", row=4, col=1)
     fig.add_hline(y=80, line_dash="dash", line_color="gray", row=4, col=1)
@@ -1014,8 +1023,8 @@ def build_kline_chart(kline_data, ticker, fib_levels=None, dark_mode=False, uire
     fig.update_xaxes(row=4, col=1, showgrid=True)
 
     # ── Row 5: RSI ────────────────────────────────────────────
-    if ind.get("rsi"):
-        fig.add_trace(go.Scatter(x=dates, y=ind["rsi"], name="RSI", line=dict(color="purple", width=1)),
+    if calculated.get("rsi"):
+        fig.add_trace(go.Scatter(x=dates, y=calculated["rsi"], name="RSI", line=dict(color="purple", width=1)),
                        row=5, col=1)
     fig.add_hline(y=30, line_dash="dash", line_color="gray", row=5, col=1)
     fig.add_hline(y=70, line_dash="dash", line_color="gray", row=5, col=1)
@@ -2005,15 +2014,39 @@ def _render_kline_body():
                     rows_data.append({"Ratio": lbl, "Price": f"{level:.2f}", "Type": is_ext})
                 st.dataframe(pd.DataFrame(rows_data), width="stretch", hide_index=True)
 
-        # Now render the chart with potentially updated fib_levels
-        fig = build_kline_chart(kd, ticker, fib_levels=fib_levels, dark_mode=dark_mode, uirevision=request_key)
-        if fig:
-            render_persistent_kline_chart(fig, request_key)
-        else:
-            if kd:
-                st.error(kd.get("error", "Failed to load K-line data"))
+        # Keep configurable indicators beside the chart and retain them for this browser session.
+        settings = normalize_indicator_settings(
+            st.session_state.get("kline_indicator_settings", default_indicator_settings())
+        )
+        form_revision = int(st.session_state.get("kline_indicator_form_revision", 0))
+        chart_column, settings_column = st.columns([4, 1])
+        with settings_column:
+            updated_settings, settings_action = render_indicator_settings_panel(
+                settings,
+                key_prefix=f"single_kline_indicator_{form_revision}",
+                apply_label="Apply parameters",
+                reset_label="Restore defaults",
+            )
+            if settings_action:
+                st.session_state["kline_indicator_settings"] = updated_settings
+                st.session_state["kline_indicator_form_revision"] = form_revision + 1
+                settings = updated_settings
+                st.success("Indicator parameters applied")
+
+        with chart_column:
+            fig = build_kline_chart(
+                kd,
+                ticker,
+                fib_levels=fib_levels,
+                dark_mode=dark_mode,
+                uirevision=request_key,
+                indicator_settings=settings,
+                interval=interval,
+            )
+            if fig:
+                render_persistent_kline_chart(fig, request_key)
             else:
-                st.info("Click 'Plot' to load chart")
+                st.error(kd.get("error", "Failed to load K-line data"))
     else:
         if kd:
             st.error(kd.get("error", "Failed to load K-line data"))

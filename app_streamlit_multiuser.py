@@ -23,6 +23,8 @@ import streamlit.components.v1 as components
 import yfinance as yf
 from PIL import Image
 
+from kline_indicator_controls import render_indicator_settings_panel
+from kline_indicators import calculate_configurable_indicators, default_indicator_settings, normalize_indicator_settings
 import stock_watch_list_back_end
 from daily_report.jobs import (
     ActiveJobError,
@@ -2423,7 +2425,7 @@ def display_vix_gauge(kline_data, dark_mode=False):
     st.plotly_chart(build_vix_gauge(value, dark_mode=dark_mode), width="stretch")
 
 
-def build_kline_chart(kline_data, ticker, fib_levels=None, dark_mode=False, uirevision=None):
+def build_kline_chart(kline_data, ticker, fib_levels=None, dark_mode=False, uirevision=None, indicator_settings=None, interval="1d"):
     if not kline_data or not kline_data.get("success"):
         st.warning("K-line data not available")
         return None
@@ -2439,6 +2441,8 @@ def build_kline_chart(kline_data, ticker, fib_levels=None, dark_mode=False, uire
 
     n = len(dates)
     closes = ohlc["close"]
+    indicator_settings = normalize_indicator_settings(indicator_settings)
+    calculated = calculate_configurable_indicators(kline_data["dates"], ohlc, indicator_settings, interval)
 
     def _fmt(value, fmt_str=None):
         if value is None or (isinstance(value, float) and pd.isna(value)):
@@ -2524,27 +2528,37 @@ def build_kline_chart(kline_data, ticker, fib_levels=None, dark_mode=False, uire
         col=1,
     )
 
-    ma_colors = {
-        "ma5": "#60a5fa" if dark_mode else "blue",
-        "ma10": "#fbbf24" if dark_mode else "orange",
-        "ma20": "#c084fc" if dark_mode else "purple",
-        "ma50": "#f97316" if dark_mode else "brown",
-        "ma100": "#f9a8d4" if dark_mode else "pink",
-        "ma200": "#d1d5db" if dark_mode else "gray",
-    }
-    for key, color in ma_colors.items():
-        if indicators.get(key):
-            fig.add_trace(
-                go.Scatter(
-                    x=dates,
-                    y=indicators[key],
-                    name=key.upper(),
-                    line=dict(color=color, width=1, dash="dash"),
-                    showlegend=True,
-                ),
-                row=1,
-                col=1,
-            )
+    ma_colors = [
+        "#60a5fa" if dark_mode else "blue",
+        "#fbbf24" if dark_mode else "orange",
+        "#c084fc" if dark_mode else "purple",
+        "#f97316" if dark_mode else "brown",
+        "#f9a8d4" if dark_mode else "pink",
+        "#d1d5db" if dark_mode else "gray",
+    ]
+    for ma, values, color in zip(indicator_settings["moving_averages"], calculated["moving_averages"], ma_colors):
+        fig.add_trace(
+            go.Scatter(
+                x=dates,
+                y=values,
+                name=f"{ma['type']}({ma['period']})",
+                line=dict(color=color, width=1, dash="dash"),
+                showlegend=True,
+            ),
+            row=1,
+            col=1,
+        )
+    if any(pd.notna(calculated["vwap"])):
+        fig.add_trace(
+            go.Scatter(
+                x=dates,
+                y=calculated["vwap"],
+                name="VWAP",
+                line=dict(color="#2dd4bf" if dark_mode else "teal", width=1.5),
+            ),
+            row=1,
+            col=1,
+        )
 
     if indicators.get("bollinger_upper"):
         fig.add_trace(
@@ -2634,29 +2648,29 @@ def build_kline_chart(kline_data, ticker, fib_levels=None, dark_mode=False, uire
     fig.update_yaxes(title_text="Volume", row=2, col=1, showgrid=True)
     fig.update_xaxes(row=2, col=1, showgrid=True)
 
-    if indicators.get("macd"):
-        fig.add_trace(go.Scatter(x=dates, y=indicators["macd"], name="MACD", line=dict(color="#60a5fa" if dark_mode else "blue", width=1)), row=3, col=1)
-    if indicators.get("signal"):
-        fig.add_trace(go.Scatter(x=dates, y=indicators["signal"], name="Signal", line=dict(color="#f87171" if dark_mode else "red", width=1)), row=3, col=1)
-    if indicators.get("hist"):
-        hist_colors = ["#26a69a" if value >= 0 else "#ef5350" for value in indicators["hist"]]
-        fig.add_trace(go.Bar(x=dates, y=indicators["hist"], name="Hist", marker_color=hist_colors, showlegend=False), row=3, col=1)
+    if calculated.get("macd"):
+        fig.add_trace(go.Scatter(x=dates, y=calculated["macd"], name="MACD", line=dict(color="#60a5fa" if dark_mode else "blue", width=1)), row=3, col=1)
+    if calculated.get("signal"):
+        fig.add_trace(go.Scatter(x=dates, y=calculated["signal"], name="Signal", line=dict(color="#f87171" if dark_mode else "red", width=1)), row=3, col=1)
+    if calculated.get("hist"):
+        hist_colors = ["#26a69a" if value >= 0 else "#ef5350" for value in calculated["hist"]]
+        fig.add_trace(go.Bar(x=dates, y=calculated["hist"], name="Hist", marker_color=hist_colors, showlegend=False), row=3, col=1)
     fig.update_yaxes(title_text="MACD", row=3, col=1, showgrid=True)
     fig.update_xaxes(row=3, col=1, showgrid=True)
 
-    if indicators.get("kdj_k"):
-        fig.add_trace(go.Scatter(x=dates, y=indicators["kdj_k"], name="K", line=dict(color="#60a5fa" if dark_mode else "blue", width=1)), row=4, col=1)
-    if indicators.get("kdj_d"):
-        fig.add_trace(go.Scatter(x=dates, y=indicators["kdj_d"], name="D", line=dict(color="#fbbf24" if dark_mode else "orange", width=1)), row=4, col=1)
-    if indicators.get("kdj_j"):
-        fig.add_trace(go.Scatter(x=dates, y=indicators["kdj_j"], name="J", line=dict(color="#34d399" if dark_mode else "green", width=1)), row=4, col=1)
+    if calculated.get("kdj_k"):
+        fig.add_trace(go.Scatter(x=dates, y=calculated["kdj_k"], name="K", line=dict(color="#60a5fa" if dark_mode else "blue", width=1)), row=4, col=1)
+    if calculated.get("kdj_d"):
+        fig.add_trace(go.Scatter(x=dates, y=calculated["kdj_d"], name="D", line=dict(color="#fbbf24" if dark_mode else "orange", width=1)), row=4, col=1)
+    if calculated.get("kdj_j"):
+        fig.add_trace(go.Scatter(x=dates, y=calculated["kdj_j"], name="J", line=dict(color="#34d399" if dark_mode else "green", width=1)), row=4, col=1)
     fig.add_hline(y=20, line_dash="dash", line_color="gray", row=4, col=1)
     fig.add_hline(y=80, line_dash="dash", line_color="gray", row=4, col=1)
     fig.update_yaxes(title_text="KDJ", row=4, col=1, showgrid=True)
     fig.update_xaxes(row=4, col=1, showgrid=True)
 
-    if indicators.get("rsi"):
-        fig.add_trace(go.Scatter(x=dates, y=indicators["rsi"], name="RSI", line=dict(color="#c084fc" if dark_mode else "purple", width=1)), row=5, col=1)
+    if calculated.get("rsi"):
+        fig.add_trace(go.Scatter(x=dates, y=calculated["rsi"], name="RSI", line=dict(color="#c084fc" if dark_mode else "purple", width=1)), row=5, col=1)
     fig.add_hline(y=30, line_dash="dash", line_color="gray", row=5, col=1)
     fig.add_hline(y=70, line_dash="dash", line_color="gray", row=5, col=1)
     fig.update_yaxes(title_text="RSI", row=5, col=1, showgrid=True)
@@ -2870,6 +2884,17 @@ def render_persistent_kline_chart(fig, storage_key, height=None):
     components.html(html_doc, height=chart_height + 10, scrolling=False)
 
 
+def reset_kline_indicator_session_state():
+    """Remove account-scoped chart settings/widgets before an identity change."""
+    for key in list(st.session_state):
+        if key in {
+            "kline_indicator_settings",
+            "kline_indicator_settings_owner",
+            "kline_indicator_form_revision",
+        } or key.startswith("multi_kline_indicator_"):
+            st.session_state.pop(key, None)
+
+
 def render_auth_panel():
     with st.sidebar:
         st.header("Account")
@@ -2880,6 +2905,7 @@ def render_auth_panel():
             if st.button("Sign out", width="stretch"):
                 st.session_state.pop("user", None)
                 st.session_state.pop("watchlist_config", None)
+                reset_kline_indicator_session_state()
                 st.rerun()
             return user
 
@@ -2901,6 +2927,7 @@ def render_auth_panel():
             else:
                 user = authenticate(username, password)
                 if user:
+                    reset_kline_indicator_session_state()
                     st.session_state["user"] = user
                     st.session_state["watchlist_config"] = get_user_config(user["id"])
                     st.rerun()
@@ -3192,7 +3219,7 @@ def render_portfolio_section(config, raw_df, editable, user, dark_mode=False, di
     return config
 
 
-def render_kline(cache_key, display_currency="Local"):
+def render_kline(user, cache_key, display_currency="Local"):
     st.subheader("K-Line Chart")
     c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
     with c1:
@@ -3327,17 +3354,53 @@ def render_kline(cache_key, display_currency="Local"):
                     rows.append({"Ratio": label, "Price": f"{level:.2f}", "Type": "Extension" if color == "blue" else "Retracement"})
                 st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
+        owner = f"user:{user['id']}" if user else "guest"
+        if st.session_state.get("kline_indicator_settings_owner") != owner:
+            saved_settings = (
+                get_active_config(user).get("kline_indicator_settings")
+                if user else default_indicator_settings()
+            )
+            st.session_state["kline_indicator_settings"] = normalize_indicator_settings(saved_settings)
+            st.session_state["kline_indicator_settings_owner"] = owner
+            st.session_state["kline_indicator_form_revision"] = 0
+
+        settings = normalize_indicator_settings(st.session_state["kline_indicator_settings"])
+        form_revision = int(st.session_state.get("kline_indicator_form_revision", 0))
         dark_mode = st.session_state.get("dark_mode", False)
         chart_data = convert_kline_data_for_display(data, ticker, display_currency)
-        fig = build_kline_chart(
-            chart_data,
-            ticker,
-            fib_levels=fib_levels,
-            dark_mode=dark_mode,
-            uirevision=f"{request_key}_{display_currency}",
-        )
-        if fig:
-            render_persistent_kline_chart(fig, f"{request_key}_{display_currency}")
+        chart_column, settings_column = st.columns([4, 1])
+        with settings_column:
+            updated_settings, settings_action = render_indicator_settings_panel(
+                settings,
+                key_prefix=f"multi_kline_indicator_{owner}_{form_revision}",
+                apply_label="Apply and save" if user else "Apply parameters",
+                reset_label="Restore and save" if user else "Restore defaults",
+            )
+            if settings_action:
+                st.session_state["kline_indicator_settings"] = updated_settings
+                st.session_state["kline_indicator_form_revision"] = form_revision + 1
+                settings = updated_settings
+                if user:
+                    updated_config = get_active_config(user)
+                    updated_config["kline_indicator_settings"] = updated_settings
+                    st.session_state["watchlist_config"] = normalize_config(updated_config)
+                    save_user_config(user["id"], st.session_state["watchlist_config"])
+                    st.success("Indicator parameters saved")
+                else:
+                    st.success("Indicator parameters applied for this guest session")
+
+        with chart_column:
+            fig = build_kline_chart(
+                chart_data,
+                ticker,
+                fib_levels=fib_levels,
+                dark_mode=dark_mode,
+                uirevision=f"{request_key}_{display_currency}",
+                indicator_settings=settings,
+                interval=interval,
+            )
+            if fig:
+                render_persistent_kline_chart(fig, f"{request_key}_{display_currency}")
 
     _render_kline_body()
 
@@ -3798,8 +3861,9 @@ run_auto_refresh_controller(
 inject_css(dark_mode)
 st.title("Stock Watchlist")
 st.caption(
-    "Stock Watchlists are for custom stock/ETF lists. Market Dashboard is for indices and cross-asset signals. "
-    "Portfolios track personal holdings. Market Breadth is calculated from shared S&P 500 and Nasdaq 100 universes."
+    "Stock Watchlists organize custom stock and ETF lists; Market Dashboard tracks indices and cross-asset signals; "
+    "Market Breadth summarizes the shared S&P 500 and Nasdaq 100 universes; Portfolios monitor personal holdings; "
+    "and AI Agent Reports let signed-in users generate, download, email, and schedule in-depth ticker reports."
 )
 
 fg1, fg_vix, fg2 = st.columns(3)
@@ -3814,7 +3878,13 @@ with fg2:
     display_fear_greed(cfg, "Crypto Fear & Greed", dark_mode=dark_mode)
 
 config = get_active_config(user)
-config_json = json.dumps(config, sort_keys=True)
+# Chart-display settings do not affect watch-list data; keep them out of the
+# stock-data cache key so saving a K-line preference never refreshes prices.
+config_json = json.dumps({
+    "stocks_pages": config["stocks_pages"],
+    "broad_pages": config["broad_pages"],
+    "portfolio_pages": config["portfolio_pages"],
+}, sort_keys=True)
 with st.spinner("Loading watch list data..."):
     stock_payload = fetch_stock_data(config_json, cache_key)
 
@@ -3926,4 +3996,4 @@ with main_tabs[4]:
     render_daily_report(user)
 
 st.divider()
-render_kline(cache_key, display_currency=display_currency)
+render_kline(user, cache_key, display_currency=display_currency)
