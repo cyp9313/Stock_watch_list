@@ -73,7 +73,9 @@ def apply_deterministic_action_targets(
         item["target_weight_method"] = target["method"]
         item["expected_portfolio_risk_reduction"] = None
         item["expected_risk_change"] = None
-        if covariance is not None and ticker in covariance_tickers:
+        # 修改计划第六轮第 23 节：watch action 不得设置 expected_risk_reduction
+        action_type = str(item.get("action") or "watch").lower()
+        if covariance is not None and ticker in covariance_tickers and action_type != "watch":
             before = np.asarray([current_weights.get(t, 0.0) for t in covariance_tickers], dtype=float)
             after = before.copy()
             after[covariance_tickers.index(ticker)] = (

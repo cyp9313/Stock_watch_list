@@ -40,7 +40,10 @@ def summarize_evidence_zh(
     model: str,
     provider: str,
 ) -> dict[str, Any]:
-    """Summarize all selected evidence in one lightweight LLM call.
+    """Decision Evidence Summarizer（修改计划第六轮第 19 节）。
+
+    升级为决策证据摘要器：支持 reject、what_changed、why_it_matters、
+    supports_action、does_not_prove、verification_level。
 
     The model may translate and classify supplied facts only. It is explicitly
     prohibited from creating portfolio actions or adding facts.
@@ -54,6 +57,21 @@ def summarize_evidence_zh(
         return {"status": "not_configured", "evidence": evidence, "errors": ["DeepSeek API key not configured"]}
     if provider == "openai_compatible" and not (os.environ.get("OPENAI_API_KEY") or os.environ.get("QWEN_API_KEY")):
         return {"status": "not_configured", "evidence": evidence, "errors": ["OpenAI-compatible API key not configured"]}
+
+    # 先用 evidence_verifier 计算 verification_level（确定性，不依赖 LLM）
+    from .research_core.evidence_verifier import verify_evidence, compute_corroboration_counts
+    corroboration = compute_corroboration_counts(evidence)
+    for item in evidence:
+        ticker = item.get("ticker")
+        meta = instrument_metadata.get(ticker, {}) if ticker else {}
+        key = str(item.get("event_key") or item.get("evidence_id") or "")
+        vinfo = verify_evidence(item, meta=meta, corroboration_count=corroboration.get(key, 0))
+        item["body_fetch_status"] = vinfo["body_fetch_status"]
+        item["body_text_quality"] = vinfo["body_text_quality"]
+        item["source_authenticity"] = vinfo["source_authenticity"]
+        item["corroboration_count"] = vinfo["corroboration_count"]
+        item["verification_level"] = vinfo["verification_level"]
+        item["verification_level_zh"] = vinfo["verification_level_zh"]
 
     payload = []
     for item in evidence:
@@ -69,13 +87,27 @@ def summarize_evidence_zh(
             "date": item.get("published_date"),
             "content_basis": item.get("content_basis"),
             "article_fetch_ok": bool(item.get("article_fetch_ok")),
+            "verification_level": item.get("verification_level"),
+            "entity_role": item.get("entity_role"),
+            "materiality_score": item.get("materiality_score"),
+            "event_type": item.get("event_type") or item.get("event_hint"),
         })
     prompt = (
-        "你是证据摘要器，只能基于输入事实做忠实中文摘要，不得生成投资或交易建议，不得补充输入中没有的事实。"
-        "article_fetch_ok=false 表示内容仅来自搜索结果摘要，必须按未验证线索表述，不得改写成已确认事实，也不得补充因果关系。"
-        "返回严格 JSON：{\"items\":[{\"evidence_id\":\"E001\",\"facts_zh\":[\"...\"],"
-        "\"summary_zh\":\"...\",\"impact_direction\":\"positive|negative|mixed|neutral|unknown\","
-        "\"impact_horizon\":\"short|medium|long\",\"relevance_reason\":\"...\",\"confidence\":0.0}]}。\n"
+        "你是决策证据摘要器，只能基于输入事实做忠实中文摘要，不得生成投资或交易建议，不得补充输入中没有的事实。\n"
+        "article_fetch_ok=false 或 verification_level=search_snippet 表示内容仅来自搜索结果摘要，必须按未验证线索表述。\n\n"
+        "对每条证据返回严格 JSON：\n"
+        "{\"items\":[{\"evidence_id\":\"E001\",\"accept\":true|false,\"reject_reason\":null|\"incidental_entity_mention\"|\"quote_page\"|\"stale\"|\"low_materiality\",\n"
+        "\"event_title_zh\":\"事件标题中文\",\"what_happened_zh\":\"发生了什么\",\"what_changed_zh\":\"本轮新增变化\",\n"
+        "\"why_it_matters_to_ticker_zh\":\"为什么影响标的\",\"portfolio_impact_zh\":\"为什么影响当前持仓\",\n"
+        "\"supports_action\":\"reduce|trim|hold|watch|add|none\",\n"
+        "\"does_not_prove_zh\":\"该证据不能单独证明什么\",\n"
+        "\"impact_direction\":\"positive|negative|mixed|neutral|unknown\",\n"
+        "\"impact_horizon\":\"short|medium|long\",\"confidence\":0.0}]}\n\n"
+        "规则：\n"
+        "- 如果 entity_role=incidental 或 page_classification=quote_page，accept=false；\n"
+        "- supports_action 仅表示该证据倾向支持哪个方向，不是最终建议；\n"
+        "- does_not_prove_zh 必须明确该证据的局限性；\n"
+        "- 不得编造事件或因果关系。\n\n"
         + json.dumps(payload, ensure_ascii=False)
     )
     try:
@@ -92,23 +124,39 @@ def summarize_evidence_zh(
             summary = by_id.get(str(item.get("evidence_id")))
             if not summary:
                 continue
-            item["facts_zh"] = [str(x) for x in summary.get("facts_zh") or []]
-            item["summary_zh"] = str(summary.get("summary_zh") or item.get("summary_zh") or "")
+            item["accept"] = bool(summary.get("accept", True))
+            item["reject_reason"] = summary.get("reject_reason")
+            if not item["accept"]:
+                # 被拒绝的证据标记但不删除（保留供诊断）
+                item["decision_rejected"] = True
+            item["event_title_zh"] = str(summary.get("event_title_zh") or item.get("title") or "")
+            item["what_happened_zh"] = str(summary.get("what_happened_zh") or "")
+            item["what_changed_zh"] = str(summary.get("what_changed_zh") or "")
+            item["why_it_matters_to_ticker_zh"] = str(summary.get("why_it_matters_to_ticker_zh") or "")
+            item["portfolio_impact_zh"] = str(summary.get("portfolio_impact_zh") or "")
+            item["supports_action"] = str(summary.get("supports_action") or "none")
+            item["does_not_prove_zh"] = str(summary.get("does_not_prove_zh") or "")
             item["impact_direction"] = str(summary.get("impact_direction") or "unknown")
             item["impact_horizon"] = str(summary.get("impact_horizon") or "medium")
-            item["relevance_reason"] = str(summary.get("relevance_reason") or "")
+            # 保留旧字段兼容
+            item["facts_zh"] = [str(summary.get("what_happened_zh") or "")]
+            item["summary_zh"] = str(summary.get("event_title_zh") or item.get("summary_zh") or "")
+            item["relevance_reason"] = str(summary.get("why_it_matters_to_ticker_zh") or "")
             try:
                 item["summary_confidence"] = max(0.0, min(1.0, float(summary.get("confidence"))))
             except (TypeError, ValueError):
                 item["summary_confidence"] = None
             if not item.get("article_fetch_ok") and item.get("summary_confidence") is not None:
                 item["summary_confidence"] = min(0.60, item["summary_confidence"])
-            item["summary_method"] = "llm_evidence_summarizer"
-        covered = sum(1 for item in evidence if item.get("summary_method") == "llm_evidence_summarizer")
+            item["summary_method"] = "llm_decision_summarizer"
+        covered = sum(1 for item in evidence if item.get("summary_method") == "llm_decision_summarizer")
+        accepted = sum(1 for item in evidence if item.get("accept", True))
         return {
             "status": "success" if covered == len(evidence) else "partial",
             "evidence": evidence,
             "summarized_count": covered,
+            "accepted_count": accepted,
+            "rejected_count": len(evidence) - accepted,
             "errors": [],
         }
     except Exception as exc:  # noqa: BLE001

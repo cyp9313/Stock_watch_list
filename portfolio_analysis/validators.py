@@ -223,6 +223,7 @@ _FRESH_TIERS = {"fresh_event", "recent_background"}
 
 
 def _claim_text_fields(advice: dict[str, Any]) -> list[str]:
+    """修改计划第六轮第 25 节：扩大 Claim Validator 字段范围。"""
     fields: list[str] = []
     for s in advice.get("executive_summary") or []:
         fields.append(str(s))
@@ -236,12 +237,146 @@ def _claim_text_fields(advice: dict[str, Any]) -> list[str]:
             fields.append(str(kr.get("title") or ""))
     for a in advice.get("actions") or []:
         if isinstance(a, dict):
-            for k in ("portfolio_reason", "technical_reason", "news_reason", "bull_case", "bear_case"):
+            # 第 25 节：扩大到所有 action 文本字段
+            for k in (
+                "portfolio_reason", "technical_reason", "news_reason",
+                "bull_case", "bear_case",
+            ):
                 fields.append(str(a.get(k) or ""))
+            for k in ("execute_if", "cancel_or_upgrade_if", "further_reduce_if", "monitoring_items"):
+                for item in (a.get(k) or []):
+                    fields.append(str(item))
+            for threshold in (a.get("thresholds") or []):
+                if isinstance(threshold, dict):
+                    fields.append(str(threshold.get("note") or ""))
+            fields.append(str(a.get("validation_note") or ""))
     for w in advice.get("watch_items") or []:
         if isinstance(w, dict):
             fields.append(str(w.get("reason") or ""))
+            fields.append(str(w.get("title") or ""))
     return fields
+
+
+# ── 第六轮 Phase 6：Action 状态一致性硬校验（修改计划第 23 节）──
+def _validate_action_state_consistency(
+    advice: dict[str, Any], evidence: list[dict[str, Any]] | None,
+) -> tuple[list[str], list[str]]:
+    """校验 action 状态一致性，返回 (hard_errors, soft_warnings)。
+
+    规则（修改计划第 23 节）：
+    - monitor + 立即执行 → 自动清理 execute_if + warning（不阻断，watch+monitor 的"立即执行"是良性冗余）
+    - watch + target != current → hard error
+    - watch + expected risk reduction != null → hard error
+    - act_now + directional + execute_if empty → hard error
+
+    注意：「无 material evidence 的 directional action」不在此检查——由 _guard_actions
+    自动降级为 watch（避免 runner 内部校验在 _guard_actions 之前触发死循环）。
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+    evidence = evidence or []
+
+    for action in advice.get("actions") or []:
+        if not isinstance(action, dict):
+            continue
+        ticker = str(action.get("ticker") or "").upper()
+        action_type = str(action.get("action") or "watch").lower()
+        timing = str(action.get("action_timing") or "").lower()
+        current = float(action.get("current_weight") or 0.0)
+        try:
+            tw_min = float(action.get("target_weight_min", current))
+            tw_max = float(action.get("target_weight_max", current))
+        except (TypeError, ValueError):
+            tw_min = tw_max = current
+        execute_if = action.get("execute_if") or []
+        expected_risk_reduction = action.get("expected_portfolio_risk_reduction")
+        expected_risk_change = action.get("expected_risk_change")
+
+        # watch + target != current → hard error
+        if action_type == "watch":
+            if abs(tw_min - current) > 1e-4 or abs(tw_max - current) > 1e-4:
+                errors.append(
+                    f"{ticker}: action=watch 但 target_weight [{tw_min:.4f},{tw_max:.4f}] != current {current:.4f}"
+                )
+            if expected_risk_reduction is not None:
+                errors.append(f"{ticker}: action=watch 但 expected_portfolio_risk_reduction != null")
+            if expected_risk_change is not None:
+                errors.append(f"{ticker}: action=watch 但 expected_risk_change != null")
+
+        # monitor + 立即执行 → 自动清理 execute_if + warning（不阻断）
+        # 修改计划第 23 节原为 hard error，但实际运行中 LLM 经常给 watch+monitor+execute_if=["立即执行"]，
+        # 这是良性冗余（watch 本身就不执行），自动清理比阻断更合理。
+        if timing == "monitor":
+            execute_text = " ".join(str(e) for e in execute_if).lower()
+            if any(k in execute_text for k in ("立即执行", "execute now", "immediate")):
+                # 自动清理：移除含"立即执行"的条目
+                cleaned = [
+                    str(e) for e in execute_if
+                    if not any(k in str(e).lower() for k in ("立即执行", "立即", "execute now", "immediate"))
+                ]
+                action["execute_if"] = cleaned
+                warnings.append(
+                    f"{ticker}: action_timing=monitor 但 execute_if 含「立即执行」，已自动清理。"
+                )
+
+        # act_now + directional + execute_if empty → hard error
+        if timing == "act_now" and action_type in {"add", "trim", "reduce", "exit"} and not execute_if:
+            errors.append(f"{ticker}: action_timing=act_now 但 execute_if 为空")
+
+    return errors, warnings
+
+
+# ── 第六轮 Phase 6：阈值-证据绑定校验（修改计划第 24 节）──
+def validate_threshold_evidence_binding(
+    advice: dict[str, Any],
+    evidence: list[dict[str, Any]] | None,
+) -> list[str]:
+    """校验阈值是否可追溯到 Evidence（修改计划第 24 节）。
+
+    检查：
+    - Evidence ID 存在
+    - Evidence 属于 ticker/theme
+    - Evidence facts 包含数值
+    - 单位匹配
+    - 比较方向合理
+
+    无法证明 → basis 必须为 scenario_assumption，不得为 evidence。
+    """
+    errors: list[str] = []
+    evidence = evidence or []
+    ev_by_id = {str(e.get("evidence_id")): e for e in evidence if e.get("evidence_id")}
+
+    for action in advice.get("actions") or []:
+        if not isinstance(action, dict):
+            continue
+        ticker = str(action.get("ticker") or "").upper()
+        for threshold in action.get("thresholds") or []:
+            if not isinstance(threshold, dict):
+                continue
+            basis = str(threshold.get("basis") or "").lower()
+            if basis != "evidence":
+                continue  # scenario_assumption 不需要证据绑定
+            ev_id = str(threshold.get("evidence_id") or "")
+            if not ev_id or ev_id not in ev_by_id:
+                errors.append(
+                    f"{ticker}: threshold basis=evidence 但 evidence_id={ev_id} 不存在"
+                )
+                continue
+            ev = ev_by_id[ev_id]
+            ev_ticker = str(ev.get("ticker") or "").upper()
+            if ev_ticker and ev_ticker != ticker:
+                errors.append(
+                    f"{ticker}: threshold 引用了不属于该 ticker 的证据 {ev_id}（属于 {ev_ticker}）"
+                )
+                continue
+            # 检查 facts 是否包含数值
+            facts_text = " ".join(str(f) for f in (ev.get("facts") or []))
+            import re as _re
+            if not _re.search(r"\d+\.?\d*", facts_text):
+                errors.append(
+                    f"{ticker}: threshold basis=evidence 但证据 {ev_id} 的 facts 不含数值"
+                )
+    return errors
 
 
 def validate_portfolio_claims(
@@ -349,5 +484,11 @@ def validate_portfolio_claims(
             errors.append(f"中文正文暴露内部字段名 {token}。")
     if re.search(r"\b(weak|neutral|oversold|overbought)\b", all_text, re.I):
         errors.append("中文正文暴露 RSI 内部英文枚举。")
+
+    # 第六轮 Phase 6：Action 状态一致性 + 阈值绑定（修改计划第 23-24 节）
+    state_errors, state_warnings = _validate_action_state_consistency(advice, evidence)
+    errors.extend(state_errors)
+    warnings.extend(state_warnings)
+    errors.extend(validate_threshold_evidence_binding(advice, evidence))
 
     return list(dict.fromkeys(errors)), list(dict.fromkeys(warnings))

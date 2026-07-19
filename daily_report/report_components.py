@@ -302,20 +302,59 @@ def render_news_group(title: str, items: list[dict[str, Any]]) -> str:
             f'<a href="{esc(url)}" target="_blank" rel="noopener noreferrer">{esc(e.get("title", ""))}</a>'
             if url else esc(e.get("title", ""))
         )
+        # 第六轮第 20 节：verification_level 标签（官方原文/监管文件/主流媒体正文已提取/多源交叉确认/单一来源/搜索摘要）
+        verification_level_zh = e.get("verification_level_zh")
+        if not verification_level_zh:
+            verification_level_zh = "正文已验证" if e.get("article_fetch_ok") else "搜索摘要·未验证"
+        # 第六轮第 32 节：事件类型/事件日期
+        event_type = e.get("event_type") or e.get("event_hint") or ""
+        event_date = e.get("event_date") or e.get("published_date") or ""
         tags = (
             f'<span class="tier-badge {esc(tier)}">{esc(e.get("source_quality", ""))}</span>'
             f'<span class="tier-badge" style="background:{verification_color}22;color:{verification_color};">'
-            f'{"正文已验证" if e.get("article_fetch_ok") else "搜索摘要·未验证"}</span>'
+            f'{esc(verification_level_zh)}</span>'
             f'<span class="tier-badge" style="background:{imp_color}22;color:{imp_color};">{esc(impact_zh(imp))}</span>'
             f'<span class="tier-badge" style="background:{COLOR_TOKENS["info"]}22;color:{COLOR_TOKENS["info"]};">{esc(horizon_zh(e.get("impact_horizon")))}</span>'
             f'<span class="chip">{esc(e.get("evidence_id", ""))}</span>'
         )
+        # 第六轮第 16 节：materiality 评分标签
+        selection_score = e.get("selection_score")
+        if selection_score is not None:
+            _muted = COLOR_TOKENS.get("muted", "#8b949e")
+            tags += f'<span class="tier-badge" style="background:{_muted}22;color:{_muted};">选择分 {esc(str(selection_score))}</span>'
+        # 第六轮第 32 节：新事件卡片正文（发生了什么/本轮新增变化/为什么影响标的/为什么影响当前持仓/支持什么建议/不支持什么结论）
+        detail_lines: list[str] = []
+        if event_type or event_date:
+            detail_lines.append(f'<div class="sc-meta"><span>事件类型：{esc(event_type or "—")}</span><span>事件日期：{esc(event_date or "—")}</span></div>')
+        detail_lines.append(
+            f'<div class="sc-meta"><span>来源：{esc(e.get("source_name", ""))}</span><span>日期：{esc(e.get("published_date", ""))}</span>'
+            f'<span>关联：{esc(e.get("ticker") or "—")}</span></div>'
+        )
+        # 优先用第六轮 Decision Summarizer 字段，回退到旧 summary_zh
+        what_happened = e.get("what_happened_zh") or e.get("summary_zh") or e.get("title") or ""
+        if what_happened:
+            detail_lines.append(f'<div class="sc-summary"><strong>发生了什么：</strong>{esc(what_happened)}</div>')
+        what_changed = e.get("what_changed_zh")
+        if what_changed:
+            detail_lines.append(f'<div class="sc-summary"><strong>本轮新增变化：</strong>{esc(what_changed)}</div>')
+        why_matters = e.get("why_it_matters_to_ticker_zh") or e.get("relevance_reason")
+        if why_matters:
+            detail_lines.append(f'<div class="sc-summary"><strong>为什么影响标的：</strong>{esc(why_matters)}</div>')
+        portfolio_impact = e.get("portfolio_impact_zh")
+        if portfolio_impact:
+            detail_lines.append(f'<div class="sc-summary"><strong>为什么影响当前持仓：</strong>{esc(portfolio_impact)}</div>')
+        supports_action = e.get("supports_action")
+        if supports_action and supports_action != "none":
+            action_label = {"reduce": "支持减仓", "trim": "支持小幅减仓", "hold": "支持持有", "watch": "支持观察", "add": "支持加仓"}.get(supports_action, supports_action)
+            detail_lines.append(f'<div class="sc-summary"><strong>支持什么建议：</strong>{esc(action_label)}</div>')
+        does_not_prove = e.get("does_not_prove_zh")
+        if does_not_prove:
+            detail_lines.append(f'<div class="sc-summary"><strong>不支持什么结论：</strong>{esc(does_not_prove)}</div>')
+        detail_html = "\n".join(detail_lines)
         cards.append(
             f'<div class="source-card {imp_cls}">\n'
             f'  <div class="sc-head"><div class="sc-title">{title_html}</div></div>\n'
-            f'  <div class="sc-meta"><span>来源：{esc(e.get("source_name", ""))}</span><span>日期：{esc(e.get("published_date", ""))}</span>'
-            f'<span>关联：{esc(e.get("ticker") or "—")}</span></div>\n'
-            f'  <div class="sc-summary">{esc(e.get("summary_zh") or e.get("title") or "")}</div>\n'
+            f'  {detail_html}\n'
             f'  <div class="sc-tags">{tags}</div>\n'
             f'</div>'
         )

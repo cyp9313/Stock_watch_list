@@ -201,6 +201,14 @@ def classify_instrument(
         "classification_source": "heuristic" if instrument_type != "EQUITY" else "default",
         "classification_confidence": 0.75 if instrument_type != "EQUITY" else 0.4,
         "needs_review": instrument_type == "EQUITY" and not low_qt,
+        # 第六轮（修改计划第 14.1 节）：官方来源字段，供 Planner 和 source_lanes 使用
+        "official_domains": [],
+        "ir_domain": None,
+        "sec_cik": None,
+        "issuer_domain": None,
+        "regulator_domains": [],
+        "key_drivers": [],
+        "known_upcoming_events": [],
     }
 
 

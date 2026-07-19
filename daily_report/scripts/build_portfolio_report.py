@@ -107,11 +107,19 @@ def build_html(
     ))
 
     # 修改计划第三轮 40：明确数据截止口径与时间。
+    # 修改计划第六轮第 27 节：新闻时间字段拆分（检索时间 vs 最新事件日期）。
+    news_exec_at = research_diagnostics.get("news_search_executed_at") if research_diagnostics else None
+    latest_event_date = research_diagnostics.get("latest_selected_event_date") if research_diagnostics else None
+    news_time_html = f'新闻检索截止：{esc(news_cutoff)}'
+    if news_exec_at:
+        news_time_html += f'　|　新闻检索时间：{esc(str(news_exec_at)[:19])}'
+    if latest_event_date:
+        news_time_html += f'　|　最新入选事件日期：{esc(str(latest_event_date))}'
     cutoff_html = (
         '<div class="data-cutoff">'
         f'报告生成时间：{esc(as_of)}　|　股票行情截止：{esc(price_cutoff)} 收盘　|　'
         f'ETF/ETC 截止：{esc(etf_cutoff)} 收盘　|　加密资产截止：{esc(crypto_cutoff)}　|　'
-        f'基准截止：{esc(benchmark_cutoff)} 收盘　|　新闻检索截止：{esc(news_cutoff)}'
+        f'基准截止：{esc(benchmark_cutoff)} 收盘　|　{news_time_html}'
         '</div>'
     )
     parts.append(cutoff_html)
@@ -428,6 +436,30 @@ def build_html(
             f'原始结果：{research_diagnostics.get("raw_results_count", 0)}；过滤后：{research_diagnostics.get("filtered_results_count", 0)}；'
             f'入选证据：{research_diagnostics.get("selected_evidence_count", 0)}；主要过滤原因：{reasons}</p>'
         )
+        # 第六轮：Risk-weighted Coverage（修改计划第 21 节）
+        rwc = research_diagnostics.get("risk_weighted_coverage")
+        if rwc is not None:
+            dq_html += f'<p class="kpi-sub">风险加权覆盖率：{format_ratio_as_pct(rwc)}；Top-risk 覆盖率：{format_ratio_as_pct(research_diagnostics.get("top_risk_coverage") or 0)}</p>'
+        # 第六轮：新闻时间字段拆分（修改计划第 27 节）
+        news_exec_at = research_diagnostics.get("news_search_executed_at")
+        latest_event = research_diagnostics.get("latest_selected_event_date")
+        if news_exec_at or latest_event:
+            dq_html += '<p class="kpi-sub">'
+            if news_exec_at:
+                dq_html += f'新闻检索时间：{esc(str(news_exec_at)[:19])}；'
+            if latest_event:
+                dq_html += f'最新入选事件日期：{esc(str(latest_event))}；'
+            dq_html += '</p>'
+        # 第六轮：Materiality 统计（修改计划第 16 节）
+        mat_stats = research_diagnostics.get("materiality_stats") or {}
+        if mat_stats:
+            dq_html += (
+                f'<p class="kpi-sub">Materiality 评分：入选 {mat_stats.get("accepted_count", 0)} 条，'
+                f'拒绝 {mat_stats.get("rejected_count", 0)} 条，'
+                f'事件聚类 {mat_stats.get("cluster_count", 0)} 组，'
+                f'平均选择分 {mat_stats.get("avg_selection_score", 0)}；'
+                f'拒绝原因：' + "、".join(f"{esc(k)} {v}" for k, v in (mat_stats.get("rejected_reasons") or {}).items() if v) + '</p>'
+            )
     if report_quality:
         dq_html += f'<p>报告质量评分：{format_ratio_as_pct(report_quality.get("quality_score"))}；可操作：{"是" if report_quality.get("actionable") else "否"}</p>'
         quality_warnings = [str(item) for item in (report_quality.get("warnings") or []) if str(item).strip()]
@@ -435,7 +467,35 @@ def build_html(
             dq_html += '<p class="kpi-sub warn-text">质量提示：' + '；'.join(esc(item) for item in quality_warnings) + '</p>'
     if not dq_html:
         dq_html = '<p class="kpi-sub">数据完整。</p>'
-    dq_html += f'<p class="kpi-sub">搜索提供方：{esc(str(settings.get("search_provider") or "auto"))}；AI 模型：{esc(str(settings.get("model") or "未配置"))}</p>'
+    # 第六轮：Search Provider 与 Planner 诊断显示（修改计划第 28 节）
+    planner_mode = research_diagnostics.get("planner_mode") if research_diagnostics else None
+    planner_model = research_diagnostics.get("planner_model") if research_diagnostics else None
+    provider_used = research_diagnostics.get("provider_used") if research_diagnostics else None
+    verticals = research_diagnostics.get("verticals_used") if research_diagnostics else None
+    search_lanes = research_diagnostics.get("search_lanes") if research_diagnostics else None
+    gap_mode = research_diagnostics.get("gap_mode") if research_diagnostics else None
+    dq_html += f'<p class="kpi-sub">请求模式：{esc(str(settings.get("search_provider") or "auto"))}；'
+    if provider_used:
+        dq_html += f'实际使用：{esc(str(provider_used))}；'
+    if verticals:
+        dq_html += f'搜索通道：{esc(" + ".join(verticals))}；'
+    if search_lanes:
+        lane_parts = [f"{esc(k)} {v}" for k, v in search_lanes.items() if v and k not in ("official_total", "news_total")]
+        if lane_parts:
+            dq_html += f'Lane 分布：{"、".join(lane_parts)}；'
+    dq_html += f'AI 模型：{esc(str(settings.get("model") or "未配置"))}</p>'
+    if planner_mode:
+        planner_label = "AI Planner" if planner_mode == "ai" else "确定性 Fallback Planner"
+        dq_html += f'<p class="kpi-sub">Planner 模式：{esc(planner_label)}'
+        if planner_model:
+            dq_html += f'；Planner 模型：{esc(str(planner_model))}（与 Portfolio Agent 相同）'
+        fallback_reason = research_diagnostics.get("planner_fallback_reason") if research_diagnostics else None
+        if fallback_reason and planner_mode != "ai":
+            dq_html += f'；降级原因：{esc(str(fallback_reason))}'
+        if gap_mode:
+            gap_label = {"ai": "AI 缺口分析", "deterministic": "确定性补搜", "skipped": "无需补搜"}.get(gap_mode, gap_mode)
+            dq_html += f'；Gap Analyzer：{esc(gap_label)}'
+        dq_html += '</p>'
     parts.append(render_section("数据质量与限制", "🛡️", dq_html))
 
     parts.append(render_disclaimer(advice.get("disclaimer") or "本报告仅供研究参考，不构成投资建议。"))

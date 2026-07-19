@@ -70,9 +70,18 @@ def normalize_action(raw: dict[str, Any], weights: dict[str, float]) -> dict[str
         action = "watch"
     current = weights.get(ticker, _as_float(raw.get("current_weight"), 0.0))
     # 修改计划第三轮 26：重构触发/失效条件语义。
-    timing = str(raw.get("action_timing") or "act_now").lower()
-    if timing not in {"act_now", "conditional", "monitor", "trim_on_rebound", "reduce_on_breakdown"}:
+    # 第六轮第 23 节：act_now + 空 execute_if → hard error。
+    # 因此当 raw 未显式提供 action_timing 且 execute_if 为空时，默认 monitor 而非 act_now。
+    raw_timing = raw.get("action_timing")
+    execute_if_list = _as_list(raw.get("execute_if"))
+    if raw_timing:
+        timing = str(raw_timing).lower()
+        if timing not in {"act_now", "conditional", "monitor", "trim_on_rebound", "reduce_on_breakdown"}:
+            timing = "act_now"
+    elif execute_if_list:
         timing = "act_now"
+    else:
+        timing = "monitor"
     thresholds = []
     for th in _as_list(raw.get("thresholds")):
         if isinstance(th, dict):

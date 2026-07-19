@@ -233,16 +233,47 @@ def _apply_confidence_cap(
 
 
 def _guard_actions(advice: dict, evidence: list[dict], settings: dict) -> dict:
+    """修改计划第六轮第 22 节：Action Evidence Gate。
+
+    - 无 Material Evidence 的 directional action 强制转 Watch；
+    - exit 缺少新鲜 thesis 证伪证据 → 降级 reduce；
+    - 缺少新鲜证据的 directional action → monitor。
+    """
     fresh_by_ticker = {
         str(item.get("ticker") or "").upper()
         for item in evidence
         if item.get("ticker") and item.get("recency_tier") in {"fresh_event", "recent_background"}
     }
+    # 有 material evidence 的 ticker（修改计划第 22 节）
+    material_tickers = {
+        str(item.get("ticker") or "").upper()
+        for item in evidence
+        if item.get("ticker")
+        and item.get("materiality_accepted", True)
+        and item.get("entity_role") != "incidental"
+        and not item.get("is_quote_page")
+    }
     allow_exit = bool(settings.get("allow_exit_advice", False))
     for action in advice.get("actions") or []:
         ticker = str(action.get("ticker") or "").upper()
         current = float(action.get("current_weight") or 0.0)
-        if action.get("action") == "exit" and not (allow_exit and ticker in fresh_by_ticker):
+        action_type = str(action.get("action") or "watch").lower()
+
+        # 第 22.1 节：无 Material Evidence 的 directional action → watch
+        if action_type in {"add", "trim", "reduce", "exit"} and ticker not in material_tickers:
+            # 保留内部候选标记（修改计划第 22.1 节）
+            action["quantitative_candidate_action"] = action_type
+            action["action"] = "watch"
+            action["action_timing"] = "monitor"
+            action["target_weight_min"] = current
+            action["target_weight_max"] = current
+            action["execute_if"] = []
+            action["expected_portfolio_risk_reduction"] = None
+            action["expected_risk_change"] = None
+            action["validation_note"] = "无 material evidence 支撑，已转为观察项（量化候选保留为内部字段）。"
+            continue
+
+        if action_type == "exit" and not (allow_exit and ticker in fresh_by_ticker):
             action["action"] = "reduce"
             action["validation_note"] = "退出建议缺少明确用户约束或新鲜 thesis 证伪证据，已降级为减仓。"
         if ticker not in fresh_by_ticker and action.get("action") in {"add", "trim", "reduce", "exit"}:
@@ -331,7 +362,8 @@ def run_pipeline(
     ))
 
     if close is None:
-        close = MarketDataService.fetch_adjusted_close_batch(tickers + [benchmark], period="1y", interval="1d")
+        # 修改计划第六轮第 30 节：下载 2y 数据，确保 252+ 有效 benchmark trading days
+        close = MarketDataService.fetch_adjusted_close_batch(tickers + [benchmark], period="2y", interval="1d")
     latest_prices = _latest_prices(close)
     market_rows = payload.get("market_rows") or market_rows or _market_rows_from_close(close, portfolio_page)
 
@@ -367,37 +399,71 @@ def run_pipeline(
     snapshot.setdefault("data_quality", {})
     snapshot["data_quality"]["non_finite_metrics"] = non_finite
 
-    # instrument-aware 新闻研究
+    # instrument-aware 新闻研究（第六轮：AI Research Query Planner）
     fallback_reason = ""
     evidence: list[dict] = []
     research_result: dict = {"status": "unknown", "evidence": [], "diagnostics": {}}
+    research_plan: dict = {}
+    planner_diagnostics: dict = {}
     try:
         svc = research_service if research_service is not None else PortfolioResearchService(provider=search_provider)
-        raw_research = svc.research(
-            ranking.get("top_risk_tickers") or [],
-            instrument_metadata,
-            benchmark=benchmark,
-        )
-        if isinstance(raw_research, dict):
-            research_result = raw_research
-            evidence = list(raw_research.get("evidence") or [])
+        # 优先使用第六轮 research_plan 入口（AI Planner + 多通道搜索）
+        if hasattr(svc, "research_plan"):
+            plan_save_path = run_dir / "portfolio_research_plan.json"
+            raw_research = svc.research_plan(
+                top_risk_tickers=ranking.get("top_risk_tickers") or [],
+                instrument_metadata=instrument_metadata,
+                snapshot=snapshot,
+                metrics=metrics,
+                ranking=ranking,
+                model=model,
+                provider=provider,
+                benchmark=benchmark,
+                save_plan_path=plan_save_path,
+            )
+            if isinstance(raw_research, dict):
+                research_result = raw_research
+                evidence = list(raw_research.get("evidence") or [])
+                research_plan = raw_research.get("research_plan") or {}
         else:
-            evidence = list(raw_research or [])
-            covered = {str(x.get("ticker")) for x in evidence if x.get("ticker")}
-            top = set(ranking.get("top_risk_tickers") or [])
-            coverage = len(top & covered) / len(top) if top else 1.0
-            min_coverage = float(os.environ.get("PORTFOLIO_REPORT_MIN_NEWS_COVERAGE", "0.60"))
-            normalized_status = "success" if evidence and coverage >= min_coverage else ("insufficient_coverage" if evidence else "no_raw_results")
-            research_result = {
-                "status": normalized_status,
-                "evidence": evidence,
-                "diagnostics": {
+            # 向后兼容：旧版 research_service 仅实现 research()
+            raw_research = svc.research(
+                ranking.get("top_risk_tickers") or [],
+                instrument_metadata,
+                benchmark=benchmark,
+            )
+            if isinstance(raw_research, dict):
+                research_result = raw_research
+                evidence = list(raw_research.get("evidence") or [])
+            else:
+                evidence = list(raw_research or [])
+                covered = {str(x.get("ticker")) for x in evidence if x.get("ticker")}
+                top = set(ranking.get("top_risk_tickers") or [])
+                coverage = len(top & covered) / len(top) if top else 1.0
+                min_coverage = float(os.environ.get("PORTFOLIO_REPORT_MIN_NEWS_COVERAGE", "0.60"))
+                normalized_status = "success" if evidence and coverage >= min_coverage else ("insufficient_coverage" if evidence else "no_raw_results")
+                research_result = {
                     "status": normalized_status,
-                    "raw_results_count": len(evidence), "filtered_results_count": len(evidence),
-                    "selected_evidence_count": len(evidence), "top_risk_coverage": coverage,
-                },
-                "raw_results": evidence, "filtered_results": evidence,
-            }
+                    "evidence": evidence,
+                    "diagnostics": {
+                        "status": normalized_status,
+                        "raw_results_count": len(evidence), "filtered_results_count": len(evidence),
+                        "selected_evidence_count": len(evidence), "top_risk_coverage": coverage,
+                    },
+                    "raw_results": evidence, "filtered_results": evidence,
+                }
+        planner_diagnostics = {
+            k: research_result.get("diagnostics", {}).get(k)
+            for k in (
+                "planner_mode", "planner_model", "planner_provider", "planner_enabled",
+                "planner_temperature", "planner_errors", "planner_fallback_reason",
+                "plan_version", "plan_total_queries", "compiled_queries_count",
+                "official_lane_queries_count", "total_executed_queries",
+                "risk_weighted_coverage", "news_search_executed_at",
+                "latest_selected_event_date", "search_lanes",
+            )
+            if k in research_result.get("diagnostics", {})
+        }
     except Exception as exc:  # noqa: BLE001
         fallback_reason += f" 新闻研究失败：{exc}"
         research_result = {
@@ -555,6 +621,9 @@ def run_pipeline(
         "raw_search": run_dir / "portfolio_raw_search_results.json",
         "filtered_search": run_dir / "portfolio_filtered_search_results.json",
         "quality": run_dir / "portfolio_report_quality.json",
+        "research_plan": run_dir / "portfolio_research_plan.json",
+        "planner_diagnostics": run_dir / "portfolio_planner_diagnostics.json",
+        "gap_diagnostics": run_dir / "portfolio_gap_diagnostics.json",
     }
     for key, value in (("snapshot", snapshot), ("metrics", metrics), ("ranking", ranking), ("evidence", evidence), ("advice", advice)):
         paths[key].write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
@@ -562,6 +631,28 @@ def run_pipeline(
     paths["raw_search"].write_text(json.dumps(research_result.get("raw_results") or [], ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     paths["filtered_search"].write_text(json.dumps(research_result.get("filtered_results") or [], ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     paths["quality"].write_text(json.dumps(quality, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    # 第六轮：保存 research_plan 和 planner_diagnostics（research_plan 可能已由 build_ai_research_plan 写入）
+    if research_plan:
+        try:
+            paths["research_plan"].write_text(json.dumps(research_plan, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            pass
+    if planner_diagnostics:
+        paths["planner_diagnostics"].write_text(json.dumps(planner_diagnostics, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    # 第六轮 Phase 4：保存 gap diagnostics
+    gap_diag = research_result.get("diagnostics", {})
+    if gap_diag.get("gap_mode"):
+        gap_payload = {
+            "gap_mode": gap_diag.get("gap_mode"),
+            "additional_search_required": gap_diag.get("gap_additional_search_required"),
+            "total_new_queries": gap_diag.get("gap_total_new_queries"),
+            "errors": gap_diag.get("gap_errors"),
+            "ticker_gaps": [],  # 从 research_result 可选提取
+        }
+        try:
+            paths["gap_diagnostics"].write_text(json.dumps(gap_payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            pass
 
     # 中文 HTML
     html_text = build_html(
