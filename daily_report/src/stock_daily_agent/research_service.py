@@ -64,8 +64,8 @@ class ResearchService:
                     verticals_used.add(vertical)
             except requests.RequestException as exc:
                 diagnostics["errors"].append(f"{type(exc).__name__}: {exc}")
-        for index, item in enumerate(evidence, start=1):
-            item.setdefault("evidence_id", f"E{index:03d}")
+        # 第七轮第 3 节：原始搜索结果不得分配最终 evidence_id（子流程只产生候选输入）。
+        # 最终编号由研究管线的收口点在 accepted 证据上统一分配。
         diagnostics["raw_results_count"] = len(evidence)
         diagnostics["provider_used"] = evidence[0].get("provider") if evidence else (configured[0] if configured else None)
         diagnostics["verticals_used"] = sorted(verticals_used)

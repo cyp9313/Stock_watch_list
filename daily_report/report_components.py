@@ -297,6 +297,9 @@ def render_news_group(title: str, items: list[dict[str, Any]]) -> str:
         imp_color = IMPACT_COLORS.get(imp, COLOR_TOKENS["warn"])
         verification_color = _color("up") if e.get("article_fetch_ok") else _color("warn")
         tier = str(e.get("source_quality") or "tier_3").replace("_", "-")
+        # §28 修复：source_quality 显示为中文标签
+        _TIER_DISPLAY = {"tier-1": "一级来源", "tier-2": "二级来源", "tier-3": "三级来源"}
+        tier_display = _TIER_DISPLAY.get(tier, tier)
         url = str(e.get("url") or "")
         title_html = (
             f'<a href="{esc(url)}" target="_blank" rel="noopener noreferrer">{esc(e.get("title", ""))}</a>'
@@ -305,12 +308,12 @@ def render_news_group(title: str, items: list[dict[str, Any]]) -> str:
         # 第六轮第 20 节：verification_level 标签（官方原文/监管文件/主流媒体正文已提取/多源交叉确认/单一来源/搜索摘要）
         verification_level_zh = e.get("verification_level_zh")
         if not verification_level_zh:
-            verification_level_zh = "正文已验证" if e.get("article_fetch_ok") else "搜索摘要·未验证"
+            verification_level_zh = "正文已提取" if e.get("article_fetch_ok") else "搜索摘要"
         # 第六轮第 32 节：事件类型/事件日期
         event_type = e.get("event_type") or e.get("event_hint") or ""
         event_date = e.get("event_date") or e.get("published_date") or ""
         tags = (
-            f'<span class="tier-badge {esc(tier)}">{esc(e.get("source_quality", ""))}</span>'
+            f'<span class="tier-badge {esc(tier)}">{esc(tier_display)}</span>'
             f'<span class="tier-badge" style="background:{verification_color}22;color:{verification_color};">'
             f'{esc(verification_level_zh)}</span>'
             f'<span class="tier-badge" style="background:{imp_color}22;color:{imp_color};">{esc(impact_zh(imp))}</span>'

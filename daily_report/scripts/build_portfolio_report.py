@@ -170,7 +170,7 @@ def build_html(
         {"label": "总盈亏", "value": format_money(summary.get("profit_loss_base"), base), "sub": fmt_metric("profit_loss_pct", summary.get('profit_loss_pct')), "value_cls": pct_color_class(summary.get("profit_loss_pct"))},
         {"label": "Top 1 / Top 3", "value": f"{fmt_metric('top1_weight', metrics.get('top1_weight'))} / {fmt_metric('top3_weight', metrics.get('top3_weight'))}", "sub": f"HHI×1e4 {format_number(metrics.get('hhi_10000'), 0)}"},
         {"label": "有效持仓数", "value": format_number(metrics.get("effective_holdings"), 1), "sub": f"持仓 {len(snapshot.get('holdings', []))} 只"},
-        {"label": "历史组合 Beta", "value": format_number(metrics.get("portfolio_beta"), 2), "sub": f"样本 {metrics.get('portfolio_beta_observations') or 0} 日 · 本地货币近似"},
+        {"label": "历史组合 Beta", "value": format_number(metrics.get("portfolio_beta"), 2), "sub": f"2年回溯 · 观测 {metrics.get('portfolio_beta_observations') or 0} 日 · 未做货币转换 · 上一版为 1 年回测"},
         {"label": "63D 回撤", "value": fmt_metric("max_drawdown_63d", metrics.get("max_drawdown_63d")), "sub": f"252D {fmt_metric('max_drawdown_252d', metrics.get('max_drawdown_252d'))}", "value_cls": pct_color_class(metrics.get("max_drawdown_63d"))},
         {"label": "相对基准(5D)", "value": fmt_metric("relative", rel_5d.get("relative")), "sub": f"组合 {fmt_metric('portfolio_return', rel_5d.get('portfolio'))} / 基准 {fmt_metric('benchmark_return', rel_5d.get('benchmark'))}", "value_cls": pct_color_class(rel_5d.get("relative"))},
         {"label": "Python 风险评分", "value": format_number(metrics.get("portfolio_risk_score"), 0), "sub": f"评分可信度 {format_ratio_as_pct(metrics.get('risk_score_confidence'))}"},
@@ -316,7 +316,7 @@ def build_html(
             f'<span>新鲜事件：{fresh_events}</span>'
             f'<span>Tier 1/2 来源：{tier12}</span>'
             f'<span>未知日期：{unknown_dates}</span>'
-            f'<span>正文已验证：{verified_articles}</span>'
+            f'<span>正文已提取：{verified_articles}</span>'
             f'<span>未验证摘要：{unverified_snippets}</span>'
             f'<span>证据总数：{len(evidence)}</span>'
             '</div>'

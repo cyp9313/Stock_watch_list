@@ -256,12 +256,18 @@ def calculate_portfolio_metrics(
     close_prices: pd.DataFrame | None = None,
     *,
     benchmark: str | None = None,
+    return_model: "PortfolioReturnModel | None" = None,
 ) -> dict[str, Any]:
+    """计算组合指标。
+
+    §22 修复：可选接收统一 Return Model，从中读取年化波动率、Beta、回撤、风险贡献。
+    当 return_model 提供时，优先使用其值。
+    """
     holdings = [h for h in snapshot.get("holdings", []) if _safe_float(h.get("weight")) and _safe_float(h.get("weight")) > 0]
-    weights = np.array([float(h["weight"]) for h in holdings], dtype=float)
+    weights_array = np.array([float(h["weight"]) for h in holdings], dtype=float)
     tickers = [h["ticker"] for h in holdings]
-    top_weights = sorted(weights.tolist(), reverse=True)
-    hhi = float(np.sum(weights ** 2)) if len(weights) else None
+    top_weights = sorted(weights_array.tolist(), reverse=True)
+    hhi = float(np.sum(weights_array ** 2)) if len(weights_array) else None
     metrics: dict[str, Any] = {
         "top1_weight": top_weights[0] if top_weights else None,
         "top3_weight": float(sum(top_weights[:3])) if top_weights else None,
@@ -283,6 +289,25 @@ def calculate_portfolio_metrics(
         "relative_returns": {},
         "technical_breadth": {},
     }
+
+    # §22 修复：优先使用统一 Return Model
+    if return_model is not None:
+        if return_model.annualized_volatility is not None:
+            metrics["annualized_volatility"] = return_model.annualized_volatility
+        if return_model.portfolio_beta is not None:
+            metrics["portfolio_beta"] = return_model.portfolio_beta
+            metrics["portfolio_beta_historical"] = return_model.portfolio_beta
+            metrics["portfolio_beta_status"] = "from_return_model"
+            metrics["portfolio_beta_observations"] = return_model.total_date_count - return_model.invalid_date_count
+        if return_model.max_drawdown_63d is not None:
+            metrics["max_drawdown_63d"] = return_model.max_drawdown_63d
+        if return_model.max_drawdown_252d is not None:
+            metrics["max_drawdown_252d"] = return_model.max_drawdown_252d
+        # 风险贡献使用 Return Model 的 covariance
+        if return_model.covariance_matrix is not None:
+            from portfolio_analysis.return_model import risk_contributions as rc_from_model
+            weights_dict = {h["ticker"]: float(h.get("weight") or 0.0) for h in holdings}
+            metrics["risk_contributions"] = rc_from_model(return_model, weights_dict)
 
     for window_name, field in (("1D", "return_1d"), ("YTD", "return_ytd")):
         vals = []
@@ -427,6 +452,15 @@ def calculate_portfolio_metrics(
     # 修改计划第三轮 20：Python 预计算聚合值，禁止模型自行求和/平均/推导数值。
     _technical_breadth_from_snapshot(metrics, holdings)
     metrics["aggregates"] = _compute_aggregates(holdings, metrics)
+
+    # §24: metadata_coverage 供风险评分置信度使用
+    inst_meta = snapshot.get("instrument_metadata", {}) if isinstance(snapshot, dict) else {}
+    tickers_held = {h["ticker"] for h in holdings}
+    metrics["metadata_coverage_score"] = round(
+        sum(1 for t in tickers_held if inst_meta.get(t, {}).get("instrument_type"))
+        / max(1, len(tickers_held)), 3
+    ) if tickers_held else 0.8
+
     # 修改计划第三轮 22：Python 风险评分，AI 只负责解释（最多凭新鲜证据上调一级）。
     risk_score = compute_portfolio_risk_score(metrics)
     metrics["portfolio_risk_score"] = risk_score["score"]
@@ -528,6 +562,12 @@ def compute_portfolio_risk_score(metrics: dict[str, Any]) -> dict[str, Any]:
         level = "medium_high"
     else:
         level = "high"
+    # §24 修复：风险评分置信度不能仅基于组件可用性，需考虑数据质量
+    component_availability = round(available_max / 100.0, 3)
+    metadata_cov = metrics.get("metadata_coverage_score", 0.8) or 0.8
+    perf_method = metrics.get("performance_methodology", {})
+    fx_aligned = 1.0 if perf_method.get("historical_fx_aligned", False) else 0.85
+    score_confidence = round(min(component_availability, metadata_cov, fx_aligned), 3)
     return {
         "score": score,
         "level": level,
@@ -535,7 +575,7 @@ def compute_portfolio_risk_score(metrics: dict[str, Any]) -> dict[str, Any]:
         "component_max": dict(RISK_COMPONENT_WEIGHTS),
         "available_components": len(available),
         "missing_components": missing,
-        "score_confidence": round(available_max / 100.0, 3),
+        "score_confidence": score_confidence,
     }
 
 

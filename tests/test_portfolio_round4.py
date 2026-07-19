@@ -460,7 +460,7 @@ def test_news_card_renders_verified_article_with_existing_theme_color():
         "published_date": "2026-07-17", "ticker": "TSLA",
         "source_quality": "tier_1", "article_fetch_ok": True,
     }])
-    assert "正文已验证" in html
+    assert "正文已提取" in html
     assert "#3fb950" in html
 
 

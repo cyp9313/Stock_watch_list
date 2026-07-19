@@ -117,7 +117,10 @@ def _compute_ticker_gaps(
     plan: dict[str, Any],
     evidence: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """确定性计算每个 ticker 的 planned_needs 与 found_events 缺口（供 LLM 输入）。"""
+    """确定性计算每个 ticker 的 planned_needs 与 found_events 缺口（供 LLM 输入）。
+
+    §16 修复：仅基于 materiality_accepted 且未被拒绝的证据判断"已找到事件"。
+    """
     ticker_gaps: list[dict[str, Any]] = []
     for t in plan.get("tickers") or []:
         ticker = str(t.get("ticker") or "").upper()
@@ -126,11 +129,16 @@ def _compute_ticker_gaps(
             en = str(q.get("event_need") or "")
             if en and en not in planned_needs:
                 planned_needs.append(en)
-        # 找到该 ticker 的已发现事件
+        # 找到该 ticker 的已发现事件（§16：仅 accepted 证据）
         found_events: list[dict[str, Any]] = []
         found_needs: set[str] = set()
         for ev in evidence:
             if str(ev.get("ticker") or "").upper() != ticker:
+                continue
+            # §16 修复：跳过未被 materiality 接受或被 reject 的 evidence
+            if not ev.get("materiality_accepted"):
+                continue
+            if ev.get("accept") is False:
                 continue
             en = str(ev.get("event_hint") or ev.get("event_need") or "")
             found_events.append({
@@ -195,6 +203,7 @@ def analyze_research_gap(
         queries = _deterministic_gap_queries(ticker_gaps)
         diagnostics["additional_search_required"] = bool(queries)
         diagnostics["total_new_queries"] = len(queries)
+        diagnostics["gap_queries"] = queries
         for g in diagnostics["ticker_gaps"]:
             g["queries"] = [q for q in queries if q.get("ticker") == g["ticker"]]
         if save_path is not None:
@@ -249,6 +258,7 @@ def analyze_research_gap(
         diagnostics["total_new_queries"] = len(validated_queries)
         diagnostics["gap_mode"] = "ai"
         diagnostics["validated_queries"] = validated_queries
+        diagnostics["gap_queries"] = validated_queries
     except Exception as exc:  # noqa: BLE001
         diagnostics["errors"].append(f"gap_analyzer_llm_failed: {type(exc).__name__}: {exc}")
         # 降级到确定性
@@ -256,6 +266,7 @@ def analyze_research_gap(
         queries = _deterministic_gap_queries(ticker_gaps)
         diagnostics["additional_search_required"] = bool(queries)
         diagnostics["total_new_queries"] = len(queries)
+        diagnostics["gap_queries"] = queries
         for g in diagnostics["ticker_gaps"]:
             g["queries"] = [q for q in queries if q.get("ticker") == g["ticker"]]
 

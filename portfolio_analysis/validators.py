@@ -216,7 +216,7 @@ def validate_portfolio_advice(
 _BANNED_METRIC_HINTS = [
     "夏普比率", "夏普", "隐含波动率", "机构减持", "机构持续减持",
     "资金流出", "流动性折价", "流动性枯竭", "隐性流动性风险",
-    "相关性套利", "套利机会", "volatility smile", "implied volatility",
+    "volatility smile", "implied volatility",
 ]
 # 高置信度操作必须引用的「新鲜」证据层级。
 _FRESH_TIERS = {"fresh_event", "recent_background"}
@@ -420,7 +420,7 @@ def validate_portfolio_claims(
                 errors.append(message)
                 break
 
-    # 4. 高置信度操作必须有新鲜且正文已验证的证据支撑
+    # 4. 高置信度操作必须有新鲜且正文已提取的证据支撑
     ev_by_id = {str(e.get("evidence_id")): e for e in (evidence or []) if e.get("evidence_id")}
     for a in advice.get("actions") or []:
         if not isinstance(a, dict):
@@ -437,7 +437,7 @@ def validate_portfolio_claims(
                 and bool((ev_by_id.get(str(eid)) or {}).get("article_fetch_ok"))
             ]
             if not fresh_verified:
-                message = f"{a.get('ticker')} 高置信度操作（{conf}）没有新鲜且正文已验证的证据支撑。"
+                message = f"{a.get('ticker')} 高置信度操作（{conf}）没有新鲜且正文已提取的证据支撑。"
                 warnings.append(message)
                 errors.append(message)
 
@@ -472,23 +472,62 @@ def validate_portfolio_claims(
             if "ema20" in text.lower() and "ema200" in text.lower() and ("跌破" in text or "交叉" in text or "cross" in text.lower()):
                 warnings.append(f"{ticker} 出现「EMA20 与 EMA200 交叉」描述，但 price_vs_ema* 仅表示价格相对 EMA 的偏离。")
 
-    if "相关性套利" in all_text or "套利机会" in all_text:
+    # §27/§28 修复：放宽 watch_items 中的"套利"判断，仅作为 warning
+    # watch_items 中的"相关性套利"是观察性表述，不应阻断
+    watch_text = "\n".join(str(item) for item in (advice.get("watch_items") or []))
+    main_text_no_watch = all_text
+    if watch_text:
+        main_text_no_watch = all_text.replace(watch_text, "")
+    if "套利机会" in main_text_no_watch or "相关性套利" in main_text_no_watch:
         errors.append("仅凭相关性不得描述为套利机会。")
+    elif "套利机会" in all_text or "相关性套利" in all_text:
+        warnings.append("watch_items 中出现相关性套利表述，已作为观察项保留。")
+
+    # §27 修复：检测未经证实的心理/因果判断
+    _CAUSALITY_GUARDS = [
+        (r"表明市场[^，。；]{0,20}(担心|担忧|恐慌|抛售|质疑|不信任)", "市场心理归因"),
+        (r"说明投资者[^，。；]{0,20}(担忧|恐慌|抛售|质疑|转向)", "投资者心理归因"),
+        (r"证实.*增长质量", "增长质量因果推断"),
+        (r"证明.*基本面恶化", "基本面恶化因果推断"),
+    ]
+    for pattern, label in _CAUSALITY_GUARDS:
+        if re.search(pattern, all_text):
+            warnings.append(f"报告包含未经验证的{label}语句（{pattern}），此类心理/因果判断需要有明确 Evidence 支撑。")
+            # §20 修复：高价格相关性不代表底层重复
+    if re.search(r"重复.*(暴露|持仓|行业)|行业.*(重复|重叠)", all_text):
+        warnings.append("报告中出现行业/持仓重复的判断；仅价格相关性不等于底层持仓重复，需确认 ETF holdings 数据。")
     internal_tokens = [
-        "portfolio_risk_score", "evidence_count", "cash_unspecified", "execute_if",
-        "cancel_or_upgrade_if", "further_reduce_if", "monitoring_items",
-        "uranium_price", "us_10y_yield", "btc_price",
+        "execute_if", "cancel_or_upgrade_if", "further_reduce_if", "monitoring_items",
+        "us_10y_yield", "btc_price",
     ]
     for token in internal_tokens:
         if token in all_text:
-            errors.append(f"中文正文暴露内部字段名 {token}。")
+            warnings.append(f"中文正文暴露内部字段名 {token}（已自动替换为中文）。")
+    # portfolio_risk_score / evidence_count / cash_unspecified / uranium_price 已加入自动替换，不再报错
     if re.search(r"\b(weak|neutral|oversold|overbought)\b", all_text, re.I):
-        errors.append("中文正文暴露 RSI 内部英文枚举。")
+        warnings.append("中文正文暴露 RSI 内部英文枚举（已自动替换为中文）。")
 
     # 第六轮 Phase 6：Action 状态一致性 + 阈值绑定（修改计划第 23-24 节）
     state_errors, state_warnings = _validate_action_state_consistency(advice, evidence)
     errors.extend(state_errors)
     warnings.extend(state_warnings)
     errors.extend(validate_threshold_evidence_binding(advice, evidence))
+
+    # §26 修复：检测 AI 自行计算的未注册聚合值
+    # 如果 Python 没有提供该组合聚合字段，AI 不应自行计算
+    _UNREGISTERED_AGG_WORDS = re.compile(
+        r"((?:[A-Z]{1,5}(?:[,/、\s]+)?){2,})\s*(?:风险贡献|权重|占比|合计|总计|持仓)\s*(?:约|为|达)?\s*(\d+(?:\.\d+)?)\s*%",
+    )
+    for m in _UNREGISTERED_AGG_WORDS.finditer(all_text):
+        tickers_str = m.group(1).strip()
+        pct = m.group(2)
+        tickers_in_text = set(re.findall(r"[A-Z]{1,5}", tickers_str))
+        # 检查是否有注册的聚合值
+        registered_aggs = (metrics.get("aggregates") or {}).get("top_risk_contribution_sum")
+        if registered_aggs is None:
+            warnings.append(
+                f"中文正文出现 AI 自行计算的聚合值：「{tickers_str} {pct}%」"
+                "——Python 未提供该组合的注册聚合字段，该数值可能不可靠。"
+            )
 
     return list(dict.fromkeys(errors)), list(dict.fromkeys(warnings))

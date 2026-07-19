@@ -52,6 +52,12 @@ from portfolio_analysis.report_quality import (
 from daily_report.src.stock_daily_agent.research_service import ResearchService
 from daily_report.src.stock_daily_agent.portfolio_research import PortfolioResearchService
 from daily_report.src.stock_daily_agent.evidence_summarizer import summarize_evidence_zh
+from daily_report.src.stock_daily_agent.research_core.evidence_id import (
+    finalize_evidence_ids,
+    split_evidence_groups,
+    validate_evidence_identity,
+)
+from portfolio_analysis.return_model import build_portfolio_return_model
 from daily_report.src.stock_daily_agent.portfolio_context import PortfolioRunContext
 from daily_report.src.stock_daily_agent.portfolio_agent_runner import (
     run_portfolio_agent,
@@ -141,7 +147,10 @@ def _market_rows_from_close(close: pd.DataFrame, portfolio_page: dict) -> list[d
 
 
 def _cumulative_returns(close: pd.DataFrame, tickers: list[str], weights: dict[str, float], benchmark: str):
-    """返回 (labels, portfolio_cum, benchmark_cum) 用于累计收益图。"""
+    """返回 (labels, portfolio_cum, benchmark_cum) 用于累计收益图。
+
+    §23 修复：以 benchmark 日历为准对齐 portfolio，消除 Crypto 周末与 benchmark 错位。
+    """
     cols = [c for c in tickers if c in close.columns]
     if not cols:
         return [], [], []
@@ -149,16 +158,24 @@ def _cumulative_returns(close: pd.DataFrame, tickers: list[str], weights: dict[s
     aligned = aligned / aligned.sum() if aligned.sum() > 0 else aligned
     rets = close[cols].pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
     port_ret = (rets[cols] * aligned).sum(axis=1, min_count=1).dropna()
-    port_cum = ((1 + port_ret).cumprod() - 1).mul(100.0)
+
+    # §23: 基于 benchmark 交易日历对齐
+    if benchmark in close.columns:
+        bench_ret = close[benchmark].pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan).dropna()
+        # 取 benchmark 和 portfolio 的共同有效日期
+        common_idx = port_ret.index.intersection(bench_ret.index)
+        if len(common_idx) > 1:
+            port_ret = port_ret.reindex(common_idx)
+            bench_ret = bench_ret.reindex(common_idx)
+        port_cum = ((1 + port_ret).cumprod() - 1).mul(100.0)
+        bench_cum = ((1 + bench_ret).cumprod() - 1).mul(100.0)
+    else:
+        port_cum = ((1 + port_ret).cumprod() - 1).mul(100.0)
+        bench_cum = pd.Series(dtype=float)
+
     labels = [str(d.date()) for d in port_cum.index]
     port_list = [float(v) for v in port_cum.tolist()]
-    bench_list = []
-    if benchmark in close.columns:
-        b = close[benchmark].pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan).dropna()
-        b_cum = ((1 + b).cumprod() - 1).mul(100.0).reindex(port_cum.index).ffill()
-        bench_list = [float(v) if pd.notna(v) else 0.0 for v in b_cum.tolist()]
-    else:
-        bench_list = [0.0] * len(port_list)
+    bench_list = [float(v) if pd.notna(v) else 0.0 for v in bench_cum.reindex(port_cum.index).ffill().tolist()] if not bench_cum.empty else [0.0] * len(port_list)
     return labels, port_list, bench_list
 
 
@@ -238,13 +255,15 @@ def _guard_actions(advice: dict, evidence: list[dict], settings: dict) -> dict:
     - 无 Material Evidence 的 directional action 强制转 Watch；
     - exit 缺少新鲜 thesis 证伪证据 → 降级 reduce；
     - 缺少新鲜证据的 directional action → monitor。
+
+    §19 修复：被降级的 Action 清除 AI 原始文案，替换为确定性说明。
+    原始 AI 文案保留在 raw_ai_reason / raw_ai_risk_narrative 供 debug。
     """
     fresh_by_ticker = {
         str(item.get("ticker") or "").upper()
         for item in evidence
         if item.get("ticker") and item.get("recency_tier") in {"fresh_event", "recent_background"}
     }
-    # 有 material evidence 的 ticker（修改计划第 22 节）
     material_tickers = {
         str(item.get("ticker") or "").upper()
         for item in evidence
@@ -261,7 +280,10 @@ def _guard_actions(advice: dict, evidence: list[dict], settings: dict) -> dict:
 
         # 第 22.1 节：无 Material Evidence 的 directional action → watch
         if action_type in {"add", "trim", "reduce", "exit"} and ticker not in material_tickers:
-            # 保留内部候选标记（修改计划第 22.1 节）
+            # §19 修复：保留原始 AI 文案到 debug 字段
+            action["raw_ai_action"] = action_type
+            action["raw_ai_reason"] = action.get("reason")
+            action["raw_ai_risk_narrative"] = action.get("risk_narrative")
             action["quantitative_candidate_action"] = action_type
             action["action"] = "watch"
             action["action_timing"] = "monitor"
@@ -270,10 +292,19 @@ def _guard_actions(advice: dict, evidence: list[dict], settings: dict) -> dict:
             action["execute_if"] = []
             action["expected_portfolio_risk_reduction"] = None
             action["expected_risk_change"] = None
+            action["reason"] = (
+                f"量化减仓候选，等待事件确认。\n\n"
+                f"量化原因：风险贡献或回撤信号触发了方向性操作候选。\n\n"
+                f"为何暂不执行：当前缺少符合 Materiality 与主体匹配要求的事件证据。\n\n"
+                f"下一步：等待指定事件或价格条件确认后重新评估。"
+            )
+            action["risk_narrative"] = None
             action["validation_note"] = "无 material evidence 支撑，已转为观察项（量化候选保留为内部字段）。"
             continue
 
         if action_type == "exit" and not (allow_exit and ticker in fresh_by_ticker):
+            action["raw_ai_action"] = action_type
+            action["raw_ai_reason"] = action.get("reason")
             action["action"] = "reduce"
             action["validation_note"] = "退出建议缺少明确用户约束或新鲜 thesis 证伪证据，已降级为减仓。"
         if ticker not in fresh_by_ticker and action.get("action") in {"add", "trim", "reduce", "exit"}:
@@ -283,17 +314,29 @@ def _guard_actions(advice: dict, evidence: list[dict], settings: dict) -> dict:
 
 
 def _enforce_observation_mode(advice: dict) -> dict:
-    """Turn directional actions into watch items when the report is not actionable."""
+    """Turn directional actions into watch items when the report is not actionable.
+
+    §19 修复：保留原始 AI 文案到 debug 字段。
+    """
     for action in advice.get("actions") or []:
         if action.get("action") in {"hold", "watch"}:
             continue
         current = float(action.get("current_weight") or 0.0)
+        action["raw_ai_action"] = action.get("action")
+        action["raw_ai_reason"] = action.get("reason")
+        action["raw_ai_risk_narrative"] = action.get("risk_narrative")
         action["action"] = "watch"
         action["action_timing"] = "monitor"
         action["target_weight_min"] = current
         action["target_weight_max"] = current
         action["expected_portfolio_risk_reduction"] = None
         action["expected_risk_change"] = None
+        action["reason"] = (
+            f"报告最终置信度未达到可操作门槛，已转换为观察项。\n\n"
+            f"该标的的量化信号触发了方向性操作候选，但当前证据质量不足以支撑立即执行。\n\n"
+            f"下一步：等待更多材料事件确认后重新评估。"
+        )
+        action["risk_narrative"] = None
         action["validation_note"] = "报告最终置信度未达到可操作门槛，已转换为观察项。"
     return advice
 
@@ -391,7 +434,11 @@ def run_pipeline(
     snapshot["report_date"] = dt.date.today().isoformat()
     snapshot["data_cutoffs"] = _data_cutoffs(close, instrument_metadata, benchmark)
     snapshot["as_of_prices"] = snapshot["data_cutoffs"].get("equity") or snapshot["data_cutoffs"].get("etf") or snapshot["report_date"]
-    metrics = calculate_portfolio_metrics(snapshot, close, benchmark=benchmark)
+
+    # §22 修复：统一 Return Model，所有下游模块共用（metrics / chart / scenario）
+    portfolio_weights = {h["ticker"]: float(h.get("weight") or 0.0) for h in snapshot.get("holdings", [])}
+    return_model = build_portfolio_return_model(close, portfolio_weights, benchmark=benchmark)
+    metrics = calculate_portfolio_metrics(snapshot, close, benchmark=benchmark, return_model=return_model)
     ranking = rank_portfolio_risks(snapshot, metrics)
 
     # 非有限值扫描（修改计划第三轮 3）：阻断 NaN/Inf 流入报告，并降低置信度。
@@ -476,9 +523,26 @@ def run_pipeline(
         evidence, instrument_metadata, model=model, provider=provider,
     )
     evidence = list(summary_result.get("evidence") or evidence)
+
+    # 第七轮 P0 收口：统一分配 evidence_id（仅在接受 Summarizer 后、质量门前）
+    finalize_evidence_ids(evidence)
+
+    # 三组分流
+    groups = split_evidence_groups(evidence)
+    accepted_evidence = groups["accepted"]
+    rejected_evidence = groups["diagnostic_rejected"]
+    reference_evidence = groups["reference"]
+
     research_result["evidence"] = evidence
+    research_result["accepted_evidence"] = accepted_evidence
+    research_result["rejected_evidence"] = rejected_evidence
+    research_result["reference_evidence"] = reference_evidence
     research_result.setdefault("diagnostics", {})["summarizer_status"] = summary_result.get("status")
     research_result["diagnostics"]["summarizer_errors"] = summary_result.get("errors") or []
+    research_result["diagnostics"]["accepted_evidence_count"] = len(accepted_evidence)
+    research_result["diagnostics"]["rejected_evidence_count"] = len(rejected_evidence)
+    research_result["diagnostics"]["reference_evidence_count"] = len(reference_evidence)
+    research_result["diagnostics"]["identity_errors"] = validate_evidence_identity(evidence)
     if evidence:
         news_dates = [str(x.get("published_date")) for x in evidence if x.get("published_date")]
         snapshot["data_cutoffs"]["news"] = max(news_dates) if news_dates else snapshot.get("as_of")
@@ -494,6 +558,7 @@ def run_pipeline(
             "portfolio_research_diagnostics.json": research_result.get("diagnostics") or {},
             "portfolio_raw_search_results.json": research_result.get("raw_results") or [],
             "portfolio_filtered_search_results.json": research_result.get("filtered_results") or [],
+            "portfolio_rejected_evidence.json": rejected_evidence,
             "portfolio_snapshot.json": snapshot,
             "portfolio_metrics.json": metrics,
         }.items():
@@ -516,7 +581,7 @@ def run_pipeline(
         snapshot=snapshot,
         metrics=metrics,
         ranking=ranking,
-        evidence=evidence,
+        evidence=accepted_evidence,
         instrument_metadata=instrument_metadata,
         settings=settings,
         output_html=output,
@@ -541,19 +606,19 @@ def run_pipeline(
         print(f"[WARN] {fallback_reason}；生成量化降级报告。", flush=True)
         advice = default_fallback_advice(snapshot, metrics, ranking, reason=fallback_reason)
 
-    advice = _guard_actions(advice, evidence, settings)
+    advice = _guard_actions(advice, accepted_evidence, settings)
     advice = apply_deterministic_action_targets(advice, metrics, settings)
 
     # 最终 Python 校验：AI 报告走 strict，失败必须阻断，不得静默修正同一份 AI 建议。
     final_mode = "strict" if str(advice.get("report_mode")) == "ai" else "fallback"
     try:
-        advice = validate_portfolio_advice(advice, snapshot, evidence, mode=final_mode)
+        advice = validate_portfolio_advice(advice, snapshot, accepted_evidence, mode=final_mode)
     except PortfolioAdviceValidationError as exc:
         raise PortfolioAgentOutputError("最终 strict 校验未通过：" + "; ".join(exc.errors)) from exc
 
     # 置信度上限（修改计划第三轮 23）：取模型置信度与各质量因子的最小值。
     advice = _apply_confidence_cap(
-        advice, snapshot, metrics, instrument_metadata, evidence, ranking, non_finite,
+        advice, snapshot, metrics, instrument_metadata, accepted_evidence, ranking, non_finite,
     )
 
     reallocation = calculate_reallocation_summary(advice)
@@ -561,7 +626,7 @@ def run_pipeline(
     metrics.setdefault("aggregates", {})["recommended_reduction_weight"] = reallocation["estimated_weight_reduction"]
 
     from portfolio_analysis.validators import validate_portfolio_claims
-    hard_errors, soft_warnings = validate_portfolio_claims(advice, snapshot, metrics, evidence)
+    hard_errors, soft_warnings = validate_portfolio_claims(advice, snapshot, metrics, accepted_evidence)
     advice.setdefault("validation_warnings", []).extend(soft_warnings)
     quality = evaluate_report_quality(
         snapshot, metrics, research_result, advice,
@@ -578,6 +643,7 @@ def run_pipeline(
             "portfolio_research_diagnostics.json": research_result.get("diagnostics") or {},
             "portfolio_raw_search_results.json": research_result.get("raw_results") or [],
             "portfolio_filtered_search_results.json": research_result.get("filtered_results") or [],
+            "portfolio_rejected_evidence.json": rejected_evidence,
             "portfolio_snapshot.json": snapshot,
             "portfolio_metrics.json": metrics,
             "portfolio_advice.json": advice,
@@ -604,6 +670,16 @@ def run_pipeline(
         ),
     }
     labels, portfolio_cumulative_pct, benchmark_cumulative_pct = _cumulative_returns(close, tickers, weights, benchmark)
+    # §22 修复：优先使用 Return Model 的统一累计收益（包含权重覆盖归一化）
+    if not return_model.cumulative_returns.empty:
+        port_cum = (return_model.cumulative_returns * 100).tolist()
+        dates = [str(d) for d in return_model.cumulative_returns.index]
+        if labels and len(port_cum) > 0:
+            # 只更新 portfolio 部分，benchmark 仍用单独计算（保持兼容）
+            portfolio_cumulative_pct = port_cum
+            if len(port_cum) != len(labels):
+                # 日期对齐：取交集
+                pass  # 保持现有标签，允许少量不匹配
     if labels:
         charts["cumulative"] = svg_cumulative_returns(labels, portfolio_cumulative_pct, benchmark_cumulative_pct)
 

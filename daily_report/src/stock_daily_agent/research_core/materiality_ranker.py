@@ -60,6 +60,57 @@ _MATERIAL_EVENT_PATTERNS = [
     r"\b(production|deliveries|output)\b.*\b(cut|increase|miss|beat)\b",
 ]
 
+# §18 修复：Event Type-specific materiality 加分模式
+# 仅当证据的 event_hint 匹配时，额外计入这些多词规则。
+# 未匹配的模式在基础分中仍可能命中，但 event-specific 命中权重更高（×1.5）。
+_EVENT_SPECIFIC_PATTERNS: dict[str, list[str]] = {
+    "earnings_date": [
+        r"\b(earnings\s+date|report\s+date|fiscal\s+quarter)\b.*\b\d{4}-\d{2}-\d{2}\b",
+        r"\b(earnings\s+calendar|upcoming\s+earnings)\b",
+    ],
+    "earnings_results": [
+        r"\b(reported|posted|announced)\b.*\b(revenue|eps|earnings|profit|loss)\b.*\b(\$?\d+(?:\.\d+)?\s*[bm])\b",
+        r"\b(revenue|eps|earnings)\b.*\b(increased|decreased|grew|fell|rose|dropped)\b.*\b\d+%",
+        r"\b(beat|missed|met|exceeded)\b.*\b(estimate|expectation|consensus|forecast)\b",
+        r"\b(q[1-4]|fy\d{2})\b.*\b(results?|earnings?|numbers?)\b",
+    ],
+    "guidance": [
+        r"\b(raised|lowered|reaffirmed|updated|issued|withdrew)\b.*\b(guidance|outlook|forecast)\b",
+        r"\b(sees|expects|projects|anticipates)\b.*\b(revenue|eps|growth|margin)\b.*\b\d{4}\b",
+    ],
+    "credit_and_financing": [
+        r"\b(moody'?s?|s&p|fitch|morningstar)\b.*\b(downgrade|upgrade|outlook|rating|affirm)\b",
+        r"\b(credit\s+rating|bond\s+rating|issuer\s+rating)\b",
+        r"\b(debt|bond|note|offering|facility|revolving)\b.*\b(\$?\d+(?:\.\d+)?\s*[bm])\b",
+        r"\b(refinanc\w*|maturit\w*|covenant|leverage|interest\s+coverage)\b",
+    ],
+    "merger_acquisition": [
+        r"\b(acquir\w*|buy|purchase|merge)\b.*\b(\$?\d+(?:\.\d+)?\s*[bm])\b",
+        r"\b(definitive\s+agreement|letter\s+of\s+intent|binding\s+offer)\b",
+    ],
+    "management_change": [
+        r"\b(CEO|CFO|CTO|COO|president|chairman|director)\b.*\b(resign\w*|step\s+down|appoint\w*|named|hire\w*)\b",
+    ],
+    "theme_supply": [
+        r"\b(mine|mining|production|output|capacity|expansion)\b.*\b(outage|disruption|halt|shutdown|restart|increase)\b",
+        r"\b(supply|inventory|stockpile)\b.*\b(deficit|shortage|surplus|tight|glut)\b",
+        r"\b(agreement|contract|deal|approval|permit|license)\b.*\b(government|regulator|ministry)\b",
+        r"\b(uranium|nuclear|enrichment|reactor|waste)\b.*\b(plant|facility|capacity|production)\b",
+    ],
+    "theme_policy": [
+        r"\b(regulation|policy|legislation|bill|directive|mandate)\b.*\b(passed|approved|proposed|introduced|implement)\b",
+        r"\b(tariff|sanction|ban|restriction|subsidy|tax\s+credit)\b",
+    ],
+    "regulatory": [
+        r"\b(fine|penalty|settlement|consent\s+order|cease\s+and\s+desist)\b",
+        r"\b(DOJ|SEC|FTC|CFPB|FCA|ESMA)\b.*\b(investigat\w*|charge\w*|sue\w*|action)\b",
+    ],
+    "crypto_regulation": [
+        r"\b(SEC|CFTC|EU|MiCA)\b.*\b(approv\w*|reject\w*|delay|file\w*)\b.*\b(ETF|crypto|bitcoin)\b",
+        r"\b(exchange|platform)\b.*\b(ban|restrict|license|register)\b",
+    ],
+}
+
 # 决策无用关键词（decision_usefulness_score 降分）
 _LOW_DECISION_HINTS = [
     "summary", "overview", "what is", "how to", "explained",
@@ -87,18 +138,31 @@ def _recency_score(published_date: str, *, fresh_days: int = 45, background_days
     return 0.1
 
 
-def _materiality_score(title: str, summary: str, body: str) -> float:
-    """重大性评分：基于事件关键词匹配。"""
+def _materiality_score(title: str, summary: str, body: str, *, event_hint: str = "") -> float:
+    """重大性评分：通用模式 + Event Type-specific 双轨（§18 修复）。
+
+    - 通用模式命中：基础分
+    - Event-specific 模式命中：权重 ×1.5
+    - 0 命中=0.25, 1=0.60, 2=0.80, 3+=0.95
+    """
     text = " ".join([title or "", summary or "", body or ""]).lower()
     if not text.strip():
         return 0.2
-    hits = sum(1 for pat in _MATERIAL_EVENT_PATTERNS if re.search(pat, text, re.I))
-    # 0 命中 → 0.2；1 命中 → 0.6；2 命中 → 0.8；3+ → 0.95
-    if hits == 0:
+
+    generic_hits = sum(1 for pat in _MATERIAL_EVENT_PATTERNS if re.search(pat, text, re.I))
+
+    # Event-specific bonuses (§18)
+    specific_hits = 0
+    if event_hint and event_hint in _EVENT_SPECIFIC_PATTERNS:
+        specific_patterns = _EVENT_SPECIFIC_PATTERNS[event_hint]
+        specific_hits = sum(1 for pat in specific_patterns if re.search(pat, text, re.I))
+
+    weighted_hits = generic_hits + int(specific_hits * 1.5)
+    if weighted_hits == 0:
         return 0.25
-    if hits == 1:
+    if weighted_hits <= 1:
         return 0.60
-    if hits == 2:
+    if weighted_hits <= 2:
         return 0.80
     return 0.95
 
@@ -206,7 +270,8 @@ def rank_evidence(
 
     # 各分量评分
     primary_entity_score = entity["primary_entity_score"]
-    materiality_score = _materiality_score(title, summary, body)
+    event_hint = str(result.get("event_hint") or result.get("event_need") or "")
+    materiality_score = _materiality_score(title, summary, body, event_hint=event_hint)
     recency_score = _recency_score(result.get("published_date"))
     portfolio_impact_score = _portfolio_impact_score(ticker, meta, ranking, metrics)
     decision_usefulness = _decision_usefulness_score(title, summary, body, entity["page_classification"])

@@ -35,8 +35,8 @@ class PortfolioAgentOutputError(RuntimeError):
 _FRESH_EVIDENCE_TIERS = {"fresh_event", "recent_background"}
 
 _DISPLAY_TERM_REPLACEMENTS = {
-    "search_snippet_unverified": "未验证搜索摘要",
-    "article_body_verified": "正文已验证",
+    "search_snippet_unverified": "搜索摘要",
+    "article_body_verified": "正文已提取",
     "recent_background": "近期背景信息",
     "fresh_event": "新鲜事件",
     "content_basis=": "内容依据：",
@@ -46,6 +46,10 @@ _DISPLAY_TERM_REPLACEMENTS = {
     "neutral": "中性",
     "strong": "偏强",
     "weak": "偏弱",
+    "evidence_count": "证据数量",
+    "portfolio_risk_score": "风险评分",
+    "cash_unspecified": "现金（未指定）",
+    "uranium_price": "铀价",
 }
 
 
@@ -206,7 +210,7 @@ def _apply_python_owned_action_controls(advice: dict[str, Any], ctx: PortfolioRu
                 action["confidence"] = 0.60
             else:
                 action["confidence"] = 0.30
-            action["confidence_note"] = "未引用该标的新鲜且正文已验证证据，操作置信度已由 Python 限制。"
+            action["confidence_note"] = "未引用该标的新鲜且正文已提取的证据，操作置信度已由 Python 限制。"
     return advice
 
 

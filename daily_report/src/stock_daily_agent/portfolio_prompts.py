@@ -141,7 +141,7 @@ def _portfolio_context_text(ctx: PortfolioRunContext) -> str:
             lines.append(
                 f"- {e.get('evidence_id')} [{e.get('scope')}/{e.get('ticker') or '-'}] {e.get('title')} "
                 f"来源={e.get('source_name')}({e.get('source_quality')}) 日期={e.get('published_date')} "
-                f"验证={'正文已验证' if e.get('article_fetch_ok') else '搜索摘要未验证'} "
+                f"提取状态={'正文已提取' if e.get('article_fetch_ok') else '搜索摘要'} "
                 f"影响={e.get('impact_direction')}/{e.get('impact_horizon')} "
                 f"中文摘要：{e.get('summary_zh')} 关联ticker：{', '.join(e.get('related_tickers') or [])}"
             )

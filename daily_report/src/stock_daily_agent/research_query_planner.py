@@ -104,8 +104,11 @@ def _ticker_research_context(
     risk_contribution_ratio = (float(rc.get("risk_contribution") or 0.0) / total_rc) if total_rc > 0 else 0.0
 
     weights = [float(it.get("weight") or 0.0) for it in ranking_items]
-    total_weight = sum(weights) if weights else 0.0
-    weight_ratio = (float(ranking_item.get("weight") or 0.0) / total_weight) if total_weight > 0 else 0.0
+    total_top_weight = sum(weights) if weights else 0.0
+    top_risk_weight_share = (float(ranking_item.get("weight") or 0.0) / total_top_weight) if total_top_weight > 0 else 0.0
+
+    # §9 修复：区分 portfolio_weight（持仓实际权重）与 top_risk_weight_share（风险榜内占比）
+    portfolio_weight = float(h.get("weight") or 0.0)
 
     lang_decision = determine_search_language(ticker, instrument_metadata)
 
@@ -127,7 +130,8 @@ def _ticker_research_context(
         "market": lang_decision.get("market") or "US",
         "exchange": meta.get("exchange"),
         "search_language": lang_decision["primary_language"],
-        "weight_ratio": round(weight_ratio, 4),
+        "portfolio_weight": round(portfolio_weight, 4),
+        "top_risk_weight_share": round(top_risk_weight_share, 4),
         "risk_contribution_ratio": round(risk_contribution_ratio, 4),
         "risk_priority_rank": ranking_item.get("risk_priority_rank"),
         "risk_contribution_rank": ranking_item.get("risk_contribution_rank"),
@@ -244,6 +248,35 @@ def _call_planner_llm(
 
 
 # ── Deterministic Fallback Planner（修改计划第 12 节）──────
+def _current_year(report_date: str | None = None) -> str:
+    """返回当前年份字符串（如 '2026'），从 report_date 或今天推算。"""
+    if report_date:
+        try:
+            return str(date.fromisoformat(str(report_date)[:10]).year)
+        except (ValueError, TypeError):
+            pass
+    return str(date.today().year)
+
+
+def _current_earnings_label(report_date: str | None = None) -> str:
+    """返回当前合理财报季标签（如 'Q2 2026'），从 report_date 推算。"""
+    try:
+        if report_date:
+            d = date.fromisoformat(str(report_date)[:10])
+        else:
+            d = date.today()
+    except (ValueError, TypeError):
+        d = date.today()
+    # 财报通常在季度结束后 2-6 周发布；report_date 对应的合理季度
+    # 简单规则：当前季度 + 下一季度
+    q = (d.month - 1) // 3 + 1
+    year = d.year
+    # 如果 report_date 在季度中间，当前季度的财报可能尚未发布
+    # 返回两个季度的标签供 query 使用
+    # 简化：返回当前季度
+    return f"Q{q} {year}"
+
+
 def _fallback_lookback_for_event(event_need: str) -> int:
     """根据 event_need 推荐时间窗口。"""
     if event_need in {
@@ -268,7 +301,7 @@ def _fallback_lookback_for_event(event_need: str) -> int:
     return 30
 
 
-def _fallback_equity_queries(ticker: str, ctx: dict[str, Any]) -> list[dict[str, Any]]:
+def _fallback_equity_queries(ticker: str, ctx: dict[str, Any], *, report_date: str = "") -> list[dict[str, Any]]:
     """基于风险上下文为 Equity 标的生成规则化研究问题。"""
     meta_name = ctx.get("name") or ticker
     lang = ctx.get("search_language") or "en"
@@ -276,15 +309,18 @@ def _fallback_equity_queries(ticker: str, ctx: dict[str, Any]) -> list[dict[str,
     rsi_regime = str(ctx.get("rsi_regime") or "").lower()
     price_vs_ema200 = float(ctx.get("price_vs_ema200_pct") or 0.0)
     beta = float(ctx.get("beta") or 0.0)
+    # §10 修复：动态财报季 + 年份
+    yr = _current_year(report_date)
+    earnings_q = _current_earnings_label(report_date)
     questions: list[dict[str, Any]] = []
 
     # 1. 财报日期 / 最新财报 / 指引（基本面驱动）
     q1_event = "earnings_date"
     if lang == "zh-CN":
-        queries = [f"{meta_name} {ticker} 2026年最新财报 业绩 指引"]
+        queries = [f"{meta_name} {ticker} {yr}年最新财报 业绩 指引"]
         reason = "需要确认最新/即将到来的财报日期与业绩指引，验证基本面是否支持当前估值。"
     else:
-        queries = [f"{meta_name} {ticker} Q2 2026 earnings date results guidance"]
+        queries = [f"{meta_name} {ticker} {earnings_q} earnings date results guidance"]
         reason = "Need to verify the latest/upcoming earnings date and guidance to test whether fundamentals support the current valuation."
     questions.append({
         "question_id": f"{ticker}_Q1",
@@ -303,10 +339,10 @@ def _fallback_equity_queries(ticker: str, ctx: dict[str, Any]) -> list[dict[str,
     if drawdown_63d <= -25 or price_vs_ema200 <= -30:
         q2_event = "credit_and_financing"
         if lang == "zh-CN":
-            queries = [f"{meta_name} {ticker} 信用评级 融资 资本开支 债务 2026"]
+            queries = [f"{meta_name} {ticker} 信用评级 融资 资本开支 债务 {yr}"]
             reason = "深度回撤可能与融资、评级或资本开支有关，需要验证近期是否存在新的信用事件。"
         else:
-            queries = [f"{meta_name} {ticker} credit rating debt financing capex 2026"]
+            queries = [f"{meta_name} {ticker} credit rating debt financing capex {yr}"]
             reason = "Deep drawdown may be linked to financing, rating or capex; verify whether a new credit event occurred."
         questions.append({
             "question_id": f"{ticker}_Q2",
@@ -321,7 +357,6 @@ def _fallback_equity_queries(ticker: str, ctx: dict[str, Any]) -> list[dict[str,
             "priority": 2,
         })
     else:
-        # 普通回撤：查分析师评级修订 + 监管/诉讼
         q2_event = "analyst_revision"
         if lang == "zh-CN":
             queries = [f"{meta_name} {ticker} 分析师 评级 下调 上调 最新"]
@@ -346,10 +381,10 @@ def _fallback_equity_queries(ticker: str, ctx: dict[str, Any]) -> list[dict[str,
     if rsi_regime == "oversold":
         q3_event = "regulatory"
         if lang == "zh-CN":
-            queries = [f"{meta_name} {ticker} 监管 处罚 诉讼 重大事件 2026"]
+            queries = [f"{meta_name} {ticker} 监管 处罚 诉讼 重大事件 {yr}"]
             reason = "RSI 超卖状态下需要排查是否存在未识别的近期重大事件。"
         else:
-            queries = [f"{meta_name} {ticker} regulatory investigation lawsuit 2026"]
+            queries = [f"{meta_name} {ticker} regulatory investigation lawsuit {yr}"]
             reason = "Oversold RSI requires checking for unidentified recent material events."
         questions.append({
             "question_id": f"{ticker}_Q3",
@@ -368,10 +403,10 @@ def _fallback_equity_queries(ticker: str, ctx: dict[str, Any]) -> list[dict[str,
     if beta >= 1.5:
         q4_event = "product_event"
         if lang == "zh-CN":
-            queries = [f"{meta_name} {ticker} 产品 重大合同 管理层变动 2026"]
+            queries = [f"{meta_name} {ticker} 产品 重大合同 管理层变动 {yr}"]
             reason = "高 Beta 标的对公司层面事件敏感，需要确认近期产品/合同/管理层变化。"
         else:
-            queries = [f"{meta_name} {ticker} product launch major contract management change 2026"]
+            queries = [f"{meta_name} {ticker} product launch major contract management change {yr}"]
             reason = "High-beta name is sensitive to company-level events; verify recent product/contract/management changes."
         questions.append({
             "question_id": f"{ticker}_Q4",
@@ -389,83 +424,78 @@ def _fallback_equity_queries(ticker: str, ctx: dict[str, Any]) -> list[dict[str,
     return questions[:PLANNER_MAX_QUESTIONS_PER_TICKER]
 
 
-def _fallback_etf_queries(ticker: str, ctx: dict[str, Any]) -> list[dict[str, Any]]:
-    """基于风险上下文为 ETF/ETC/Index 标的生成主题驱动研究问题。"""
+def _fallback_etf_queries(ticker: str, ctx: dict[str, Any], *, report_date: str = "") -> list[dict[str, Any]]:
+    """基于风险上下文为 ETF/ETC/Index 标的生成主题驱动研究问题。
+
+    §10 修复：每个 key_driver 独立成 question，不再只用 key_drivers[0]。
+    """
     meta_name = ctx.get("name") or ticker
     theme = ctx.get("theme") or ""
     underlying = ctx.get("underlying_index") or ""
     key_drivers = ctx.get("key_drivers") or []
     drawdown_63d = float(ctx.get("max_drawdown_63d_pct") or 0.0)
+    yr = _current_year(report_date)
     questions: list[dict[str, Any]] = []
 
-    # 1. 主题供给/政策
-    q1_event = "theme_supply"
-    focus = key_drivers[0] if key_drivers else (theme or underlying or meta_name)
-    queries = [f"{focus} supply outage production latest 2026"]
-    reason = f"ETF/ETC 标的需要追溯底层主题驱动；当前主题={theme or underlying}，重点={focus}。"
-    if drawdown_63d <= -20:
-        queries.append(f"{focus} supply disruption policy risk 2026")
-        reason += " 深度回撤提示可能存在供给侧冲击。"
-    questions.append({
-        "question_id": f"{ticker}_Q1",
-        "event_need": q1_event,
-        "reason_zh": reason,
-        "lane": "theme",
-        "lookback_days": _fallback_lookback_for_event(q1_event),
-        "queries": queries,
-        "preferred_domains": [],
-        "required_entities": [meta_name, focus],
-        "exclude_terms": [],
-        "priority": 1,
-    })
+    # §10 修复：每个 key_driver 独立成 question
+    # 第 1 批：每个 driver 一个 supply 问题
+    drivers = key_drivers if key_drivers else [theme or underlying or meta_name]
+    saw_flow = False
+    for di, driver in enumerate(drivers[:3]):  # 最多 3 个 driver，避免超限
+        q_event = "theme_supply"
+        queries = [f"{driver} supply outage production latest {yr}"]
+        reason = f"ETF/ETC 标的需要追溯底层主题驱动：{driver}。"
+        if drawdown_63d <= -20 and di == 0:
+            queries.append(f"{driver} supply disruption policy risk {yr}")
+            reason += " 深度回撤提示可能存在供给侧冲击。"
+        questions.append({
+            "question_id": f"{ticker}_D{di + 1}",
+            "event_need": q_event,
+            "reason_zh": reason,
+            "lane": "theme",
+            "lookback_days": _fallback_lookback_for_event(q_event),
+            "queries": queries,
+            "preferred_domains": [],
+            "required_entities": [meta_name, driver],
+            "exclude_terms": [],
+            "priority": di + 1,
+        })
+        saw_flow = True
 
-    # 2. 主题政策
-    q2_event = "theme_policy"
-    queries = [f"{focus} policy regulation approval 2026"]
-    questions.append({
-        "question_id": f"{ticker}_Q2",
-        "event_need": q2_event,
-        "reason_zh": "政策与监管审批直接影响主题 ETF 的中长期定价。",
-        "lane": "theme",
-        "lookback_days": _fallback_lookback_for_event(q2_event),
-        "queries": queries,
-        "preferred_domains": [],
-        "required_entities": [focus],
-        "exclude_terms": [],
-        "priority": 2,
-    })
-
-    # 3. 资金流 / AUM / 溢价折价
-    q3_event = "fund_flow"
-    queries = [f"{ticker} ETF fund flows AUM premium discount 2026"]
-    questions.append({
-        "question_id": f"{ticker}_Q3",
-        "event_need": q3_event,
-        "reason_zh": "ETF 的资金流与折溢价是市场定价偏差的领先信号。",
-        "lane": "news",
-        "lookback_days": _fallback_lookback_for_event(q3_event),
-        "queries": queries,
-        "preferred_domains": [],
-        "required_entities": [ticker],
-        "exclude_terms": [],
-        "priority": 3,
-    })
+    # 最后 1 个 slot：资金流 / AUM / 溢价折价（如果还有空间）
+    remaining = PLANNER_MAX_QUESTIONS_PER_TICKER - len(questions)
+    if remaining > 0:
+        q3_event = "fund_flow"
+        queries = [f"{ticker} ETF fund flows AUM premium discount {yr}"]
+        questions.append({
+            "question_id": f"{ticker}_FLOW",
+            "event_need": q3_event,
+            "reason_zh": "ETF 的资金流与折溢价是市场定价偏差的领先信号。",
+            "lane": "news",
+            "lookback_days": _fallback_lookback_for_event(q3_event),
+            "queries": queries,
+            "preferred_domains": [],
+            "required_entities": [ticker],
+            "exclude_terms": [],
+            "priority": len(questions) + 1,
+        })
 
     return questions[:PLANNER_MAX_QUESTIONS_PER_TICKER]
 
 
-def _fallback_crypto_queries(ticker: str, ctx: dict[str, Any]) -> list[dict[str, Any]]:
+def _fallback_crypto_queries(ticker: str, ctx: dict[str, Any], *, report_date: str = "") -> list[dict[str, Any]]:
     """基于风险上下文为 Crypto 标的生成研究问题。"""
     meta_name = ctx.get("name") or ticker
     base = ticker.split("-")[0] if "-" in ticker else ticker
     drawdown_63d = float(ctx.get("max_drawdown_63d_pct") or 0.0)
+    yr = _current_year(report_date)
     questions: list[dict[str, Any]] = []
 
     q1_event = "crypto_regulation"
-    queries = [f"{base} regulation ETF approval enforcement 2026"]
+    queries = [f"{base} regulation ETF approval enforcement {yr}"]
     reason = "加密资产对监管事件高度敏感，需确认近期监管动态。"
     if drawdown_63d <= -25:
-        queries.append(f"{base} exchange volume outflow risk 2026")
+        queries.append(f"{base} exchange volume outflow risk {yr}")
         reason += " 深度回撤需排查交易所资金外流与流动性事件。"
     questions.append({
         "question_id": f"{ticker}_Q1",
@@ -481,7 +511,7 @@ def _fallback_crypto_queries(ticker: str, ctx: dict[str, Any]) -> list[dict[str,
     })
 
     q2_event = "trading_volume"
-    queries = [f"{base} ETF flows institutional demand 2026"]
+    queries = [f"{base} ETF flows institutional demand {yr}"]
     questions.append({
         "question_id": f"{ticker}_Q2",
         "event_need": q2_event,
@@ -510,6 +540,7 @@ def _build_fallback_plan(
     reason: str,
 ) -> dict[str, Any]:
     """构建 deterministic fallback plan（修改计划第 12 节）。"""
+    report_date = str(snapshot.get("report_date") or "")
     tickers_out: list[dict[str, Any]] = []
     for ticker in top_risk_tickers:
         ctx = _ticker_research_context(
@@ -517,13 +548,13 @@ def _build_fallback_plan(
         )
         itype = str(ctx.get("instrument_type") or "UNKNOWN").upper()
         if itype == "EQUITY":
-            qs = _fallback_equity_queries(ticker, ctx)
+            qs = _fallback_equity_queries(ticker, ctx, report_date=report_date)
         elif itype in {"ETF", "ETC", "INDEX", "FUND"}:
-            qs = _fallback_etf_queries(ticker, ctx)
+            qs = _fallback_etf_queries(ticker, ctx, report_date=report_date)
         elif itype == "CRYPTO":
-            qs = _fallback_crypto_queries(ticker, ctx)
+            qs = _fallback_crypto_queries(ticker, ctx, report_date=report_date)
         else:
-            qs = _fallback_equity_queries(ticker, ctx)
+            qs = _fallback_equity_queries(ticker, ctx, report_date=report_date)
         if not qs:
             continue
         tickers_out.append({
@@ -539,7 +570,7 @@ def _build_fallback_plan(
         "reason_zh": "组合层面的宏观/系统性因素影响全部持仓的风险偏好与贴现率。",
         "lane": "macro",
         "lookback_days": 45,
-        "queries": [f"{benchmark} interest rates macro market risk outlook 2026"],
+        "queries": [f"{benchmark} interest rates macro market risk outlook {_current_year(report_date)}"],
         "preferred_domains": [],
         "required_entities": [],
         "exclude_terms": [],
@@ -554,6 +585,124 @@ def _build_fallback_plan(
         "tickers": tickers_out,
         "macro_questions": macro_questions,
     }
+
+
+# ── Repair / Salvage 工具（第七轮 P0-6）────────────────────
+
+def _planner_repair_enabled() -> bool:
+    """环境变量控制是否启用 Planner Repair Retry（计划 §8.2）。"""
+    return os.environ.get(
+        "PORTFOLIO_PLANNER_REPAIR_ENABLED", "true",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _save_plan_json(path: "os.PathLike[str] | str | None", suffix: str, data: Any) -> None:
+    """在 save_path 同级目录写入 *_raw / *_sanitized / *_errors JSON。"""
+    if path is None:
+        return
+    import pathlib
+    base = pathlib.Path(path)
+    target = base.with_name(base.stem + suffix + base.suffix)
+    try:
+        target.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _call_planner_repair(
+    raw_plan: dict[str, Any],
+    sanitized_plan: dict[str, Any],
+    errors: list[dict[str, Any]],
+    *,
+    model: str,
+    provider: str,
+) -> dict[str, Any] | None:
+    """Repair Retry：将结构化错误 + 已清洗 partial plan 反馈 LLM 修复一次（计划 §8.2）。
+
+    返回修复后的 plan dict，失败返回 None。
+    """
+    if not errors:
+        return None
+    error_text = json.dumps(
+        [{"path": e.get("path"), "code": e.get("code"), "message": e.get("message"),
+          "received": e.get("received"), "allowed": e.get("allowed")}
+         for e in errors],
+        ensure_ascii=False, indent=2,
+    )
+    partial_text = json.dumps(
+        {k: v for k, v in sanitized_plan.items() if k not in ("warnings", "total_queries")},
+        ensure_ascii=False, indent=2,
+    )
+
+    repair_prompt = f"""你的上一个 Research Plan 输出通过了结构校验，但存在以下致命错误。请修复这些错误，保持其余内容不变。
+
+## 致命校验错误
+{error_text}
+
+## 当前已清洗的 Partial Plan（仅合法部分保留）
+{partial_text}
+
+## 修复要求
+1. 仅修正上述错误涉及的字段，不得改动已通过校验的 ticker/question；
+2. 缺失的 ticker（不在 top_risk_tickers 内）需移除；
+3. 对错误中缺失的字段按规范补齐；
+4. 返回完整的 JSON Plan 对象。
+
+请直接返回修复后的 JSON Plan（不要 markdown 包裹）。"""
+
+    try:
+        return _call_planner_llm(repair_prompt, model=model, provider=provider)
+    except Exception:
+        return None
+
+
+def _salvage_hybrid_plan(
+    ai_validated: dict[str, Any],
+    top_risk_tickers: list[str],
+    snapshot: dict[str, Any],
+    metrics: dict[str, Any],
+    ranking: dict[str, Any],
+    instrument_metadata: dict[str, dict[str, Any]],
+    previous_events: list[dict[str, Any]] | None,
+    benchmark: str,
+) -> dict[str, Any]:
+    """Hybrid Salvage：保留合法 AI ticker/question，缺失的用 fallback 补齐（计划 §8.3）。
+
+    返回 hybrid plan（planner_mode="hybrid"），diagnostics 记录 ai_questions / fallback_questions。
+    """
+    ai_tickers: set[str] = {
+        str(t["ticker"]).upper()
+        for t in (ai_validated.get("tickers") or []) if isinstance(t, dict)
+    }
+    missing_tickers = [t for t in top_risk_tickers if t not in ai_tickers]
+
+    fallback_tickers: list[dict[str, Any]] = []
+    if missing_tickers:
+        fallback_plan = _build_fallback_plan(
+            missing_tickers, snapshot, metrics, ranking, instrument_metadata,
+            previous_events, benchmark, reason="planner_salvage",
+        )
+        fallback_tickers = fallback_plan.get("tickers") or []
+
+    merged_tickers = list(ai_validated.get("tickers") or []) + fallback_tickers
+    merged_macro = list(ai_validated.get("macro_questions") or [])
+
+    hybrid = {
+        "plan_version": "1.0",
+        "planner_model": ai_validated.get("planner_model") or "hybrid",
+        "planner_mode": "hybrid",
+        "planner_fallback_reason": "plan_validation_failed_after_repair",
+        "tickers": merged_tickers,
+        "macro_questions": merged_macro,
+        "salvage_ai_tickers": sorted(ai_tickers),
+        "salvage_fallback_tickers": missing_tickers,
+        "ai_questions": sum(len(t.get("research_questions") or []) for t in (ai_validated.get("tickers") or [])),
+        "fallback_questions": sum(len(t.get("research_questions") or []) for t in fallback_tickers),
+    }
+    return hybrid
 
 
 # ── 主入口 ──────────────────────────────────────────────────
@@ -650,7 +799,7 @@ def build_ai_research_plan(
                 diagnostics["planner_errors"].append(f"save_plan_failed: {exc}")
         return validated, diagnostics
 
-    # 主路径：调用 LLM
+    # 主路径：调用 LLM（第七轮 P0-6：保存 raw，Repair Retry，Salvage hybrid）
     prompt = _build_planner_prompt(
         top_risk_tickers, snapshot, metrics, ranking, instrument_metadata,
         previous_events, benchmark,
@@ -661,21 +810,30 @@ def build_ai_research_plan(
         raw_plan = _call_planner_llm(prompt, model=model, provider=provider)
     except Exception as exc:  # noqa: BLE001
         llm_error = f"{type(exc).__name__}: {exc}"
-        diagnostics["planner_errors"].append(f"llm_call_failed: {llm_error}")
+        diagnostics["planner_errors"].append(
+            {"path": "llm_call", "code": "llm_call_failed", "message": llm_error, "fatal": True}
+        )
 
     if raw_plan is not None:
         raw_plan.setdefault("planner_model", model)
+
+        # 7.1 保存原始 plan（计划 §8）
+        _save_plan_json(save_path, "_raw", raw_plan)
+
         validated, errors = validate_research_plan(
             raw_plan,
             snapshot=snapshot, metrics=metrics, ranking=ranking,
             instrument_metadata=instrument_metadata,
             top_risk_tickers=top_risk_tickers,
         )
+
         if not errors:
+            # 校验通过 → ai mode
             validated["planner_mode"] = "ai"
             validated["planner_model"] = model
             diagnostics["planner_mode"] = "ai"
             diagnostics["planner_errors"] = []
+            _save_plan_json(save_path, "_sanitized", validated)
             if save_path is not None:
                 try:
                     import pathlib
@@ -684,15 +842,89 @@ def build_ai_research_plan(
                         encoding="utf-8",
                     )
                 except Exception as exc:  # noqa: BLE001
-                    diagnostics["planner_errors"].append(f"save_plan_failed: {exc}")
+                    diagnostics["planner_errors"].append(
+                        {"path": "save_plan", "code": "save_failed", "message": str(exc), "fatal": False}
+                    )
             return validated, diagnostics
-        # Plan Validator 失败：降级到 fallback
-        diagnostics["planner_errors"] = errors
-        diagnostics["planner_fallback_reason"] = "plan_validation_failed"
-    else:
-        diagnostics["planner_fallback_reason"] = f"llm_call_failed: {llm_error}"
 
-    # 降级
+        # 校验有致命错误 — 保存错误 JSON（计划 §8）
+        diagnostics["planner_errors"] = errors
+        _save_plan_json(save_path, "_errors", errors)
+
+        # 7.2 Repair Retry（计划 §8.2）
+        if _planner_repair_enabled():
+            repaired = _call_planner_repair(
+                raw_plan, validated, errors,
+                model=model, provider=provider,
+            )
+            if repaired is not None:
+                repaired.setdefault("planner_model", model)
+                validated2, errors2 = validate_research_plan(
+                    repaired,
+                    snapshot=snapshot, metrics=metrics, ranking=ranking,
+                    instrument_metadata=instrument_metadata,
+                    top_risk_tickers=top_risk_tickers,
+                )
+                if not errors2:
+                    validated2["planner_mode"] = "ai"
+                    validated2["planner_model"] = model
+                    diagnostics["planner_mode"] = "ai"
+                    diagnostics["planner_errors"] = []
+                    diagnostics["planner_repair_succeeded"] = True
+                    _save_plan_json(save_path, "_sanitized", validated2)
+                    if save_path is not None:
+                        try:
+                            import pathlib
+                            pathlib.Path(save_path).write_text(
+                                json.dumps(validated2, ensure_ascii=False, indent=2, default=str),
+                                encoding="utf-8",
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            diagnostics["planner_errors"].append(
+                                {"path": "save_plan", "code": "save_failed", "message": str(exc), "fatal": False}
+                            )
+                    return validated2, diagnostics
+                # repair 仍失败 → 记录，继续 salvage
+                diagnostics["planner_repair_succeeded"] = False
+                validated, errors = validated2, errors2
+
+        # 7.3 Hybrid Salvage（计划 §8.3）
+        diagnostics["planner_mode"] = "hybrid"
+        diagnostics["planner_fallback_reason"] = "plan_validation_failed_after_repair"
+        hybrid_plan = _salvage_hybrid_plan(
+            validated, top_risk_tickers, snapshot, metrics, ranking,
+            instrument_metadata, previous_events, benchmark,
+        )
+        validated_final, final_errors = validate_research_plan(
+            hybrid_plan,
+            snapshot=snapshot, metrics=metrics, ranking=ranking,
+            instrument_metadata=instrument_metadata,
+            top_risk_tickers=top_risk_tickers,
+        )
+        diagnostics["planner_errors"].extend(final_errors)
+        diagnostics["salvage_ai_tickers"] = hybrid_plan.get("salvage_ai_tickers") or []
+        diagnostics["salvage_fallback_tickers"] = hybrid_plan.get("salvage_fallback_tickers") or []
+        diagnostics["ai_questions"] = hybrid_plan.get("ai_questions") or 0
+        diagnostics["fallback_questions"] = hybrid_plan.get("fallback_questions") or 0
+
+        _save_plan_json(save_path, "_sanitized", validated_final)
+        if save_path is not None:
+            try:
+                import pathlib
+                pathlib.Path(save_path).write_text(
+                    json.dumps(validated_final, ensure_ascii=False, indent=2, default=str),
+                    encoding="utf-8",
+                )
+            except Exception as exc:  # noqa: BLE001
+                diagnostics["planner_errors"].append(
+                    {"path": "save_plan", "code": "save_failed", "message": str(exc), "fatal": False}
+                )
+        return validated_final, diagnostics
+
+    # LLM 调用完全失败 → fallback
+    diagnostics["planner_fallback_reason"] = f"llm_call_failed: {llm_error}"
+
+    # 降级（保持与旧逻辑兼容）
     diagnostics["planner_mode"] = "fallback"
     plan = _build_fallback_plan(
         top_risk_tickers, snapshot, metrics, ranking, instrument_metadata,
@@ -705,7 +937,6 @@ def build_ai_research_plan(
         instrument_metadata=instrument_metadata,
         top_risk_tickers=top_risk_tickers,
     )
-    # fallback plan 自身可能也有少量 errors（best-effort），但通常应通过
     diagnostics["planner_errors"].extend(errors)
     if save_path is not None:
         try:
@@ -715,5 +946,7 @@ def build_ai_research_plan(
                 encoding="utf-8",
             )
         except Exception as exc:  # noqa: BLE001
-            diagnostics["planner_errors"].append(f"save_plan_failed: {exc}")
+            diagnostics["planner_errors"].append(
+                {"path": "save_plan", "code": "save_failed", "message": str(exc), "fatal": False}
+            )
     return validated, diagnostics
