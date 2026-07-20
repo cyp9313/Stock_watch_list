@@ -84,6 +84,30 @@ def _build_event_key(ticker: str | None, event_type: str, event_date: str | None
     return "_".join(parts)
 
 
+def annotate_event_identity(
+    evidence: list[dict[str, Any]],
+    *,
+    instrument_metadata: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """在 Materiality/Novelty 评分前确定 event_key，不执行去重。"""
+    instrument_metadata = instrument_metadata or {}
+    annotated: list[dict[str, Any]] = []
+    for item in evidence or []:
+        event = dict(item)
+        ticker = event.get("ticker")
+        event_info = normalize_event(
+            event, ticker=ticker,
+            event_need=event.get("event_hint") or event.get("event_need") or event.get("event_type"),
+        )
+        event["event_type"] = event_info["event_type"]
+        event["event_date"] = event_info["event_date"]
+        event["event_key"] = _build_event_key(
+            ticker, event_info["event_type"], event_info["event_date"], event.get("title") or "",
+        )
+        annotated.append(event)
+    return annotated
+
+
 def cluster_events(
     evidence: list[dict[str, Any]],
     *,

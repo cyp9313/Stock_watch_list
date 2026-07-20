@@ -1,10 +1,12 @@
-"""Deterministic portfolio action targets and risk-change estimates."""
+"""Deterministic portfolio action targets and Return-Model risk estimates."""
 from __future__ import annotations
 
-import math
 from typing import Any
 
+import math
 import numpy as np
+
+from portfolio_analysis.return_model import PortfolioReturnModel, scenario_volatility
 
 
 def calculate_risk_budget_target_range(
@@ -44,17 +46,13 @@ def apply_deterministic_action_targets(
     advice: dict[str, Any],
     metrics: dict[str, Any],
     settings: dict[str, Any],
+    *,
+    return_model: PortfolioReturnModel | None = None,
 ) -> dict[str, Any]:
-    rc = {str(x.get("ticker")): x.get("risk_contribution") for x in metrics.get("risk_contributions", []) or []}
-    covariance_tickers = list(metrics.get("covariance_tickers") or [])
-    covariance_raw = metrics.get("covariance_matrix_daily") or []
-    covariance = None
-    try:
-        covariance = np.asarray(covariance_raw, dtype=float)
-        if covariance.shape != (len(covariance_tickers), len(covariance_tickers)) or not np.isfinite(covariance).all():
-            covariance = None
-    except (TypeError, ValueError):
-        covariance = None
+    rc = {
+        str(item.get("ticker")): item.get("risk_contribution")
+        for item in metrics.get("risk_contributions", []) or []
+    }
     current_weights = {
         str(item.get("ticker")): float(item.get("weight") or 0.0)
         for item in metrics.get("risk_contributions", []) or []
@@ -62,39 +60,65 @@ def apply_deterministic_action_targets(
     max_position = float(settings.get("max_position_weight") or settings.get("max_position_pct") or 0.20)
     if max_position > 1:
         max_position /= 100.0
+
     for item in advice.get("actions") or []:
         ticker = str(item.get("ticker") or "")
+        action_type = str(item.get("action") or "watch").lower()
         target = calculate_risk_budget_target_range(
-            float(item.get("current_weight") or 0.0), rc.get(ticker),
-            action=str(item.get("action") or "watch"), max_position_weight=max_position,
+            float(item.get("current_weight") or 0.0),
+            rc.get(ticker),
+            action=action_type,
+            max_position_weight=max_position,
         )
         item["target_weight_min"] = target["recommended_target_weight_min"]
         item["target_weight_max"] = target["recommended_target_weight_max"]
         item["target_weight_method"] = target["method"]
         item["expected_portfolio_risk_reduction"] = None
         item["expected_risk_change"] = None
-        # 修改计划第六轮第 23 节：watch action 不得设置 expected_risk_reduction
-        action_type = str(item.get("action") or "watch").lower()
-        if covariance is not None and ticker in covariance_tickers and action_type != "watch":
-            before = np.asarray([current_weights.get(t, 0.0) for t in covariance_tickers], dtype=float)
-            after = before.copy()
-            after[covariance_tickers.index(ticker)] = (
-                target["recommended_target_weight_min"] + target["recommended_target_weight_max"]
-            ) / 2.0
-            current_variance = float(before.T @ covariance @ before)
-            new_variance = float(after.T @ covariance @ after)
-            if current_variance > 0 and new_variance >= 0:
-                current_vol = math.sqrt(current_variance * 252.0) * 100.0
-                new_vol = math.sqrt(new_variance * 252.0) * 100.0
-                variance_reduction = max(0.0, 1.0 - new_variance / current_variance)
-                item["expected_portfolio_risk_reduction"] = round(variance_reduction, 6)
-                item["expected_risk_change"] = {
-                    "method": "target_midpoint_to_cash_same_covariance",
-                    "current_annualized_volatility": round(current_vol, 4),
-                    "new_annualized_volatility": round(new_vol, 4),
-                    "volatility_reduction_pct_points": round(max(0.0, current_vol - new_vol), 4),
-                    "variance_reduction_ratio": round(variance_reduction, 6),
-                }
+
+        if action_type in {"watch", "hold"}:
+            continue
+
+        target_weights = dict(current_weights)
+        target_weights[ticker] = (
+            target["recommended_target_weight_min"] + target["recommended_target_weight_max"]
+        ) / 2.0
+        if return_model is not None:
+            change = scenario_volatility(return_model, current_weights, target_weights)
+            if change.get("target_volatility") is None:
+                continue
+            item["expected_risk_change"] = change
+            item["expected_portfolio_risk_reduction"] = change.get("variance_reduction_ratio")
+            continue
+
+        # 旧调用方兼容：仅在没有 Return Model 时读取明确标记为 daily 的 legacy covariance。
+        covariance_tickers = list(metrics.get("covariance_tickers") or [])
+        covariance_raw = metrics.get("covariance_matrix_daily") or []
+        if ticker not in covariance_tickers:
+            continue
+        try:
+            covariance = np.asarray(covariance_raw, dtype=float)
+        except (TypeError, ValueError):
+            continue
+        if covariance.shape != (len(covariance_tickers), len(covariance_tickers)) or not np.isfinite(covariance).all():
+            continue
+        before = np.asarray([current_weights.get(t, 0.0) for t in covariance_tickers], dtype=float)
+        after = np.asarray([target_weights.get(t, 0.0) for t in covariance_tickers], dtype=float)
+        current_variance = float(before.T @ covariance @ before)
+        target_variance = float(after.T @ covariance @ after)
+        if current_variance <= 0 or target_variance < 0:
+            continue
+        current_vol = math.sqrt(current_variance * 252.0) * 100.0
+        target_vol = math.sqrt(target_variance * 252.0) * 100.0
+        reduction = max(0.0, 1.0 - target_variance / current_variance)
+        item["expected_portfolio_risk_reduction"] = round(reduction, 6)
+        item["expected_risk_change"] = {
+            "method": "target_midpoint_to_cash_same_covariance",
+            "current_annualized_volatility": round(current_vol, 4),
+            "new_annualized_volatility": round(target_vol, 4),
+            "volatility_reduction_pct_points": round(max(0.0, current_vol - target_vol), 4),
+            "variance_reduction_ratio": round(reduction, 6),
+        }
     return advice
 
 
@@ -106,8 +130,7 @@ def calculate_reallocation_summary(advice: dict[str, Any]) -> dict[str, Any]:
         current = float(item.get("current_weight") or 0.0)
         lo = float(item.get("target_weight_min") or current)
         hi = float(item.get("target_weight_max") or current)
-        midpoint = (lo + hi) / 2.0
-        reduction += max(0.0, current - midpoint)
+        reduction += max(0.0, current - (lo + hi) / 2.0)
     return {
         "estimated_weight_reduction": round(reduction, 6),
         "calculation_method": "target_range_midpoint_to_cash",

@@ -249,9 +249,13 @@ def test_partial_news_coverage_reaches_main_agent(monkeypatch, tmp_path):
     class PartialEvidence:
         def research(self, *args, **kwargs):
             evidence = [{
-                "evidence_id": "E001", "ticker": "AAA", "related_tickers": ["AAA"],
+                "evidence_id": "E001", "evidence_uid": "ev_aaa",
+                "ticker": "AAA", "related_tickers": ["AAA"],
                 "recency_tier": "fresh_event", "published_date": "2026-07-17",
                 "source_quality": "tier_1", "article_fetch_ok": False,
+                "snippet_fallback_ok": True, "materiality_accepted": True,
+                "accept": True, "entity_role": "primary",
+                "is_quote_page": False, "is_reference_page": False,
             }]
             return {
                 "status": "insufficient_coverage", "evidence": evidence,

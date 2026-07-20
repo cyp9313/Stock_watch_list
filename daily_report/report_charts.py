@@ -39,6 +39,14 @@ def _esc(value: Any) -> str:
     return escape(str(value if value is not None else ""), quote=True)
 
 
+def _date_axis_label(value: Any) -> str:
+    """Render chart dates without midnight timestamp noise."""
+    text = str(value if value is not None else "").strip()
+    if len(text) >= 10 and text[4:5] == "-" and text[7:8] == "-":
+        return text[:10]
+    return text
+
+
 def svg_weight_bars(holdings: list[dict[str, Any]], top_n: int = 12) -> str:
     items = sorted(
         ((h.get("ticker"), float(h.get("weight") or 0.0)) for h in holdings),
@@ -127,7 +135,8 @@ def svg_cumulative_returns(
     xticks = []
     for k in range(n_ticks):
         i = int(k * (n - 1) / (n_ticks - 1)) if n_ticks > 1 else 0
-        xticks.append(f'<text x="{x(i):.1f}" y="{height-8}" fill="{COLOR_TOKENS["muted_soft"]}" font-size="10" text-anchor="middle">{_esc(labels[i] if i < len(labels) else "")}</text>')
+        label = _date_axis_label(labels[i] if i < len(labels) else "")
+        xticks.append(f'<text x="{x(i):.1f}" y="{height-8}" fill="{COLOR_TOKENS["muted_soft"]}" font-size="10" text-anchor="middle">{_esc(label)}</text>')
     svg = (
         f'<svg viewBox="0 0 {_W} {height}" xmlns="http://www.w3.org/2000/svg" role="img">'
         f'<text x="10" y="16" fill="{COLOR_TOKENS["text_strong"]}" font-size="14" font-weight="700">当前持仓静态权重回溯模拟 vs 基准</text>'

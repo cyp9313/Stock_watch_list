@@ -54,6 +54,20 @@ def _clean_query_text(text: str) -> str:
     return s
 
 
+def _clean_domain(value: str) -> str:
+    """Normalize a preferred domain for a ``site:`` query.
+
+    Planner/metadata may provide either ``example.com`` or a full URL/path.
+    Only the hostname is valid after the ``site:`` operator.
+    """
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+    domain = (parsed.netloc or parsed.path.split("/", 1)[0]).strip().removeprefix("www.")
+    return re.sub(r"[^a-z0-9.-]", "", domain)
+
+
 def _normalize_query(text: str) -> str:
     """归一化用于去重比较。"""
     s = _clean_query_text(text).lower()
@@ -230,13 +244,19 @@ def expand_official_lane_queries(
         raw = str(entry.get("raw_query") or "")
         for entity in entities[:1]:
             for domain in domains[:3]:
+                clean_domain = _clean_domain(str(domain))
+                if not clean_domain:
+                    continue
                 # 构造 site: 查询：site:domain entity + 关键事件词
-                site_query = f"site:{domain} {entity}"
+                site_query = f"site:{clean_domain} {entity}"
                 # 附带事件关键词（限制长度，避免过长）
-                keywords = raw.replace(entity, "").strip()
+                keywords = _clean_query_text(raw.replace(str(entity), "")).strip()
                 if keywords and len(keywords) < 80:
                     site_query = f"{site_query} {keywords}"
-                site_query = _clean_query_text(site_query)
+                # Do not call ``_clean_query_text`` on the complete string here:
+                # that helper intentionally strips user-supplied operators.  In
+                # this function the site operator is compiler-owned and trusted.
+                site_query = re.sub(r"\s+", " ", site_query).strip()
                 if not site_query:
                     continue
                 norm = _normalize_query(site_query)
@@ -255,7 +275,7 @@ def expand_official_lane_queries(
                     "ticker": ticker,
                     "event_need": entry.get("event_need"),
                     "question_id": entry.get("question_id"),
-                    "preferred_domains": [domain],
+                    "preferred_domains": [clean_domain],
                     "required_entities": list(entities),
                     "exclude_terms": list(entry.get("exclude_terms") or []),
                     "use_news_vertical": False,

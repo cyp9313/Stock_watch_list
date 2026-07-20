@@ -14,6 +14,7 @@ import html
 from .report_theme import REPORT_CSS, COLOR_TOKENS, ACTION_COLORS, RISK_COLORS, IMPACT_COLORS
 from .report_i18n import (
     action_zh, risk_level_zh, severity_zh, impact_zh, horizon_zh, instrument_type_zh,
+    portfolio_stance_zh, risk_profile_zh, investment_horizon_zh,
     format_money, format_pct, format_number, pct_color_class,
     format_ratio_as_pct, format_pct_value, finite_float,
 )
@@ -59,20 +60,21 @@ def render_report_header(
     investment_horizon: str,
     risk_level: str,
     stance: str,
+    report_title: str | None = None,
 ) -> str:
     pills = [
         f'<span class="pill brand">基础货币 {esc(base_currency)}</span>',
         f'<span class="pill">基准 {esc(benchmark)}</span>',
-        f'<span class="pill">风险偏好 {esc(risk_profile)}</span>',
-        f'<span class="pill">投资期限 {esc(investment_horizon)}</span>',
+        f'<span class="pill">风险偏好 {esc(risk_profile_zh(risk_profile))}</span>',
+        f'<span class="pill">投资期限 {esc(investment_horizon_zh(investment_horizon))}</span>',
         f'<span class="pill warn">风险等级 {esc(risk_level_zh(risk_level))}</span>',
-        f'<span class="pill info">组合态度 {esc(stance)}</span>',
+        f'<span class="pill info">组合态度 {esc(portfolio_stance_zh(stance))}</span>',
     ]
     return (
         '<div class="header">\n'
         '  <div class="logo">SWL</div>\n'
         '  <div class="header-info">\n'
-        f'    <h1>AI 投资组合分析报告</h1>\n'
+        f'    <h1>{esc(report_title or "AI 投资组合分析报告")}</h1>\n'
         f'    <div class="subtitle">{esc(portfolio_name)} · Stock Watch List</div>\n'
         '  </div>\n'
         '  <div class="header-badge">\n'
@@ -166,27 +168,43 @@ def render_risk_cards(findings: list[dict[str, Any]]) -> str:
 def render_action_summary_table(
     actions: list[dict[str, Any]],
     risk_contribution_by_ticker: dict[str, float] | None = None,
+    *,
+    observation_only: bool = False,
 ) -> str:
-    headers = ["标的", "建议", "优先级", "当前权重", "目标区间", "风险贡献", "置信度"]
+    headers = (
+        ["标的", "状态", "综合风险优先级", "当前权重", "风险贡献", "置信度"]
+        if observation_only
+        else ["标的", "建议", "优先级", "当前权重", "目标区间", "风险贡献", "置信度"]
+    )
     rc_map = risk_contribution_by_ticker or {}
     rows = []
     for a in actions:
         color = ACTION_COLORS.get(a.get("action", "watch"), COLOR_TOKENS["muted"])
         rng = f"{format_ratio_as_pct(a.get('target_weight_min'))} – {format_ratio_as_pct(a.get('target_weight_max'))}"
         rc = rc_map.get(a.get("ticker"))
-        rows.append([
+        row = [
             a.get("ticker", ""),
             SafeHtml(f'<span class="badge" style="background:{color}22;color:{color};">{esc(action_zh(a.get("action")))}</span>'),
             a.get("priority", ""),
             format_ratio_as_pct(a.get("current_weight")),
-            rng,
+        ]
+        if not observation_only:
+            row.append(rng)
+        row.extend([
             format_ratio_as_pct(rc) if rc is not None else "—",
             format_ratio_as_pct(a.get("confidence")),
         ])
+        rows.append(row)
     return render_table(headers, rows)
 
 
-def render_action_detail(a: dict[str, Any], risk_contribution: Any = None, ticker_metrics: dict[str, Any] | None = None) -> str:
+def render_action_detail(
+    a: dict[str, Any],
+    risk_contribution: Any = None,
+    ticker_metrics: dict[str, Any] | None = None,
+    *,
+    observation_only: bool = False,
+) -> str:
     action = a.get("action", "watch")
     color = ACTION_COLORS.get(action, COLOR_TOKENS["muted"])
     rng = f"{format_ratio_as_pct(a.get('target_weight_min'))} – {format_ratio_as_pct(a.get('target_weight_max'))}"
@@ -195,12 +213,20 @@ def render_action_detail(a: dict[str, Any], risk_contribution: Any = None, ticke
         "act_now": "立即执行", "conditional": "条件触发", "monitor": "持续观察",
         "trim_on_rebound": "反弹减仓", "reduce_on_breakdown": "跌破后减仓",
     }.get(timing, "持续观察")
-    grid = [
-        {"k": "当前权重", "v": format_ratio_as_pct(a.get("current_weight"))},
-        {"k": "目标区间", "v": rng},
-        {"k": "风险贡献", "v": format_ratio_as_pct(risk_contribution if risk_contribution is not None else a.get("risk_contribution"))},
-        {"k": "置信度", "v": format_ratio_as_pct(a.get("confidence"))},
-    ]
+    if observation_only:
+        grid = [
+            {"k": "当前权重", "v": format_ratio_as_pct(a.get("current_weight"))},
+            {"k": "风险贡献", "v": format_ratio_as_pct(risk_contribution if risk_contribution is not None else a.get("risk_contribution"))},
+            {"k": "综合风险优先级", "v": str(a.get("priority") or "—")},
+            {"k": "决策置信度", "v": format_ratio_as_pct(a.get("confidence"))},
+        ]
+    else:
+        grid = [
+            {"k": "当前权重", "v": format_ratio_as_pct(a.get("current_weight"))},
+            {"k": "目标区间", "v": rng},
+            {"k": "风险贡献", "v": format_ratio_as_pct(risk_contribution if risk_contribution is not None else a.get("risk_contribution"))},
+            {"k": "置信度", "v": format_ratio_as_pct(a.get("confidence"))},
+        ]
     grid_html = "".join(
         f'<div class="cell"><div class="k">{esc(c["k"])}</div><div class="v">{esc(c["v"])}</div></div>'
         for c in grid
@@ -263,6 +289,29 @@ def render_action_detail(a: dict[str, Any], risk_contribution: Any = None, ticke
             f'年化波动 {esc(format_pct_value(risk_change.get("current_annualized_volatility")))} → '
             f'{esc(format_pct_value(risk_change.get("new_annualized_volatility")))}</span>'
         )
+    if observation_only:
+        upgrade = cancel or execute
+        if not upgrade:
+            upgrade = "<li>获得通过研究质量门的 Accepted Evidence，并满足量化触发条件后再重新评估。</li>"
+        return (
+            f'<div class="action-detail" style="border-top-color:{color};">\n'
+            f'  <div class="action-head">\n'
+            f'    <span class="ticker">{esc(a.get("ticker", ""))}</span>\n'
+            f'    <span class="action-name" style="background:{color}22;color:{color};">{esc(action_zh(action))}</span>\n'
+            f'    <span class="kpi-sub">综合风险优先级 {esc(a.get("priority", ""))}</span>\n'
+            f'    <span class="kpi-sub">状态：持续观察</span>\n'
+            f'  </div>\n'
+            f'  <div class="action-grid">{grid_html}</div>\n'
+            f'  <div class="reason-block">\n'
+            f'    <h5>列入观察的量化原因</h5><p>{esc(a.get("portfolio_reason") or a.get("reason") or "—")}</p>\n'
+            f'    <h5>当前技术状态</h5><p>{esc(a.get("technical_reason") or "—")}</p>\n'
+            f'    <h5>研究证据状态</h5><p>{esc(a.get("news_reason") or "本轮没有通过质量门的事件证据。")}</p>\n'
+            f'  </div>\n'
+            f'  <div class="reason-block"><h5>升级为可操作建议所需条件</h5><ul class="trigger-list">{upgrade}</ul></div>\n'
+            f'  <div class="reason-block"><h5>持续监控指标</h5><ul class="trigger-list">{monitor or "<li>风险贡献、回撤与关键均线位置</li>"}</ul></div>\n'
+            f'  {("<div class=\"reason-block\"><h5>指标证据（确定性数据）</h5><ul class=\"trigger-list\">" + me_html + "</ul></div>") if me_html else ""}\n'
+            f'</div>\n'
+        )
     return (
         f'<div class="action-detail" style="border-top-color:{color};">\n'
         f'  <div class="action-head">\n'
@@ -312,7 +361,7 @@ def render_news_group(title: str, items: list[dict[str, Any]]) -> str:
         # 第六轮第 20 节：verification_level 标签（官方原文/监管文件/主流媒体正文已提取/多源交叉确认/单一来源/搜索摘要）
         verification_level_zh = e.get("verification_level_zh")
         if not verification_level_zh:
-            verification_level_zh = "正文已提取" if e.get("article_fetch_ok") else "搜索摘要"
+            verification_level_zh = "正文已提取" if e.get("article_fetch_ok") else "搜索摘要·未验证"
         # §18: 分离 Planned Need 与 Detected Content Type
         content_type = e.get("content_type") or ""
         event_type = e.get("event_type") or e.get("event_hint") or ""
@@ -392,7 +441,7 @@ def render_chart_container(svg: str, caption: str = "") -> str:
 def render_fallback_banner(reason: str) -> str:
     return (
         f'<div class="banner-fallback">\n'
-        f'<strong>量化降级报告 · AI 分析未完成</strong><br>\n'
-        f'以下内容仅基于确定性指标，不包含模型综合判断。{esc(reason)}\n'
+        f'<strong>量化降级报告 · 研究证据不足，已生成量化观察报告</strong><br>\n'
+        f'本报告为量化降级报告；以下内容仅基于确定性指标，不包含未经质量门验证的模型判断。{esc(reason)}\n'
         f'</div>\n'
     )

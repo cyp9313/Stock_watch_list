@@ -117,8 +117,9 @@ def _manager_from_name(name: str) -> str | None:
     return None
 
 
-def _entity_aliases(ticker: str, name: str) -> list[str]:
-    aliases = [ticker, name]
+def _entity_aliases(ticker: str, name: str, extra_aliases: list[str] | None = None) -> list[str]:
+    aliases = [ticker, ticker.split(".", 1)[0], name]
+    aliases.extend(str(item) for item in (extra_aliases or []) if str(item).strip())
     shortened = re.sub(
         r"\b(incorporated|inc\.?|corporation|corp\.?|plc|ltd\.?|limited|se|ag|class\s+[a-z])\b",
         " ", name, flags=re.I,
@@ -147,15 +148,20 @@ def _is_relevant_to_ticker(result: dict[str, Any], ticker: str | None, meta: dic
     itype = str(meta.get("instrument_type") or "UNKNOWN").upper()
 
     if itype == "EQUITY":
-        for alias in _entity_aliases(ticker, name):
+        for alias in _entity_aliases(ticker, name, meta.get("entity_aliases") or []):
             cleaned = re.sub(rf"\bunrelated\s+to\s+{re.escape(alias)}\b", "", text, flags=re.I)
-            if alias in cleaned:
+            if re.fullmatch(r"[a-z0-9.-]{1,6}", alias):
+                if re.search(rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])", cleaned):
+                    return True
+            elif alias in cleaned:
                 return True
         return False
     if itype in ("ETF", "ETC", "FUND", "INDEX"):
-        if ticker.lower() in text:
+        ticker_aliases = [ticker.lower(), ticker.split(".", 1)[0].lower()]
+        if any(re.search(rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])", text) for alias in ticker_aliases if alias):
             return True
-        if name and name.lower() in text:
+        product_aliases = [name] + list(meta.get("entity_aliases") or [])
+        if any(str(alias).lower() in text for alias in product_aliases if str(alias).strip()):
             return True
         underlying = str(meta.get("underlying_index") or "").lower()
         theme = str(meta.get("theme") or "").lower()
@@ -269,33 +275,106 @@ _REQUIRE_VERIFIED_ARTICLE = os.environ.get(
 ).strip().lower() in {"1", "true", "yes"}
 
 
-def _normalize_date(value: Any) -> str:
+def _normalize_date(
+    value: Any,
+    *,
+    reference_datetime: datetime | None = None,
+) -> str:
+    """Normalize provider dates to ``YYYY-MM-DD``.
+
+    Search providers commonly return relative values such as ``21 hours ago``.
+    These must be resolved before recency scoring or latest-event selection; slicing
+    the raw string to ten characters previously produced values such as
+    ``21 hours a``.  Unknown values now return an empty string and the original
+    provider value is retained separately in ``raw_published_date``.
+    """
     s = str(value or "").strip()
     if not s:
         return ""
-    m = re.search(r"(\d+)\s+days?\s+ago", s, re.I)
-    if m:
-        return (date.today() - timedelta(days=int(m.group(1)))).isoformat()
-    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%b %d, %Y", "%d %b %Y", "%Y-%m", "%Y"):
-        try:
-            return datetime.strptime(s[: len(fmt) + 2] if False else s[:30], fmt).date().isoformat()
-        except (ValueError, TypeError):
-            continue
+
+    ref = reference_datetime or datetime.now().astimezone()
+    low = s.lower()
+    if low in {"today", "just now", "now"}:
+        return ref.date().isoformat()
+    if low == "yesterday":
+        return (ref - timedelta(days=1)).date().isoformat()
+
+    relative = re.search(
+        r"(\d+)\s*(minutes?|mins?|hours?|hrs?|days?|weeks?|months?)\s+ago",
+        s,
+        re.I,
+    )
+    if relative:
+        amount = int(relative.group(1))
+        unit = relative.group(2).lower()
+        if unit.startswith(("minute", "min")):
+            delta = timedelta(minutes=amount)
+        elif unit.startswith(("hour", "hr")):
+            delta = timedelta(hours=amount)
+        elif unit.startswith("week"):
+            delta = timedelta(weeks=amount)
+        elif unit.startswith("month"):
+            # Search snippets generally use approximate month ages; preserve that
+            # convention rather than inventing a calendar day.
+            delta = timedelta(days=30 * amount)
+        else:
+            delta = timedelta(days=amount)
+        return (ref - delta).date().isoformat()
+
+    # ISO timestamps and ISO dates are the most common absolute forms.
+    try:
+        parsed_iso = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return parsed_iso.date().isoformat()
+    except (ValueError, TypeError):
+        pass
     try:
         return date.fromisoformat(s[:10]).isoformat()
     except (ValueError, TypeError):
-        return s
+        pass
+
+    for fmt in (
+        "%Y/%m/%d",
+        "%b %d, %Y",
+        "%B %d, %Y",
+        "%d %b %Y",
+        "%d %B %Y",
+        "%Y-%m",
+        "%Y",
+    ):
+        try:
+            return datetime.strptime(s[:40], fmt).date().isoformat()
+        except (ValueError, TypeError):
+            continue
+    return ""
 
 
-def _recency_tier(published_date: str) -> str:
-    s = _normalize_date(published_date)
+def _coerce_reference_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.astimezone()
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo is not None else parsed.astimezone()
+    except (ValueError, TypeError):
+        return None
+
+
+def _recency_tier(
+    published_date: str,
+    *,
+    reference_datetime: datetime | None = None,
+) -> str:
+    ref = reference_datetime or datetime.now().astimezone()
+    s = _normalize_date(published_date, reference_datetime=ref)
     if not s or len(s) < 10:
         return "unknown"
     try:
         d = date.fromisoformat(s[:10])
     except (ValueError, TypeError):
         return "unknown"
-    age = (date.today() - d).days
+    age = (ref.date() - d).days
     if age <= _FRESH_DAYS:
         return "fresh_event"
     if age <= _BACKGROUND_DAYS:
@@ -405,6 +484,9 @@ def build_evidence_notes(
     max_evidence: int = 15,
     search_provider: str = "unknown",
     fetch_timeout: float = 12,
+    max_candidates_per_ticker: int = 3,
+    preselection_multiplier: int = 1,
+    reference_datetime: datetime | None = None,
 ) -> list[dict[str, Any]]:
     """把候选结果转换为结构化 Evidence Notes（含中文摘要、影响方向、时效、类型）。"""
     notes: list[dict[str, Any]] = []
@@ -414,7 +496,16 @@ def build_evidence_notes(
         url = str(c.get("url") or "").strip()
         title = str(c.get("title") or "")
         source_name = str(c.get("source") or _source_domain(url) or "unknown")
-        published_date = _normalize_date(c.get("published_date"))
+        raw_published_date = str(c.get("published_date") or "").strip()
+        date_reference = (
+            _coerce_reference_datetime(c.get("search_retrieved_at"))
+            or reference_datetime
+            or datetime.now().astimezone()
+        )
+        published_date = _normalize_date(
+            raw_published_date,
+            reference_datetime=date_reference,
+        )
         summary = str(c.get("summary") or "")
         facts_raw = re.split(r"(?<=[.!?])\s+", summary)
         facts = [f.strip() for f in facts_raw if len(f.strip()) > 12][:4]
@@ -433,13 +524,19 @@ def build_evidence_notes(
             "scope": c.get("scope") or ("ticker" if ticker else "portfolio"),
             "ticker": ticker,
             "related_tickers": [ticker] if ticker else [],
-            "event_type": c.get("event_hint") or "general",
+            "event_type": c.get("event_hint") or c.get("event_need") or "general_event",
+            "event_hint": c.get("event_hint") or c.get("event_need"),
+            "question_id": c.get("question_id"),
+            "lane": c.get("lane") or "news",
+            "vertical": c.get("vertical"),
+            "gap_search": bool(c.get("gap_search")),
             "evidence_kind": evidence_kind,
             "title": title,
             "raw_title": title,
             "raw_snippet": summary,
             "raw_url": url,
-            "raw_published_date": published_date,
+            "raw_published_date": raw_published_date,
+            "date_reference_datetime": date_reference.isoformat(),
             "source_name": source_name,
             "source_domain": _source_domain(url),
             "search_provider": search_provider,
@@ -451,7 +548,9 @@ def build_evidence_notes(
             "summary_zh": _summarize_zh(facts, title, source_name, published_date),
             "impact_direction": direction,
             "impact_horizon": horizon,
-            "recency_tier": _recency_tier(published_date),
+            "recency_tier": _recency_tier(
+                published_date, reference_datetime=date_reference,
+            ),
             "portfolio_relevance": _relevance_note(ticker, meta),
             "confidence": round(min(0.95, max(0.4, score / 100.0)), 2),
             "article_fetch_ok": False,
@@ -473,31 +572,54 @@ def build_evidence_notes(
 
         notes.append(note)
 
-    # 先按元数据打分和每 ticker 配额精选，再抓正文，避免低价值候选耗尽抓取预算。
-    notes.sort(key=lambda n: n.get("priority_score", 0), reverse=True)
-    limit = 15 if max_evidence is None else max(1, int(max_evidence))
+    # Materiality 前只做宽松预选。Official/Regulator 候选有独立保底位，
+    # 避免前三条通用新闻把真正的 IR/监管事件挤出正文抓取预算。
+    notes.sort(
+        key=lambda n: (
+            str(n.get("source_type") or "") in {"official", "regulator", "rating_agency"},
+            str(n.get("lane") or "") in {"official", "official_and_news"},
+            float(n.get("priority_score") or 0.0),
+        ),
+        reverse=True,
+    )
+    final_limit = 15 if max_evidence is None else max(1, int(max_evidence))
+    preselection_limit = max(final_limit, final_limit * max(1, int(preselection_multiplier)))
+    per_ticker_limit = max(1, int(max_candidates_per_ticker))
     selected: list[dict[str, Any]] = []
     ticker_counts: dict[str, int] = {}
     macro_count = 0
-    # 第一轮保证每个有候选的 top-risk ticker 至少一条。
+
+    # 每个 ticker 最多保留 2 条官方/监管候选。
     for note in notes:
+        ticker = str(note.get("ticker") or "")
+        is_official = str(note.get("source_type") or "") in {"official", "regulator", "rating_agency"} \
+            or str(note.get("lane") or "") in {"official", "official_and_news"}
+        if ticker and is_official and ticker_counts.get(ticker, 0) < min(2, per_ticker_limit):
+            selected.append(note)
+            ticker_counts[ticker] = ticker_counts.get(ticker, 0) + 1
+            if len(selected) >= preselection_limit:
+                break
+
+    # 保证每个有候选的 ticker 至少一条。
+    for note in notes:
+        if note in selected or len(selected) >= preselection_limit:
+            continue
         ticker = str(note.get("ticker") or "")
         if ticker and ticker_counts.get(ticker, 0) == 0:
             selected.append(note)
             ticker_counts[ticker] = 1
-            if len(selected) >= limit:
-                break
-    # 第二轮按分数填充：单 ticker 最多 3 条，宏观最多 3 条。
+
+    # 再按分数填充；完整管线可扩大配额，直接调用保持旧版每 ticker 3 条。
     for note in notes:
-        if note in selected or len(selected) >= limit:
+        if note in selected or len(selected) >= preselection_limit:
             continue
         ticker = str(note.get("ticker") or "")
         if ticker:
-            if ticker_counts.get(ticker, 0) >= 3:
+            if ticker_counts.get(ticker, 0) >= per_ticker_limit:
                 continue
             ticker_counts[ticker] = ticker_counts.get(ticker, 0) + 1
         else:
-            if macro_count >= 3:
+            if macro_count >= 4:
                 continue
             macro_count += 1
         selected.append(note)
@@ -640,12 +762,14 @@ class PortfolioResearchService:
                 use_news_vertical=use_news,
             )
             results = list(search_result.get("results") or [])
+            retrieved_at = datetime.now().astimezone().isoformat()
             diag = search_result.get("diagnostics") or {}
             provider_used = provider_used or diag.get("provider_used")
             provider_errors.extend(diag.get("errors") or [])
             for v in (diag.get("verticals_used") or []):
                 verticals_used.add(v)
             for r in results:
+                r.setdefault("search_retrieved_at", retrieved_at)
                 r.setdefault("scope", q.get("scope") or "ticker")
                 r.setdefault("ticker", q.get("ticker"))
                 r.setdefault("event_hint", q.get("event_need"))
@@ -674,29 +798,46 @@ class PortfolioResearchService:
 
         # 第七轮第 5 节：Gap Analyzer 只产出 query；补搜结果合并进统一候选池，
         # 由 process_all_results_once 单一收口，杜绝子流程自行编号导致的重复 ID。
-        gap_diagnostics = analyze_research_gap(plan, raw, model=model, provider=provider)
-        for gq in (gap_diagnostics.get("gap_queries") or [])[:MAX_GAP_QUERIES]:
+        gap_diagnostics = analyze_research_gap(
+            plan, raw, model=model, provider=provider,
+            instrument_metadata=instrument_metadata, first_pass=True,
+        )
+        initial_gap_budget = max(1, MAX_GAP_QUERIES // 2)
+        initial_gap_queries = (gap_diagnostics.get("gap_queries") or [])[:initial_gap_budget]
+        for gq in initial_gap_queries:
             qtext = str(gq.get("query") or "")
             if not qtext:
                 continue
             try:
+                gap_lane = str(gq.get("lane") or "official_and_news")
+                gap_use_news = gap_lane in {"news", "official_and_news"}
                 search_result = self._service.search(
                     [qtext], provider=self.provider, max_results=max_results_per_query,
-                    recency_days=int(gq.get("lookback_days") or 30), use_news_vertical=True,
+                    recency_days=int(gq.get("lookback_days") or 30), use_news_vertical=gap_use_news,
                 )
                 results = list(search_result.get("results") or [])
+                retrieved_at = datetime.now().astimezone().isoformat()
                 for r in results:
+                    r.setdefault("search_retrieved_at", retrieved_at)
                     r.setdefault("scope", gq.get("scope") or "ticker")
                     r.setdefault("ticker", gq.get("ticker"))
                     r.setdefault("event_hint", gq.get("event_need"))
                     r.setdefault("lane", gq.get("lane") or "news")
                     r.setdefault("question_id", gq.get("question_id"))
                     r.setdefault("gap_search", True)
+                    r.setdefault("gap_stage", "first_pass")
                 raw.extend(results)
-            except Exception:  # noqa: BLE001
-                continue
+                query_stats.append({
+                    "ticker": gq.get("ticker"), "scope": "ticker",
+                    "query": qtext, "lane": gap_lane,
+                    "event_need": gq.get("event_need"), "lookback_days": gq.get("lookback_days"),
+                    "use_news_vertical": gap_use_news, "raw_count": len(results),
+                    "accepted_count": 0, "rejected": {}, "gap_stage": "first_pass",
+                })
+            except Exception as exc:  # noqa: BLE001
+                provider_errors.append(f"first_pass_gap_search_failed:{type(exc).__name__}:{exc}")
 
-        # 第七轮第 5 节：单一收口点——初始+补搜原始结果统一进入同一管线。
+        # 初始+第一轮补搜统一进入同一管线。
         processed = process_all_results_once(
             raw,
             plan=plan,
@@ -713,6 +854,59 @@ class PortfolioResearchService:
         reference_count = processed["reference_count"]
         outside_window_count = processed["outside_window_count"]
         filtered_count = processed["filtered_count"]
+
+        # 第二级 Gap Gate：Raw Candidate 覆盖不等于 Materiality 覆盖。
+        # 第一轮管线完成后再按 materiality_accepted 检查一次，使用剩余 Query 预算精准补搜。
+        post_gap_diagnostics = analyze_research_gap(
+            plan, selected, model=model, provider=provider,
+            instrument_metadata=instrument_metadata, first_pass=False,
+        )
+        remaining_gap_budget = max(0, MAX_GAP_QUERIES - len(initial_gap_queries))
+        post_gap_queries = (post_gap_diagnostics.get("gap_queries") or [])[:remaining_gap_budget]
+        if post_gap_queries:
+            for gq in post_gap_queries:
+                qtext = str(gq.get("query") or "")
+                if not qtext:
+                    continue
+                try:
+                    search_result = self._service.search(
+                        [qtext], provider=self.provider, max_results=max_results_per_query,
+                        recency_days=int(gq.get("lookback_days") or 45), use_news_vertical=False,
+                    )
+                    results = list(search_result.get("results") or [])
+                    retrieved_at = datetime.now().astimezone().isoformat()
+                    for result in results:
+                        result.setdefault("search_retrieved_at", retrieved_at)
+                        result.setdefault("scope", "ticker")
+                        result.setdefault("ticker", gq.get("ticker"))
+                        result.setdefault("event_hint", gq.get("event_need"))
+                        result.setdefault("lane", gq.get("lane") or "official_and_news")
+                        result.setdefault("question_id", gq.get("question_id"))
+                        result.setdefault("gap_search", True)
+                        result.setdefault("gap_stage", "post_materiality")
+                    raw.extend(results)
+                    query_stats.append({
+                        "ticker": gq.get("ticker"), "scope": "ticker",
+                        "query": qtext, "lane": gq.get("lane") or "official_and_news",
+                        "event_need": gq.get("event_need"), "lookback_days": gq.get("lookback_days"),
+                        "use_news_vertical": False, "raw_count": len(results),
+                        "accepted_count": 0, "rejected": {}, "gap_stage": "post_materiality",
+                    })
+                except Exception as exc:  # noqa: BLE001
+                    provider_errors.append(f"post_materiality_gap_search_failed:{type(exc).__name__}:{exc}")
+
+            # 新结果与原始结果再次统一收口一次，不产生子流程 Evidence ID。
+            processed = process_all_results_once(
+                raw, plan=plan, instrument_metadata=instrument_metadata,
+                ranking=ranking, metrics=metrics, max_articles=max_articles,
+                max_evidence=max_evidence, search_provider=self.provider,
+            )
+            selected = processed["evidence"]
+            materiality_stats = processed["materiality_stats"]
+            event_clusters = processed["event_clusters"]
+            reference_count = processed["reference_count"]
+            outside_window_count = processed["outside_window_count"]
+            filtered_count = processed["filtered_count"]
 
         # Risk-weighted coverage（修改计划第 21 节）
         risk_weighted_coverage = _risk_weighted_coverage(
@@ -771,8 +965,8 @@ class PortfolioResearchService:
             "plan_total_queries": plan.get("total_queries"),
             "compiled_queries_count": len(compiled_queries),
             "official_lane_queries_count": len(official_queries),
-            "total_executed_queries": len(all_queries),
-            "queries_count": len(all_queries),
+            "total_executed_queries": len(all_queries) + len(initial_gap_queries) + len(post_gap_queries),
+            "queries_count": len(all_queries) + len(initial_gap_queries) + len(post_gap_queries),
             "verticals_used": sorted(verticals_used),
             "raw_results_count": raw_count,
             "filtered_results_count": filtered_count,
@@ -795,14 +989,22 @@ class PortfolioResearchService:
             "snippet_fallback_count": snippet_fallback_count,
             "strict_article_verification": _REQUIRE_VERIFIED_ARTICLE,
             "query_stats": query_stats,
-            "search_lanes": _search_lanes_summary(all_queries),
+            "search_lanes": _search_lanes_summary(
+                all_queries + initial_gap_queries + post_gap_queries
+            ),
             "materiality_stats": materiality_stats,
             "event_clusters": event_clusters,
             "event_cluster_count": len(event_clusters),
             "gap_mode": gap_diagnostics.get("gap_mode"),
-            "gap_additional_search_required": gap_diagnostics.get("additional_search_required"),
-            "gap_total_new_queries": gap_diagnostics.get("total_new_queries"),
-            "gap_errors": gap_diagnostics.get("errors") or [],
+            "gap_additional_search_required": bool(initial_gap_queries or post_gap_queries),
+            "gap_total_new_queries": len(initial_gap_queries) + len(post_gap_queries),
+            "gap_errors": (gap_diagnostics.get("errors") or []) + (post_gap_diagnostics.get("errors") or []),
+            "gap_diagnostics": {
+                "first_pass": gap_diagnostics,
+                "post_materiality": post_gap_diagnostics,
+            },
+            "first_pass_gap_query_count": len(initial_gap_queries),
+            "post_materiality_gap_query_count": len(post_gap_queries),
         }
         return {
             "status": status,
@@ -811,6 +1013,77 @@ class PortfolioResearchService:
             "raw_results": raw,
             "filtered_results": processed["filtered"],
             "research_plan": plan,
+        }
+
+    def precision_gap_search(
+        self,
+        *,
+        plan: dict[str, Any],
+        accepted_evidence: list[dict[str, Any]],
+        instrument_metadata: dict[str, dict[str, Any]],
+        ranking: dict[str, Any],
+        metrics: dict[str, Any],
+        model: str,
+        provider: str,
+        max_results_per_query: int = 4,
+        max_articles: int = 12,
+        max_evidence: int = 15,
+    ) -> dict[str, Any]:
+        """Accepted Evidence 收口后的最后一次精准补搜。
+
+        该方法不分配 ``evidence_id``，返回的新候选仍须经过 Decision Summarizer
+        和全局 ``finalize_evidence_ids``。
+        """
+        diagnostics = analyze_research_gap(
+            plan, accepted_evidence, model=model, provider=provider,
+            instrument_metadata=instrument_metadata, first_pass=False,
+        )
+        queries = (diagnostics.get("gap_queries") or [])[:MAX_GAP_QUERIES]
+        raw: list[dict[str, Any]] = []
+        errors: list[str] = []
+        for query in queries:
+            text = str(query.get("query") or "")
+            if not text:
+                continue
+            try:
+                result = self._service.search(
+                    [text], provider=self.provider, max_results=max_results_per_query,
+                    recency_days=int(query.get("lookback_days") or 45),
+                    use_news_vertical=False,
+                )
+                rows = list(result.get("results") or [])
+                retrieved_at = datetime.now().astimezone().isoformat()
+                for row in rows:
+                    row.setdefault("search_retrieved_at", retrieved_at)
+                    row.setdefault("scope", "ticker")
+                    row.setdefault("ticker", query.get("ticker"))
+                    row.setdefault("event_hint", query.get("event_need"))
+                    row.setdefault("lane", "official_and_news")
+                    row.setdefault("gap_search", True)
+                    row.setdefault("gap_stage", "post_accepted")
+                raw.extend(rows)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"post_accepted_gap_search_failed:{type(exc).__name__}:{exc}")
+
+        processed = process_all_results_once(
+            raw, plan=plan, instrument_metadata=instrument_metadata, ranking=ranking,
+            metrics=metrics, max_articles=max_articles, max_evidence=max_evidence,
+            search_provider=self.provider,
+        ) if raw else {
+            "evidence": [], "filtered": [], "filter_rejected": {},
+            "materiality_stats": {}, "event_clusters": [],
+            "reference_count": 0, "outside_window_count": 0,
+            "raw_count": 0, "filtered_count": 0,
+        }
+        diagnostics["errors"] = list(diagnostics.get("errors") or []) + errors
+        diagnostics["executed_query_count"] = len(queries)
+        diagnostics["raw_results_count"] = len(raw)
+        diagnostics["selected_evidence_count"] = len(processed.get("evidence") or [])
+        return {
+            "evidence": processed.get("evidence") or [],
+            "raw_results": raw,
+            "filtered_results": processed.get("filtered") or [],
+            "diagnostics": diagnostics,
         }
 
     def research(
@@ -834,10 +1107,12 @@ class PortfolioResearchService:
                 recency_days=_BACKGROUND_DAYS,
             )
             results = list(search_result.get("results") or [])
+            retrieved_at = datetime.now().astimezone().isoformat()
             diag = search_result.get("diagnostics") or {}
             provider_used = provider_used or diag.get("provider_used")
             provider_errors.extend(diag.get("errors") or [])
             for r in results:
+                r.setdefault("search_retrieved_at", retrieved_at)
                 r.setdefault("scope", q["scope"])
                 r.setdefault("ticker", q["ticker"])
                 r.setdefault("event_hint", q["event_hint"])
@@ -861,7 +1136,13 @@ class PortfolioResearchService:
             if _evidence_kind(candidate, candidate.get("scope"), meta) == "reference":
                 reference_count += 1
                 continue
-            tier = _recency_tier(candidate.get("published_date"))
+            candidate_reference = (
+                _coerce_reference_datetime(candidate.get("search_retrieved_at"))
+                or datetime.now().astimezone()
+            )
+            tier = _recency_tier(
+                candidate.get("published_date"), reference_datetime=candidate_reference,
+            )
             if tier not in {"fresh_event", "recent_background", "unknown"}:
                 outside_window_count += 1
                 continue
@@ -1011,14 +1292,20 @@ def _apply_materiality_and_clustering(
     - event_clusters：聚类元信息（同事件去重）。
     """
     from .research_core.materiality_ranker import rank_evidence
-    from .research_core.event_clusterer import cluster_events
+    from .research_core.event_clusterer import annotate_event_identity, cluster_events
 
     if not evidence:
         return [], {"rejected_reasons": {}, "ranked_count": 0, "accepted_count": 0}, []
 
+    # Event identity 必须先于 Novelty Score，避免 event_key 缺失时全部得到默认分。
+    evidence = annotate_event_identity(evidence, instrument_metadata=instrument_metadata)
     ranked: list[dict[str, Any]] = []
     seen_event_keys: set[str] = set()
     reject_reasons: dict[str, int] = {}
+    rejected_by_ticker: dict[str, int] = {}
+    accepted_by_ticker: dict[str, int] = {}
+    source_type_counts: dict[str, dict[str, int]] = {}
+    lane_counts: dict[str, dict[str, int]] = {}
 
     for ev in evidence:
         ticker = ev.get("ticker")
@@ -1044,6 +1331,8 @@ def _apply_materiality_and_clustering(
         ev["portfolio_impact_score"] = scores["portfolio_impact_score"]
         ev["decision_usefulness_score"] = scores["decision_usefulness_score"]
         ev["source_authority_score"] = scores["source_authority_score"]
+        ev["source_type"] = scores.get("source_type") or ev.get("source_type") or "unknown"
+        ev["source_is_official"] = bool(scores.get("source_is_official"))
         ev["novelty_score"] = scores["novelty_score"]
         ev["selection_score"] = scores["selection_score"]
         ev["entity_role"] = scores["entity_role"]
@@ -1052,8 +1341,17 @@ def _apply_materiality_and_clustering(
         ev["is_reference_page"] = scores["is_reference_page"]
         ev["materiality_accepted"] = scores["accepted"]
         ev["reject_reason"] = scores["reject_reason"]
+        ticker_key = str(ticker or "MACRO")
+        source_key = str(ev.get("source_type") or "unknown")
+        lane_key = str(ev.get("lane") or "unknown")
+        outcome = "accepted" if scores["accepted"] else "rejected"
+        source_type_counts.setdefault(source_key, {"accepted": 0, "rejected": 0})[outcome] += 1
+        lane_counts.setdefault(lane_key, {"accepted": 0, "rejected": 0})[outcome] += 1
         if scores["reject_reason"]:
             reject_reasons[scores["reject_reason"]] = reject_reasons.get(scores["reject_reason"], 0) + 1
+            rejected_by_ticker[ticker_key] = rejected_by_ticker.get(ticker_key, 0) + 1
+        else:
+            accepted_by_ticker[ticker_key] = accepted_by_ticker.get(ticker_key, 0) + 1
         # §17 修复：将已处理 event_key 加入集合，确保后续 evidence 的 Novelty Score 能判断重复
         ek = ev.get("event_key")
         if ek:
@@ -1068,12 +1366,48 @@ def _apply_materiality_and_clustering(
         "accepted_count": sum(1 for e in ranked if e.get("materiality_accepted")),
         "rejected_count": sum(1 for e in ranked if not e.get("materiality_accepted")),
         "rejected_reasons": reject_reasons,
+        "accepted_by_ticker": accepted_by_ticker,
+        "rejected_by_ticker": rejected_by_ticker,
+        "source_type_counts": source_type_counts,
+        "lane_counts": lane_counts,
         "cluster_count": len(event_clusters),
         "avg_selection_score": round(
             sum(float(e.get("selection_score") or 0) for e in ranked) / len(ranked), 3
         ) if ranked else 0.0,
     }
     return clustered, stats, event_clusters
+
+
+def _select_final_evidence(
+    ranked: list[dict[str, Any]],
+    max_evidence: int,
+) -> list[dict[str, Any]]:
+    """Materiality 后再执行最终 Top-K，优先 accepted 且保持 ticker 多样性。"""
+    limit = max(1, int(max_evidence))
+    ordered = sorted(
+        ranked,
+        key=lambda item: (
+            bool(item.get("materiality_accepted")),
+            float(item.get("selection_score") or 0.0),
+            float(item.get("priority_score") or 0.0),
+        ),
+        reverse=True,
+    )
+    selected: list[dict[str, Any]] = []
+    represented: set[str] = set()
+    for item in ordered:
+        ticker = str(item.get("ticker") or "")
+        if item.get("materiality_accepted") and ticker and ticker not in represented:
+            selected.append(item)
+            represented.add(ticker)
+            if len(selected) >= limit:
+                return selected
+    for item in ordered:
+        if item not in selected:
+            selected.append(item)
+            if len(selected) >= limit:
+                break
+    return selected
 
 
 # ── Phase 5: 单一收口点（第七轮第 5 节）─────────────
@@ -1087,6 +1421,7 @@ def process_all_results_once(
     max_articles: int = 15,
     max_evidence: int = 15,
     search_provider: str = "auto",
+    reference_datetime: datetime | None = None,
 ) -> dict[str, Any]:
     """第七轮第 5 节：研究管线唯一收口点。
 
@@ -1104,7 +1439,14 @@ def process_all_results_once(
         if _evidence_kind(candidate, candidate.get("scope"), meta) == "reference":
             reference_count += 1
             continue
-        tier = _recency_tier(candidate.get("published_date"))
+        candidate_reference = (
+            _coerce_reference_datetime(candidate.get("search_retrieved_at"))
+            or reference_datetime
+            or datetime.now().astimezone()
+        )
+        tier = _recency_tier(
+            candidate.get("published_date"), reference_datetime=candidate_reference,
+        )
         if tier not in {"fresh_event", "recent_background", "unknown"}:
             outside_window_count += 1
             continue
@@ -1114,10 +1456,16 @@ def process_all_results_once(
         recent_filtered, instrument_metadata,
         max_articles=max_articles, max_evidence=max_evidence,
         search_provider=search_provider,
+        max_candidates_per_ticker=8, preselection_multiplier=3,
+        reference_datetime=reference_datetime,
     )
     selected, materiality_stats, event_clusters = _apply_materiality_and_clustering(
         selected, instrument_metadata, ranking, metrics,
     )
+    expanded_ranked_count = len(selected)
+    selected = _select_final_evidence(selected, max_evidence)
+    materiality_stats["expanded_ranked_count"] = expanded_ranked_count
+    materiality_stats["final_selected_count"] = len(selected)
 
     # 复刻既有 snippet 置信度上限逻辑：未验证但可用的 snippet 证据置信度封顶 0.60。
     for item in selected:

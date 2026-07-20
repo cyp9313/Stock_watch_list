@@ -75,8 +75,9 @@ def _classify_source_type(domain: str, url: str, meta: dict[str, Any]) -> str:
         return "rating_agency"
 
     # 3. Official（公司 IR 域名或 meta 中的 official_domains）
-    official_domains = [str(od).lower() for od in (meta.get("official_domains") or [])]
-    if d in official_domains or _OFFICIAL_IR_PATH.search(url.lower()):
+    official_domains = [str(od).lower().removeprefix("www.") for od in (meta.get("official_domains") or [])]
+    if any(d == od or d.endswith("." + od) or od.endswith("." + d) for od in official_domains) \
+            or _OFFICIAL_IR_PATH.search(url.lower()):
         return "official"
 
     # 4. Aggregator

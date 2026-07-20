@@ -73,6 +73,100 @@ _UNDERLYING_INDEX_PATTERNS = [
 ]
 
 INSTRUMENT_OVERRIDES: dict[str, dict[str, Any]] = {
+    # Research identity overrides.  These fields are intentionally local and
+    # deterministic: they let the Official Lane and Entity Resolver recognise
+    # the issuer/company without requiring a live yfinance ``info`` call.
+    "SOFI": {
+        "name": "SoFi Technologies, Inc.",
+        "entity_aliases": ["SoFi", "SoFi Technologies"],
+        "official_domains": ["sofi.com", "investors.sofi.com"],
+        "ir_domain": "investors.sofi.com",
+    },
+    "TSLA": {
+        "name": "Tesla, Inc.",
+        "entity_aliases": ["Tesla", "Tesla Motors"],
+        "official_domains": ["tesla.com", "ir.tesla.com"],
+        "ir_domain": "ir.tesla.com",
+    },
+    "META": {
+        "name": "Meta Platforms, Inc.",
+        "entity_aliases": ["Meta Platforms", "Meta", "Facebook"],
+        "official_domains": ["investor.atmeta.com", "atmeta.com", "about.fb.com"],
+        "ir_domain": "investor.atmeta.com",
+    },
+    "VST": {
+        "name": "Vistra Corp.",
+        "entity_aliases": ["Vistra", "Vistra Corp"],
+        "official_domains": ["vistracorp.com", "investor.vistracorp.com"],
+        "ir_domain": "investor.vistracorp.com",
+    },
+    "ORCL": {
+        "name": "Oracle Corporation",
+        "entity_aliases": ["Oracle", "Oracle Corporation"],
+        "official_domains": ["oracle.com", "investor.oracle.com"],
+        "ir_domain": "investor.oracle.com",
+    },
+    "MSFT": {
+        "name": "Microsoft Corporation",
+        "entity_aliases": ["Microsoft", "Microsoft Corporation"],
+        "official_domains": ["microsoft.com"],
+        "ir_domain": "microsoft.com/en-us/investor",
+    },
+    "NVDA": {
+        "name": "NVIDIA Corporation",
+        "entity_aliases": ["NVIDIA", "Nvidia Corporation"],
+        "official_domains": ["nvidia.com", "investor.nvidia.com"],
+        "ir_domain": "investor.nvidia.com",
+    },
+    "NVD.DE": {
+        "name": "NVIDIA Corporation",
+        "entity_aliases": ["NVIDIA", "Nvidia Corporation", "NVDA"],
+        "official_domains": ["nvidia.com", "investor.nvidia.com"],
+        "ir_domain": "investor.nvidia.com",
+    },
+    "UNH": {
+        "name": "UnitedHealth Group Incorporated",
+        "entity_aliases": ["UnitedHealth Group", "UnitedHealth", "UnitedHealthcare"],
+        "official_domains": ["unitedhealthgroup.com"],
+        "ir_domain": "unitedhealthgroup.com/investors",
+    },
+    "JPM": {
+        "name": "JPMorgan Chase & Co.",
+        "entity_aliases": ["JPMorgan Chase", "JPMorgan", "J.P. Morgan"],
+        "official_domains": ["jpmorganchase.com"],
+        "ir_domain": "jpmorganchase.com/ir",
+    },
+    "COIN": {
+        "name": "Coinbase Global, Inc.",
+        "entity_aliases": ["Coinbase", "Coinbase Global"],
+        "official_domains": ["coinbase.com", "investor.coinbase.com"],
+        "ir_domain": "investor.coinbase.com",
+    },
+    "WNUC.DE": {
+        "name": "WisdomTree Uranium and Nuclear Energy UCITS ETF",
+        "entity_aliases": [
+            "WisdomTree Uranium and Nuclear Energy UCITS ETF",
+            "WisdomTree Uranium and Nuclear Energy",
+            "WNUC",
+        ],
+        "official_domains": ["wisdomtree.eu", "wisdomtree.com"],
+        "issuer_domain": "wisdomtree.eu",
+        "theme": "Uranium & Nuclear Energy",
+        "key_drivers": ["uranium", "nuclear energy", "uranium supply", "nuclear policy"],
+    },
+    "LYMS.DE": {
+        "name": "Amundi Core Nasdaq-100 Swap UCITS ETF Acc",
+        "entity_aliases": [
+            "Amundi Core Nasdaq-100 Swap UCITS ETF",
+            "Amundi Nasdaq-100 UCITS ETF",
+            "LYMS",
+        ],
+        "official_domains": ["amundietf.com", "amundi.com"],
+        "issuer_domain": "amundietf.com",
+        "underlying_index": "Nasdaq-100",
+        "theme": "Nasdaq-100 / 美国大盘成长",
+        "key_drivers": ["Nasdaq-100", "large cap technology", "US growth equities"],
+    },
     "PPFB.DE": {
         "instrument_type": "ETC",
         "asset_class": "Precious Metal ETC",
@@ -80,6 +174,10 @@ INSTRUMENT_OVERRIDES: dict[str, dict[str, Any]] = {
         "classification_source": "manual",
         "classification_confidence": 1.0,
         "needs_review": False,
+        "entity_aliases": ["iShares Physical Gold ETC", "iShares Physical Metals"],
+        "official_domains": ["ishares.com", "blackrock.com"],
+        "issuer_domain": "ishares.com",
+        "key_drivers": ["gold price", "real yields", "central bank gold demand"],
     },
 }
 
@@ -312,7 +410,16 @@ def build_instrument_metadata(
         m = _finalize_metadata(m)
         override = INSTRUMENT_OVERRIDES.get(ticker)
         if override:
-            m.update(override)
+            # Preserve a concrete name supplied by the portfolio/market cache.
+            # Research overrides enrich identity metadata; they must not silently
+            # rewrite a user-visible product name when the same exchange ticker is
+            # reused for a different share class/product in a test or deployment.
+            override_fields = dict(override)
+            override_name = override_fields.pop("name", None)
+            current_name = str(m.get("name") or "").strip()
+            m.update(override_fields)
+            if override_name and (not current_name or current_name.upper() == ticker.upper()):
+                m["name"] = override_name
         meta[ticker] = m
     return meta
 

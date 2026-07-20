@@ -27,7 +27,7 @@ from ..report_components import (
 )
 from ..report_i18n import (
     action_zh, risk_level_zh, format_money, format_pct, format_number, pct_color_class,
-    format_ratio_as_pct, format_pct_value, finite_float,
+    format_ratio_as_pct, format_pct_value, finite_float, portfolio_stance_zh,
 )
 from portfolio_analysis.metric_contracts import fmt_metric
 from ..report_charts import (
@@ -52,6 +52,105 @@ def _to_berlin(iso: str | None) -> str:
         return d.astimezone(ZoneInfo("Europe/Berlin")).strftime("%Y-%m-%d %H:%M Europe/Berlin")
     except Exception:
         return str(iso)
+
+
+def _first_not_none(*values: Any) -> Any:
+    """Return the first non-None value without treating numeric zero as missing."""
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _event_date_display(value: Any) -> str:
+    """Display only validated ISO dates in the report timeline."""
+    text = str(value or "").strip()
+    if not text:
+        return "—"
+    try:
+        return _dt.fromisoformat(text.replace("Z", "+00:00")).date().isoformat()
+    except (ValueError, TypeError):
+        try:
+            return _dt.strptime(text[:10], "%Y-%m-%d").date().isoformat()
+        except (ValueError, TypeError):
+            return "未知"
+
+
+_STAGE_LABELS = {
+    "materiality_passed": "Materiality 通过",
+    "materiality_rejected": "Materiality 拒绝",
+    "summary_isolated": "摘要/身份隔离",
+    "summarizer_rejected": "摘要器明确拒绝",
+    "reference": "参考页分流",
+    "final_gate_rejected": "最终门拒绝",
+    "accepted": "Accepted",
+}
+
+
+def _render_stage_breakdown(
+    title: str,
+    dimension_label: str,
+    rows: dict[str, dict[str, int]] | None,
+) -> str:
+    if not rows:
+        return ""
+    stages = [
+        "materiality_passed", "materiality_rejected", "summary_isolated",
+        "summarizer_rejected", "reference", "final_gate_rejected", "accepted",
+    ]
+    headers = [dimension_label] + [_STAGE_LABELS[s] for s in stages]
+    table_rows = []
+    value_labels = {
+        "official": "官方来源",
+        "regulator": "监管机构",
+        "rating_agency": "评级机构",
+        "major_media": "主流财经媒体",
+        "specialty_media": "专业财经媒体",
+        "aggregator": "聚合站",
+        "unknown": "未知来源",
+        "official_and_news": "官方 + 新闻",
+        "news": "新闻",
+        "theme": "主题",
+        "macro": "宏观",
+    }
+    for key, counts in sorted(
+        rows.items(),
+        key=lambda kv: -sum(int(v or 0) for v in (kv[1] or {}).values()),
+    ):
+        display_key = value_labels.get(str(key), key) if dimension_label != "标的" else key
+        table_rows.append([display_key] + [int((counts or {}).get(stage) or 0) for stage in stages])
+    return f'<h4 style="margin:14px 0 8px">{esc(title)}</h4>' + render_table(headers, table_rows)
+
+
+def _summarizer_reason_zh(reason: str) -> str:
+    return {
+        "missing_output": "模型漏返回该 Evidence UID",
+        "duplicate_output_uid": "模型重复返回同一 Evidence UID",
+        "identity_mismatch": "模型改写了不可变身份字段",
+        "missing_or_invalid_accept": "accept 字段缺失或不是布尔值",
+        "summarizer_not_configured": "摘要模型未配置",
+        "summarizer_provider_error": "摘要模型调用或解析失败",
+    }.get(str(reason or ""), str(reason or "未知原因"))
+
+
+def _final_gate_reason_zh(reason: str) -> str:
+    text = str(reason or "")
+    if text.startswith("entity_role_not_accepted:"):
+        return "实体角色不满足正式证据门槛：" + text.split(":", 1)[1]
+    if text.startswith("recency_not_accepted:"):
+        tier = text.split(":", 1)[1]
+        return {
+            "unknown": "发布时间无法确认",
+            "structural": "仅属于结构性背景，超出近期事件门槛",
+            "stale": "证据已过期",
+        }.get(tier, f"时效等级不满足门槛：{tier}")
+    return {
+        "chronology_conflict": "事件时间线存在冲突",
+        "quote_page": "仅为行情/报价页面",
+        "reference_page": "仅为产品或参考页面",
+        "content_not_verified_or_snippet_too_weak": "正文未验证且搜索摘要不足以作为证据",
+        "unspecified_final_gate_rejection": "未满足最终证据门槛（未细分）",
+    }.get(text, text or "未知原因")
 
 
 def build_html(
@@ -94,8 +193,11 @@ def build_html(
     risk_level = advice.get("risk_level", "medium")
     stance = advice.get("portfolio_stance", "balanced")
     is_fallback = str(advice.get("report_mode") or advice.get("ai_analysis_available") == False) == "quantitative_fallback" or advice.get("report_mode") == "quantitative_fallback"
+    is_observation = bool(report_quality.get("observation_only") or advice.get("observation_only") or is_fallback)
+    report_title = "量化投资组合观察报告" if is_observation else "AI 投资组合分析报告"
+    final_confidence = _first_not_none(advice.get("final_confidence"), advice.get("confidence"), 0.0)
 
-    parts: list[str] = [render_html_head(f"{portfolio_name} AI 投资组合分析报告")]
+    parts: list[str] = [render_html_head(f"{portfolio_name} {report_title}")]
 
     # 头部
     parts.append(render_report_header(
@@ -108,22 +210,28 @@ def build_html(
         investment_horizon=str(settings.get("investment_horizon") or "1-3m"),
         risk_level=risk_level,
         stance=stance,
+        report_title=report_title,
     ))
 
     # 修改计划第三轮 40：明确数据截止口径与时间。
     # 修改计划第六轮第 27 节：新闻时间字段拆分（检索时间 vs 最新事件日期）。
-    news_exec_at = research_diagnostics.get("news_search_executed_at") if research_diagnostics else None
-    latest_event_date = research_diagnostics.get("latest_accepted_event_date") or research_diagnostics.get("latest_selected_event_date") if research_diagnostics else None
+    timeline = snapshot.get("run_timeline") or {}
+    snapshot_time = timeline.get("snapshot_completed_at") or as_of
+    news_exec_at = timeline.get("news_search_completed_at") or (
+        research_diagnostics.get("news_search_executed_at") if research_diagnostics else None
+    )
+    rendered_at = timeline.get("report_rendered_at") or "—"
+    latest_accepted_date = research_diagnostics.get("latest_accepted_event_date") if research_diagnostics else None
+    latest_candidate_date = research_diagnostics.get("latest_selected_event_date") if research_diagnostics else None
     news_time_html = f'新闻搜索完成时间：{esc(news_exec_at or news_cutoff or "—")}'
-    if latest_event_date:
-        news_time_html += f'　|　最新 Accepted Event：{esc(str(latest_event_date))}'
-    elif research_diagnostics and research_diagnostics.get("accepted_evidence_count", 0) == 0:
-        news_time_html += '　|　最新 Accepted Event：—'
+    news_time_html += f'　|　最新 Accepted Event：{esc(_event_date_display(latest_accepted_date))}'
+    if latest_candidate_date:
+        news_time_html += f'　|　最新候选事件：{esc(_event_date_display(latest_candidate_date))}'
     cutoff_html = (
         '<div class="data-cutoff">'
-        f'报告生成时间：{esc(as_of)}　|　股票行情截止：{esc(price_cutoff)} 收盘　|　'
-        f'ETF/ETC 截止：{esc(etf_cutoff)} 收盘　|　加密资产截止：{esc(crypto_cutoff)}　|　'
-        f'基准截止：{esc(benchmark_cutoff)} 收盘　|　{news_time_html}'
+        f'数据快照时间：{esc(snapshot_time)}　|　报告完成时间：{esc(rendered_at)}　|　'
+        f'股票行情截止：{esc(price_cutoff)} 收盘　|　ETF/ETC 截止：{esc(etf_cutoff)} 收盘　|　'
+        f'加密资产截止：{esc(crypto_cutoff)}　|　基准截止：{esc(benchmark_cutoff)} 收盘　|　{news_time_html}'
         '</div>'
     )
     parts.append(cutoff_html)
@@ -132,19 +240,40 @@ def build_html(
         parts.append(render_fallback_banner(fallback_reason))
 
     # ── 核心结论（P0-6 + §23: observation_only 时改变标题）──
-    is_observation = report_quality.get("observation_only") or (advice.get("observation_only"))
     section_title = "量化风险观察结论" if is_observation else "AI 核心结论"
     section_icon = "📊" if is_observation else "🧭"
-    stance_pill = f'<span class="pill info">组合态度：{esc(stance)}</span>'
+    stance_pill = f'<span class="pill info">组合态度：{esc(portfolio_stance_zh(stance))}</span>'
     risk_pill = f'<span class="pill warn">风险等级：{esc(risk_level_zh(risk_level))}</span>'
-    conf_pill = f'<span class="pill">报告最终置信度：{format_ratio_as_pct(advice.get("final_confidence") or advice.get("confidence"))}</span>'
+    conf_pill = f'<span class="pill">报告最终置信度：{format_ratio_as_pct(final_confidence)}</span>'
     core_html = (
         f'<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;">{stance_pill}{risk_pill}{conf_pill}</div>'
     )
-    if is_observation and rej_count > 0:
+    if is_observation and (rej_count > 0 or research_diagnostics):
+        selected_count = int(research_diagnostics.get("selected_evidence_count") or 0)
+        accepted_count = int(research_diagnostics.get("accepted_evidence_count") or len(evidence or []))
+        materiality_stats = research_diagnostics.get("materiality_stats") or {}
+        materiality_rejected = int(materiality_stats.get("rejected_count") or 0)
+        if "summarizer_isolation_count" in research_diagnostics:
+            isolated_count = int(research_diagnostics.get("summarizer_isolation_count") or 0)
+        else:
+            # Backward compatibility for legacy diagnostics generated before
+            # per-item Summarizer isolation reasons were recorded.
+            isolated_count = max(0, rej_count - materiality_rejected)
+        summarizer_rejected = int(research_diagnostics.get("summarizer_rejected_count") or 0)
+        final_gate_rejected = int(research_diagnostics.get("final_gate_rejected_count") or 0)
+        pipeline_text = (
+            f"本轮有 {selected_count} 条候选进入研究质量评估，其中 {materiality_rejected} 条未通过 Materiality；"
+            f"最终 Accepted Evidence 为 {accepted_count} 条。"
+        )
+        if isolated_count:
+            pipeline_text += f"另有 {isolated_count} 条在摘要或身份完整性校验中被隔离。"
+        if summarizer_rejected:
+            pipeline_text += f"摘要器明确拒绝 {summarizer_rejected} 条。"
+        if final_gate_rejected:
+            pipeline_text += f"最终 Evidence Gate 拒绝 {final_gate_rejected} 条。"
         core_html += (
             '<div class="banner warn">'
-            f'本轮新闻研究返回了 {rej_count} 条候选但未通过研究质量门槛。'
+            f'{esc(pipeline_text)}'
             '以下结论主要来自价格、风险贡献和技术指标，不包含基本面新闻判断。</div>'
         )
     exec_summary = advice.get("executive_summary") or []
@@ -160,12 +289,12 @@ def build_html(
     rel_5d = rr.get("5D", {}) if isinstance(rr.get("5D"), dict) else {}
     confidence_components = advice.get("confidence_components") or {}
     confidence_labels = {
-        "model_confidence": "模型输出",
+        "model_confidence": "量化模板基线" if is_observation else "模型输出",
         "data_quality": "行情数据质量",
         "metadata_coverage": "工具元数据覆盖",
-        "evidence_coverage": "Top-risk 证据覆盖",
-        "evidence_freshness": "证据新鲜度",
-        "evidence_verification": "正文已提取比例",
+        "evidence_coverage": "Accepted Top-risk 覆盖",
+        "evidence_freshness": "Accepted 证据新鲜度",
+        "evidence_verification": "证据正文验证（Accepted 正文提取比例）",
     }
     finite_confidence = {
         key: finite_float(value)
@@ -187,7 +316,7 @@ def build_html(
         {"label": "63D 回撤", "value": fmt_metric("max_drawdown_63d", metrics.get("max_drawdown_63d")), "sub": f"252D {fmt_metric('max_drawdown_252d', metrics.get('max_drawdown_252d'))}", "value_cls": pct_color_class(metrics.get("max_drawdown_63d"))},
         {"label": "相对基准(5D)", "value": fmt_metric("relative", rel_5d.get("relative")), "sub": f"组合 {fmt_metric('portfolio_return', rel_5d.get('portfolio'))} / 基准 {fmt_metric('benchmark_return', rel_5d.get('benchmark'))}", "value_cls": pct_color_class(rel_5d.get("relative"))},
         {"label": "Python 风险评分", "value": format_number(metrics.get("portfolio_risk_score"), 0), "sub": f"评分可信度 {format_ratio_as_pct(metrics.get('risk_score_confidence'))}"},
-        {"label": "AI 置信度", "value": format_ratio_as_pct(advice.get("confidence")), "sub": confidence_sub},
+        {"label": "报告决策置信度" if is_observation else "AI 置信度", "value": format_ratio_as_pct(final_confidence), "sub": confidence_sub},
     ]
     parts.append(render_section("Portfolio 概览", "📊", render_kpi_cards(cards, cols=4)))
 
@@ -272,9 +401,10 @@ def build_html(
     if risk_findings:
         risk_parts.append(render_section("确定性风险指标（Python 规则）", "⚠️", render_risk_cards(risk_findings)))
     if key_risks:
-        risk_parts.append(render_section("AI 综合风险解读", "⚠️", render_risk_cards(key_risks)))
+        risk_title = "量化风险解读" if is_observation else "AI 综合风险解读"
+        risk_parts.append(render_section(risk_title, "⚠️", render_risk_cards(key_risks)))
     if not risk_parts:
-        risk_parts.append(render_section("AI 风险诊断", "⚠️", render_risk_cards([])))
+        risk_parts.append(render_section("量化风险诊断" if is_observation else "AI 风险诊断", "⚠️", render_risk_cards([])))
     parts.extend(risk_parts)
 
     # ── AI 操作建议总表（修改计划 17.6）──
@@ -284,19 +414,31 @@ def build_html(
         for item in metrics.get("risk_contributions", []) or []
     }
     if actions:
-        parts.append(render_section("AI 操作建议总表", "🎯", render_action_summary_table(actions, rc_summary_map)))
+        action_summary_title = "重点观察清单（按综合风险优先级排序）" if is_observation else "AI 操作建议总表"
+        action_summary_html = ""
+        if is_observation:
+            action_summary_html += (
+                '<p class="kpi-sub">该清单综合考虑风险贡献、回撤、波动率和技术指标，'
+                '不等同于单纯按风险贡献排序的 Top5。</p>'
+            )
+        action_summary_html += render_action_summary_table(
+            actions, rc_summary_map, observation_only=is_observation,
+        )
+        parts.append(render_section(action_summary_title, "🎯", action_summary_html))
         # 修改计划第三轮 29：释放资金去向说明（系统无完整现金/目标配置时不自动推荐精确替代）。
         realloc = advice.get("portfolio_reallocation") or {}
         if realloc:
             red_w = realloc.get("estimated_weight_reduction")
-            reloc_html = (
-                '<div class="reason-block"><p>'
-                f'计划减仓预计释放组合权重：<b>{format_ratio_as_pct(red_w) if red_w is not None else "—"}</b>　|　'
-                f'计算口径：目标区间中点转为现金　|　资金去向：暂留现金，具体再配置未指定　|　'
-                f'{esc(realloc.get("note") or "")}'
-                '</p></div>'
-            )
-            parts.append(render_section("Portfolio 再平衡摘要", "⚖️", reloc_html))
+            # 全部为观察项且释放权重为 0 时，不展示没有信息量的再平衡摘要。
+            if not is_observation or (finite_float(red_w) is not None and abs(float(red_w)) > 1e-9):
+                reloc_html = (
+                    '<div class="reason-block"><p>'
+                    f'计划减仓预计释放组合权重：<b>{format_ratio_as_pct(red_w) if red_w is not None else "—"}</b>　|　'
+                    f'计算口径：目标区间中点转为现金　|　资金去向：暂留现金，具体再配置未指定　|　'
+                    f'{esc(realloc.get("note") or "")}'
+                    '</p></div>'
+                )
+                parts.append(render_section("Portfolio 再平衡摘要", "⚖️", reloc_html))
 
     # ── AI 操作建议详情（修改计划 17.7）──
     if actions:
@@ -323,8 +465,13 @@ def build_html(
                 "price_vs_ema200_pct": h.get("price_vs_ema200_pct"),
             }
         for a in actions:
-            detail_html += render_action_detail(a, rc_map.get(a.get("ticker")), detail_by_ticker.get(a.get("ticker"), {}))
-        parts.append(render_section("AI 操作建议详情", "🎯", detail_html))
+            detail_html += render_action_detail(
+                a,
+                rc_map.get(a.get("ticker")),
+                detail_by_ticker.get(a.get("ticker"), {}),
+                observation_only=is_observation,
+            )
+        parts.append(render_section("重点观察详情" if is_observation else "AI 操作建议详情", "🎯", detail_html))
 
     # ── Evidence Quality 概览 + Top-risk 新闻综合（修改计划第三轮 37/38）──
     if evidence:
@@ -372,7 +519,12 @@ def build_html(
             news_html += render_news_group("宏观 / 系统性因素", _top(macro_items))
         parts.append(render_section("Top-risk 新闻综合", "📰", news_html))
     else:
-        parts.append(render_section("Top-risk 新闻综合", "📰", '<p class="kpi-sub">（新闻研究未返回可发布证据；正式报告质量门槛会阻止操作建议发布。）</p>'))
+        empty_news_text = (
+            "（本轮没有 Accepted Evidence；新闻候选仅保留在诊断附件中，本报告不据此生成基本面结论。）"
+            if is_observation else
+            "（新闻研究未返回可发布证据；正式报告质量门槛会阻止操作建议发布。）"
+        )
+        parts.append(render_section("Top-risk 新闻综合", "📰", f'<p class="kpi-sub">{esc(empty_news_text)}</p>'))
 
     # ── 行业、主题与宏观分析（修改计划 17.9）──
     macro_html = ""
@@ -390,7 +542,11 @@ def build_html(
             macro_html += f'<li><b>{esc(w.get("title", ""))}</b>：{esc(w.get("reason", ""))}（{esc(", ".join(w.get("affected_tickers") or []))}）</li>'
         macro_html += "</ul></div>"
     if not macro_html:
-        macro_html = '<p class="kpi-sub">（AI 未生成行业/主题/宏观分析；参见上方风险诊断与新闻综合。）</p>'
+        macro_html = (
+            '<p class="kpi-sub">（量化观察模式未生成基本面行业/主题判断；参见上方风险指标。）</p>'
+            if is_observation else
+            '<p class="kpi-sub">（AI 未生成行业/主题/宏观分析；参见上方风险诊断与新闻综合。）</p>'
+        )
     parts.append(render_section("行业、主题与宏观分析", "🌐", macro_html))
 
     # ── 所有持仓技术快照（修改计划 17.10，按风险优先级降序）──
@@ -472,23 +628,40 @@ def build_html(
     if research_diagnostics:
         rejected = research_diagnostics.get("rejected") or {}
         reasons = "、".join(f"{esc(k)} {v}" for k, v in rejected.items() if v) or "无"
+        mat_stats = research_diagnostics.get("materiality_stats") or {}
+        selected_count = int(research_diagnostics.get("selected_evidence_count") or 0)
+        materiality_rejected = int(mat_stats.get("rejected_count") or 0)
+        accepted_count = int(research_diagnostics.get("accepted_evidence_count") or 0)
+        if "summarizer_isolation_count" in research_diagnostics:
+            post_materiality_isolated = int(research_diagnostics.get("summarizer_isolation_count") or 0)
+        else:
+            final_rejected_count = int(research_diagnostics.get("rejected_evidence_count") or 0)
+            post_materiality_isolated = max(0, final_rejected_count - materiality_rejected)
+        summarizer_rejected = int(research_diagnostics.get("summarizer_rejected_count") or 0)
+        final_gate_rejected = int(research_diagnostics.get("final_gate_rejected_count") or 0)
         dq_html += (
             f'<p>新闻研究状态：{esc(status_labels.get(str(research_diagnostics.get("status")), str(research_diagnostics.get("status") or "未知")))}；'
             f'原始结果：{research_diagnostics.get("raw_results_count", 0)}；过滤后：{research_diagnostics.get("filtered_results_count", 0)}；'
-            f'入选证据：{research_diagnostics.get("selected_evidence_count", 0)}；主要过滤原因：{reasons}</p>'
+            f'进入 Materiality：{selected_count}；Materiality 拒绝：{materiality_rejected}；'
+            f'摘要/身份隔离：{post_materiality_isolated}；摘要器明确拒绝：{summarizer_rejected}；'
+            f'最终门拒绝：{final_gate_rejected}；Accepted Evidence：{accepted_count}；'
+            f'过滤标签计数（同一结果可能命中多个标签）：{reasons}</p>'
         )
         # P0-2: 使用 accepted 口径的覆盖率和最新事件日期
-        rwc = research_diagnostics.get("accepted_risk_weighted_coverage") or research_diagnostics.get("risk_weighted_coverage")
-        top_cov = research_diagnostics.get("accepted_top_risk_coverage") or research_diagnostics.get("top_risk_coverage") or 0
+        rwc = research_diagnostics.get("accepted_risk_weighted_coverage")
+        if rwc is None:
+            rwc = research_diagnostics.get("risk_weighted_coverage")
+        top_cov = research_diagnostics.get("accepted_top_risk_coverage")
+        if top_cov is None:
+            top_cov = research_diagnostics.get("top_risk_coverage") or 0
         if rwc is not None:
             dq_html += f'<p class="kpi-sub">风险加权覆盖率：{format_ratio_as_pct(rwc)}；Top-risk 覆盖率：{format_ratio_as_pct(top_cov)}</p>'
-        latest_event = research_diagnostics.get("latest_accepted_event_date") or research_diagnostics.get("latest_selected_event_date")
-        if latest_event:
-            dq_html += f'<p class="kpi-sub">最新 Accepted 事件日期：{esc(str(latest_event))}</p>'
-        elif research_diagnostics.get("latest_accepted_event_date") is None and research_diagnostics.get("accepted_evidence_count", 0) == 0:
-            dq_html += '<p class="kpi-sub">最新 Accepted 事件日期：—</p>'
+        latest_event = research_diagnostics.get("latest_accepted_event_date")
+        dq_html += f'<p class="kpi-sub">最新 Accepted 事件日期：{esc(_event_date_display(latest_event))}</p>'
+        latest_candidate = research_diagnostics.get("latest_selected_event_date")
+        if latest_candidate:
+            dq_html += f'<p class="kpi-sub">最新候选事件日期：{esc(_event_date_display(latest_candidate))}</p>'
         # 第六轮：Materiality 统计（修改计划第 16 节）
-        mat_stats = research_diagnostics.get("materiality_stats") or {}
         if mat_stats:
             dq_html += (
                 f'<p class="kpi-sub">Materiality 评分：入选 {mat_stats.get("accepted_count", 0)} 条，'
@@ -497,14 +670,110 @@ def build_html(
                 f'平均选择分 {mat_stats.get("avg_selection_score", 0)}；'
                 f'拒绝原因：' + "、".join(f"{esc(k)} {v}" for k, v in (mat_stats.get("rejected_reasons") or {}).items() if v) + '</p>'
             )
+
+        isolation_reasons = research_diagnostics.get("summarizer_isolation_reasons") or {}
+        if isolation_reasons:
+            reason_text = "、".join(
+                f"{esc(_summarizer_reason_zh(str(reason)))} {count}"
+                for reason, count in isolation_reasons.items() if count
+            )
+            dq_html += f'<p class="kpi-sub warn-text">摘要隔离原因：{reason_text}</p>'
+
+        isolated_items = research_diagnostics.get("summarizer_isolated_items") or []
+        if isolated_items:
+            isolated_rows = []
+            for item in isolated_items[:12]:
+                isolated_rows.append([
+                    item.get("ticker") or "MACRO",
+                    item.get("source_type") or "unknown",
+                    item.get("lane") or "unknown",
+                    _summarizer_reason_zh(str(item.get("reason") or "")),
+                    item.get("title") or "—",
+                ])
+            dq_html += '<h4 style="margin:14px 0 8px">摘要隔离明细</h4>' + render_table(
+                ["标的", "来源类型", "Lane", "隔离原因", "标题"], isolated_rows,
+            )
+
+        final_gate_reasons = research_diagnostics.get("final_gate_reject_reasons") or {}
+        if final_gate_reasons:
+            reason_text = "、".join(
+                f"{esc(_final_gate_reason_zh(str(reason)))} {count}"
+                for reason, count in final_gate_reasons.items() if count
+            )
+            dq_html += f'<p class="kpi-sub warn-text">最终 Evidence Gate 拒绝原因：{reason_text}</p>'
+
+        final_gate_items = research_diagnostics.get("final_gate_rejected_items") or []
+        if final_gate_items:
+            final_rows = []
+            for item in final_gate_items[:12]:
+                raw_date = item.get("raw_published_date") or "—"
+                normalized_date = _event_date_display(item.get("published_date"))
+                reason_text = "；".join(
+                    _final_gate_reason_zh(str(reason))
+                    for reason in (item.get("reasons") or [])
+                ) or "未知原因"
+                final_rows.append([
+                    item.get("ticker") or "MACRO",
+                    item.get("source_domain") or "unknown",
+                    item.get("source_type") or "unknown",
+                    item.get("lane") or "unknown",
+                    raw_date,
+                    normalized_date,
+                    "是" if item.get("article_fetch_ok") else "否",
+                    "是" if item.get("snippet_fallback_ok") else "否",
+                    item.get("recency_tier") or "unknown",
+                    reason_text,
+                    item.get("title") or "—",
+                ])
+            dq_html += '<h4 style="margin:14px 0 8px">最终 Evidence Gate 拒绝明细</h4>' + render_table(
+                ["标的", "域名", "来源类型", "Lane", "发布时间原值", "标准化日期", "正文提取", "摘要可用", "时效层级", "拒绝原因", "标题"],
+                final_rows,
+            )
+
+        invariant_ok = research_diagnostics.get("stage_count_invariant_ok")
+        if invariant_ok is False:
+            dq_html += '<p class="kpi-sub warn-text">研究阶段计数未闭合，请检查候选去重与阶段聚合。</p>'
+        duplicate_count = int(research_diagnostics.get("diagnostic_duplicate_candidate_count") or 0)
+        if duplicate_count:
+            before_count = int(research_diagnostics.get("diagnostic_candidate_count_before_dedupe") or 0)
+            after_count = int(research_diagnostics.get("diagnostic_candidate_count_after_dedupe") or 0)
+            dq_html += (
+                f'<p class="kpi-sub">跨检索通道重复候选已去重：{duplicate_count} 条；'
+                f'去重前 {before_count} 条，去重后 {after_count} 条。</p>'
+            )
+
+        dq_html += _render_stage_breakdown(
+            "按来源类型的研究阶段统计",
+            "来源类型",
+            research_diagnostics.get("evidence_stage_by_source_type"),
+        )
+        dq_html += _render_stage_breakdown(
+            "按标的的研究阶段统计",
+            "标的",
+            research_diagnostics.get("evidence_stage_by_ticker"),
+        )
+        dq_html += _render_stage_breakdown(
+            "按 Search Lane 的研究阶段统计",
+            "Lane",
+            research_diagnostics.get("evidence_stage_by_lane"),
+        )
     if report_quality:
         # §24: 质量评分为分项展示
-        final_conf = report_quality.get("final_confidence") or advice.get("final_confidence") or advice.get("confidence") or 0
+        final_conf = _first_not_none(
+            report_quality.get("final_confidence"),
+            advice.get("final_confidence"),
+            advice.get("confidence"),
+            0.0,
+        )
         fresh_count = research_diagnostics.get("accepted_fresh_count", 0)
         top_cov2 = research_diagnostics.get("accepted_top_risk_coverage") or 0
+        structure_label = "通过" if report_quality.get("structure_valid", report_quality.get("publishable")) else "未通过"
+        research_sufficiency = report_quality.get("research_sufficiency")
+        if research_sufficiency is None:
+            research_sufficiency = top_cov2
         dq_html += (
-            f'<p>报告质量评分：{format_ratio_as_pct(report_quality.get("quality_score"))}'
-            f'（数据完整性 100% · 研究充分性 {format_ratio_as_pct(top_cov2)}'
+            f'<p>决策质量：{format_ratio_as_pct(report_quality.get("quality_score"))}'
+            f'（结构校验：{structure_label} · 研究充分性 {format_ratio_as_pct(research_sufficiency)}'
             f' · 决策置信度 {format_ratio_as_pct(final_conf)}'
             f' · 可操作：{"是" if report_quality.get("actionable") else "否"}）</p>'
         )

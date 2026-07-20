@@ -54,10 +54,16 @@ from daily_report.src.stock_daily_agent.portfolio_research import PortfolioResea
 from daily_report.src.stock_daily_agent.evidence_summarizer import summarize_evidence_zh
 from daily_report.src.stock_daily_agent.research_core.evidence_id import (
     finalize_evidence_ids,
+    make_evidence_uid,
     split_evidence_groups,
     validate_evidence_identity,
 )
 from portfolio_analysis.return_model import build_portfolio_return_model
+from portfolio_analysis.research_diagnostics import (
+    merge_evidence_by_identity,
+    refresh_research_stage_diagnostics,
+)
+from portfolio_analysis.observation_view import _build_observation_view
 from daily_report.src.stock_daily_agent.portfolio_context import PortfolioRunContext
 from daily_report.src.stock_daily_agent.portfolio_agent_runner import (
     run_portfolio_agent,
@@ -205,9 +211,11 @@ def _apply_confidence_cap(
     dq = data_quality_score(len(non_finite), anomaly_w)
     tickers = [h["ticker"] for h in snapshot.get("holdings", [])]
     meta_cov = metadata_coverage_score(instrument_metadata, tickers)
-    ev_cov = evidence_coverage_score(evidence, ranking.get("top_risk_tickers") or [])
-    ev_fresh = evidence_freshness_score(evidence)
-    ev_verified = evidence_verification_score(evidence)
+    ev_cov = evidence_coverage_score(
+        evidence, ranking.get("top_risk_tickers") or [], floor=0.0,
+    )
+    ev_fresh = evidence_freshness_score(evidence, empty_score=0.0, floor=0.0)
+    ev_verified = evidence_verification_score(evidence, empty_score=0.0, floor=0.0)
     final = min(model_conf, dq, meta_cov, ev_cov, ev_fresh, ev_verified)
     advice["final_confidence"] = round(final, 3)
     advice["confidence_components"] = {
@@ -372,12 +380,15 @@ def _recompute_accepted_coverage(
 
 
 def _enforce_observation_mode(advice: dict) -> dict:
-    """Turn directional actions into watch items — P0-6: 完整清空方向性展示字段。"""
+    """Rewrite every visible action as a deterministic watch item.
+
+    Observation mode is a report-wide state, not merely a directional-action
+    downgrade.  Existing ``hold``/``watch`` rows may still contain unsupported
+    AI fundamental, liquidity or sentiment claims, so every action narrative
+    must be rebuilt from safe quantitative language.
+    """
     for action in advice.get("actions") or []:
-        if action.get("action") in {"hold", "watch"}:
-            continue
         current = float(action.get("current_weight") or 0.0)
-        # P0-6: 保存原始 AI
         for field in ("action", "reason", "risk_narrative", "portfolio_reason",
                       "technical_reason", "news_reason", "bull_case", "bear_case",
                       "execute_if", "cancel_or_upgrade_if", "further_reduce_if",
@@ -389,23 +400,74 @@ def _enforce_observation_mode(advice: dict) -> dict:
         action["action_timing"] = "monitor"
         action["target_weight_min"] = current
         action["target_weight_max"] = current
-        action["reason"] = "报告最终置信度未达到可操作门槛，已转换为观察项。"
+        action["reason"] = "报告最终置信度未达到可操作门槛，当前仅列为观察项。"
         action["risk_narrative"] = None
-        action["portfolio_reason"] = "该标的被量化模型识别为风险候选，但当前无足够证据执行操作。"
-        action["technical_reason"] = "技术指标仅供参考，不构成交易信号。"
-        action["news_reason"] = "本轮新闻研究未产生可操作的事件证据。"
-        action["bull_case"] = "等待新的可验证正面事件。"
-        action["bear_case"] = "等待新的可验证负面事件。"
+        action["portfolio_reason"] = "该标的按确定性风险排序列入观察，不代表需要立即调整仓位。"
+        action["technical_reason"] = "价格、回撤和风险贡献指标仅用于风险观察，不构成交易触发。"
+        action["news_reason"] = "本轮没有足够的 Accepted Evidence 支撑方向性操作。"
+        action["bull_case"] = "等待新的、可验证的正面事件或风险指标改善。"
+        action["bear_case"] = "等待新的、可验证的负面事件或风险指标恶化。"
         action["execute_if"] = []
         action["cancel_or_upgrade_if"] = []
         action["further_reduce_if"] = []
-        action["monitoring_items"] = [f"{action.get('ticker', '')} 风险贡献变化"]
+        action["monitoring_items"] = [f"{action.get('ticker', '')} 风险贡献变化", "价格与主要均线关系"]
         action["thresholds"] = []
         action["expected_portfolio_risk_reduction"] = None
         action["expected_risk_change"] = None
         action["evidence_ids"] = []
-        action["validation_note"] = "报告最终置信度未达到可操作门槛，已转换为观察项。"
+        action["validation_note"] = "观察型报告：全部操作文本已按确定性规则重建。"
     return advice
+
+
+def _normalize_legacy_research_evidence(evidence: list[dict]) -> list[dict]:
+    """兼容仅实现 ``research()`` 的旧服务/测试注入。
+
+    只有显式结构化、近期且具备事实文本的旧 Evidence 才被标记为 accepted；
+    新 ``research_plan`` 管线不经过此兼容层。
+    """
+    for item in evidence or []:
+        recency = str(item.get("recency_tier") or "")
+        source_quality = str(item.get("source_quality") or "tier_3")
+        has_facts = bool(item.get("facts") or item.get("summary_zh") or item.get("summary"))
+        eligible = recency in {"fresh_event", "recent_background"} and source_quality != "tier_3" and has_facts
+        item.setdefault("materiality_accepted", eligible)
+        item.setdefault("entity_role", "primary")
+        item.setdefault("is_quote_page", False)
+        item.setdefault("is_reference_page", False)
+        item.setdefault("chronology_conflict", False)
+        item.setdefault("snippet_fallback_ok", bool(eligible and not item.get("article_fetch_ok")))
+        item.setdefault("accept", bool(eligible))
+    return evidence
+
+
+def _ensure_evidence_uids(evidence: list[dict]) -> list[dict]:
+    """为旧式/测试 Research Service 返回的 Evidence 补充稳定 UID。"""
+    seen: set[str] = set()
+    for index, item in enumerate(evidence or []):
+        uid = str(item.get("evidence_uid") or "")
+        if not uid:
+            uid = make_evidence_uid(item)
+        if uid in seen:
+            uid = make_evidence_uid({
+                **item,
+                "title": f"{item.get('title') or item.get('raw_title') or ''}#{index}",
+            })
+        item["evidence_uid"] = uid
+        seen.add(uid)
+    return evidence
+
+
+def _merge_evidence_by_uid(*groups: list[dict]) -> list[dict]:
+    """Backward-compatible wrapper for canonical cross-pass Evidence merging."""
+    return merge_evidence_by_identity(*groups)
+
+
+def _refresh_research_stage_diagnostics(
+    research_result: dict,
+    evidence: list[dict],
+) -> dict[str, object]:
+    """Backward-compatible wrapper for closed final-stage diagnostics."""
+    return refresh_research_stage_diagnostics(research_result, evidence)
 
 
 def _data_cutoffs(close: pd.DataFrame, metadata: dict[str, dict], benchmark: str) -> dict[str, Any]:
@@ -454,6 +516,7 @@ def run_pipeline(
     - agent_runner：提供 (ctx, model, provider, *, verbose) 的 callable，
       跳过真实 LLM。默认 run_portfolio_agent。
     """
+    run_started_at = dt.datetime.now().astimezone().isoformat()
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     output = Path(output)
@@ -501,6 +564,10 @@ def run_pipeline(
     snapshot["report_date"] = dt.date.today().isoformat()
     snapshot["data_cutoffs"] = _data_cutoffs(close, instrument_metadata, benchmark)
     snapshot["as_of_prices"] = snapshot["data_cutoffs"].get("equity") or snapshot["data_cutoffs"].get("etf") or snapshot["report_date"]
+    snapshot["run_timeline"] = {
+        "run_started_at": run_started_at,
+        "snapshot_completed_at": dt.datetime.now().astimezone().isoformat(),
+    }
 
     # §22 修复：统一 Return Model，所有下游模块共用（metrics / chart / scenario）
     portfolio_weights = {h["ticker"]: float(h.get("weight") or 0.0) for h in snapshot.get("holdings", [])}
@@ -519,6 +586,8 @@ def run_pipeline(
     research_result: dict = {"status": "unknown", "evidence": [], "diagnostics": {}}
     research_plan: dict = {}
     planner_diagnostics: dict = {}
+    legacy_research_mode = False
+    svc = None
     try:
         svc = research_service if research_service is not None else PortfolioResearchService(provider=search_provider)
         # 优先使用第六轮 research_plan 入口（AI Planner + 多通道搜索）
@@ -541,6 +610,7 @@ def run_pipeline(
                 research_plan = raw_research.get("research_plan") or {}
         else:
             # 向后兼容：旧版 research_service 仅实现 research()
+            legacy_research_mode = True
             raw_research = svc.research(
                 ranking.get("top_risk_tickers") or [],
                 instrument_metadata,
@@ -586,11 +656,44 @@ def run_pipeline(
             "raw_results": [], "filtered_results": [],
         }
 
-    summary_result = summarize_evidence_zh(
-        evidence, instrument_metadata, model=model, provider=provider,
-        report_date=str(snapshot.get("report_date") or ""),
+    snapshot["run_timeline"]["news_search_completed_at"] = (
+        (research_result.get("diagnostics") or {}).get("news_search_executed_at")
+        or dt.datetime.now().astimezone().isoformat()
     )
-    evidence = list(summary_result.get("evidence") or evidence)
+
+    if legacy_research_mode:
+        # Legacy/injected research services already return structured evidence.
+        # Do not send test fixtures or caller-owned evidence through an external
+        # LLM: doing so makes offline runs non-deterministic and may change the
+        # explicit acceptance decision supplied by the caller.
+        evidence = _normalize_legacy_research_evidence(evidence)
+    evidence = _ensure_evidence_uids(evidence)
+    if legacy_research_mode:
+        summary_result = {
+            "status": "legacy_structured",
+            "evidence": evidence,
+            "summarized_count": 0,
+            "accepted_count": sum(1 for item in evidence if item.get("accept") is True),
+            "rejected_count": sum(1 for item in evidence if item.get("accept") is not True),
+            "errors": [],
+        }
+        evidence = list(summary_result.get("evidence") or evidence)
+    else:
+        # Materiality-rejected candidates are retained for diagnostics but never
+        # sent to the LLM.  Summarizing only eligible candidates reduces token use
+        # and prevents already-rejected rows from crowding valid UIDs out of the
+        # model response.
+        summarizable_evidence = [
+            item for item in evidence if item.get("materiality_accepted")
+        ]
+        summary_result = summarize_evidence_zh(
+            summarizable_evidence, instrument_metadata, model=model, provider=provider,
+            report_date=str(snapshot.get("report_date") or ""),
+        )
+        evidence = _merge_evidence_by_uid(
+            evidence,
+            list(summary_result.get("evidence") or summarizable_evidence),
+        )
 
     # 第七轮 P0 收口：统一分配 evidence_id（仅在接受 Summarizer 后、质量门前）
     finalize_evidence_ids(evidence)
@@ -606,17 +709,85 @@ def run_pipeline(
     research_result["rejected_evidence"] = rejected_evidence
     research_result["reference_evidence"] = reference_evidence
     research_result.setdefault("diagnostics", {})["summarizer_status"] = summary_result.get("status")
+    research_result["diagnostics"]["summarizer_input_count"] = (
+        len(evidence) if legacy_research_mode else len(summarizable_evidence)
+    )
     research_result["diagnostics"]["summarizer_errors"] = summary_result.get("errors") or []
+    research_result["diagnostics"]["summarizer_isolation_count"] = int(summary_result.get("isolated_count") or 0)
+    research_result["diagnostics"]["summarizer_isolation_reasons"] = summary_result.get("isolation_reasons") or {}
+    research_result["diagnostics"]["summarizer_isolated_by_ticker"] = summary_result.get("isolated_by_ticker") or {}
+    research_result["diagnostics"]["summarizer_isolated_items"] = summary_result.get("isolated_items") or []
     research_result["diagnostics"]["accepted_evidence_count"] = len(accepted_evidence)
     research_result["diagnostics"]["rejected_evidence_count"] = len(rejected_evidence)
     research_result["diagnostics"]["reference_evidence_count"] = len(reference_evidence)
     research_result["diagnostics"]["identity_errors"] = validate_evidence_identity(evidence)
+    _refresh_research_stage_diagnostics(research_result, evidence)
     if evidence:
         news_dates = [str(x.get("published_date")) for x in evidence if x.get("published_date")]
         snapshot["data_cutoffs"]["news"] = max(news_dates) if news_dates else snapshot.get("as_of")
 
     # P0-2: 收口后基于 accepted_evidence 重算覆盖率和新鲜度
     _recompute_accepted_coverage(research_result, ranking, metrics, accepted_evidence)
+
+    # Round 9：Accepted Evidence 收口后的最后一次精准补搜。
+    min_news_coverage = float(os.environ.get("PORTFOLIO_REPORT_MIN_NEWS_COVERAGE", "0.60"))
+    current_coverage = float((research_result.get("diagnostics") or {}).get("accepted_top_risk_coverage") or 0.0)
+    final_gap_result: dict = {}
+    if (
+        current_coverage < min_news_coverage
+        and research_plan
+        and svc is not None
+        and hasattr(svc, "precision_gap_search")
+    ):
+        try:
+            final_gap_result = svc.precision_gap_search(
+                plan=research_plan, accepted_evidence=accepted_evidence,
+                instrument_metadata=instrument_metadata, ranking=ranking, metrics=metrics,
+                model=model, provider=provider,
+            )
+            new_candidates = list(final_gap_result.get("evidence") or [])
+            if new_candidates:
+                summarizable_new = [
+                    item for item in new_candidates if item.get("materiality_accepted")
+                ]
+                final_summary = summarize_evidence_zh(
+                    summarizable_new, instrument_metadata, model=model, provider=provider,
+                    report_date=str(snapshot.get("report_date") or ""),
+                )
+                summarized_new = list(final_summary.get("evidence") or summarizable_new)
+                evidence = _merge_evidence_by_uid(evidence, new_candidates, summarized_new)
+                finalize_evidence_ids(evidence)
+                groups = split_evidence_groups(evidence)
+                accepted_evidence = groups["accepted"]
+                rejected_evidence = groups["diagnostic_rejected"]
+                reference_evidence = groups["reference"]
+                research_result["evidence"] = evidence
+                research_result["accepted_evidence"] = accepted_evidence
+                research_result["rejected_evidence"] = rejected_evidence
+                research_result["reference_evidence"] = reference_evidence
+                research_result["raw_results"] = list(research_result.get("raw_results") or []) + list(final_gap_result.get("raw_results") or [])
+                research_result["filtered_results"] = merge_evidence_by_identity(
+                    list(research_result.get("filtered_results") or []),
+                    list(final_gap_result.get("filtered_results") or []),
+                )
+                research_result["diagnostics"]["raw_results_count"] = len(research_result["raw_results"])
+                research_result["diagnostics"]["filtered_results_count"] = len(research_result["filtered_results"])
+                research_result["diagnostics"]["summarizer_errors"] = list(
+                    research_result["diagnostics"].get("summarizer_errors") or []
+                ) + list(final_summary.get("errors") or [])
+                research_result["diagnostics"]["accepted_evidence_count"] = len(accepted_evidence)
+                research_result["diagnostics"]["rejected_evidence_count"] = len(rejected_evidence)
+                research_result["diagnostics"]["reference_evidence_count"] = len(reference_evidence)
+                research_result["diagnostics"]["identity_errors"] = validate_evidence_identity(evidence)
+                _refresh_research_stage_diagnostics(research_result, evidence)
+                _recompute_accepted_coverage(research_result, ranking, metrics, accepted_evidence)
+            research_result["diagnostics"]["post_accepted_gap"] = final_gap_result.get("diagnostics") or {}
+            research_result["diagnostics"]["post_accepted_gap_performed"] = True
+        except Exception as exc:  # noqa: BLE001
+            research_result["diagnostics"]["post_accepted_gap_performed"] = True
+            research_result["diagnostics"]["post_accepted_gap_error"] = f"{type(exc).__name__}: {exc}"
+    else:
+        research_result["diagnostics"]["post_accepted_gap_performed"] = False
 
     # Top-risk news is a precondition: fail before invoking the main Portfolio Agent.
     preflight_quality = evaluate_report_quality(
@@ -660,25 +831,62 @@ def run_pipeline(
     )
 
     allow_quant_fallback = os.environ.get("PORTFOLIO_REPORT_ALLOW_QUANT_FALLBACK", "false").strip().lower() in {"1", "true", "yes"}
+    # Invalid model output is different from an unavailable provider: strict validation has
+    # already proved that the AI narrative/action payload is unsafe to publish.  Default to
+    # a deterministic observation report instead of aborting the whole report.  Operators
+    # can opt back into fail-hard behaviour for debugging.
+    allow_output_validation_fallback = os.environ.get(
+        "PORTFOLIO_REPORT_ALLOW_OUTPUT_VALIDATION_FALLBACK", "true"
+    ).strip().lower() in {"1", "true", "yes"}
     runner = agent_runner if agent_runner is not None else run_portfolio_agent
-    try:
-        advice = runner(ctx, model=model, provider=provider, verbose=verbose)
-        advice["report_mode"] = "ai"
-    except (PortfolioAgentUnavailable, PortfolioAgentOutputError) as exc:
-        if not allow_quant_fallback:
-            raise
-        fallback_reason = f"AI Agent 未参与：{exc}"
-        print(f"[WARN] {fallback_reason}；生成量化降级报告。", flush=True)
+
+    if not accepted_evidence:
+        # There is nothing the model may cite for event/fundamental claims.  Calling it here
+        # wastes tokens and commonly produces exactly the unsupported Top5/overlap narratives
+        # that the strict validator is designed to reject.  Build the observation report
+        # deterministically and retain the rejected candidates only in diagnostics.
+        fallback_reason = (
+            "本轮研究未产生 Accepted Evidence；已跳过 AI 交易建议，"
+            "生成确定性的量化观察报告。"
+        )
+        print(f"[WARN] {fallback_reason}", flush=True)
         advice = default_fallback_advice(snapshot, metrics, ranking, reason=fallback_reason)
-    except Exception as exc:  # noqa: BLE001
-        if not allow_quant_fallback:
-            raise
-        fallback_reason = f"AI Agent 异常：{exc}"
-        print(f"[WARN] {fallback_reason}；生成量化降级报告。", flush=True)
-        advice = default_fallback_advice(snapshot, metrics, ranking, reason=fallback_reason)
+    else:
+        try:
+            advice = runner(ctx, model=model, provider=provider, verbose=verbose)
+            advice["report_mode"] = "ai"
+        except PortfolioAgentOutputError as exc:
+            if not (allow_quant_fallback or allow_output_validation_fallback):
+                raise
+            # Keep the exact rejected model payload/error in diagnostics and logs, not in the
+            # user-facing report.  Invalid phrases (for example a wrong Top5 member list)
+            # must not re-enter HTML through data_limitations/fallback_reason.
+            diagnostics = research_result.setdefault("diagnostics", {})
+            diagnostics["agent_validation_fallback"] = True
+            diagnostics["agent_validation_error"] = str(exc)
+            fallback_reason = (
+                "AI 输出未通过严格校验，相关内容已全部忽略；"
+                "本报告已安全降级为确定性量化观察。"
+            )
+            print(f"[WARN] AI 输出未通过严格校验：{exc}；生成安全的量化观察报告。", flush=True)
+            advice = default_fallback_advice(snapshot, metrics, ranking, reason=fallback_reason)
+        except PortfolioAgentUnavailable as exc:
+            if not allow_quant_fallback:
+                raise
+            fallback_reason = f"AI Agent 未参与：{exc}"
+            print(f"[WARN] {fallback_reason}；生成量化降级报告。", flush=True)
+            advice = default_fallback_advice(snapshot, metrics, ranking, reason=fallback_reason)
+        except Exception as exc:  # noqa: BLE001
+            if not allow_quant_fallback:
+                raise
+            fallback_reason = f"AI Agent 异常：{exc}"
+            print(f"[WARN] {fallback_reason}；生成量化降级报告。", flush=True)
+            advice = default_fallback_advice(snapshot, metrics, ranking, reason=fallback_reason)
 
     advice = _guard_actions(advice, accepted_evidence, settings)
-    advice = apply_deterministic_action_targets(advice, metrics, settings)
+    advice = apply_deterministic_action_targets(
+        advice, metrics, settings, return_model=return_model,
+    )
 
     # 最终 Python 校验：AI 报告走 strict，失败必须阻断，不得静默修正同一份 AI 建议。
     final_mode = "strict" if str(advice.get("report_mode")) == "ai" else "fallback"
@@ -696,6 +904,15 @@ def run_pipeline(
     advice["portfolio_reallocation"] = reallocation
     metrics.setdefault("aggregates", {})["recommended_reduction_weight"] = reallocation["estimated_weight_reduction"]
 
+    # 先判定是否具备可操作条件；不可操作时在 Claim Validation 前清除原始 AI 叙事。
+    preliminary_quality = evaluate_report_quality(snapshot, metrics, research_result, advice, {})
+    if not preliminary_quality["actionable"]:
+        advice = _enforce_observation_mode(advice)
+        advice = _build_observation_view(advice, snapshot, metrics, ranking, accepted_evidence)
+        reallocation = calculate_reallocation_summary(advice)
+        advice["portfolio_reallocation"] = reallocation
+        metrics.setdefault("aggregates", {})["recommended_reduction_weight"] = reallocation["estimated_weight_reduction"]
+
     from portfolio_analysis.validators import validate_portfolio_claims
     hard_errors, soft_warnings = validate_portfolio_claims(advice, snapshot, metrics, accepted_evidence)
     advice.setdefault("validation_warnings", []).extend(soft_warnings)
@@ -703,11 +920,6 @@ def run_pipeline(
         snapshot, metrics, research_result, advice,
         {"hard_errors": hard_errors, "soft_warnings": soft_warnings},
     )
-    if not quality["actionable"]:
-        advice = _enforce_observation_mode(advice)
-        reallocation = calculate_reallocation_summary(advice)
-        advice["portfolio_reallocation"] = reallocation
-        metrics.setdefault("aggregates", {})["recommended_reduction_weight"] = reallocation["estimated_weight_reduction"]
     if not quality["publishable"]:
         debug_payloads = {
             "portfolio_report_quality.json": quality,
@@ -794,14 +1006,20 @@ def run_pipeline(
             "additional_search_required": gap_diag.get("gap_additional_search_required"),
             "total_new_queries": gap_diag.get("gap_total_new_queries"),
             "errors": gap_diag.get("gap_errors"),
-            "ticker_gaps": [],  # 从 research_result 可选提取
+            "stages": gap_diag.get("gap_diagnostics") or {},
+            "post_accepted": gap_diag.get("post_accepted_gap") or {},
+            "post_accepted_gap_performed": gap_diag.get("post_accepted_gap_performed"),
+            "post_accepted_gap_error": gap_diag.get("post_accepted_gap_error"),
         }
         try:
             paths["gap_diagnostics"].write_text(json.dumps(gap_payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
         except Exception:  # noqa: BLE001
             pass
 
-    # 中文 HTML（P0-1: 仅传入 accepted_evidence）
+    snapshot["run_timeline"]["agent_completed_at"] = dt.datetime.now().astimezone().isoformat()
+    snapshot["run_timeline"]["report_rendered_at"] = dt.datetime.now().astimezone().isoformat()
+
+    # 中文 HTML（仅传入 accepted_evidence）
     html_text = build_html(
         snapshot, metrics, ranking, advice, accepted_evidence,
         instrument_metadata=instrument_metadata,

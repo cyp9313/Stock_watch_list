@@ -313,6 +313,8 @@ def rank_evidence(
         "portfolio_impact_score": round(portfolio_impact_score, 3),
         "decision_usefulness_score": round(decision_usefulness, 3),
         "source_authority_score": round(source_authority, 3),
+        "source_type": str(src_class.get("source_type") or "unknown"),
+        "source_is_official": bool(src_class.get("is_official")),
         "novelty_score": round(novelty_score, 3),
         "selection_score": round(selection_score, 3),
         "entity_role": entity["entity_role"],

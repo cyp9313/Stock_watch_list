@@ -62,6 +62,36 @@ def is_accepted_evidence(item: dict[str, Any]) -> bool:
     return True
 
 
+def evidence_final_gate_reasons(item: dict[str, Any]) -> list[str]:
+    """Return deterministic reasons why a post-Summarizer item is not publishable.
+
+    The function mirrors :func:`is_accepted_evidence` but exposes the exact
+    failing gates for diagnostics and HTML reporting.  Materiality and explicit
+    Summarizer rejection are included for completeness; callers that already
+    classified those stages can ignore them.
+    """
+    reasons: list[str] = []
+    if not item.get("materiality_accepted"):
+        reasons.append("materiality_not_accepted")
+    if item.get("accept") is not True:
+        reasons.append("summarizer_not_accepted")
+    if item.get("chronology_conflict"):
+        reasons.append("chronology_conflict")
+    role = str(item.get("entity_role") or "unknown")
+    if role not in _ACCEPTED_ENTITY_ROLES:
+        reasons.append(f"entity_role_not_accepted:{role}")
+    if item.get("is_quote_page"):
+        reasons.append("quote_page")
+    if item.get("is_reference_page") or str(item.get("page_classification") or "") == "reference":
+        reasons.append("reference_page")
+    recency = str(item.get("recency_tier") or "unknown")
+    if recency not in _ACCEPTED_RECENCY_TIERS:
+        reasons.append(f"recency_not_accepted:{recency}")
+    if not (item.get("article_fetch_ok") or item.get("snippet_fallback_ok")):
+        reasons.append("content_not_verified_or_snippet_too_weak")
+    return reasons
+
+
 def finalize_evidence_ids(evidence: list[dict[str, Any]]) -> None:
     """收口：仅为 accepted 证据分配显示编号 E001..，其余置 ``None``。
 
@@ -79,14 +109,13 @@ def finalize_evidence_ids(evidence: list[dict[str, Any]]) -> None:
 
 
 def validate_evidence_identity(evidence: list[dict[str, Any]]) -> list[str]:
-    """返回身份完整性错误列表（空列表表示通过）。
-
-    检查：
-    - ``evidence_uid`` 全局唯一；
-    - 非 None 的 ``evidence_id`` 在集合内唯一。
-    """
+    """校验 UID、显示 ID 与 accepted/rejected 收口不变量。"""
     errors: list[str] = []
-    uids = [item.get("evidence_uid") for item in evidence if item.get("evidence_uid")]
+    missing_uid_indexes = [str(i) for i, item in enumerate(evidence) if not item.get("evidence_uid")]
+    if missing_uid_indexes:
+        errors.append("missing_evidence_uid:indexes=" + ",".join(missing_uid_indexes))
+
+    uids = [str(item.get("evidence_uid")) for item in evidence if item.get("evidence_uid")]
     if len(uids) != len(set(uids)):
         seen: set[str] = set()
         dups: set[str] = set()
@@ -95,15 +124,33 @@ def validate_evidence_identity(evidence: list[dict[str, Any]]) -> list[str]:
                 dups.add(uid)
             seen.add(uid)
         errors.append("duplicate_evidence_uid:" + ",".join(sorted(dups)))
-    ids = [item.get("evidence_id") for item in evidence if item.get("evidence_id")]
+
+    ids = [str(item.get("evidence_id")) for item in evidence if item.get("evidence_id")]
     if len(ids) != len(set(ids)):
-        seen = set()
-        dups = set()
-        for eid in ids:
-            if eid in seen:
-                dups.add(eid)
-            seen.add(eid)
-        errors.append("duplicate_evidence_id:" + ",".join(sorted(dups)))
+        seen_ids: set[str] = set()
+        dup_ids: set[str] = set()
+        for evidence_id in ids:
+            if evidence_id in seen_ids:
+                dup_ids.add(evidence_id)
+            seen_ids.add(evidence_id)
+        errors.append("duplicate_evidence_id:" + ",".join(sorted(dup_ids)))
+
+    for item in evidence:
+        # 只有完整 Evidence 对象才检查 accepted/rejected 与显示 ID 的收口关系；
+        # 纯身份单测对象只校验 UID/ID 唯一性。
+        has_acceptance_fields = any(
+            key in item for key in (
+                "materiality_accepted", "accept", "entity_role", "recency_tier",
+                "article_fetch_ok", "snippet_fallback_ok",
+            )
+        )
+        if not has_acceptance_fields:
+            continue
+        accepted = is_accepted_evidence(item)
+        if accepted and not item.get("evidence_id"):
+            errors.append(f"accepted_missing_evidence_id:{item.get('evidence_uid') or 'missing_uid'}")
+        if not accepted and item.get("evidence_id"):
+            errors.append(f"rejected_has_evidence_id:{item.get('evidence_uid') or 'missing_uid'}")
     return errors
 
 

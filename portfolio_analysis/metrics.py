@@ -278,7 +278,11 @@ def calculate_portfolio_metrics(
         "portfolio_beta_historical": None,
         "portfolio_beta_weighted_snapshot": None,
         "portfolio_beta_status": "insufficient_data",
+        "portfolio_beta_source": None,
+        "portfolio_beta_method": None,
         "portfolio_beta_observations": 0,
+        "portfolio_beta_start_date": None,
+        "portfolio_beta_end_date": None,
         "annualized_volatility": None,
         "max_drawdown_63d": None,
         "max_drawdown_252d": None,
@@ -296,18 +300,39 @@ def calculate_portfolio_metrics(
             metrics["annualized_volatility"] = return_model.annualized_volatility
         if return_model.portfolio_beta is not None:
             metrics["portfolio_beta"] = return_model.portfolio_beta
-            metrics["portfolio_beta_historical"] = return_model.portfolio_beta
-            metrics["portfolio_beta_status"] = "from_return_model"
-            metrics["portfolio_beta_observations"] = return_model.total_date_count - return_model.invalid_date_count
+            metrics["portfolio_beta_historical"] = {
+                "value": return_model.portfolio_beta,
+                "observations": return_model.beta_observations,
+                "start_date": return_model.beta_start_date,
+                "end_date": return_model.beta_end_date,
+                "status": "actual",
+                "method": "return_model_historical_covariance",
+            }
+            metrics["portfolio_beta_status"] = "actual"
+            metrics["portfolio_beta_source"] = "return_model"
+            metrics["portfolio_beta_method"] = "historical_covariance_common_dates"
+            metrics["portfolio_beta_observations"] = return_model.beta_observations
+            metrics["portfolio_beta_start_date"] = return_model.beta_start_date
+            metrics["portfolio_beta_end_date"] = return_model.beta_end_date
         if return_model.max_drawdown_63d is not None:
             metrics["max_drawdown_63d"] = return_model.max_drawdown_63d
         if return_model.max_drawdown_252d is not None:
             metrics["max_drawdown_252d"] = return_model.max_drawdown_252d
-        # 风险贡献使用 Return Model 的 covariance
+        # 风险贡献、Scenario 与 Overview 共用 Return Model 的年化 covariance。
         if return_model.covariance_matrix is not None:
             from portfolio_analysis.return_model import risk_contributions as rc_from_model
             weights_dict = {h["ticker"]: float(h.get("weight") or 0.0) for h in holdings}
             metrics["risk_contributions"] = rc_from_model(return_model, weights_dict)
+            metrics["covariance_tickers"] = list(return_model.covariance_matrix.index)
+            metrics["covariance_matrix_annualized"] = [
+                [float(value) if math.isfinite(float(value)) else None for value in row]
+                for row in return_model.covariance_matrix.to_numpy()
+            ]
+            metrics["covariance_frequency"] = return_model.covariance_frequency
+            metrics["covariance_source"] = "return_model"
+            metrics["covariance_weight_coverage"] = return_model.covariance_weight_coverage
+            metrics["covariance_observations"] = return_model.covariance_observations
+            metrics["covariance_excluded_tickers"] = list(return_model.covariance_excluded_tickers)
 
     for window_name, field in (("1D", "return_1d"), ("YTD", "return_ytd")):
         vals = []
@@ -357,7 +382,11 @@ def calculate_portfolio_metrics(
             metrics["portfolio_beta"] = beta_result["value"]
             metrics["portfolio_beta_historical"] = beta_result
             metrics["portfolio_beta_status"] = beta_result["status"]
+            metrics["portfolio_beta_source"] = "legacy_returns"
+            metrics["portfolio_beta_method"] = beta_result.get("method")
             metrics["portfolio_beta_observations"] = beta_result["observations"]
+            metrics["portfolio_beta_start_date"] = beta_result.get("start_date")
+            metrics["portfolio_beta_end_date"] = beta_result.get("end_date")
         for name, periods in RETURN_WINDOWS.items():
             if len(close) > periods + 1:
                 metrics["relative_returns"][name] = calculate_relative_window_return(
@@ -425,13 +454,15 @@ def calculate_portfolio_metrics(
             ))
 
     cov = returns[ticker_cols].dropna(how="all").cov()
-    if cov.shape[0] and aligned_weights.sum() > 0:
+    if cov.shape[0] and aligned_weights.sum() > 0 and return_model is None:
         metrics["covariance_tickers"] = list(cov.index)
         metrics["covariance_matrix_daily"] = [
             [float(value) if math.isfinite(float(value)) else None for value in row]
             for row in cov.to_numpy()
         ]
-        # P0-7: 仅在 return_model 未提供风险贡献时使用旧计算
+        metrics["covariance_frequency"] = "daily"
+        metrics["covariance_source"] = "legacy_returns"
+        # 旧调用方没有 Return Model 时才使用旧风险贡献计算。
         if return_model is None:
             w = aligned_weights.reindex(cov.index).fillna(0.0).to_numpy()
             cov_matrix = cov.to_numpy()
@@ -523,13 +554,27 @@ def _compute_aggregates(holdings: list[dict[str, Any]], metrics: dict[str, Any])
         for h in holdings
         if _safe_float(h.get("price_vs_ema50_pct")) is not None and _safe_float(h.get("price_vs_ema50_pct")) < 0
     ))
+    holding_by_ticker = {str(h.get("ticker")): h for h in holdings}
+    top5_members = [str(x.get("ticker")) for x in top_risk if x.get("ticker")]
+    top5_below_ema50 = sum(
+        1 for ticker in top5_members
+        if _safe_float((holding_by_ticker.get(ticker) or {}).get("price_vs_ema50_pct")) is not None
+        and _safe_float((holding_by_ticker.get(ticker) or {}).get("price_vs_ema50_pct")) < 0
+    )
     return {
         "top_risk_contribution_sum": round(top_risk_contribution_sum, 4),
         "top_risk_weight_sum": round(top_risk_weight_sum, 4),
         "top5_risk_contributors": [
-            {"ticker": x.get("ticker"), "risk_contribution": round(float(x.get("risk_contribution") or 0.0), 6)}
+            {
+                "ticker": x.get("ticker"),
+                "risk_contribution": round(float(x.get("risk_contribution") or 0.0), 6),
+                "weight": round(float(x.get("weight") or 0.0), 6),
+            }
             for x in top_risk
         ],
+        "top5_risk_contributor_tickers": top5_members,
+        "top5_below_ema50_count": top5_below_ema50,
+        "top5_count": len(top5_members),
         "high_beta_weight": {"threshold": 1.5, "weight": round(beta_gt_1_5_weight, 4)},
         "beta_gt_1_5_weight": round(beta_gt_1_5_weight, 4),
         "beta_gt_2_0_weight": round(beta_gt_2_0_weight, 4),
@@ -591,7 +636,9 @@ def compute_portfolio_risk_score(metrics: dict[str, Any]) -> dict[str, Any]:
         level = "high"
     # §24 修复：风险评分置信度不能仅基于组件可用性，需考虑数据质量
     component_availability = round(available_max / 100.0, 3)
-    metadata_cov = metrics.get("metadata_coverage_score", 0.8) or 0.8
+    metadata_cov = metrics.get("metadata_coverage_score", 1.0)
+    if metadata_cov is None:
+        metadata_cov = 1.0
     perf_method = metrics.get("performance_methodology", {})
     fx_aligned = 1.0 if perf_method.get("historical_fx_aligned", False) else 0.85
     score_confidence = round(min(component_availability, metadata_cov, fx_aligned), 3)

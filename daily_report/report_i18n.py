@@ -43,6 +43,34 @@ RISK_LEVEL_LABELS_ZH = {
     "high": "高",
 }
 
+# ── Portfolio 状态中文名 ─────────────────────────────────────
+PORTFOLIO_STANCE_LABELS_ZH = {
+    "observe": "观察",
+    "balanced": "均衡",
+    "neutral": "中性",
+    "cautious_bullish": "谨慎偏多",
+    "cautious_bearish": "谨慎偏空",
+    "defensive": "防御",
+}
+
+RISK_PROFILE_LABELS_ZH = {
+    "growth": "成长",
+    "balanced": "平衡",
+    "conservative": "稳健",
+    "aggressive": "进取",
+    "income": "收益",
+}
+
+INVESTMENT_HORIZON_LABELS_ZH = {
+    "1-3m": "1–3个月",
+    "3-6m": "3–6个月",
+    "6-12m": "6–12个月",
+    "12m+": "12个月以上",
+    "long_term": "长期",
+    "medium_term": "中期",
+    "short_term": "短期",
+}
+
 # ── 严重程度中文名 ─────────────────────────────────────────────
 SEVERITY_LABELS_ZH = {
     "high": "高",
@@ -97,6 +125,21 @@ def action_zh(action: Any) -> str:
 
 def risk_level_zh(level: Any) -> str:
     return RISK_LEVEL_LABELS_ZH.get(str(level or "").lower(), str(level or "中等"))
+
+
+def portfolio_stance_zh(value: Any) -> str:
+    raw = str(value or "").strip()
+    return PORTFOLIO_STANCE_LABELS_ZH.get(raw.lower(), raw or "均衡")
+
+
+def risk_profile_zh(value: Any) -> str:
+    raw = str(value or "").strip()
+    return RISK_PROFILE_LABELS_ZH.get(raw.lower(), raw or "平衡")
+
+
+def investment_horizon_zh(value: Any) -> str:
+    raw = str(value or "").strip()
+    return INVESTMENT_HORIZON_LABELS_ZH.get(raw.lower(), raw or "未指定")
 
 
 def severity_zh(severity: Any) -> str:

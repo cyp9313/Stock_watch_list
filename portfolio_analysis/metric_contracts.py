@@ -141,43 +141,59 @@ def metadata_coverage_score(instrument_metadata: dict[str, dict[str, Any]], tick
     return round(max(0.1, confidence / len(tickers)), 3)
 
 
-def evidence_coverage_score(evidence: list[dict[str, Any]], top_risk_tickers: list[str]) -> float:
-    """证据覆盖度：Top-risk ticker 被高质量证据覆盖的比例。"""
+def evidence_coverage_score(
+    evidence: list[dict[str, Any]],
+    top_risk_tickers: list[str],
+    *,
+    floor: float = 0.10,
+) -> float:
+    """Top-risk Accepted Evidence 覆盖率；``floor`` 仅用于旧置信度模型。"""
     if not top_risk_tickers:
-        return 0.5
-    covered = set()
-    for e in evidence:
-        t = e.get("ticker")
-        if t and str(e.get("source_quality") or "tier_3") != "tier_3":
-            covered.add(t)
+        return 1.0
+    covered = {
+        e.get("ticker") for e in evidence
+        if e.get("ticker") and str(e.get("source_quality") or "tier_3") != "tier_3"
+    }
     ratio = len(set(top_risk_tickers) & covered) / len(top_risk_tickers)
-    return round(max(0.1, ratio), 3)
+    return round(max(float(floor), min(1.0, ratio)), 3)
 
 
-def evidence_freshness_score(evidence: list[dict[str, Any]], fresh_days: int = 45, background_days: int = 180) -> float:
-    """证据新鲜度：新鲜/近期证据占比（未知日期降权）。"""
+def evidence_freshness_score(
+    evidence: list[dict[str, Any]],
+    fresh_days: int = 45,
+    background_days: int = 180,
+    *,
+    empty_score: float = 0.30,
+    floor: float = 0.10,
+) -> float:
+    """证据新鲜度。报告真实指标应传 ``empty_score=0, floor=0``。"""
     if not evidence:
-        return 0.3
-    fresh = 0
+        return round(float(empty_score), 3)
+    fresh = 0.0
     today = _today()
-    for e in evidence:
-        d = _parse_date(e.get("published_date"))
-        if d is None:
+    for item in evidence:
+        published = _parse_date(item.get("published_date"))
+        if published is None:
             continue
-        age = (today - d).days
+        age = (today - published).days
         if age <= fresh_days:
-            fresh += 1
+            fresh += 1.0
         elif age <= background_days:
             fresh += 0.6
-    return round(max(0.1, min(1.0, fresh / len(evidence))), 3)
+    return round(max(float(floor), min(1.0, fresh / len(evidence))), 3)
 
 
-def evidence_verification_score(evidence: list[dict[str, Any]]) -> float:
-    """正文验证度：已验证正文计 1，合格但未验证的搜索摘要计 0.5。"""
+def evidence_verification_score(
+    evidence: list[dict[str, Any]],
+    *,
+    empty_score: float = 0.30,
+    floor: float = 0.10,
+) -> float:
+    """正文提取比例；搜索摘要计 0.5，仅作为模型置信度输入。"""
     if not evidence:
-        return 0.3
+        return round(float(empty_score), 3)
     score = sum(1.0 if item.get("article_fetch_ok") else 0.5 for item in evidence)
-    return round(max(0.1, min(1.0, score / len(evidence))), 3)
+    return round(max(float(floor), min(1.0, score / len(evidence))), 3)
 
 
 def _today():

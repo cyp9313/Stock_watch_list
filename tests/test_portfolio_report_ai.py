@@ -32,7 +32,8 @@ from daily_report.src.stock_daily_agent.portfolio_schema import (
     default_fallback_advice, normalize_advice,
 )
 from daily_report.src.stock_daily_agent.portfolio_agent_runner import (
-    PortfolioAgentUnavailable, PortfolioRunContext, _llm_configured, run_portfolio_agent,
+    PortfolioAgentUnavailable, PortfolioAgentOutputError, PortfolioRunContext,
+    _llm_configured, run_portfolio_agent,
 )
 from daily_report.src.stock_daily_agent.portfolio_research import (
     build_instrument_aware_queries, filter_candidates,
@@ -279,7 +280,7 @@ def _fixture():
 class _FakeResearch:
     def research(self, top_risk_tickers, instrument_metadata, benchmark="^GSPC", **kw):
         notes = []
-        for i, t in enumerate((top_risk_tickers or [])[:2]):
+        for i, t in enumerate(top_risk_tickers or []):
             notes.append({
                 "evidence_id": "", "scope": "ticker", "ticker": t, "related_tickers": [t],
                 "event_type": "earnings", "title": f"{t} 最新财报与指引",
@@ -448,3 +449,87 @@ def test_build_html_ai_vs_fallback_difference():
     )
     assert "量化降级报告" not in ai_html
     assert "量化降级报告" in fb_html
+
+
+
+def test_zero_accepted_evidence_skips_agent_and_publishes_observation(tmp_path, monkeypatch):
+    """Rejected candidates must not trigger an expensive/unsafe Agent call."""
+    monkeypatch.setenv("PORTFOLIO_REPORT_ALLOW_QUANT_FALLBACK", "false")
+    payload, close, market_rows, fx = _fixture()
+
+    class RejectedOnlyResearch:
+        def research(self, *args, **kwargs):
+            candidate = {
+                "ticker": "AAPL",
+                "title": "Generic AAPL stock comparison",
+                "url": "https://example.com/aapl-comparison",
+                "materiality_accepted": False,
+                "accept": False,
+                "reject_reason": "primary_entity_score_below_0.7",
+            }
+            return {
+                "status": "insufficient_coverage",
+                "evidence": [],
+                "raw_results": [candidate],
+                "filtered_results": [candidate],
+                "diagnostics": {
+                    "status": "insufficient_coverage",
+                    "raw_results_count": 1,
+                    "filtered_results_count": 1,
+                    "selected_evidence_count": 1,
+                    "materiality_accepted_count": 0,
+                    "top_risk_coverage": 0.0,
+                    "risk_weighted_coverage": 0.0,
+                },
+            }
+
+    called = {"agent": False}
+
+    def should_not_run(*args, **kwargs):
+        called["agent"] = True
+        raise AssertionError("Agent must be skipped when Accepted Evidence is empty")
+
+    out = tmp_path / "zero-accepted.html"
+    advice = run_pipeline(
+        payload, run_dir=tmp_path, output=out,
+        portfolio_name="Test", portfolio_id="pf_test", owner_scope="owner",
+        model="qwen-plus", provider="dashscope", search_provider="none",
+        close=close, market_rows=market_rows, fx_rates=fx,
+        research_service=RejectedOnlyResearch(), agent_runner=should_not_run, verbose=False,
+    )
+
+    assert called["agent"] is False
+    assert advice["report_mode"] == "quantitative_fallback"
+    assert advice["observation_only"] is True
+    html = out.read_text(encoding="utf-8")
+    assert "量化风险观察结论" in html
+    assert "Accepted Evidence" in html
+
+
+def test_agent_strict_validation_failure_auto_falls_back(tmp_path, monkeypatch):
+    """A twice-invalid AI payload must degrade safely instead of failing the report."""
+    monkeypatch.setenv("PORTFOLIO_REPORT_ALLOW_QUANT_FALLBACK", "false")
+    monkeypatch.setenv("PORTFOLIO_REPORT_ALLOW_OUTPUT_VALIDATION_FALLBACK", "true")
+    payload, close, market_rows, fx = _fixture()
+
+    def invalid_agent(*args, **kwargs):
+        raise PortfolioAgentOutputError(
+            "Portfolio Agent validation failed: Top5 成员与 Python 注册结果不一致；"
+            "仅有价格相关性而无 ETF holdings 数据"
+        )
+
+    out = tmp_path / "invalid-agent-fallback.html"
+    advice = run_pipeline(
+        payload, run_dir=tmp_path, output=out,
+        portfolio_name="Test", portfolio_id="pf_test", owner_scope="owner",
+        model="qwen-plus", provider="dashscope", search_provider="none",
+        close=close, market_rows=market_rows, fx_rates=fx,
+        research_service=_FakeResearch(), agent_runner=invalid_agent, verbose=False,
+    )
+
+    assert advice["report_mode"] == "quantitative_fallback"
+    assert advice["observation_only"] is True
+    html = out.read_text(encoding="utf-8")
+    assert "量化降级报告" in html
+    assert "Top5 成员与 Python 注册结果不一致" not in html
+    assert "底层持仓重复" not in html

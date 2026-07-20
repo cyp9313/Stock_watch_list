@@ -494,15 +494,24 @@ def validate_portfolio_claims(
         if re.search(pattern, all_text):
             warnings.append(f"报告包含未经验证的{label}语句（{pattern}），此类心理/因果判断需要有明确 Evidence 支撑。")
             # §20 修复：高价格相关性不代表底层重复
-    if re.search(r"重复.*(暴露|持仓|行业)|行业.*(重复|重叠)", all_text):
-        warnings.append("报告中出现行业/持仓重复的判断；仅价格相关性不等于底层持仓重复，需确认 ETF holdings 数据。")
+    overlap_data_available = bool(
+        metrics.get("holdings_overlap") or metrics.get("etf_holdings_overlap")
+        or (snapshot.get("data_quality") or {}).get("etf_holdings_available")
+    )
+    overlap_pattern = r"(底层|持仓|成分|行业).{0,12}(重复|重叠)|重复.{0,12}(暴露|持仓|宽基)|隐性.{0,8}(超配|持仓)"
+    if re.search(overlap_pattern, all_text) and not overlap_data_available:
+        message = "仅有价格相关性而无 ETF holdings 数据，不得声称底层持仓重复、重叠或隐性超配。"
+        warnings.append(message)
+        errors.append(message)
     internal_tokens = [
         "execute_if", "cancel_or_upgrade_if", "further_reduce_if", "monitoring_items",
-        "us_10y_yield", "btc_price",
+        "us_10y_yield", "btc_price", "portfolio_risk_score",
     ]
     for token in internal_tokens:
         if token in all_text:
-            warnings.append(f"中文正文暴露内部字段名 {token}（已自动替换为中文）。")
+            message = f"中文正文暴露内部字段名 {token}，必须改为用户可读表述。"
+            warnings.append(message)
+            errors.append(message)
     # portfolio_risk_score / evidence_count / cash_unspecified / uranium_price 已加入自动替换，不再报错
     if re.search(r"\b(weak|neutral|oversold|overbought)\b", all_text, re.I):
         warnings.append("中文正文暴露 RSI 内部英文枚举（已自动替换为中文）。")
@@ -542,7 +551,9 @@ def validate_portfolio_claims(
         ]
         for pattern in _ZERO_EVIDENCE_BANNED:
             if re.search(pattern, all_text):
-                warnings.append(f"零 Accepted Evidence 时出现未证实结论「{pattern}」，系统只能确定技术面与风险贡献。")
+                message = f"零 Accepted Evidence 时出现未证实结论「{pattern}」，系统只能确定技术面与风险贡献。"
+                warnings.append(message)
+                errors.append(message)
 
     # §13: 禁止单个 ticker 被归因为风险评分子项得分
     ticker_risk_score_claim = re.compile(
@@ -550,14 +561,18 @@ def validate_portfolio_claims(
         re.I,
     )
     for m in ticker_risk_score_claim.finditer(all_text):
-        warnings.append(
+        message = (
             f"{m.group(1)} 被错误归因为风险评分子项得分（{m.group(2)} 分），"
             f"该分数属于全组合风险贡献集中度子项，非单标的贡献。"
         )
+        warnings.append(message)
+        errors.append(message)
 
     # §16: 相关性/重合语义分离
-    if re.search(r"科技股.*(超配|过度.*暴露|隐性.*持仓)", all_text):
-        warnings.append("未验证 ETF 底层持仓重合度，不得得出持仓重叠/隐性超配结论。仅能表述为价格相关性。")
+    if re.search(r"科技股.*(超配|过度.*暴露|隐性.*持仓)", all_text) and not overlap_data_available:
+        message = "未验证 ETF 底层持仓重合度，不得得出持仓重叠/隐性超配结论；只能表述为价格相关性。"
+        warnings.append(message)
+        errors.append(message)
 
     # §15: 禁止无数据流动性/情绪结论
     _NO_LIQUIDITY_DATA_CLAIMS = [
@@ -573,10 +588,39 @@ def validate_portfolio_claims(
     if not has_liquidity_data:
         for pattern in _NO_LIQUIDITY_DATA_CLAIMS:
             if re.search(pattern, all_text):
-                warnings.append(
+                message = (
                     f"出现无数据支撑的流动性/情绪结论（{pattern}）。系统缺少成交额、Bid-ask、AUM 数据，"
                     f"只能表述为回撤和风险贡献较高，不能归因于流动性或情绪。"
                 )
-                break  # 每个报告仅报一次
+                warnings.append(message)
+                errors.append(message)
+                break
+
+    # Round 9：Top5 成员与 Python 注册聚合必须绑定一致。
+    aggregates = metrics.get("aggregates") or {}
+    expected_top5 = [
+        str(item.get("ticker")) for item in aggregates.get("top5_risk_contributors") or []
+        if item.get("ticker")
+    ]
+    if expected_top5:
+        known_tickers = sorted(holdings.keys(), key=len, reverse=True)
+        for segment in re.split(r"[。；\n]", all_text):
+            if not re.search(r"top\s*5|top5|前五", segment, re.I):
+                continue
+            mentioned = [ticker for ticker in known_tickers if ticker in segment]
+            # 只有句子确实列出了成员时才比较，避免普通“Top5 合计”句误报。
+            if len(mentioned) >= 3 and set(mentioned) != set(expected_top5):
+                message = (
+                    f"Top5 成员与 Python 注册结果不一致：文案={mentioned}，"
+                    f"确定性结果={expected_top5}。"
+                )
+                warnings.append(message)
+                errors.append(message)
+
+    # 不得把历史波动率写成“基准隐含水平”，除非系统明确提供该指标。
+    if "基准隐含水平" in all_text or "隐含波动率" in all_text:
+        message = "系统未提供基准隐含波动率，不得使用“基准隐含水平/隐含波动率”表述。"
+        warnings.append(message)
+        errors.append(message)
 
     return list(dict.fromkeys(errors)), list(dict.fromkeys(warnings))
