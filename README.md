@@ -9,10 +9,10 @@ Stock Watch List 是一个本地优先的股票观察、市场仪表盘、个人
 - 股票和跨市场 watchlist：价格、1D/5D/1M/YTD、RSI、相对 `^GSPC` 的 20D/60D/120D 超额收益、3/6/12M 相对动量、EMA 偏离、布林带、成交量、估值、分析师评级、目标价、市值和 Beta。
 - 顶部市场情绪 gauge：CNN Fear & Greed、`^VIX` volatility gauge、Crypto Fear & Greed。
 - 市场宽度：S&P 500 和 Nasdaq 100 成分股位于 20/50/200 日均线上方的比例、历史曲线和 treemap；该重计算只在点击 sidebar 的 `Refresh Breadth` 时触发，页面启动、切换 tab 或刷新 watchlist 不会自动下载和重算。
-- K 线图：K 线、均线、MACD、RSI、KDJ、布林带、成交量、Fibonacci 和 60d 筹码峰。
+- K 线图：K 线、6 条可分别设置周期和 SMA/EMA 的均线、VWAP、MACD、RSI、KDJ、布林带、成交量、Fibonacci 和 60d 筹码峰。VWAP 仅累计有成交量的 K 线，日内图按交易日重置。
 - 多用户配置：账号登录、每个用户独立 watchlist、market dashboard、portfolio pages 和 AI 日报任务。
 - Portfolio Monitor：用户可以录入个人持仓，按现有 watchlist 表格模板展示市场数据，并额外显示买入价、股数、持仓现价、绝对盈亏和盈亏百分比。
-- AI 日报：行情、搜索证据、可选文章正文、技术指标、评分、图表和 HTML 报告。
+- AI Agent Reports（多用户版登录后可用）：基于行情、搜索证据、可选文章正文、技术指标、评分和图表生成 HTML 报告；支持下载、一次性邮件任务和每周邮件计划。
 - 邮件日报：一次性邮件、按周计划、后台 worker、失败重试、队列容量控制和过期控制。
 
 ## 当前架构关系
@@ -487,10 +487,10 @@ This project is for research and data observation only. It is not investment adv
 - Stock and cross-market watchlists: price, 1D/5D/1M/YTD returns, RSI, 20D/60D/120D excess returns versus `^GSPC`, weighted 3/6/12M relative momentum, EMA deviation, Bollinger Band deviation, volume ratio, valuation metrics, analyst ratings, price targets, market cap, and beta.
 - Top sentiment gauges: CNN Fear & Greed, `^VIX` volatility gauge, and Crypto Fear & Greed.
 - Market breadth: S&P 500 and Nasdaq 100 constituent ratios above their 20/50/200-day moving averages, with charts and treemaps. This heavy recalculation only runs when the sidebar `Refresh Breadth` button is clicked; app startup, tab switching, and watchlist refreshes do not automatically download or recalculate breadth data.
-- K-line charts: candlesticks, moving averages, MACD, RSI, KDJ, Bollinger Bands, volume, Fibonacci tools, and a 60d volume-by-price profile.
+- K-line charts: candlesticks, six independently configurable SMA/EMA moving averages, VWAP, MACD, RSI, KDJ, Bollinger Bands, volume, Fibonacci tools, and a 60d volume-by-price profile. VWAP uses only bars with volume and resets by trading day for intraday charts.
 - Multi-user configuration: account login, per-user watchlists, market dashboards, portfolio pages, and AI report jobs.
 - Portfolio Monitor: users can enter holdings and monitor them with the existing watchlist table style plus buy price, shares, market value, absolute P/L, P/L%, and 1D/5D/1M holding-level changes.
-- AI daily reports: market data, search evidence, optional article text, technical indicators, scoring, charts, and HTML output.
+- AI Agent Reports (available to signed-in multi-user accounts): generate HTML reports from market data, search evidence, optional article text, technical indicators, scoring, and charts; download them, queue one-off email delivery, or create weekly email schedules.
 - Email reports: one-off email jobs, weekly schedules, a background worker, retries, queue capacity controls, and expiration controls.
 
 ## Architecture

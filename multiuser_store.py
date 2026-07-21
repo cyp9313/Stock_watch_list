@@ -12,6 +12,7 @@ import secrets
 import sqlite3
 import uuid
 
+from kline_indicators import normalize_indicator_settings
 from ticker_mapping import normalize_yfinance_ticker
 
 
@@ -103,6 +104,9 @@ def normalize_config(config):
         "portfolio_pages": _normalize_portfolio_pages(
             config.get("portfolio_pages") or DEFAULT_PORTFOLIO_PAGES,
             "Portfolio",
+        ),
+        "kline_indicator_settings": normalize_indicator_settings(
+            config.get("kline_indicator_settings")
         ),
     }
 
