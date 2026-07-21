@@ -144,6 +144,8 @@ REPORT_CSS = """
   .source-card.imp-neutral { border-left-color: #d29922; }
   .source-card .sc-head { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; flex-wrap: wrap; }
   .source-card .sc-title { font-size: 14px; font-weight: 600; color: #f0f6fc; }
+  .source-card .sc-title a { color: #a8d5ba; text-decoration-color: rgba(168, 213, 186, 0.55); text-underline-offset: 2px; }
+  .source-card .sc-title a:hover { color: #d7f0df; }
   .source-card .sc-meta { font-size: 11px; color: #6e7681; margin-top: 4px; display: flex; gap: 14px; flex-wrap: wrap; }
   .source-card .sc-summary { font-size: 13px; color: #c9d1d9; margin-top: 8px; line-height: 1.6; }
   .source-card .sc-tags { margin-top: 8px; display: flex; gap: 6px; flex-wrap: wrap; }

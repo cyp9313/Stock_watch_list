@@ -65,3 +65,15 @@ def test_portfolio_html_ai_mode_has_no_fallback_banner():
     assert "量化降级报告" not in html
     assert "Apple 财报" in html
     assert "集中度风险" in html
+
+
+def test_portfolio_news_links_use_the_soft_high_contrast_color():
+    html = build_html(
+        _snapshot(),
+        {"top1_weight": 0.5, "risk_contributions": [{"ticker": "AAA", "risk_contribution": 0.5}]},
+        {"items": [{"ticker": "AAA", "risk_priority_score": 0.5}]},
+        {"actions": [{"ticker": "AAA", "action": "hold"}], "report_mode": "ai"},
+        [{"evidence_id": "E1", "title": "News title", "url": "https://example.com/a"}],
+    )
+
+    assert ".source-card .sc-title a { color: #a8d5ba;" in html

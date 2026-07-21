@@ -163,13 +163,15 @@ SECTION_META = {
         ),
     },
     "portfolio_pages": {
-        "tab": "Portfolios",
-        "title": "Portfolio Monitor",
+        "tab": "Portfolios & AI Reports",
+        "title": "Portfolio Monitor & AI Reports",
         "add_label": "Portfolio page",
         "new_page": "New Portfolio",
         "help": (
             "Use these pages for personal holdings. Each row stores ticker, buy price, "
-            "shares and buy currency, while market data is reused from the shared watchlist API."
+            "shares and buy currency, while market data is reused from the shared watchlist API. "
+            "Signed-in users can also generate, download, email and schedule AI Portfolio Reports "
+            "for each portfolio page."
         ),
     },
 }
@@ -4320,8 +4322,9 @@ inject_css(dark_mode)
 st.title("Stock Watchlist")
 st.caption(
     "Stock Watchlists organize custom stock and ETF lists; Market Dashboard tracks indices and cross-asset signals; "
-    "Market Breadth summarizes the shared S&P 500 and Nasdaq 100 universes; Portfolios monitor personal holdings; "
-    "and AI Agent Reports let signed-in users generate, download, email, and schedule in-depth ticker reports."
+    "Market Breadth summarizes the shared S&P 500 and Nasdaq 100 universes; Portfolios & AI Reports combine personal "
+    "holding monitoring with AI Portfolio Report generation, download, email, and scheduling; and AI Agent Reports let "
+    "signed-in users generate, download, email, and schedule in-depth ticker reports."
 )
 
 fg1, fg_vix, fg2 = st.columns(3)
