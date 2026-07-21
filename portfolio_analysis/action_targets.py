@@ -120,20 +120,3 @@ def apply_deterministic_action_targets(
             "variance_reduction_ratio": round(reduction, 6),
         }
     return advice
-
-
-def calculate_reallocation_summary(advice: dict[str, Any]) -> dict[str, Any]:
-    reduction = 0.0
-    for item in advice.get("actions") or []:
-        if item.get("action") not in {"trim", "reduce", "exit"}:
-            continue
-        current = float(item.get("current_weight") or 0.0)
-        lo = float(item.get("target_weight_min") or current)
-        hi = float(item.get("target_weight_max") or current)
-        reduction += max(0.0, current - (lo + hi) / 2.0)
-    return {
-        "estimated_weight_reduction": round(reduction, 6),
-        "calculation_method": "target_range_midpoint_to_cash",
-        "destination": "cash_unspecified",
-        "note": "暂留现金，具体再配置未指定。",
-    }

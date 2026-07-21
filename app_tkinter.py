@@ -684,28 +684,6 @@ def apply_crypto_fear_greed_result(result):
         fear_greed_crypto_var.set(f"Crypto恐惧贪婪指数: 获取失败")
         fear_greed_crypto_label.config(fg="black")
 
-def update_fear_greed_index():
-    try:
-        result = fetch_from_api('/api/fear_greed')
-        apply_fear_greed_result(result)
-    except Exception as e:
-        fear_greed_var.set(f"CNN股票恐惧贪婪指数: 获取失败 ({str(e)})")
-        fear_greed_label.config(fg="black")
-
-def update_crypto_fear_greed_index():
-    try:
-        result = fetch_from_api('/api/fear_greed_crypto')
-        apply_crypto_fear_greed_result(result)
-    except Exception as e:
-        fear_greed_crypto_var.set(f"Crypto恐惧贪婪指数: 获取失败 ({str(e)})")
-        fear_greed_crypto_label.config(fg="black")
-
-# 计算斐波那契回撤水平线
-def fibonacci_retracement_levels(max_price, min_price):
-    diff = max_price - min_price
-    levels = [max_price - diff * ratio for ratio in [0, 0.236, 0.382, 0.5, 0.618, 1]]
-    return levels
-
 # 计算神奇九转 (TD Sequential 简化版)
 def calculate_td_sequential(closes):
     """

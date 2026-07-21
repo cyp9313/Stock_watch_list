@@ -17,7 +17,6 @@
 """
 from __future__ import annotations
 
-import re
 from typing import Any
 
 try:
@@ -342,7 +341,6 @@ def _finalize_metadata(meta: dict[str, Any]) -> dict[str, Any]:
     meta["theme"] = _infer_theme(instrument_type, name, meta.get("underlying_index"))
     return meta
 
-
 def _name_from_market_row(row: dict[str, Any] | None) -> str | None:
     if not row:
         return None
@@ -464,12 +462,3 @@ def _enrich_via_yfinance(ticker: str, meta: dict[str, Any]) -> dict[str, Any]:
     except Exception:
         pass
     return meta
-
-
-def is_equity_like(meta: dict[str, Any]) -> bool:
-    return str(meta.get("instrument_type", "")).upper() in {"EQUITY"}
-
-
-def is_searchable_as_stock(meta: dict[str, Any]) -> bool:
-    """是否应使用「公司财报/分析师」式新闻查询。"""
-    return str(meta.get("instrument_type", "")).upper() in {"EQUITY"}

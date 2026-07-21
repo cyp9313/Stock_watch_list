@@ -184,29 +184,3 @@ REPORT_CSS = """
     a { color: #1f6feb; }
   }
 """.replace("__FONT_STACK__", FONT_STACK).replace("__MONO_STACK__", MONO_STACK)
-
-
-def _reads_shared_theme(script_name: str, markers: tuple[str, ...]) -> bool:
-    """修改计划第三轮 41：源码级检查——个股日报 / Portfolio 报告是否真正导入共享主题。"""
-    try:
-        from pathlib import Path
-        src = Path(__file__).resolve().parent.parent / "scripts" / script_name
-        text = src.read_text(encoding="utf-8")
-        return all(m in text for m in markers)
-    except Exception:
-        return False
-
-
-def portfolio_report_uses_shared_theme() -> bool:
-    return _reads_shared_theme(
-        "build_portfolio_report.py",
-        ("report_theme", "render_section"),
-    )
-
-
-def stock_report_uses_shared_theme() -> bool:
-    # 个股日报至少复用共享色彩 token（COLOR_TOKENS）。
-    return _reads_shared_theme(
-        "build_report.py",
-        ("report_theme", "COLOR_TOKENS"),
-    )

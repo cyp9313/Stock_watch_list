@@ -63,11 +63,21 @@ DEFAULT_PORTFOLIO_PAGES = [
             "benchmark": "^GSPC",
             "investment_horizon": "1-3m",
             "risk_profile": "balanced",
+            "report_style": "balanced",
+            "detail_level": "standard",
+            "advice_mode": "conditional",
+            "report_language": "zh-CN",
+            "analysis_focus": ["technical", "news", "portfolio_risk", "actions"],
+            "include_news": True,
+            "include_macro": True,
+            "include_all_holdings": False,
+            "news_lookback_days": 30,
+            "max_focus_holdings": 5,
             "max_position_pct": 20.0,
             "max_group_pct": 40.0,
             "allow_add": True,
             "allow_reduce": True,
-            "research_max_tickers": 5,
+            "custom_instructions": "",
         },
     }
 ]
@@ -186,12 +196,41 @@ def _normalize_portfolio_analysis_settings(settings):
             data[key] = max(0.0, min(100.0, float(data.get(key, default))))
         except (TypeError, ValueError):
             data[key] = default
-    data["allow_add"] = bool(data.get("allow_add", True))
-    data["allow_reduce"] = bool(data.get("allow_reduce", True))
+    data["report_style"] = str(data.get("report_style") or "balanced").strip().lower()
+    if data["report_style"] not in {"balanced", "concise", "deep_dive", "risk_control", "opportunity"}:
+        data["report_style"] = "balanced"
+    data["detail_level"] = str(data.get("detail_level") or "standard").strip().lower()
+    if data["detail_level"] not in {"brief", "standard", "detailed"}:
+        data["detail_level"] = "standard"
+    data["advice_mode"] = str(data.get("advice_mode") or "conditional").strip().lower()
+    if data["advice_mode"] not in {"observe_only", "conditional", "actionable"}:
+        data["advice_mode"] = "conditional"
+    data["report_language"] = str(data.get("report_language") or "zh-CN").strip()
+    if data["report_language"] not in {"zh-CN", "en", "de"}:
+        data["report_language"] = "zh-CN"
+    allowed_focus = {"technical", "news", "portfolio_risk", "macro", "valuation", "actions"}
+    raw_focus = data.get("analysis_focus")
+    if not isinstance(raw_focus, list):
+        raw_focus = ["technical", "news", "portfolio_risk", "actions"]
+    data["analysis_focus"] = list(dict.fromkeys(str(x).strip() for x in raw_focus if str(x).strip() in allowed_focus))
+    if not data["analysis_focus"]:
+        data["analysis_focus"] = ["technical", "news", "portfolio_risk", "actions"]
+    for key, default in (("include_news", True), ("include_macro", True), ("include_all_holdings", False),
+                         ("allow_add", True), ("allow_reduce", True)):
+        data[key] = bool(data.get(key, default))
     try:
-        data["research_max_tickers"] = max(1, min(10, int(data.get("research_max_tickers", 5))))
+        data["news_lookback_days"] = max(3, min(90, int(data.get("news_lookback_days", 30))))
     except (TypeError, ValueError):
-        data["research_max_tickers"] = 5
+        data["news_lookback_days"] = 30
+    raw_focus_count = data.get("max_focus_holdings", data.get("research_max_tickers", 5))
+    if isinstance(settings, dict) and "max_focus_holdings" not in settings and "research_max_tickers" in settings:
+        raw_focus_count = settings.get("research_max_tickers")
+    try:
+        data["max_focus_holdings"] = max(2, min(12, int(raw_focus_count)))
+    except (TypeError, ValueError):
+        data["max_focus_holdings"] = 5
+    data.pop("research_max_tickers", None)
+    data["custom_instructions"] = str(data.get("custom_instructions") or "").strip()[:600]
     return data
 
 

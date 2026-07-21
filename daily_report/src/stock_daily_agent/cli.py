@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import argparse
-import shutil
 import os
-from datetime import date
 from pathlib import Path
 import sys
 

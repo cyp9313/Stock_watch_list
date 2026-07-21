@@ -30,7 +30,6 @@ Usage by the daily report pipeline::
 
 from __future__ import annotations
 
-import os
 import pickle
 from enum import Enum
 from pathlib import Path

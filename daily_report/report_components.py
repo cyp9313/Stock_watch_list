@@ -11,12 +11,11 @@ from typing import Any
 
 import html
 
-from .report_theme import REPORT_CSS, COLOR_TOKENS, ACTION_COLORS, RISK_COLORS, IMPACT_COLORS
+from .report_theme import REPORT_CSS, COLOR_TOKENS, ACTION_COLORS, IMPACT_COLORS
 from .report_i18n import (
-    action_zh, risk_level_zh, severity_zh, impact_zh, horizon_zh, instrument_type_zh,
+    action_zh, risk_level_zh, severity_zh, impact_zh, horizon_zh,
     portfolio_stance_zh, risk_profile_zh, investment_horizon_zh,
-    format_money, format_pct, format_number, pct_color_class,
-    format_ratio_as_pct, format_pct_value, finite_float,
+    format_number, format_ratio_as_pct, format_pct_value,
 )
 
 
@@ -112,16 +111,6 @@ def render_section(title: str, icon: str, body_html: str) -> str:
 
 def render_badge(text: str, kind: str = "muted") -> str:
     return f'<span class="badge {esc(kind)}">{esc(text)}</span>'
-
-
-def render_score_bar(value: float, color: str) -> str:
-    try:
-        pct = max(0.0, min(1.0, float(value))) * 100.0
-    except (TypeError, ValueError):
-        pct = 0.0
-    return (
-        f'<div class="score-bar-bg"><div class="score-bar-fill" style="width:{pct:.0f}%;background:{esc(color)};"></div></div>'
-    )
 
 
 def render_table(headers: list[str], rows: list[list[Any]], scroll: bool = True) -> str:
@@ -292,7 +281,7 @@ def render_action_detail(
     if observation_only:
         upgrade = cancel or execute
         if not upgrade:
-            upgrade = "<li>获得通过研究质量门的 Accepted Evidence，并满足量化触发条件后再重新评估。</li>"
+            upgrade = "<li>获得新的 AI 综合分析并满足量化触发条件后再重新评估。</li>"
         return (
             f'<div class="action-detail" style="border-top-color:{color};">\n'
             f'  <div class="action-head">\n'

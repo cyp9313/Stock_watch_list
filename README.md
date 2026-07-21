@@ -324,29 +324,17 @@ python daily_report/run_report.py AAPL --months 3 --search-provider auto
 - Portfolio 删除后，worker 不会发送旧持仓快照，相关 job 会失败并显示错误；
 - Portfolio 报告和 ticker 日报共享 `daily_report_jobs.db`、worker、SMTP、Message-ID 幂等、重试和队列容量控制。
 
-Portfolio AI 报告采用单次联网架构：Python 先计算组合权重、风险贡献、Beta、波动率、回撤与技术广度，再由 `deepseek-v4-flash` 通过 DashScope 内置联网搜索完成一次研究与结构化分析。该路径固定使用 `turbo`，每份报告最多调用一次联网搜索；不会调用 Serper，不运行 Query Planner、Official Lane、Materiality/Summarizer 多阶段链路、Gap Search、补搜或模型重试。
+Portfolio AI Analyst v3 采用“Python 量化事实 + 单次 AI 综合分析”架构：Python 先计算组合权重、风险贡献、Beta、波动率、回撤与技术广度，再由 `deepseek-v4-pro` 使用 DashScope 内置联网搜索和 high 深度思考完成一次完整投资组合分析。用户可在每个 Portfolio 页面的 AI report settings 中设置投资期限、风险偏好、报告风格、分析重点、建议模式、新闻窗口与自定义要求；这些设置会动态改变 Prompt。价格、权重和技术指标仍由 Python 固定，模型不能改写。该路径最多调用一次模型/联网搜索；不会调用 Serper、Gap Search、补搜或模型重试。
 
-模型返回的事件只有在本地校验通过后才能进入正式报告。DeepSeek 属于百炼第三方模型，其联网搜索不提供可靠的 provider-side freshness 与 citation 保证，因此程序默认把一次调用拆成最多 2 个明确的公司级查询指令，并写入绝对 after/before 日期范围。模型只返回新闻 Evidence，不再同时生成组合动作或大段投资组合分析。URL、标题和日期仍由本地程序控制：模型 URL 仅作为匹配提示，最终身份必须存在于 DashScope `search_info.search_results`。程序还会并行抓取最多 3 个已经由 DashScope 返回的文章页面，用于补全和验证发布日期；这不是第二次搜索，也不重试。新鲜的官方/监管来源或可信媒体重大事件可由本地规则直接转为决策证据，即使模型 JSON 绑定失败；其他真实文章来源作为背景引用。运行目录会输出 `portfolio_research_diagnostics.json`、`portfolio_dashscope_sources.json`、页面日期校验记录、本地拒绝明细和 Token 用量。
+AI Analyst 直接生成组合观点、技术面解释、消息面分析、持仓结论和条件式建议；消息链接质量不会决定整份分析是否存在。Python 只做必要的结构与安全校验：Ticker 必须属于持仓，当前权重与量化指标不可被模型改写，私有 URL 和未来日期会被移除，用户禁用的加仓/减仓方向会被本地规则覆盖。消息链接会标记为“与 DashScope 来源匹配”或“AI 返回、未独立核验”；链接不完整不会删除其余分析。运行目录会输出 Analyst 设置、诊断、消息分析、搜索来源、最终 JSON、reasoning 内容和 Token 用量。
 
 相关环境变量为：
 
 ```dotenv
-PORTFOLIO_REPORT_MODEL=deepseek-v4-flash
+PORTFOLIO_REPORT_MODEL=deepseek-v4-pro
 PORTFOLIO_REPORT_PROVIDER=dashscope
-PORTFOLIO_RESEARCH_MODE=dashscope_single_search
-PORTFOLIO_SINGLE_SEARCH_TOP_TICKERS=5
-PORTFOLIO_SINGLE_SEARCH_ENTITY_LIMIT=2
-PORTFOLIO_SINGLE_SEARCH_FRESHNESS_DAYS=30
-PORTFOLIO_SOURCE_FETCH_MAX=3
-PORTFOLIO_SOURCE_FETCH_TIMEOUT_SECONDS=5
-PORTFOLIO_REFERENCE_PER_TICKER=2
-PORTFOLIO_REFERENCE_MAX_TOTAL=6
-PORTFOLIO_REPORT_REQUIRE_TOP_RISK_NEWS=true
-PORTFOLIO_REPORT_MIN_NEWS_COVERAGE=0.60
-PORTFOLIO_REPORT_STRICT_NEWS_COVERAGE=false
-PORTFOLIO_REPORT_MIN_FRESH_EVIDENCE=1
-PORTFOLIO_REPORT_MIN_ACTIONABLE_CONFIDENCE=0.50
-PORTFOLIO_REPORT_MIN_RISK_WEIGHTED_COVERAGE=0.85
+PORTFOLIO_ENABLE_THINKING=true
+PORTFOLIO_REASONING_EFFORT=high
 ```
 
 产品约束不是可配置的软目标：`search_strategy=turbo`、联网搜索调用上限为 1、外部搜索调用为 0、重试与 Gap Search 为 0。报告会把这些计数和 DashScope 输入/输出 Token 直接显示在“数据质量与限制”中。
@@ -796,27 +784,15 @@ Each `Portfolios` subpage also supports Portfolio AI reports:
 - if the portfolio is deleted, the worker does not send an old snapshot and the job fails visibly;
 - portfolio reports and ticker reports share `daily_report_jobs.db`, the worker, SMTP delivery, deterministic Message-ID deduplication, retries, and queue capacity controls.
 
-Portfolio AI v2 uses a single-call research architecture. Python calculates weights, risk contributions, beta, volatility, drawdown, and technical breadth first. Then `deepseek-v4-flash` performs exactly one DashScope built-in web-search call with the fixed `turbo` strategy and returns both evidence candidates and structured portfolio analysis. The Portfolio path does not call Serper, Query Planner, Official Lane, the old Materiality/Summarizer pipeline, Gap Search, follow-up search, or model retry.
+Portfolio AI Analyst v3 uses a Python-facts-plus-one-analyst-call architecture. Python calculates weights, risk contributions, beta, volatility, drawdown, and technical breadth first. Then `deepseek-v4-pro` performs one DashScope built-in web-search analyst call with thinking enabled at `high`. Per-portfolio AI report settings dynamically shape the prompt, including investment horizon, risk profile, report style, analysis focus, advice mode, news window, and custom instructions. Quantitative values remain immutable. The Portfolio path does not call Serper, Gap Search, follow-up search, or model retry.
 
-A model event enters the report only after local validation. Because DeepSeek is a third-party Model Studio search model without dependable provider-side freshness or citation guarantees, the single call is expressed as at most two explicit company-level queries with absolute `after:` and `before:` dates. The model returns news evidence only; portfolio actions remain deterministic. Model URLs are matching hints only and must resolve to a real DashScope source. The service can fetch up to three URLs already returned by DashScope, in parallel and without retry, to validate page metadata and publication dates. This is metadata validation rather than a second search. Fresh official/regulatory items or trusted-media material events can be promoted deterministically even when model binding fails; other article sources remain non-decision references. Run artifacts include source objects, local page-date provenance, raw model output, rejection details, call counters, elapsed time, and token usage.
+The analyst directly produces the portfolio view, technical interpretation, news analysis, holding conclusions, and conditional recommendations. News-link completeness no longer acts as a switch that can erase the entire AI report. Python performs only structural and safety enforcement: tickers must belong to the portfolio, current weights and quantitative metrics are immutable, private URLs and future dates are removed, and user-disabled add/reduce directions are overridden locally. Links are labelled as either matched to a DashScope source or AI-returned without independent verification; an imperfect link does not delete the surrounding analysis. Run artifacts include settings, diagnostics, news analysis, search sources, final JSON, reasoning content, elapsed time, and token usage.
 
 ```dotenv
-PORTFOLIO_REPORT_MODEL=deepseek-v4-flash
+PORTFOLIO_REPORT_MODEL=deepseek-v4-pro
 PORTFOLIO_REPORT_PROVIDER=dashscope
-PORTFOLIO_RESEARCH_MODE=dashscope_single_search
-PORTFOLIO_SINGLE_SEARCH_TOP_TICKERS=5
-PORTFOLIO_SINGLE_SEARCH_ENTITY_LIMIT=2
-PORTFOLIO_SINGLE_SEARCH_FRESHNESS_DAYS=30
-PORTFOLIO_SOURCE_FETCH_MAX=3
-PORTFOLIO_SOURCE_FETCH_TIMEOUT_SECONDS=5
-PORTFOLIO_REFERENCE_PER_TICKER=2
-PORTFOLIO_REFERENCE_MAX_TOTAL=6
-PORTFOLIO_REPORT_REQUIRE_TOP_RISK_NEWS=true
-PORTFOLIO_REPORT_MIN_NEWS_COVERAGE=0.60
-PORTFOLIO_REPORT_STRICT_NEWS_COVERAGE=false
-PORTFOLIO_REPORT_MIN_FRESH_EVIDENCE=1
-PORTFOLIO_REPORT_MIN_ACTIONABLE_CONFIDENCE=0.50
-PORTFOLIO_REPORT_MIN_RISK_WEIGHTED_COVERAGE=0.85
+PORTFOLIO_ENABLE_THINKING=true
+PORTFOLIO_REASONING_EFFORT=high
 ```
 
 The product invariants are hard-coded rather than configurable: `search_strategy=turbo`, a maximum of one built-in search call, zero external search calls, and zero retries or Gap Search calls.

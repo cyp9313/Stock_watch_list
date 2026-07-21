@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import os
 from typing import Any
 
 
@@ -126,13 +125,15 @@ def rank_portfolio_risks(snapshot: dict[str, Any], metrics: dict[str, Any]) -> d
         item["weight_rank"] = weight_rank[ticker]
         item["volatility_rank"] = volatility_rank[ticker]
 
-    max_tickers = max(1, min(10, int(os.environ.get("PORTFOLIO_SINGLE_SEARCH_TOP_TICKERS", "5") or "5")))
-    configured = snapshot.get("analysis_settings", {}).get("research_max_tickers") if isinstance(snapshot.get("analysis_settings"), dict) else None
-    if configured:
-        max_tickers = min(max_tickers, max(1, int(configured)))
+    analysis_settings = snapshot.get("analysis_settings") if isinstance(snapshot.get("analysis_settings"), dict) else {}
+    configured = analysis_settings.get("max_focus_holdings", 5)
+    try:
+        max_tickers = max(1, min(12, int(configured)))
+    except (TypeError, ValueError):
+        max_tickers = 5
     count = min(len(ranked), max_tickers)
     return {
         "items": ranked,
         "top_risk_tickers": [item["ticker"] for item in ranked[:count]],
-        "research_ticker_count": count,
+        "focus_ticker_count": count,
     }

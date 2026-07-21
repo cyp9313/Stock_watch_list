@@ -17,9 +17,7 @@ gen_chart.py — 通用 Plotly K线图生成脚本
 import sys
 import os
 import re
-import yfinance as yf
 import pandas as pd
-import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 

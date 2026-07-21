@@ -24,7 +24,7 @@ def test_normalize_config_preserves_portfolio_id_and_settings():
                 "base_currency": "USD",
                 "benchmark": "SXR8.DE",
                 "risk_profile": "growth",
-                "research_max_tickers": 3,
+                "max_focus_holdings": 3,
             },
             "holdings": [],
         }]
@@ -35,7 +35,7 @@ def test_normalize_config_preserves_portfolio_id_and_settings():
     assert page["analysis_settings"]["base_currency"] == "USD"
     assert page["analysis_settings"]["benchmark"] == "SXR8.DE"
     assert page["analysis_settings"]["risk_profile"] == "growth"
-    assert page["analysis_settings"]["research_max_tickers"] == 3
+    assert page["analysis_settings"]["max_focus_holdings"] == 3
 
 
 def test_portfolio_tickers_are_included_in_stock_data_api_groups():

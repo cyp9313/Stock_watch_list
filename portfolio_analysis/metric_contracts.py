@@ -63,10 +63,6 @@ METRIC_UNITS = {
 }
 
 
-def unit_of(name: str) -> str:
-    return METRIC_UNITS.get(name, "unknown")
-
-
 def fmt_metric(name: str, value: Any, digits: int | None = None) -> str:
     """按契约选择格式化函数；未知字段默认当作 number。
 
@@ -81,14 +77,6 @@ def fmt_metric(name: str, value: Any, digits: int | None = None) -> str:
     if unit == "number":
         return _i18n.format_number(value, digits if digits is not None else 2)
     return _i18n.format_number(value, digits if digits is not None else 2)
-
-
-def is_ratio(name: str) -> bool:
-    return METRIC_UNITS.get(name) == "ratio"
-
-
-def is_pct_value(name: str) -> bool:
-    return METRIC_UNITS.get(name) == "pct_value"
 
 
 def scan_non_finite(obj: Any, path: str = "") -> list[str]:
@@ -112,114 +100,3 @@ def scan_non_finite(obj: Any, path: str = "") -> list[str]:
         if not math.isfinite(number):
             found.append(path or "root")
     return found
-
-
-# ── 置信度上限因子（修改计划第三轮 23）────────────────────────
-def data_quality_score(non_finite_count: int, anomaly_weight: float) -> float:
-    """数据完整度评分：非有限指标越多、异常权重越大，分数越低。"""
-    score = 1.0
-    score -= min(0.5, 0.08 * max(0, non_finite_count))
-    score -= min(0.4, 0.6 * max(0.0, min(1.0, anomaly_weight)))
-    return round(max(0.1, score), 3)
-
-
-def metadata_coverage_score(instrument_metadata: dict[str, dict[str, Any]], tickers: list[str]) -> float:
-    """工具类型覆盖度：按分类置信度加权，默认猜测不能获得满分。"""
-    if not tickers:
-        return 0.5
-    confidence = 0.0
-    for ticker in tickers:
-        item = instrument_metadata.get(ticker) or {}
-        if str(item.get("instrument_type") or "UNKNOWN").upper() == "UNKNOWN":
-            continue
-        try:
-            score = float(item.get("classification_confidence"))
-        except (TypeError, ValueError):
-            # Legacy callers without provenance are treated as explicitly supplied metadata.
-            score = 0.4 if item.get("classification_source") == "default" else 1.0
-        confidence += max(0.0, min(1.0, score))
-    return round(max(0.1, confidence / len(tickers)), 3)
-
-
-def evidence_coverage_score(
-    evidence: list[dict[str, Any]],
-    top_risk_tickers: list[str],
-    *,
-    floor: float = 0.10,
-) -> float:
-    """Top-risk Accepted Evidence 覆盖率；``floor`` 仅用于旧置信度模型。"""
-    if not top_risk_tickers:
-        return 1.0
-    covered = {
-        e.get("ticker") for e in evidence
-        if e.get("ticker") and str(e.get("source_quality") or "tier_3") != "tier_3"
-    }
-    ratio = len(set(top_risk_tickers) & covered) / len(top_risk_tickers)
-    return round(max(float(floor), min(1.0, ratio)), 3)
-
-
-def evidence_freshness_score(
-    evidence: list[dict[str, Any]],
-    fresh_days: int = 45,
-    background_days: int = 180,
-    *,
-    empty_score: float = 0.30,
-    floor: float = 0.10,
-) -> float:
-    """证据新鲜度。报告真实指标应传 ``empty_score=0, floor=0``。"""
-    if not evidence:
-        return round(float(empty_score), 3)
-    fresh = 0.0
-    today = _today()
-    for item in evidence:
-        published = _parse_date(item.get("published_date"))
-        if published is None:
-            continue
-        age = (today - published).days
-        if age <= fresh_days:
-            fresh += 1.0
-        elif age <= background_days:
-            fresh += 0.6
-    return round(max(float(floor), min(1.0, fresh / len(evidence))), 3)
-
-
-def evidence_verification_score(
-    evidence: list[dict[str, Any]],
-    *,
-    empty_score: float = 0.30,
-    floor: float = 0.10,
-) -> float:
-    """证据来源验证比例。
-
-    ``article_fetch_ok`` 表示已抓取并验证正文；``source_verified`` 表示模型
-    返回的 URL 已与 DashScope ``search_info.search_results`` 做本地精确匹配。
-    两者都可作为正式证据来源验证，普通未验证摘要只计 0.5。
-    """
-    if not evidence:
-        return round(float(empty_score), 3)
-    score = sum(
-        1.0 if (item.get("article_fetch_ok") or item.get("source_verified")) else 0.5
-        for item in evidence
-    )
-    return round(max(float(floor), min(1.0, score / len(evidence))), 3)
-
-
-def _today():
-    from datetime import date
-    return date.today()
-
-
-def _parse_date(value):
-    if not value:
-        return None
-    import datetime as _dt
-    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y-%m", "%Y"):
-        try:
-            return _dt.datetime.strptime(str(value)[:len(_dt.date.today().strftime(fmt)) + 1] if False else str(value), fmt).date()
-        except (ValueError, TypeError):
-            continue
-    # 尝试 ISO 日期前缀
-    try:
-        return _dt.date.fromisoformat(str(value)[:10])
-    except (ValueError, TypeError):
-        return None

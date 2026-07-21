@@ -1,12 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Portfolio AI v2 单次联网报告主流程。
+"""Portfolio AI Analyst v3 report pipeline.
 
-流程：snapshot -> metrics -> risk ranking -> one DashScope built-in web-search
-call with deepseek-v4-flash -> local URL/date/schema validation -> quality gate ->
-HTML. Portfolio 报告不调用 Serper、Query Planner、Official Lane、Gap Search、
-Evidence Summarizer 或第二个 Portfolio Agent。
-
-保留 portfolio_service.py 的子进程契约以兼容现有 job/UI；运行时固定使用 DashScope 内置搜索。
+Python computes immutable portfolio metrics. One DeepSeek-v4-Pro DashScope call
+adds integrated technical/news/risk interpretation according to user settings.
+The legacy evidence-gate pipeline is no longer used by the production path.
 """
 from __future__ import annotations
 
@@ -31,29 +28,19 @@ from portfolio_analysis import (
     build_portfolio_snapshot,
     calculate_portfolio_metrics,
     rank_portfolio_risks,
-    validate_portfolio_advice,
 )
-from portfolio_analysis.validators import PortfolioAdviceValidationError
 from portfolio_analysis.rules import generate_portfolio_rule_findings
 from portfolio_analysis.instrument_metadata import build_instrument_metadata
 from portfolio_analysis.snapshot import infer_ticker_currency
-from portfolio_analysis.metric_contracts import (
-    scan_non_finite, data_quality_score, metadata_coverage_score,
-    evidence_coverage_score, evidence_freshness_score, evidence_verification_score,
-)
-from portfolio_analysis.action_targets import (
-    apply_deterministic_action_targets, calculate_reallocation_summary,
-)
-from portfolio_analysis.report_quality import (
-    evaluate_report_quality, PortfolioReportQualityError,
-)
+from portfolio_analysis.metric_contracts import scan_non_finite
+from portfolio_analysis.action_targets import apply_deterministic_action_targets
 from portfolio_analysis.return_model import build_portfolio_return_model
-from portfolio_analysis.observation_view import _build_observation_view
-from daily_report.src.stock_daily_agent.portfolio_schema import default_fallback_advice
-from daily_report.src.stock_daily_agent.portfolio_single_search import (
-    run_portfolio_single_search,
-    PortfolioSingleSearchUnavailable,
-    PortfolioSingleSearchOutputError,
+from daily_report.src.stock_daily_agent.portfolio_fallback import build_quantitative_fallback
+from daily_report.src.stock_daily_agent.portfolio_ai_analyst import (
+    run_portfolio_ai_analyst,
+    normalize_analyst_settings,
+    PortfolioAnalystUnavailable,
+    PortfolioAnalystOutputError,
 )
 from ticker_mapping import normalize_yfinance_ticker
 
@@ -180,229 +167,6 @@ def _allocation_weights(snapshot: dict, meta: dict, key_fn) -> dict[str, float]:
     return out
 
 
-def _apply_confidence_cap(
-    advice: dict,
-    snapshot: dict,
-    metrics: dict,
-    instrument_metadata: dict,
-    evidence: list[dict],
-    ranking: dict,
-    non_finite: list[str],
-) -> dict:
-    """置信度上限：取模型、数据、覆盖、新鲜度和来源验证度的最小值。"""
-    model_conf = max(0.0, min(1.0, float(advice.get("confidence", 0.5))))
-    anomaly_w = (metrics.get("return_anomalies") or {}).get("anomaly_weight", 0.0) or 0.0
-    dq = data_quality_score(len(non_finite), anomaly_w)
-    tickers = [h["ticker"] for h in snapshot.get("holdings", [])]
-    meta_cov = metadata_coverage_score(instrument_metadata, tickers)
-    ev_cov = evidence_coverage_score(
-        evidence, ranking.get("top_risk_tickers") or [], floor=0.0,
-    )
-    ev_fresh = evidence_freshness_score(evidence, empty_score=0.0, floor=0.0)
-    ev_verified = evidence_verification_score(evidence, empty_score=0.0, floor=0.0)
-    final = min(model_conf, dq, meta_cov, ev_cov, ev_fresh, ev_verified)
-    advice["final_confidence"] = round(final, 3)
-    advice["confidence_components"] = {
-        "model_confidence": round(model_conf, 3),
-        "data_quality": dq,
-        "metadata_coverage": meta_cov,
-        "evidence_coverage": ev_cov,
-        "evidence_freshness": ev_fresh,
-        "evidence_verification": ev_verified,
-    }
-    if str(advice.get("report_mode")) == "ai":
-        advice["confidence"] = round(final, 3)
-    evidence_by_ticker: dict[str, list[dict]] = {}
-    for item in evidence:
-        ticker = str(item.get("ticker") or "").upper()
-        if ticker:
-            evidence_by_ticker.setdefault(ticker, []).append(item)
-    for action in advice.get("actions") or []:
-        ticker = str(action.get("ticker") or "").upper()
-        try:
-            action_model = max(0.0, min(1.0, float(action.get("confidence", model_conf))))
-        except (TypeError, ValueError):
-            action_model = model_conf
-        ticker_evidence = evidence_by_ticker.get(ticker, [])
-        has_verified_fresh = any(
-            item.get("recency_tier") in {"fresh_event", "recent_background"}
-            and (item.get("article_fetch_ok") or item.get("source_verified"))
-            for item in ticker_evidence
-        )
-        has_unverified_fresh = any(
-            item.get("recency_tier") in {"fresh_event", "recent_background"}
-            for item in ticker_evidence
-        )
-        ticker_evidence_score = 1.0 if has_verified_fresh else (0.6 if has_unverified_fresh else 0.3)
-        action_final = min(action_model, final, dq, meta_cov, ticker_evidence_score)
-        action["model_confidence"] = round(action_model, 3)
-        action["final_confidence"] = round(action_final, 3)
-        action["confidence"] = round(action_final, 3)
-    return advice
-
-
-def _guard_actions(advice: dict, evidence: list[dict], settings: dict) -> dict:
-    """Directionally actionable claims require locally validated Evidence.
-
-    Unsupported directional actions are rewritten as watch items while raw AI
-    fields are retained only in debug artifacts.
-    """
-    fresh_by_ticker = {
-        str(item.get("ticker") or "").upper()
-        for item in evidence
-        if item.get("ticker") and item.get("recency_tier") in {"fresh_event", "recent_background"}
-    }
-    material_tickers = {
-        str(item.get("ticker") or "").upper()
-        for item in evidence
-        if item.get("ticker")
-        and item.get("materiality_accepted", True)
-        and item.get("entity_role") != "incidental"
-        and not item.get("is_quote_page")
-    }
-    allow_exit = bool(settings.get("allow_exit_advice", False))
-    for action in advice.get("actions") or []:
-        ticker = str(action.get("ticker") or "").upper()
-        current = float(action.get("current_weight") or 0.0)
-        action_type = str(action.get("action") or "watch").lower()
-
-        if action_type in {"add", "trim", "reduce", "exit"} and ticker not in material_tickers:
-            # P0-6: 保存所有原始 AI 字段
-            for field in ("action", "reason", "risk_narrative", "portfolio_reason",
-                          "technical_reason", "news_reason", "bull_case", "bear_case",
-                          "execute_if", "cancel_or_upgrade_if", "further_reduce_if",
-                          "monitoring_items", "thresholds"):
-                raw_val = action.get(field)
-                if raw_val is not None or field == "action":
-                    action[f"raw_ai_{field}"] = raw_val
-            action["quantitative_candidate_action"] = action_type
-            action["action"] = "watch"
-            action["action_timing"] = "monitor"
-            action["target_weight_min"] = current
-            action["target_weight_max"] = current
-            # P0-6: 完整重写展示字段
-            action["reason"] = (
-                f"该标的风险贡献高于其权重，因此列入重点观察。\n\n"
-                f"量化原因：风险贡献或回撤信号触发了方向性操作候选。\n\n"
-                f"为何暂不执行：当前缺少通过本地 URL、日期与主体校验的事件证据。"
-            )
-            action["risk_narrative"] = None
-            action["portfolio_reason"] = "该标的风险贡献显著高于其权重，列入重点观察。"
-            action["technical_reason"] = "当前技术指标仅用于识别风险，不构成交易触发。"
-            action["news_reason"] = "本轮没有通过本地 URL 与日期校验的事件证据。"
-            action["bull_case"] = "等待新的、可验证的正面事件信号。"
-            action["bear_case"] = "等待新的、可验证的负面事件信号。"
-            action["execute_if"] = []
-            action["cancel_or_upgrade_if"] = []
-            action["further_reduce_if"] = []
-            action["monitoring_items"] = [f"{ticker} 风险贡献变化", "价格关键技术位"]
-            action["thresholds"] = []
-            action["expected_portfolio_risk_reduction"] = None
-            action["expected_risk_change"] = None
-            action["evidence_ids"] = []
-            action["validation_note"] = "无通过本地校验的 Evidence 支撑，已转为观察项。"
-            continue
-
-        if action_type == "exit" and not (allow_exit and ticker in fresh_by_ticker):
-            action["raw_ai_action"] = action_type
-            action["raw_ai_reason"] = action.get("reason")
-            action["action"] = "reduce"
-            action["validation_note"] = "退出建议缺少明确用户约束或新鲜 thesis 证伪证据，已降级为减仓。"
-        if ticker not in fresh_by_ticker and action.get("action") in {"add", "trim", "reduce", "exit"}:
-            action["action_timing"] = "monitor"
-            action.setdefault("validation_note", "缺少该标的新鲜证据，不能作为立即交易建议。")
-    return advice
-
-
-# P0-2: 收口后基于 accepted_evidence 重算所有研究指标
-def _recompute_accepted_coverage(
-    research_result: dict,
-    ranking: dict,
-    metrics: dict,
-    accepted_evidence: list[dict],
-) -> None:
-    """收口后基于 Accepted Evidence 重算覆盖率、风险加权覆盖、新鲜度等。
-
-    写入 research_result["diagnostics"] 并覆盖旧字段。
-    """
-    top_risk_tickers = [str(t).upper() for t in (ranking.get("top_risk_tickers") or [])]
-    acc = accepted_evidence or []
-    diag = research_result.setdefault("diagnostics", {})
-
-    # Accepted ticker 覆盖
-    covered = {str(e.get("ticker") or "").upper() for e in acc if e.get("ticker")}
-    top_risk_set = {t for t in top_risk_tickers}
-    accepted_top_risk = top_risk_set & covered
-    coverage = len(accepted_top_risk) / len(top_risk_set) if top_risk_set else 0.0
-
-    # Accepted Risk-weighted Coverage
-    rc_map = {str(item.get("ticker") or "").upper(): float(item.get("risk_contribution") or 0.0)
-              for item in (metrics.get("risk_contributions") or [])}
-    total_rc = sum(rc_map.get(t, 0.0) for t in top_risk_tickers)
-    covered_rc = sum(rc_map.get(t, 0.0) for t in accepted_top_risk)
-    rwc = (covered_rc / total_rc) if total_rc > 0 else 0.0
-
-    # Accepted Fresh Count
-    fresh_count = sum(1 for e in acc if str(e.get("recency_tier") or "") in {"fresh_event", "recent_background"})
-    verified_count = sum(1 for e in acc if e.get("article_fetch_ok") or e.get("source_verified"))
-    tier12_count = sum(1 for e in acc if str(e.get("source_quality") or "").startswith(("tier_1", "tier_2")))
-    event_count = len({str(e.get("event_key") or e.get("evidence_uid")) for e in acc if e.get("event_key")})
-    latest_date = max((str(e.get("published_date") or "") for e in acc if e.get("published_date")), default=None)
-
-    diag["accepted_top_risk_coverage"] = round(coverage, 3)
-    diag["accepted_risk_weighted_coverage"] = round(rwc, 3)
-    diag["accepted_fresh_count"] = fresh_count
-    diag["accepted_verified_source_count"] = verified_count
-    diag["accepted_tier12_count"] = tier12_count
-    diag["accepted_unique_event_count"] = event_count
-    diag["latest_accepted_event_date"] = latest_date
-    diag["accepted_top_risk_ticker_count"] = len(accepted_top_risk)
-
-    # 同时更新旧字段以保持兼容（P0-2: 用 accepted 值覆盖候选值）
-    diag["top_risk_coverage"] = round(coverage, 3)
-    diag["risk_weighted_coverage"] = round(rwc, 3)
-
-
-def _enforce_observation_mode(advice: dict) -> dict:
-    """Rewrite every visible action as a deterministic watch item.
-
-    Observation mode is a report-wide state, not merely a directional-action
-    downgrade.  Existing ``hold``/``watch`` rows may still contain unsupported
-    AI fundamental, liquidity or sentiment claims, so every action narrative
-    must be rebuilt from safe quantitative language.
-    """
-    for action in advice.get("actions") or []:
-        current = float(action.get("current_weight") or 0.0)
-        for field in ("action", "reason", "risk_narrative", "portfolio_reason",
-                      "technical_reason", "news_reason", "bull_case", "bear_case",
-                      "execute_if", "cancel_or_upgrade_if", "further_reduce_if",
-                      "monitoring_items", "thresholds"):
-            raw_val = action.get(field)
-            if raw_val is not None or field == "action":
-                action[f"raw_ai_{field}"] = raw_val
-        action["action"] = "watch"
-        action["action_timing"] = "monitor"
-        action["target_weight_min"] = current
-        action["target_weight_max"] = current
-        action["reason"] = "报告最终置信度未达到可操作门槛，当前仅列为观察项。"
-        action["risk_narrative"] = None
-        action["portfolio_reason"] = "该标的按确定性风险排序列入观察，不代表需要立即调整仓位。"
-        action["technical_reason"] = "价格、回撤和风险贡献指标仅用于风险观察，不构成交易触发。"
-        action["news_reason"] = "本轮没有足够的 Accepted Evidence 支撑方向性操作。"
-        action["bull_case"] = "等待新的、可验证的正面事件或风险指标改善。"
-        action["bear_case"] = "等待新的、可验证的负面事件或风险指标恶化。"
-        action["execute_if"] = []
-        action["cancel_or_upgrade_if"] = []
-        action["further_reduce_if"] = []
-        action["monitoring_items"] = [f"{action.get('ticker', '')} 风险贡献变化", "价格与主要均线关系"]
-        action["thresholds"] = []
-        action["expected_portfolio_risk_reduction"] = None
-        action["expected_risk_change"] = None
-        action["evidence_ids"] = []
-        action["validation_note"] = "观察型报告：全部操作文本已按确定性规则重建。"
-    return advice
-
-
 def _data_cutoffs(close: pd.DataFrame, metadata: dict[str, dict], benchmark: str) -> dict[str, Any]:
     groups: dict[str, list[pd.Timestamp]] = {"equity": [], "etf": [], "crypto": []}
     for ticker, item in metadata.items():
@@ -423,6 +187,38 @@ def _data_cutoffs(close: pd.DataFrame, metadata: dict[str, dict], benchmark: str
     return result
 
 
+def _search_sources_as_notes(sources: list[dict], existing_urls: set[str]) -> list[dict]:
+    """Expose DashScope-returned sources without turning them into trading evidence."""
+    items = []
+    for index, source in enumerate(sources or []):
+        url = str(source.get("url") or "").strip()
+        if not url or url in existing_urls:
+            continue
+        items.append({
+            "reference_id": f"S{index + 1:03d}",
+            "ticker": None,
+            "title": str(source.get("title") or "DashScope 搜索来源"),
+            "url": url,
+            "source_name": str(source.get("source_name") or "DashScope"),
+            "published_date": source.get("published_date") or "",
+            "summary_zh": str(source.get("snippet") or "该链接由 DashScope 内置搜索返回，未被模型选为核心消息。"),
+            "what_happened_zh": str(source.get("snippet") or "该链接由 DashScope 内置搜索返回。"),
+            "why_it_matters_to_ticker_zh": "作为联网搜索透明度附录展示，不单独支撑交易建议。",
+            "impact_direction": "neutral",
+            "impact_horizon": "short_term",
+            "source_verified": True,
+            "article_fetch_ok": False,
+            "source_quality": "tier_3",
+            "verification_level_zh": "DashScope 搜索来源",
+            "source_note_only": True,
+            "event_type": "搜索来源",
+            "content_type": "search_result",
+            "supports_action": "watch",
+            "does_not_prove_zh": "未被 AI 选为核心消息，不单独支撑方向性交易建议。",
+        })
+    return items[:12]
+
+
 def run_pipeline(
     payload: dict,
     *,
@@ -436,17 +232,14 @@ def run_pipeline(
     close: "pd.DataFrame | None" = None,
     market_rows: list[dict] | None = None,
     fx_rates: dict | None = None,
-    single_search_runner=None,
+    analyst_runner=None,
     verbose: bool = True,
 ) -> dict:
-    """端到端生成 Portfolio 报告。
+    """Generate Portfolio AI Analyst v3 report.
 
-    网络边界可注入，便于确定性测试：
-    - close / market_rows / fx_rates：直接给定，跳过行情下载；
-    - single_search_runner：替代真实 DashScope 单次联网调用。
-
-    Portfolio AI v2 只允许一次 DashScope 内置联网调用，不调用 Serper、
-    Query Planner、Gap Search、Summarizer 或第二个 Portfolio Agent。
+    The production path performs one model call. Python remains authoritative for
+    all prices, weights and metrics. The AI output may enrich interpretation and
+    current news, but imperfect citations no longer suppress the full report.
     """
     run_started_at = dt.datetime.now().astimezone().isoformat()
     run_dir = Path(run_dir)
@@ -454,9 +247,9 @@ def run_pipeline(
     output = Path(output)
 
     portfolio_page = payload["portfolio_page"]
-    settings = dict(portfolio_page.get("analysis_settings") or {})
-    settings.setdefault("model", model)
-    settings.setdefault("provider", provider)
+    settings = normalize_analyst_settings(portfolio_page.get("analysis_settings") or {})
+    settings["model"] = model or settings.get("model") or "deepseek-v4-pro"
+    settings["provider"] = provider or "dashscope"
     base_currency = settings.get("base_currency", "EUR")
     benchmark = normalize_yfinance_ticker(settings.get("benchmark") or "^GSPC")
     tickers = list(dict.fromkeys(
@@ -466,7 +259,6 @@ def run_pipeline(
     ))
 
     if close is None:
-        # 修改计划第六轮第 30 节：下载 2y 数据，确保 252+ 有效 benchmark trading days
         close = MarketDataService.fetch_adjusted_close_batch(tickers + [benchmark], period="2y", interval="1d")
     latest_prices = _latest_prices(close)
     market_rows = payload.get("market_rows") or market_rows or _market_rows_from_close(close, portfolio_page)
@@ -476,11 +268,8 @@ def run_pipeline(
     if fx_rates is None:
         fx_rates = dict(payload.get("fx_rates") or {}) or _fx_rates(currencies, base_currency)
 
-    # 工具类型元数据（区分账户分组与行业/主题）
     enrich = os.environ.get("PORTFOLIO_ENRICH_YFINANCE", "false").strip().lower() in {"1", "true", "yes"}
-    instrument_metadata = build_instrument_metadata(
-        portfolio_page, market_rows=market_rows, enrich=enrich,
-    )
+    instrument_metadata = build_instrument_metadata(portfolio_page, market_rows=market_rows, enrich=enrich)
 
     snapshot = build_portfolio_snapshot(
         portfolio_page,
@@ -491,6 +280,7 @@ def run_pipeline(
         benchmark=benchmark,
         instrument_metadata=instrument_metadata,
     )
+    snapshot["portfolio_name"] = portfolio_name
     snapshot["analysis_settings"] = settings
     snapshot["report_date"] = dt.date.today().isoformat()
     snapshot["data_cutoffs"] = _data_cutoffs(close, instrument_metadata, benchmark)
@@ -500,199 +290,91 @@ def run_pipeline(
         "snapshot_completed_at": dt.datetime.now().astimezone().isoformat(),
     }
 
-    # §22 修复：统一 Return Model，所有下游模块共用（metrics / chart / scenario）
     portfolio_weights = {h["ticker"]: float(h.get("weight") or 0.0) for h in snapshot.get("holdings", [])}
     return_model = build_portfolio_return_model(close, portfolio_weights, benchmark=benchmark)
     metrics = calculate_portfolio_metrics(snapshot, close, benchmark=benchmark, return_model=return_model)
     ranking = rank_portfolio_risks(snapshot, metrics)
 
-    # 非有限值扫描（修改计划第三轮 3）：阻断 NaN/Inf 流入报告，并降低置信度。
     non_finite = scan_non_finite({"metrics": metrics, "summary": snapshot.get("summary", {})})
-    snapshot.setdefault("data_quality", {})
-    snapshot["data_quality"]["non_finite_metrics"] = non_finite
+    snapshot.setdefault("data_quality", {})["non_finite_metrics"] = non_finite
+    risk_findings = generate_portfolio_rule_findings(snapshot, metrics, settings, instrument_metadata=instrument_metadata)
 
-    # Portfolio AI v2: one DashScope built-in web-search call, no external API or retry.
     fallback_reason = ""
-    settings["search_provider"] = "dashscope_builtin"
-    settings["research_mode"] = "dashscope_single_search"
-    research_result: dict = {
-        "status": "unknown", "evidence": [], "accepted_evidence": [],
-        "rejected_evidence": [], "reference_evidence": [], "diagnostics": {},
-        "raw_results": [], "filtered_results": [],
-    }
-    runner = single_search_runner or run_portfolio_single_search
+    analyst_result: dict = {}
+    runner = analyst_runner
     try:
-        kwargs = {
-            "snapshot": snapshot,
-            "metrics": metrics,
-            "ranking": ranking,
-            "instrument_metadata": instrument_metadata,
-            "model": model,
-            "provider": provider,
-        }
-        if hasattr(runner, "run"):
-            raw_research = runner.run(**kwargs)
-        else:
-            raw_research = runner(**kwargs)
-        if not isinstance(raw_research, dict):
-            raise PortfolioSingleSearchOutputError("单次联网研究返回值不是对象。")
-        research_result.update(raw_research)
-    except (PortfolioSingleSearchUnavailable, PortfolioSingleSearchOutputError) as exc:
-        fallback_reason = f"单次 DashScope 联网研究不可用：{exc}"
-        research_result = {
-            "status": "provider_error",
-            "advice": default_fallback_advice(snapshot, metrics, ranking, reason=fallback_reason),
-            "evidence": [], "accepted_evidence": [], "rejected_evidence": [],
-            "reference_evidence": [], "raw_results": [], "filtered_results": [],
-            "diagnostics": {
-                "status": "provider_error",
-                "research_mode": "dashscope_single_search",
-                "provider_used": "dashscope_builtin_search",
-                "model": model,
-                "search_strategy": "turbo",
-                "search_call_count": 0,
-                "external_search_call_count": 0,
-                "model_call_count": 0,
-                "retry_count": 0,
-                "gap_search_count": 0,
-                "max_search_calls": 1,
-                "errors": [f"{type(exc).__name__}: {exc}"],
-                "news_search_executed_at": dt.datetime.now().astimezone().isoformat(),
-            },
-        }
-    except Exception as exc:  # noqa: BLE001
-        fallback_reason = f"单次 DashScope 联网研究异常：{exc}"
-        research_result = {
-            "status": "provider_error",
-            "advice": default_fallback_advice(snapshot, metrics, ranking, reason=fallback_reason),
-            "evidence": [], "accepted_evidence": [],
-            "rejected_evidence": [{"reasons": ["provider_error"], "error": f"{type(exc).__name__}: {exc}"}],
-            "reference_evidence": [], "raw_results": [], "filtered_results": [],
-            "diagnostics": {
-                "status": "provider_error",
-                "research_mode": "dashscope_single_search",
-                "provider_used": "dashscope_builtin_search",
-                "model": model,
-                "search_strategy": "turbo",
-                "search_call_count": 1,
-                "external_search_call_count": 0,
-                "model_call_count": 1,
-                "retry_count": 0,
-                "gap_search_count": 0,
-                "max_search_calls": 1,
-                "errors": [f"{type(exc).__name__}: {exc}"],
-                "news_search_executed_at": dt.datetime.now().astimezone().isoformat(),
-            },
-        }
-
-    diagnostics = research_result.setdefault("diagnostics", {})
-    # Product invariants: the report must never silently perform a second search.
-    diagnostics.setdefault("research_mode", "dashscope_single_search")
-    diagnostics.setdefault("search_strategy", "turbo")
-    diagnostics.setdefault("search_call_count", 0)
-    diagnostics.setdefault("external_search_call_count", 0)
-    diagnostics.setdefault("model_call_count", diagnostics.get("search_call_count", 0))
-    diagnostics.setdefault("retry_count", 0)
-    diagnostics.setdefault("gap_search_count", 0)
-    diagnostics.setdefault("max_search_calls", 1)
-    if int(diagnostics.get("search_call_count") or 0) > 1:
-        raise RuntimeError("Portfolio 单次联网模式违反调用预算：search_call_count > 1")
-    if int(diagnostics.get("external_search_call_count") or 0) != 0:
-        raise RuntimeError("Portfolio 单次联网模式禁止外部搜索 API。")
-    if int(diagnostics.get("retry_count") or 0) != 0 or int(diagnostics.get("gap_search_count") or 0) != 0:
-        raise RuntimeError("Portfolio 单次联网模式禁止重试与 Gap Search。")
-
-    accepted_evidence = list(research_result.get("accepted_evidence") or research_result.get("evidence") or [])
-    rejected_evidence = list(research_result.get("rejected_evidence") or [])
-    reference_evidence = list(research_result.get("reference_evidence") or [])
-    evidence = accepted_evidence
-    research_result["evidence"] = accepted_evidence
-    research_result["accepted_evidence"] = accepted_evidence
-    research_result["rejected_evidence"] = rejected_evidence
-    research_result["reference_evidence"] = reference_evidence
-    diagnostics["accepted_evidence_count"] = len(accepted_evidence)
-    diagnostics["rejected_evidence_count"] = len(rejected_evidence)
-    diagnostics["reference_evidence_count"] = len(reference_evidence)
-    diagnostics["raw_results_count"] = len(research_result.get("raw_results") or [])
-    diagnostics["filtered_results_count"] = len(research_result.get("filtered_results") or [])
-    diagnostics["selected_evidence_count"] = int(diagnostics.get("model_evidence_count") or len(accepted_evidence) + len(rejected_evidence))
-    _recompute_accepted_coverage(research_result, ranking, metrics, accepted_evidence)
-
-    snapshot["run_timeline"]["news_search_completed_at"] = (
-        diagnostics.get("news_search_executed_at") or dt.datetime.now().astimezone().isoformat()
-    )
-    latest_news_date = diagnostics.get("latest_accepted_event_date") or diagnostics.get("latest_selected_event_date")
-    if latest_news_date:
-        snapshot["data_cutoffs"]["news"] = str(latest_news_date)
-
-    advice = research_result.get("advice")
-    if not isinstance(advice, dict):
-        fallback_reason = fallback_reason or "单次联网模型输出缺少可用的结构化分析。"
-        advice = default_fallback_advice(snapshot, metrics, ranking, reason=fallback_reason)
-    if not accepted_evidence and str(advice.get("report_mode") or "") == "ai":
-        fallback_reason = "本轮单次联网研究没有通过本地 URL 与日期校验的 Evidence。"
-        advice = default_fallback_advice(snapshot, metrics, ranking, reason=fallback_reason)
-
-    advice = _guard_actions(advice, accepted_evidence, settings)
-    advice = apply_deterministic_action_targets(
-        advice, metrics, settings, return_model=return_model,
-    )
-
-    # 单次调用模式不允许让模型重试。AI 结构校验失败时立即安全降级。
-    final_mode = "strict" if str(advice.get("report_mode")) == "ai" else "fallback"
-    try:
-        advice = validate_portfolio_advice(advice, snapshot, accepted_evidence, mode=final_mode)
-    except PortfolioAdviceValidationError as exc:
-        diagnostics["model_advice_validation_error"] = "; ".join(exc.errors)
-        fallback_reason = "单次联网模型分析未通过本地结构校验；未重试，已降级为量化观察报告。"
-        advice = default_fallback_advice(snapshot, metrics, ranking, reason=fallback_reason)
-        advice = apply_deterministic_action_targets(advice, metrics, settings, return_model=return_model)
-        advice = validate_portfolio_advice(advice, snapshot, accepted_evidence, mode="fallback")
-
-    # 置信度上限（修改计划第三轮 23）：取模型置信度与各质量因子的最小值。
-    advice = _apply_confidence_cap(
-        advice, snapshot, metrics, instrument_metadata, accepted_evidence, ranking, non_finite,
-    )
-
-    reallocation = calculate_reallocation_summary(advice)
-    advice["portfolio_reallocation"] = reallocation
-    metrics.setdefault("aggregates", {})["recommended_reduction_weight"] = reallocation["estimated_weight_reduction"]
-
-    # 先判定是否具备可操作条件；不可操作时在 Claim Validation 前清除原始 AI 叙事。
-    preliminary_quality = evaluate_report_quality(snapshot, metrics, research_result, advice, {})
-    if not preliminary_quality["actionable"]:
-        advice = _enforce_observation_mode(advice)
-        advice = _build_observation_view(advice, snapshot, metrics, ranking, accepted_evidence)
-        reallocation = calculate_reallocation_summary(advice)
-        advice["portfolio_reallocation"] = reallocation
-        metrics.setdefault("aggregates", {})["recommended_reduction_weight"] = reallocation["estimated_weight_reduction"]
-
-    from portfolio_analysis.validators import validate_portfolio_claims
-    hard_errors, soft_warnings = validate_portfolio_claims(advice, snapshot, metrics, accepted_evidence)
-    advice.setdefault("validation_warnings", []).extend(soft_warnings)
-    quality = evaluate_report_quality(
-        snapshot, metrics, research_result, advice,
-        {"hard_errors": hard_errors, "soft_warnings": soft_warnings},
-    )
-    if not quality["publishable"]:
-        debug_payloads = {
-            "portfolio_report_quality.json": quality,
-            "portfolio_research_diagnostics.json": research_result.get("diagnostics") or {},
-            "portfolio_raw_search_results.json": research_result.get("raw_results") or [],
-            "portfolio_filtered_search_results.json": research_result.get("filtered_results") or [],
-            "portfolio_rejected_evidence.json": rejected_evidence,
-            "portfolio_reference_evidence.json": reference_evidence,
-            "portfolio_snapshot.json": snapshot,
-            "portfolio_metrics.json": metrics,
-            "portfolio_advice.json": advice,
-        }
-        for name, value in debug_payloads.items():
-            (run_dir / name).write_text(
-                json.dumps(value, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+        if runner is None:
+            analyst_result = run_portfolio_ai_analyst(
+                snapshot, metrics, ranking, settings,
+                instrument_metadata=instrument_metadata,
+                risk_findings=risk_findings,
             )
-        raise PortfolioReportQualityError(quality)
+        else:
+            analyst_result = runner(
+                snapshot=snapshot,
+                metrics=metrics,
+                ranking=ranking,
+                settings=settings,
+                instrument_metadata=instrument_metadata,
+                risk_findings=risk_findings,
+            )
+        if not isinstance(analyst_result, dict) or not isinstance(analyst_result.get("advice"), dict):
+            raise PortfolioAnalystOutputError("analyst runner returned no renderable advice")
+        advice = analyst_result["advice"]
+        diagnostics = dict(analyst_result.get("diagnostics") or {})
+        evidence = list(analyst_result.get("news_analysis") or [])
+        sources = list(analyst_result.get("sources") or [])
+        existing_urls = {str(item.get("url") or "") for item in evidence if item.get("url")}
+        source_notes = _search_sources_as_notes(sources, existing_urls)
+        report_quality = {
+            "publishable": True,
+            "actionable": settings.get("advice_mode") != "observe_only",
+            "observation_only": settings.get("advice_mode") == "observe_only",
+            "architecture": "portfolio_ai_analyst_v3",
+        }
+    except (PortfolioAnalystUnavailable, PortfolioAnalystOutputError) as exc:
+        fallback_reason = f"Portfolio AI Analyst 调用未产生可用结构化结果：{exc}"
+        advice = build_quantitative_fallback(snapshot, metrics, ranking, reason=fallback_reason)
+        advice = apply_deterministic_action_targets(advice, metrics, settings, return_model=return_model)
+        advice["report_style"] = settings.get("report_style")
+        advice["report_style_title"] = "量化降级"
+        advice["model_name"] = settings.get("model")
+        diagnostics = {
+            "status": "analyst_fallback",
+            "architecture": "portfolio_ai_analyst_v3",
+            "search_call_count": 1 if os.getenv("DASHSCOPE_API_KEY") else 0,
+            "model_call_count": 1 if os.getenv("DASHSCOPE_API_KEY") else 0,
+            "external_search_call_count": 0,
+            "retry_count": 0,
+            "gap_search_count": 0,
+            "model": settings.get("model"),
+            "error": str(exc),
+        }
+        evidence = []
+        sources = []
+        source_notes = []
+        analyst_result = {"raw_model_output": "", "raw_model_payload": {}, "reasoning_content": ""}
+        report_quality = {
+            "publishable": True,
+            "actionable": False,
+            "observation_only": True,
+            "architecture": "portfolio_ai_analyst_v3",
+        }
 
-    # 图表
+    if int(diagnostics.get("search_call_count") or 0) > 1 or int(diagnostics.get("model_call_count") or 0) > 1:
+        raise RuntimeError("Portfolio AI Analyst v3 违反单调用预算。")
+    if int(diagnostics.get("external_search_call_count") or 0) != 0:
+        raise RuntimeError("Portfolio AI Analyst v3 禁止外部搜索 API。")
+
+    latest_news_dates = [
+        str(item.get("published_date")) for item in evidence + source_notes
+        if item.get("published_date")
+    ]
+    if latest_news_dates:
+        snapshot["data_cutoffs"]["news"] = max(latest_news_dates)
+    snapshot["run_timeline"]["news_search_completed_at"] = diagnostics.get("generated_at") or dt.datetime.now().astimezone().isoformat()
+
+    # Charts remain deterministic and independent of the model.
     weights = {h["ticker"]: float(h.get("weight") or 0.0) for h in snapshot.get("holdings", [])}
     rc_map = {item.get("ticker"): item.get("risk_contribution") for item in metrics.get("risk_contributions", [])}
     charts = {
@@ -708,79 +390,65 @@ def run_pipeline(
         ),
     }
     labels, portfolio_cumulative_pct, benchmark_cumulative_pct = _cumulative_returns(close, tickers, weights, benchmark)
-    # P0-8: 优先使用 Return Model 统一日期索引（Portfolio + Benchmark 对齐）
     if not return_model.cumulative_returns.empty:
-        port_cum = (return_model.cumulative_returns * 100).tolist()
-        bench_cum = (return_model.benchmark_cumulative_returns * 100).tolist() if not return_model.benchmark_cumulative_returns.empty else []
         dates = [str(d) for d in return_model.cumulative_returns.index]
-        if len(dates) > 0:
+        if dates:
             labels = dates
-            portfolio_cumulative_pct = port_cum
-            if bench_cum and len(bench_cum) == len(dates):
-                benchmark_cumulative_pct = bench_cum
+            portfolio_cumulative_pct = (return_model.cumulative_returns * 100).tolist()
+            bench = (return_model.benchmark_cumulative_returns * 100).tolist() if not return_model.benchmark_cumulative_returns.empty else []
+            if bench and len(bench) == len(dates):
+                benchmark_cumulative_pct = bench
     if labels:
         charts["cumulative"] = svg_cumulative_returns(labels, portfolio_cumulative_pct, benchmark_cumulative_pct)
 
-    # 确定性风险发现（供降级或风险诊断补充展示）
-    risk_findings = generate_portfolio_rule_findings(snapshot, metrics, settings, instrument_metadata=instrument_metadata)
-
-    # 在写入工件前固定最终时间线，确保 JSON 与 HTML 口径一致。
-    snapshot["run_timeline"]["single_search_completed_at"] = (
-        diagnostics.get("news_search_executed_at") or dt.datetime.now().astimezone().isoformat()
-    )
     snapshot["run_timeline"]["report_rendered_at"] = dt.datetime.now().astimezone().isoformat()
 
-    # 中间 JSON：只保留单次联网模式实际产生的工件。
-    paths = {
-        "snapshot": run_dir / "portfolio_snapshot.json",
-        "metrics": run_dir / "portfolio_metrics.json",
-        "ranking": run_dir / "portfolio_risk_ranking.json",
-        "evidence": run_dir / "portfolio_evidence.json",
-        "rejected_evidence": run_dir / "portfolio_rejected_evidence.json",
-        "reference_evidence": run_dir / "portfolio_reference_evidence.json",
-        "advice": run_dir / "portfolio_advice.json",
-        "research_diagnostics": run_dir / "portfolio_research_diagnostics.json",
-        "dashscope_sources": run_dir / "portfolio_dashscope_sources.json",
-        "raw_model_output": run_dir / "portfolio_single_search_raw_output.txt",
-        "raw_model_payload": run_dir / "portfolio_single_search_raw_payload.json",
-        "quality": run_dir / "portfolio_report_quality.json",
+    artifacts = {
+        "portfolio_snapshot.json": snapshot,
+        "portfolio_metrics.json": metrics,
+        "portfolio_risk_ranking.json": ranking,
+        "portfolio_ai_analyst_advice.json": advice,
+        "portfolio_ai_analyst_news.json": evidence,
+        "portfolio_ai_analyst_sources.json": sources,
+        "portfolio_ai_analyst_diagnostics.json": diagnostics,
+        "portfolio_ai_analyst_settings.json": settings,
+        "portfolio_report_quality.json": report_quality,
+        "portfolio_ai_analyst_source_notes.json": source_notes,
     }
-    json_payloads = {
-        "snapshot": snapshot, "metrics": metrics, "ranking": ranking,
-        "evidence": evidence, "rejected_evidence": rejected_evidence,
-        "reference_evidence": reference_evidence,
-        "advice": advice, "research_diagnostics": diagnostics,
-        "dashscope_sources": research_result.get("sources") or research_result.get("raw_results") or [],
-        "raw_model_payload": research_result.get("raw_model_payload") or {},
-        "quality": quality,
-    }
-    for key, value in json_payloads.items():
-        paths[key].write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-    paths["raw_model_output"].write_text(str(research_result.get("raw_model_output") or ""), encoding="utf-8")
+    for name, value in artifacts.items():
+        (run_dir / name).write_text(json.dumps(value, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    (run_dir / "portfolio_ai_analyst_raw_output.txt").write_text(
+        str(analyst_result.get("raw_model_output") or ""), encoding="utf-8"
+    )
+    (run_dir / "portfolio_ai_analyst_reasoning.txt").write_text(
+        str(analyst_result.get("reasoning_content") or ""), encoding="utf-8"
+    )
+    (run_dir / "portfolio_ai_analyst_raw_payload.json").write_text(
+        json.dumps(analyst_result.get("raw_model_payload") or {}, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
+    )
 
-    # 中文 HTML（仅传入 accepted_evidence）
     html_text = build_html(
-        snapshot, metrics, ranking, advice, accepted_evidence,
+        snapshot, metrics, ranking, advice, evidence,
         instrument_metadata=instrument_metadata,
         settings=settings,
         charts=charts,
         risk_findings=risk_findings,
         cumulative_labels=labels,
         fallback_reason=fallback_reason,
-        research_diagnostics=research_result.get("diagnostics") or {},
-        report_quality=quality,
-        rejected_evidence=rejected_evidence,
-        reference_evidence=reference_evidence,
+        research_diagnostics=diagnostics,
+        report_quality=report_quality,
+        source_notes=source_notes,
     )
     output.write_text(html_text, encoding="utf-8")
 
-    print(f"Portfolio report generated: {output}")
-    print(f"Report mode: {advice.get('report_mode')}")
-    print(f"Top-risk tickers: {', '.join(ranking.get('top_risk_tickers') or [])}")
-    print(f"Evidence count: {len(evidence)}")
-    print(f"Actions: {len(advice.get('actions') or [])}")
+    if verbose:
+        print(f"Portfolio report generated: {output}")
+        print(f"Architecture: portfolio_ai_analyst_v3")
+        print(f"Model: {settings.get('model')}")
+        print(f"Report style: {settings.get('report_style')}")
+        print(f"News analysis items: {len(evidence)}")
+        print(f"Actions: {len(advice.get('actions') or [])}")
     return advice
-
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -790,7 +458,7 @@ def main() -> int:
     parser.add_argument("--owner-scope", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--run-dir", required=True)
-    parser.add_argument("--model", default=os.environ.get("PORTFOLIO_REPORT_MODEL") or "deepseek-v4-flash")
+    parser.add_argument("--model", default=os.environ.get("PORTFOLIO_REPORT_MODEL") or "deepseek-v4-pro")
     parser.add_argument("--provider", default=os.environ.get("PORTFOLIO_REPORT_PROVIDER") or "dashscope")
     args = parser.parse_args()
 

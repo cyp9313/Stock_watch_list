@@ -22,7 +22,6 @@ build_report.py — 通用金融日报 HTML 报告生成器
 
 import sys
 import json
-import re
 from datetime import date as Date
 from html import escape as html_escape
 

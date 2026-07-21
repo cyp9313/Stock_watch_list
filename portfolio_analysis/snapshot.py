@@ -247,20 +247,3 @@ def build_portfolio_snapshot(
         },
         "instrument_metadata": instrument_metadata or {},
     }
-
-
-def close_from_yfinance_download(data: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
-    """Extract an adjusted-close frame from a yfinance style DataFrame."""
-    if data is None or data.empty:
-        return pd.DataFrame()
-    if isinstance(data.columns, pd.MultiIndex):
-        field_names = list(data.columns.get_level_values(0))
-        field = "Adj Close" if "Adj Close" in field_names else "Close"
-        close = data.xs(field, axis=1, level=0)
-    else:
-        field = "Adj Close" if "Adj Close" in data.columns else "Close"
-        close = data[[field]].rename(columns={field: tickers[0] if tickers else "Ticker"})
-    close = close.copy()
-    close.columns = [normalize_yfinance_ticker(c) for c in close.columns]
-    ordered = [ticker for ticker in tickers if ticker in close.columns]
-    return close[ordered].dropna(axis=1, how="all") if ordered else pd.DataFrame()

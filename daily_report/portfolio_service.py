@@ -4,7 +4,6 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
 import subprocess
 import sys
 import time
@@ -30,8 +29,13 @@ def _extract_runner_failure(combined_output: str) -> tuple[str | None, bool]:
     """Return a concise user-facing subprocess failure and whether it is a quality failure."""
     markers = (
         (
+            "Portfolio AI Analyst v3 违反单调用预算",
+            "报告生成失败：AI Analyst 调用预算异常。",
+            True,
+        ),
+        (
             "Portfolio report quality gate failed:",
-            "报告生成失败：单次联网研究或报告质量未达到发布要求。",
+            "报告生成失败：旧版报告质量门未达到发布要求。",
             True,
         ),
     )
@@ -115,12 +119,14 @@ def generate_portfolio_report(
             combined = f"{completed.stderr}\n{completed.stdout}"
             failure_message, quality_failure = _extract_runner_failure(combined)
             diagnostics = {}
-            diagnostics_path = run_dir / "portfolio_research_diagnostics.json"
-            if diagnostics_path.is_file():
+            for diagnostics_path in (run_dir / "portfolio_ai_analyst_diagnostics.json",):
+                if not diagnostics_path.is_file():
+                    continue
                 try:
                     diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError):
                     diagnostics = {}
+                break
             return {
                 "success": False,
                 "report_kind": "portfolio",
@@ -171,6 +177,13 @@ def generate_portfolio_report_for_job(job: dict) -> dict:
     portfolio_page = get_portfolio_page_by_id(job["owner_key"], job.get("subject_key") or payload.get("portfolio_page_id"))
     if portfolio_page is None:
         raise RuntimeError("Portfolio no longer exists.")
+    queued_settings = payload.get("settings") if isinstance(payload.get("settings"), dict) else {}
+    if queued_settings:
+        portfolio_page = dict(portfolio_page)
+        portfolio_page["analysis_settings"] = {
+            **dict(portfolio_page.get("analysis_settings") or {}),
+            **queued_settings,
+        }
     return generate_portfolio_report(
         portfolio_page,
         owner_key=job["owner_key"],

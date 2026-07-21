@@ -1727,99 +1727,190 @@ def render_portfolio_analysis_settings(config, page_index, editable, user):
     page = config["portfolio_pages"][page_index]
     settings = dict(page.get("analysis_settings") or {})
     with st.expander("AI report settings", expanded=False):
+        st.caption(
+            "These settings are saved per Portfolio page and are injected into the Portfolio AI Analyst prompt. "
+            "Python-computed prices, weights and technical metrics remain immutable."
+        )
+
+        st.markdown("##### Investor profile")
         c1, c2, c3, c4 = st.columns(4)
         with c1:
+            base_options = ["EUR", "USD", "CNY", "HKD", "GBP", "JPY", "KRW", "CHF", "CAD", "AUD"]
+            base_value = settings.get("base_currency", "EUR")
             base_currency = st.selectbox(
-                "Base currency",
-                ["EUR", "USD", "CNY", "HKD", "GBP", "JPY", "KRW", "CHF", "CAD", "AUD"],
-                index=(["EUR", "USD", "CNY", "HKD", "GBP", "JPY", "KRW", "CHF", "CAD", "AUD"].index(settings.get("base_currency", "EUR")) if settings.get("base_currency", "EUR") in ["EUR", "USD", "CNY", "HKD", "GBP", "JPY", "KRW", "CHF", "CAD", "AUD"] else 0),
-                disabled=not editable,
-                key=f"portfolio_ai_{page_index}_base_currency",
+                "Base currency", base_options,
+                index=base_options.index(base_value) if base_value in base_options else 0,
+                disabled=not editable, key=f"portfolio_ai_{page_index}_base_currency",
             )
         with c2:
             benchmark = st.text_input(
-                "Benchmark",
-                value=settings.get("benchmark", "^GSPC"),
-                disabled=not editable,
+                "Benchmark", value=settings.get("benchmark", "^GSPC"), disabled=not editable,
                 key=f"portfolio_ai_{page_index}_benchmark",
             )
         with c3:
+            horizon_options = ["1-4w", "1-3m", "3-6m", "6-12m", "12m+"]
+            horizon_value = settings.get("investment_horizon", "1-3m")
             horizon = st.selectbox(
-                "Investment horizon",
-                ["1-4w", "1-3m", "3-6m", "6-12m", "12m+"],
-                index=["1-4w", "1-3m", "3-6m", "6-12m", "12m+"].index(settings.get("investment_horizon", "1-3m")) if settings.get("investment_horizon", "1-3m") in ["1-4w", "1-3m", "3-6m", "6-12m", "12m+"] else 1,
-                disabled=not editable,
-                key=f"portfolio_ai_{page_index}_horizon",
+                "Investment horizon", horizon_options,
+                index=horizon_options.index(horizon_value) if horizon_value in horizon_options else 1,
+                disabled=not editable, key=f"portfolio_ai_{page_index}_horizon",
+                help="Changes the time horizon used for catalysts, technical signals and action conditions.",
             )
         with c4:
+            risk_options = ["conservative", "balanced", "growth", "aggressive"]
+            risk_value = settings.get("risk_profile", "balanced")
             risk_profile = st.selectbox(
-                "Risk profile",
-                ["conservative", "balanced", "growth", "aggressive"],
-                index=["conservative", "balanced", "growth", "aggressive"].index(settings.get("risk_profile", "balanced")) if settings.get("risk_profile", "balanced") in ["conservative", "balanced", "growth", "aggressive"] else 1,
-                disabled=not editable,
-                key=f"portfolio_ai_{page_index}_risk_profile",
+                "Risk profile", risk_options,
+                index=risk_options.index(risk_value) if risk_value in risk_options else 1,
+                disabled=not editable, key=f"portfolio_ai_{page_index}_risk_profile",
+                help="Changes how the analyst balances drawdown protection against growth opportunities.",
             )
+
+        st.markdown("##### Report style and content")
         c5, c6, c7, c8 = st.columns(4)
         with c5:
-            max_position = st.number_input(
-                "Max position %",
-                min_value=0.0,
-                max_value=100.0,
-                value=float(settings.get("max_position_pct", 20.0)),
-                step=1.0,
-                disabled=not editable,
-                key=f"portfolio_ai_{page_index}_max_position",
+            style_options = ["balanced", "concise", "deep_dive", "risk_control", "opportunity"]
+            style_value = settings.get("report_style", "balanced")
+            report_style = st.selectbox(
+                "Report style", style_options,
+                index=style_options.index(style_value) if style_value in style_options else 0,
+                format_func=lambda x: {
+                    "balanced": "Balanced analysis", "concise": "Conclusion first",
+                    "deep_dive": "Deep research", "risk_control": "Risk control",
+                    "opportunity": "Opportunity focused",
+                }[x],
+                disabled=not editable, key=f"portfolio_ai_{page_index}_report_style",
             )
         with c6:
-            max_group = st.number_input(
-                "Max group %",
-                min_value=0.0,
-                max_value=100.0,
-                value=float(settings.get("max_group_pct", 40.0)),
-                step=1.0,
-                disabled=not editable,
-                key=f"portfolio_ai_{page_index}_max_group",
+            detail_options = ["brief", "standard", "detailed"]
+            detail_value = settings.get("detail_level", "standard")
+            detail_level = st.selectbox(
+                "Detail level", detail_options,
+                index=detail_options.index(detail_value) if detail_value in detail_options else 1,
+                disabled=not editable, key=f"portfolio_ai_{page_index}_detail_level",
             )
         with c7:
-            research_max = st.number_input(
-                "Max research tickers",
-                min_value=1,
-                max_value=10,
-                value=int(settings.get("research_max_tickers", 5)),
-                step=1,
-                disabled=not editable,
-                key=f"portfolio_ai_{page_index}_research_max",
+            advice_options = ["observe_only", "conditional", "actionable"]
+            advice_value = settings.get("advice_mode", "conditional")
+            advice_mode = st.selectbox(
+                "Advice mode", advice_options,
+                index=advice_options.index(advice_value) if advice_value in advice_options else 1,
+                format_func=lambda x: {
+                    "observe_only": "Observe only", "conditional": "Conditional advice",
+                    "actionable": "Action-oriented",
+                }[x],
+                disabled=not editable, key=f"portfolio_ai_{page_index}_advice_mode",
             )
         with c8:
+            language_options = ["zh-CN", "en", "de"]
+            language_value = settings.get("report_language", "zh-CN")
+            report_language = st.selectbox(
+                "AI narrative language", language_options,
+                index=language_options.index(language_value) if language_value in language_options else 0,
+                format_func=lambda x: {"zh-CN": "简体中文", "en": "English", "de": "Deutsch"}[x],
+                disabled=not editable, key=f"portfolio_ai_{page_index}_report_language",
+            )
+
+        focus_options = ["technical", "news", "portfolio_risk", "macro", "valuation", "actions"]
+        analysis_focus = st.multiselect(
+            "Analysis focus",
+            focus_options,
+            default=[x for x in settings.get("analysis_focus", ["technical", "news", "portfolio_risk", "actions"]) if x in focus_options],
+            format_func=lambda x: {
+                "technical": "Technical analysis", "news": "News and catalysts",
+                "portfolio_risk": "Portfolio risk", "macro": "Macro environment",
+                "valuation": "Valuation and fundamentals", "actions": "Actions and watch conditions",
+            }[x],
+            disabled=not editable, key=f"portfolio_ai_{page_index}_analysis_focus",
+        )
+
+        c9, c10, c11, c12 = st.columns(4)
+        with c9:
+            include_news = st.checkbox(
+                "Use web news", value=bool(settings.get("include_news", True)), disabled=not editable,
+                key=f"portfolio_ai_{page_index}_include_news",
+            )
+        with c10:
+            include_macro = st.checkbox(
+                "Include macro analysis", value=bool(settings.get("include_macro", True)), disabled=not editable,
+                key=f"portfolio_ai_{page_index}_include_macro",
+            )
+        with c11:
+            include_all_holdings = st.checkbox(
+                "Discuss all holdings", value=bool(settings.get("include_all_holdings", False)), disabled=not editable,
+                key=f"portfolio_ai_{page_index}_include_all_holdings",
+                help="Off: the model focuses on the highest-risk holdings while the full technical table remains in the appendix.",
+            )
+        with c12:
+            news_lookback_days = st.number_input(
+                "News lookback days", min_value=3, max_value=90,
+                value=int(settings.get("news_lookback_days", 30)), step=1, disabled=not editable,
+                key=f"portfolio_ai_{page_index}_news_lookback_days",
+            )
+
+        st.markdown("##### Position constraints and recommendation policy")
+        c13, c14, c15, c16 = st.columns(4)
+        with c13:
+            max_position = st.number_input(
+                "Max position %", min_value=0.0, max_value=100.0,
+                value=float(settings.get("max_position_pct", 20.0)), step=1.0, disabled=not editable,
+                key=f"portfolio_ai_{page_index}_max_position",
+            )
+        with c14:
+            max_group = st.number_input(
+                "Max group %", min_value=0.0, max_value=100.0,
+                value=float(settings.get("max_group_pct", 40.0)), step=1.0, disabled=not editable,
+                key=f"portfolio_ai_{page_index}_max_group",
+            )
+        with c15:
+            max_focus_holdings = st.number_input(
+                "Focus holdings", min_value=2, max_value=12,
+                value=int(settings.get("max_focus_holdings", settings.get("research_max_tickers", 5))),
+                step=1, disabled=not editable, key=f"portfolio_ai_{page_index}_max_focus_holdings",
+            )
+        with c16:
             allow_reduce = st.checkbox(
-                "Allow reduce advice",
-                value=bool(settings.get("allow_reduce", True)),
-                disabled=not editable,
+                "Allow reduce advice", value=bool(settings.get("allow_reduce", True)), disabled=not editable,
                 key=f"portfolio_ai_{page_index}_allow_reduce",
             )
         allow_add = st.checkbox(
-            "Allow add/watch advice",
-            value=bool(settings.get("allow_add", True)),
-            disabled=not editable,
+            "Allow add advice", value=bool(settings.get("allow_add", True)), disabled=not editable,
             key=f"portfolio_ai_{page_index}_allow_add",
         )
+        custom_instructions = st.text_area(
+            "Custom analyst instructions",
+            value=str(settings.get("custom_instructions") or ""),
+            height=90, max_chars=600, disabled=not editable,
+            placeholder="Example: emphasize downside protection and explain conflicts between technical and fundamental signals.",
+            key=f"portfolio_ai_{page_index}_custom_instructions",
+        )
+
         if editable and st.button("Save AI report settings", key=f"portfolio_ai_{page_index}_save_settings"):
             page["analysis_settings"] = {
                 "base_currency": base_currency,
                 "benchmark": normalize_yfinance_ticker(benchmark) or "^GSPC",
                 "investment_horizon": horizon,
                 "risk_profile": risk_profile,
+                "report_style": report_style,
+                "detail_level": detail_level,
+                "advice_mode": advice_mode,
+                "report_language": report_language,
+                "analysis_focus": analysis_focus or ["technical", "news", "portfolio_risk", "actions"],
+                "include_news": include_news,
+                "include_macro": include_macro,
+                "include_all_holdings": include_all_holdings,
+                "news_lookback_days": int(news_lookback_days),
+                "max_focus_holdings": int(max_focus_holdings),
                 "max_position_pct": max_position,
                 "max_group_pct": max_group,
                 "allow_add": allow_add,
                 "allow_reduce": allow_reduce,
-                "research_max_tickers": int(research_max),
+                "custom_instructions": custom_instructions.strip(),
             }
             config["portfolio_pages"][page_index] = page
             save_active_config(user, config)
             st.rerun()
     return config
-
 
 def render_portfolio_weekly_schedules(user, page, mail_ready, runner_ok):
     schedules = [
@@ -1910,8 +2001,8 @@ def render_portfolio_ai_report(config, page_index, raw_df, user):
     st.divider()
     st.markdown("### AI Portfolio Report")
     st.caption(
-        "Generates a self-contained HTML report with deterministic portfolio metrics and one DeepSeek-v4-Flash "
-        "DashScope built-in web-search call. The search strategy is fixed to turbo; Serper, retries and gap searches are disabled."
+        "Generates a self-contained HTML report with deterministic portfolio metrics and one DeepSeek-v4-Pro "
+        "AI Analyst call. User settings control the prompt, report style, horizon, risk preference and recommendation policy."
     )
     if not user:
         st.info("Sign in with an administrator-issued account to generate or email Portfolio AI reports.")
@@ -1934,7 +2025,7 @@ def render_portfolio_ai_report(config, page_index, raw_df, user):
     download_tab, email_tab = st.tabs(["Generate & Download", "Generate & Email"])
     with download_tab:
         with st.form(f"portfolio_report_download_form_{page.get('id')}"):
-            st.caption("Research mode: one DashScope built-in search · DeepSeek-v4-Flash · turbo · no retry")
+            st.caption("Portfolio AI Analyst v3 · DeepSeek-v4-Pro · thinking high · one call · prompt adapted to saved settings")
             submitted = st.form_submit_button("Generate Portfolio Report", disabled=not runner_ok)
         if submitted:
             session_id = None
@@ -2003,7 +2094,7 @@ def render_portfolio_ai_report(config, page_index, raw_df, user):
         with send_once_tab:
             with st.form(f"portfolio_report_email_form_{page.get('id')}"):
                 recipient = st.text_input("Recipient email", key=f"portfolio_report_email_{page.get('id')}")
-                st.caption("Research mode: one DashScope built-in search · DeepSeek-v4-Flash · turbo · no retry")
+                st.caption("Portfolio AI Analyst v3 · DeepSeek-v4-Pro · thinking high · one call · prompt adapted to saved settings")
                 queued = st.form_submit_button("Queue Portfolio Report Email", disabled=not mail_ready or not runner_ok)
             if queued:
                 try:

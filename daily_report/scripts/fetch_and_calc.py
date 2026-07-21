@@ -18,7 +18,6 @@ fetch_and_calc.py — 通用金融日报数据获取与技术指标计算脚本
 import sys
 import os
 import json
-import yfinance as yf
 import pandas as pd
 import numpy as np
 
