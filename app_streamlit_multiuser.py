@@ -3230,7 +3230,7 @@ def build_kline_chart(kline_data, ticker, fib_levels=None, dark_mode=False, uire
 
 
 def render_persistent_kline_chart(fig, storage_key, height=None):
-    """Render K-line Plotly chart while preserving browser-side zoom across reruns."""
+    """Render K-line Plotly chart while preserving browser-side view preferences."""
     if fig is None:
         return
 
@@ -3238,6 +3238,7 @@ def render_persistent_kline_chart(fig, storage_key, height=None):
     chart_height = max(chart_height, 400)
     fig_json = json.dumps(fig.to_plotly_json(), cls=PlotlyJSONEncoder)
     storage_key_json = json.dumps(f"stock_watchlist:kline_zoom:{storage_key}")
+    legend_storage_key_json = json.dumps(f"stock_watchlist:kline_legend:{storage_key}")
     html_doc = """
 <!doctype html>
 <html>
@@ -3255,6 +3256,7 @@ def render_persistent_kline_chart(fig, storage_key, height=None):
     const chart = document.getElementById("kline-chart");
     const fig = __FIG_JSON__;
     const storageKey = __STORAGE_KEY__;
+    const legendStorageKey = __LEGEND_STORAGE_KEY__;
     const config = { responsive: true, scrollZoom: true, displayModeBar: true };
 
     function readSavedZoom() {
@@ -3320,17 +3322,94 @@ def render_persistent_kline_chart(fig, storage_key, height=None):
       }
     }
 
+    function readSavedLegend() {
+      try {
+        const raw = window.localStorage.getItem(legendStorageKey);
+        return raw ? JSON.parse(raw) : null;
+      } catch (err) {
+        return null;
+      }
+    }
+
+    function writeSavedLegend(value) {
+      try {
+        window.localStorage.setItem(legendStorageKey, JSON.stringify(value));
+      } catch (err) {}
+    }
+
+    function traceKeys(traces) {
+      const occurrences = {};
+      return (traces || []).map((trace) => {
+        const rawName = String((trace && trace.name) || "");
+        const stableName = rawName.startsWith("Latest (") ? "Latest" : rawName;
+        const baseKey = `${(trace && trace.type) || "trace"}:${stableName}`;
+        const occurrence = occurrences[baseKey] || 0;
+        occurrences[baseKey] = occurrence + 1;
+        return `${baseKey}:${occurrence}`;
+      });
+    }
+
+    function saveLegend(eventData) {
+      if (!Array.isArray(eventData) || !eventData.length) {
+        return;
+      }
+      const update = eventData[0] || {};
+      if (!Object.prototype.hasOwnProperty.call(update, "visible")) {
+        return;
+      }
+      const indexes = Array.isArray(eventData[1]) ? eventData[1] : [eventData[1]];
+      const keys = traceKeys(chart.data);
+      const saved = readSavedLegend() || {};
+      let changed = false;
+
+      indexes.forEach((index, position) => {
+        const visible = Array.isArray(update.visible) ? update.visible[position] : update.visible;
+        if (
+          Number.isInteger(index) &&
+          keys[index] &&
+          (visible === true || visible === false || visible === "legendonly")
+        ) {
+          saved[keys[index]] = visible;
+          changed = true;
+        }
+      });
+
+      if (changed) {
+        writeSavedLegend(saved);
+      }
+    }
+
+    function restoreLegend() {
+      const saved = readSavedLegend();
+      if (!saved || Object.keys(saved).length === 0) {
+        return;
+      }
+      const indexes = [];
+      const visibility = [];
+      traceKeys(chart.data).forEach((key, index) => {
+        if (Object.prototype.hasOwnProperty.call(saved, key)) {
+          indexes.push(index);
+          visibility.push(saved[key]);
+        }
+      });
+      if (indexes.length) {
+        Plotly.restyle(chart, { visible: visibility }, indexes);
+      }
+    }
+
     Plotly.newPlot(chart, fig.data || [], fig.layout || {}, config).then(() => {
       restoreZoom();
+      restoreLegend();
       chart.on("plotly_relayout", saveZoom);
+      chart.on("plotly_restyle", saveLegend);
     });
     window.addEventListener("resize", () => Plotly.Plots.resize(chart));
   </script>
 </body>
 </html>
-""".replace("__PLOTLY_JS__", get_plotlyjs()).replace("__FIG_JSON__", fig_json).replace(
+    """.replace("__PLOTLY_JS__", get_plotlyjs()).replace("__FIG_JSON__", fig_json).replace(
         "__STORAGE_KEY__", storage_key_json
-    ).replace("__HEIGHT__", str(chart_height))
+    ).replace("__LEGEND_STORAGE_KEY__", legend_storage_key_json).replace("__HEIGHT__", str(chart_height))
     components.html(html_doc, height=chart_height + 10, scrolling=False)
 
 
@@ -4111,7 +4190,7 @@ def render_daily_report(user):
     with download_tab:
         if not user:
             st.info(
-                "Sign in with an administrator-issued account to generate AI Agent reports. "
+                "Sign in with an administrator-issued account to generate AI stock reports. "
                 "Guest access is not available for this resource-intensive feature."
             )
         else:
@@ -4323,7 +4402,7 @@ st.title("Stock Watchlist")
 st.caption(
     "Stock Watchlists organize custom stock and ETF lists; Market Dashboard tracks indices and cross-asset signals; "
     "Market Breadth summarizes the shared S&P 500 and Nasdaq 100 universes; Portfolios & AI Reports combine personal "
-    "holding monitoring with AI Portfolio Report generation, download, email, and scheduling; and AI Agent Reports let "
+    "holding monitoring with AI Portfolio Report generation, download, email, and scheduling; and AI Stock Reports let "
     "signed-in users generate, download, email, and schedule in-depth ticker reports."
 )
 
@@ -4361,7 +4440,7 @@ main_tabs = st.tabs([
     SECTION_META["broad_pages"]["tab"],
     "Market Breadth",
     SECTION_META["portfolio_pages"]["tab"],
-    "AI Agent Reports",
+    "AI Stock Reports",
 ])
 with main_tabs[0]:
     if not _stock_data_ok:

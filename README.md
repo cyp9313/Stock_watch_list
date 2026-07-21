@@ -12,7 +12,7 @@ Stock Watch List 是一个本地优先的股票观察、市场仪表盘、个人
 - K 线图：K 线、6 条可分别设置周期和 SMA/EMA 的均线、VWAP、MACD、RSI、KDJ、布林带、成交量、Fibonacci 和 60d 筹码峰。VWAP 仅累计有成交量的 K 线，日内图按交易日重置；单用户版将参数保留在当前浏览器会话，多用户版登录后会按账号保存。
 - 多用户配置：账号登录、每个用户独立 watchlist、market dashboard、K 线指标参数、portfolio pages 和 AI 日报任务。
 - Portfolios & AI Reports：用户可以录入个人持仓，按现有 watchlist 表格模板展示市场数据，并额外显示买入价、股数、持仓现价、绝对盈亏和盈亏百分比；登录后可直接生成、下载、邮件发送或定时发送 AI Portfolio Report。
-- AI Agent Reports（多用户版登录后可用）：基于行情、搜索证据、可选文章正文、技术指标、评分和图表生成单标的 HTML 报告；支持下载、一次性邮件任务和每周邮件计划。
+- AI Stock Reports（多用户版登录后可用）：基于行情、搜索证据、可选文章正文、技术指标、评分和图表生成单标的 HTML 报告；支持下载、一次性邮件任务和每周邮件计划。
 - 邮件日报：一次性邮件、按周计划、后台 worker、失败重试、队列容量控制和过期控制。
 
 ## 当前架构关系
@@ -71,12 +71,12 @@ Watchlist、Market Dashboard、Market Breadth 和 Portfolio 表格的第一列 `
 Sidebar 为多用户版登录用户提供可选的无人值守自动刷新模式；游客视图不会显示或启动自动刷新，以降低公共入口负载：
 
 - `Auto-refresh stocks`：按所选间隔自动刷新 watchlist、market dashboard 和 portfolio 使用的 `/api/stock_data` 数据。
-- `Auto-refresh K-line chart`：按所选间隔自动刷新当前已经绘制的 K 线图；同一 ticker/period/interval/currency 下会通过浏览器端状态保存恢复用户当前的 zoom/pan 视野。
+- `Auto-refresh K-line chart`：按所选间隔自动刷新当前已经绘制的 K 线图；同一 ticker/period/interval/currency 下会通过浏览器端状态保存恢复用户当前的 zoom/pan 视野和图例显示/隐藏选择。
 - `Auto-refresh interval`：多用户版登录用户可选 1、5、15、30 或 60 分钟。
 
 自动刷新不会触发 Market Breadth；Market Breadth 始终只在点击 sidebar 的 `Refresh Breadth` 时下载和重算。
 
-`Portfolios & AI Reports` 位于多用户版的 `Market Breadth` 和 `AI Agent Reports` 之间。每个用户可以在 Customize Pages 中添加多个 portfolio page；每个页面同时提供持仓监控和 AI Portfolio Report。Portfolio 数据会进入同一个 `/api/stock_data` 请求集合，尽量复用 watchlist、market dashboard 和 market breadth 已有缓存。
+`Portfolios & AI Reports` 位于多用户版的 `Market Breadth` 和 `AI Stock Reports` 之间。每个用户可以在 Customize Pages 中添加多个 portfolio page；每个页面同时提供持仓监控和 AI Portfolio Report。Portfolio 数据会进入同一个 `/api/stock_data` 请求集合，尽量复用 watchlist、market dashboard 和 market breadth 已有缓存。
 
 Portfolio editor 采用稳定的文本格式，每行一个持仓：
 
@@ -309,7 +309,7 @@ python daily_report/run_report.py AAPL --months 3 --search-provider auto
 
 ### 多用户 UI
 
-多用户 Streamlit 的 `AI Agent Reports` tab 提供：
+多用户 Streamlit 的 `AI Stock Reports` tab 提供：
 
 - 登录用户同步生成并下载报告；
 - 一次性生成并发送邮件任务；
@@ -495,7 +495,7 @@ This project is for research and data observation only. It is not investment adv
 - K-line charts: candlesticks, six independently configurable SMA/EMA moving averages, VWAP, MACD, RSI, KDJ, Bollinger Bands, volume, Fibonacci tools, and a 60d volume-by-price profile. VWAP uses only bars with volume and resets by trading day for intraday charts. Settings are kept for the browser session in the single-user app and persisted per account in the multi-user app.
 - Multi-user configuration: account login, per-user watchlists, market dashboards, K-line indicator settings, portfolio pages, and AI report jobs.
 - Portfolios & AI Reports: users can enter and monitor holdings with the watchlist table style plus buy price, shares, market value, absolute P/L, P/L%, and 1D/5D/1M holding-level changes. Signed-in users can generate, download, email, and schedule an AI Portfolio Report for each portfolio page.
-- AI Agent Reports (available to signed-in multi-user accounts): generate single-ticker HTML reports from market data, search evidence, optional article text, technical indicators, scoring, and charts; download them, queue one-off email delivery, or create weekly email schedules.
+- AI Stock Reports (available to signed-in multi-user accounts): generate single-ticker HTML reports from market data, search evidence, optional article text, technical indicators, scoring, and charts; download them, queue one-off email delivery, or create weekly email schedules.
 - Email reports: one-off email jobs, weekly schedules, a background worker, retries, queue capacity controls, and expiration controls.
 
 ## Architecture
@@ -554,12 +554,12 @@ The first `Ticker` column is frozen on the left side for Watchlist, Market Dashb
 The sidebar also provides optional unattended auto-refresh for signed-in multi-user sessions. Guest views do not show or start auto-refresh, which reduces public-entry load:
 
 - `Auto-refresh stocks`: refreshes `/api/stock_data` for watchlists, market dashboard, and portfolio pages at the selected interval.
-- `Auto-refresh K-line chart`: refreshes the currently plotted K-line chart at the selected interval. For the same ticker/period/interval/currency, browser-side state restores the current Plotly zoom and pan range.
+- `Auto-refresh K-line chart`: refreshes the currently plotted K-line chart at the selected interval. For the same ticker/period/interval/currency, browser-side state restores the current Plotly zoom/pan range and legend visibility choices.
 - `Auto-refresh interval`: signed-in multi-user sessions can choose 1, 5, 15, 30, or 60 minutes.
 
 Auto-refresh never triggers Market Breadth. Market Breadth is downloaded and recalculated only when the sidebar `Refresh Breadth` button is clicked.
 
-`Portfolios & AI Reports` is placed between `Market Breadth` and `AI Agent Reports` in the multi-user app. Users can add multiple portfolio pages from Customize Pages; each page combines holding monitoring with an AI Portfolio Report. Portfolio tickers are included in the same `/api/stock_data` request so they can reuse the existing market data cache where possible.
+`Portfolios & AI Reports` is placed between `Market Breadth` and `AI Stock Reports` in the multi-user app. Users can add multiple portfolio pages from Customize Pages; each page combines holding monitoring with an AI Portfolio Report. Portfolio tickers are included in the same `/api/stock_data` request so they can reuse the existing market data cache where possible.
 
 Portfolio editor format:
 
@@ -773,7 +773,7 @@ python daily_report/run_report.py AAPL --months 3 --search-provider auto
 
 Useful options include `--provider`, `--model`, `--search-provider`, `--no-article-fetch`, `--run-dir`, and `--output`.
 
-The multi-user `AI Agent Reports` tab supports:
+The multi-user `AI Stock Reports` tab supports:
 
 - logged-in synchronous report generation and download;
 - one-off email report jobs;
