@@ -78,6 +78,7 @@ def test_portfolio_news_links_use_the_soft_high_contrast_color():
     )
 
     assert ".source-card .sc-title a { color: #a8d5ba;" in html
+    assert ".simple-table a { color: #a8d5ba;" in html
 
 
 def test_observation_action_renders_metric_evidence_for_python_311_compatible_template():

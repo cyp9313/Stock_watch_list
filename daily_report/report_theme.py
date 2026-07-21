@@ -101,6 +101,8 @@ REPORT_CSS = """
   td { padding: 10px 12px; border-bottom: 1px solid #21262d; color: #e6edf3; }
   tr:last-child td { border-bottom: none; }
   tr:hover td { background: #1c2128; }
+  .simple-table a { color: #a8d5ba; text-decoration-color: rgba(168, 213, 186, 0.55); text-underline-offset: 2px; }
+  .simple-table a:hover { color: #d7f0df; }
   .num { text-align: right; font-family: __MONO_STACK__; }
   .up { color: #3fb950; } .down { color: #f85149; } .warn { color: #d29922; }
 
