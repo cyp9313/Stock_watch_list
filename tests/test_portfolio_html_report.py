@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from daily_report.scripts.build_portfolio_report import build_html
+from daily_report.report_components import render_action_detail
 
 
 def _snapshot():
@@ -77,3 +78,18 @@ def test_portfolio_news_links_use_the_soft_high_contrast_color():
     )
 
     assert ".source-card .sc-title a { color: #a8d5ba;" in html
+
+
+def test_observation_action_renders_metric_evidence_for_python_311_compatible_template():
+    html = render_action_detail(
+        {
+            "ticker": "AAA",
+            "action": "watch",
+            "metric_evidence": [{"ticker": "AAA", "metric": "rsi"}],
+        },
+        ticker_metrics={"rsi": 50.0},
+        observation_only=True,
+    )
+
+    assert "指标证据（确定性数据）" in html
+    assert "AAA · rsi：50" in html

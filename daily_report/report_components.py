@@ -267,6 +267,13 @@ def render_action_detail(
         else:
             val_disp = format_pct_value(val)
         me_html += f'<li>{esc(tk)} · {esc(metric_labels.get(metric, metric))}：{esc(val_disp)}</li>'
+    metric_evidence_html = ""
+    if me_html:
+        metric_evidence_html = (
+            '<div class="reason-block"><h5>指标证据（确定性数据）</h5><ul class="trigger-list">'
+            + me_html
+            + "</ul></div>"
+        )
     eids = "".join(f'<span class="chip">{esc(e)}</span>' for e in (a.get("evidence_ids") or []))
     epr = a.get("expected_portfolio_risk_reduction")
     epr_str = format_ratio_as_pct(epr) if epr is not None else "—"
@@ -298,7 +305,7 @@ def render_action_detail(
             f'  </div>\n'
             f'  <div class="reason-block"><h5>升级为可操作建议所需条件</h5><ul class="trigger-list">{upgrade}</ul></div>\n'
             f'  <div class="reason-block"><h5>持续监控指标</h5><ul class="trigger-list">{monitor or "<li>风险贡献、回撤与关键均线位置</li>"}</ul></div>\n'
-            f'  {("<div class=\"reason-block\"><h5>指标证据（确定性数据）</h5><ul class=\"trigger-list\">" + me_html + "</ul></div>") if me_html else ""}\n'
+            f'  {metric_evidence_html}\n'
             f'</div>\n'
         )
     return (
