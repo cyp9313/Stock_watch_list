@@ -251,6 +251,13 @@ def render_action_detail(
             f'<span class="chip">{esc(basis_label)}</span>'
             f'{("（" + esc(th_note) + "）") if th_note else ""}</li>'
         )
+    threshold_html = ""
+    if th_html:
+        threshold_html = (
+            '<div class="reason-block"><h5>关键阈值与依据</h5><ul class="trigger-list">'
+            + th_html
+            + "</ul></div>"
+        )
     # 修改计划第三轮 21：metric_evidence 由确定性数据渲染，避免模型复制数字出错。
     me_html = ""
     tm = ticker_metrics or {}
@@ -329,8 +336,8 @@ def render_action_detail(
         f'  <div class="reason-block"><h5>取消或调整条件</h5><ul class="trigger-list">{cancel or "<li>—</li>"}</ul></div>\n'
         f'  <div class="reason-block"><h5>进一步减仓条件</h5><ul class="trigger-list">{further or "<li>—</li>"}</ul></div>\n'
         f'  <div class="reason-block"><h5>持续观察</h5><ul class="trigger-list">{monitor or "<li>—</li>"}</ul></div>\n'
-        f'  {("<div class=\"reason-block\"><h5>关键阈值与依据</h5><ul class=\"trigger-list\">" + th_html + "</ul></div>") if th_html else ""}\n'
-        f'  {("<div class=\"reason-block\"><h5>指标证据（确定性数据）</h5><ul class=\"trigger-list\">" + me_html + "</ul></div>") if me_html else ""}\n'
+        f'  {threshold_html}\n'
+        f'  {metric_evidence_html}\n'
         f'  <div class="risk-meta">证据：{eids or "—"}</div>\n'
         f'</div>\n'
     )

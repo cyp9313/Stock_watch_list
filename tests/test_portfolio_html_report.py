@@ -93,3 +93,18 @@ def test_observation_action_renders_metric_evidence_for_python_311_compatible_te
 
     assert "指标证据（确定性数据）" in html
     assert "AAA · rsi：50" in html
+
+
+def test_action_detail_renders_thresholds_and_metric_evidence():
+    html = render_action_detail(
+        {
+            "ticker": "AAA",
+            "action": "hold",
+            "thresholds": [{"metric": "weight", "value": 0.2, "basis": "evidence"}],
+            "metric_evidence": [{"ticker": "AAA", "metric": "rsi"}],
+        },
+        ticker_metrics={"rsi": 50.0},
+    )
+
+    assert "关键阈值与依据" in html
+    assert "指标证据（确定性数据）" in html
