@@ -9,10 +9,10 @@ Stock Watch List 是一个本地优先的股票观察、市场仪表盘、个人
 - 股票和跨市场 watchlist：价格、1D/5D/1M/YTD、RSI、相对 `^GSPC` 的 20D/60D/120D 超额收益、3/6/12M 相对动量、EMA 偏离、布林带、成交量、估值、分析师评级、目标价、市值和 Beta。
 - 顶部市场情绪 gauge：CNN Fear & Greed、`^VIX` volatility gauge、Crypto Fear & Greed。
 - 市场宽度：S&P 500 和 Nasdaq 100 成分股位于 20/50/200 日均线上方的比例、历史曲线和 treemap；该重计算只在点击 sidebar 的 `Refresh Breadth` 时触发，页面启动、切换 tab 或刷新 watchlist 不会自动下载和重算。
-- K 线图：K 线、6 条可分别设置周期和 SMA/EMA 的均线、VWAP、MACD、RSI、KDJ、布林带、成交量、Fibonacci 和 60d 筹码峰。VWAP 仅累计有成交量的 K 线，日内图按交易日重置。
-- 多用户配置：账号登录、每个用户独立 watchlist、market dashboard、portfolio pages 和 AI 日报任务。
-- Portfolio Monitor：用户可以录入个人持仓，按现有 watchlist 表格模板展示市场数据，并额外显示买入价、股数、持仓现价、绝对盈亏和盈亏百分比。
-- AI Agent Reports（多用户版登录后可用）：基于行情、搜索证据、可选文章正文、技术指标、评分和图表生成 HTML 报告；支持下载、一次性邮件任务和每周邮件计划。
+- K 线图：K 线、6 条可分别设置周期和 SMA/EMA 的均线、VWAP、MACD、RSI、KDJ、布林带、成交量、Fibonacci 和 60d 筹码峰。VWAP 仅累计有成交量的 K 线，日内图按交易日重置；单用户版将参数保留在当前浏览器会话，多用户版登录后会按账号保存。
+- 多用户配置：账号登录、每个用户独立 watchlist、market dashboard、K 线指标参数、portfolio pages 和 AI 日报任务。
+- Portfolios & AI Reports：用户可以录入个人持仓，按现有 watchlist 表格模板展示市场数据，并额外显示买入价、股数、持仓现价、绝对盈亏和盈亏百分比；登录后可直接生成、下载、邮件发送或定时发送 AI Portfolio Report。
+- AI Agent Reports（多用户版登录后可用）：基于行情、搜索证据、可选文章正文、技术指标、评分和图表生成单标的 HTML 报告；支持下载、一次性邮件任务和每周邮件计划。
 - 邮件日报：一次性邮件、按周计划、后台 worker、失败重试、队列容量控制和过期控制。
 
 ## 当前架构关系
@@ -33,7 +33,8 @@ app_tkinter.py           app_streamlit.py               app_streamlit_multiuser.
 Multi-user Streamlit, logged-in users only
       |
       +-- synchronous AI report download:
-      |      daily_report.service.generate_report()
+      |      ticker: daily_report.service.generate_report()
+      |      portfolio: daily_report.portfolio_service.generate_portfolio_report()
       |
       +-- email jobs and weekly schedules:
              daily_report.jobs -> daily_report.worker -> SMTP
@@ -44,7 +45,7 @@ Multi-user Streamlit, logged-in users only
 
 - `app_tkinter.py` 是桌面端，通过 Flask API 获取市场数据。
 - `app_streamlit.py` 是单用户网页端，不包含多用户账号、邮件日报计划和 portfolio 配置管理。
-- `app_streamlit_multiuser.py` 是多用户网页端，包含登录、每用户配置、Portfolio Monitor、AI 报告下载、邮件任务和周计划 UI。
+- `app_streamlit_multiuser.py` 是多用户网页端，包含登录、每用户配置、可保存的 K 线指标参数、Portfolios & AI Reports、单标的 AI 报告下载、邮件任务和周计划 UI。
 - `stock_watch_list_back_end.py` 是 Flask 市场数据 API。开发模式下前端可以尝试启动本地 Flask；生产环境建议把 Flask 作为独立 systemd 服务运行。
 - `daily_report.worker` 是独立后台进程，只处理已经持久化的邮件日报任务和周计划物化，不依赖浏览器会话。
 
@@ -75,7 +76,7 @@ Sidebar 为多用户版登录用户提供可选的无人值守自动刷新模式
 
 自动刷新不会触发 Market Breadth；Market Breadth 始终只在点击 sidebar 的 `Refresh Breadth` 时下载和重算。
 
-Portfolio Monitor 位于多用户版的 `Portfolios` tab，在 `Market Breadth` 和 `AI Agent Reports` 之间。每个用户可以在 Customize Pages 中添加多个 portfolio page。Portfolio 数据会进入同一个 `/api/stock_data` 请求集合，尽量复用 watchlist、market dashboard 和 market breadth 已有缓存。
+`Portfolios & AI Reports` 位于多用户版的 `Market Breadth` 和 `AI Agent Reports` 之间。每个用户可以在 Customize Pages 中添加多个 portfolio page；每个页面同时提供持仓监控和 AI Portfolio Report。Portfolio 数据会进入同一个 `/api/stock_data` 请求集合，尽量复用 watchlist、market dashboard 和 market breadth 已有缓存。
 
 Portfolio editor 采用稳定的文本格式，每行一个持仓：
 
@@ -122,6 +123,8 @@ Portfolio page 会自动保存稳定 `id` 和 `analysis_settings`。定期任务
 ├── app_tkinter.py                    # Tkinter 桌面前端
 ├── app_streamlit.py                  # 单用户 Streamlit 前端
 ├── app_streamlit_multiuser.py        # 多用户 Streamlit、Portfolio 和日报 UI
+├── kline_indicators.py               # 可配置的均线、VWAP、MACD、RSI 和 KDJ 计算
+├── kline_indicator_controls.py       # 单/多用户 Streamlit 共用的 K 线参数面板
 ├── stock_watch_list_back_end.py      # Flask 市场数据 API
 ├── market_data_service.py            # 共享市场数据访问层
 ├── multiuser_store.py                # 用户、密码哈希、watchlist 和 portfolio 配置
@@ -213,7 +216,8 @@ copy .env.example .env
 - `STOCK_DEV_MODE`：`1` 允许 Streamlit 在开发时尝试启动本地 Flask；`0` 表示只连接独立后端。
 - `STOCK_CACHE_DB_PATH`：市场缓存 SQLite 覆盖路径。
 - `REPORT_JOB_DB`：日报队列 SQLite 覆盖路径。
-- `REPORT_*`：日报队列、下载、计划、邮件和 worker 限制。
+- `REPORT_*`：单标的日报队列、下载、计划、邮件和 worker 限制。
+- `PORTFOLIO_*`：Portfolio AI 报告的同步下载、邮件提交、计划数量、模型、提供商和推理设置；与单标的日报共享全局运行并发限制。
 - `DASHSCOPE_API_KEY`、`DEEPSEEK_API_KEY`、`OPENAI_API_KEY`、`SERPER_API_KEY`：按所选模型和搜索服务配置。模板中的 `your_...` 仅为占位符。
 
 ## 本地开发启动顺序
@@ -315,7 +319,7 @@ python daily_report/run_report.py AAPL --months 3 --search-provider auto
 - 每个账号最多 7 个 ticker schedule；
 - 暂停、恢复和删除 schedule。
 
-多用户 Streamlit 的每个 `Portfolios` 子页面还提供 Portfolio AI 报告：
+多用户 Streamlit 的每个 `Portfolios & AI Reports` 子页面都提供 Portfolio AI 报告：
 
 - 登录用户同步生成并下载 portfolio HTML 报告；
 - 一次性生成并发送 portfolio 邮件任务；
@@ -441,6 +445,7 @@ python -m pytest -q
 ```bash
 python -m pytest tests/test_report_html_escape.py tests/test_article_url_security.py -q
 python -m pytest tests/test_weekly_schedule_multiday.py tests/test_queue_capacity.py -q
+python -m pytest tests/test_kline_indicators.py tests/test_portfolio_html_report.py -q
 ```
 
 Portfolio 和多用户隔离相关测试：
@@ -487,10 +492,10 @@ This project is for research and data observation only. It is not investment adv
 - Stock and cross-market watchlists: price, 1D/5D/1M/YTD returns, RSI, 20D/60D/120D excess returns versus `^GSPC`, weighted 3/6/12M relative momentum, EMA deviation, Bollinger Band deviation, volume ratio, valuation metrics, analyst ratings, price targets, market cap, and beta.
 - Top sentiment gauges: CNN Fear & Greed, `^VIX` volatility gauge, and Crypto Fear & Greed.
 - Market breadth: S&P 500 and Nasdaq 100 constituent ratios above their 20/50/200-day moving averages, with charts and treemaps. This heavy recalculation only runs when the sidebar `Refresh Breadth` button is clicked; app startup, tab switching, and watchlist refreshes do not automatically download or recalculate breadth data.
-- K-line charts: candlesticks, six independently configurable SMA/EMA moving averages, VWAP, MACD, RSI, KDJ, Bollinger Bands, volume, Fibonacci tools, and a 60d volume-by-price profile. VWAP uses only bars with volume and resets by trading day for intraday charts.
-- Multi-user configuration: account login, per-user watchlists, market dashboards, portfolio pages, and AI report jobs.
-- Portfolio Monitor: users can enter holdings and monitor them with the existing watchlist table style plus buy price, shares, market value, absolute P/L, P/L%, and 1D/5D/1M holding-level changes.
-- AI Agent Reports (available to signed-in multi-user accounts): generate HTML reports from market data, search evidence, optional article text, technical indicators, scoring, and charts; download them, queue one-off email delivery, or create weekly email schedules.
+- K-line charts: candlesticks, six independently configurable SMA/EMA moving averages, VWAP, MACD, RSI, KDJ, Bollinger Bands, volume, Fibonacci tools, and a 60d volume-by-price profile. VWAP uses only bars with volume and resets by trading day for intraday charts. Settings are kept for the browser session in the single-user app and persisted per account in the multi-user app.
+- Multi-user configuration: account login, per-user watchlists, market dashboards, K-line indicator settings, portfolio pages, and AI report jobs.
+- Portfolios & AI Reports: users can enter and monitor holdings with the watchlist table style plus buy price, shares, market value, absolute P/L, P/L%, and 1D/5D/1M holding-level changes. Signed-in users can generate, download, email, and schedule an AI Portfolio Report for each portfolio page.
+- AI Agent Reports (available to signed-in multi-user accounts): generate single-ticker HTML reports from market data, search evidence, optional article text, technical indicators, scoring, and charts; download them, queue one-off email delivery, or create weekly email schedules.
 - Email reports: one-off email jobs, weekly schedules, a background worker, retries, queue capacity controls, and expiration controls.
 
 ## Architecture
@@ -511,7 +516,8 @@ app_tkinter.py           app_streamlit.py               app_streamlit_multiuser.
 Multi-user Streamlit, logged-in users only
       |
       +-- synchronous AI report download:
-      |      daily_report.service.generate_report()
+      |      ticker: daily_report.service.generate_report()
+      |      portfolio: daily_report.portfolio_service.generate_portfolio_report()
       |
       +-- email jobs and weekly schedules:
              daily_report.jobs -> daily_report.worker -> SMTP
@@ -522,7 +528,7 @@ Multi-user Streamlit, logged-in users only
 
 - `app_tkinter.py` is the desktop client and reads market data through the Flask API.
 - `app_streamlit.py` is the single-user web client. It does not manage multi-user accounts, email schedules, or portfolio pages.
-- `app_streamlit_multiuser.py` is the multi-user web client. It includes login, per-user configuration, Portfolio Monitor, AI report downloads, email jobs, and weekly schedule UI.
+- `app_streamlit_multiuser.py` is the multi-user web client. It includes login, per-user configuration, saved K-line indicator settings, Portfolios & AI Reports, single-ticker AI report downloads, email jobs, and weekly schedule UI.
 - `stock_watch_list_back_end.py` is the Flask market data API. In development, the frontend can try to start a local Flask backend; in production, Flask should run as a standalone service.
 - `daily_report.worker` is an independent process for persistent email report jobs and weekly schedules. It does not depend on browser sessions.
 
@@ -553,7 +559,7 @@ The sidebar also provides optional unattended auto-refresh for signed-in multi-u
 
 Auto-refresh never triggers Market Breadth. Market Breadth is downloaded and recalculated only when the sidebar `Refresh Breadth` button is clicked.
 
-Portfolio Monitor is placed in the multi-user `Portfolios` tab between `Market Breadth` and `AI Agent Reports`. Users can add multiple portfolio pages from Customize Pages. Portfolio tickers are included in the same `/api/stock_data` request so they can reuse the existing market data cache where possible.
+`Portfolios & AI Reports` is placed between `Market Breadth` and `AI Agent Reports` in the multi-user app. Users can add multiple portfolio pages from Customize Pages; each page combines holding monitoring with an AI Portfolio Report. Portfolio tickers are included in the same `/api/stock_data` request so they can reuse the existing market data cache where possible.
 
 Portfolio editor format:
 
@@ -600,6 +606,8 @@ Portfolio pages are automatically upgraded with a stable `id` and `analysis_sett
 ├── app_tkinter.py                    # Tkinter desktop frontend
 ├── app_streamlit.py                  # Single-user Streamlit frontend
 ├── app_streamlit_multiuser.py        # Multi-user Streamlit, Portfolio, and report UI
+├── kline_indicators.py               # Configurable MA, VWAP, MACD, RSI, and KDJ calculations
+├── kline_indicator_controls.py       # Shared Streamlit K-line indicator controls
 ├── stock_watch_list_back_end.py      # Flask market data API
 ├── market_data_service.py            # Shared market data access layer
 ├── multiuser_store.py                # Users, password hashes, watchlist and portfolio config
@@ -775,7 +783,7 @@ The multi-user `AI Agent Reports` tab supports:
 - up to 7 ticker schedules per account;
 - pause, resume, and delete.
 
-Each `Portfolios` subpage also supports Portfolio AI reports:
+Each `Portfolios & AI Reports` subpage supports Portfolio AI reports:
 
 - signed-in synchronous portfolio HTML generation and download;
 - one-off portfolio email jobs;
@@ -825,7 +833,7 @@ job state is updated in SQLite
 
 SMTP success and local state updates are not one atomic transaction, so strict exactly-once delivery cannot be guaranteed.
 
-Ticker reports are controlled mainly by `REPORT_*` settings. Portfolio reports add optional `PORTFOLIO_*` limits for synchronous downloads, email submissions, and schedule counts. Both kinds share `REPORT_MAX_GLOBAL_RUNNING` so multiple heavy report jobs do not run at the same time by default.
+Ticker reports are controlled mainly by `REPORT_*` settings. Portfolio reports add `PORTFOLIO_*` limits for synchronous downloads, email submissions, schedule counts, model/provider selection, and reasoning settings. Both kinds share `REPORT_MAX_GLOBAL_RUNNING` so multiple heavy report jobs do not run at the same time by default.
 
 ## systemd deployment with a dedicated user
 
@@ -890,6 +898,7 @@ Security and report tests:
 ```bash
 python -m pytest tests/test_report_html_escape.py tests/test_article_url_security.py -q
 python -m pytest tests/test_weekly_schedule_multiday.py tests/test_queue_capacity.py -q
+python -m pytest tests/test_kline_indicators.py tests/test_portfolio_html_report.py -q
 ```
 
 Portfolio and multi-user isolation tests:
