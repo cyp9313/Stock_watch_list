@@ -189,10 +189,18 @@ def evidence_verification_score(
     empty_score: float = 0.30,
     floor: float = 0.10,
 ) -> float:
-    """正文提取比例；搜索摘要计 0.5，仅作为模型置信度输入。"""
+    """证据来源验证比例。
+
+    ``article_fetch_ok`` 表示已抓取并验证正文；``source_verified`` 表示模型
+    返回的 URL 已与 DashScope ``search_info.search_results`` 做本地精确匹配。
+    两者都可作为正式证据来源验证，普通未验证摘要只计 0.5。
+    """
     if not evidence:
         return round(float(empty_score), 3)
-    score = sum(1.0 if item.get("article_fetch_ok") else 0.5 for item in evidence)
+    score = sum(
+        1.0 if (item.get("article_fetch_ok") or item.get("source_verified")) else 0.5
+        for item in evidence
+    )
     return round(max(float(floor), min(1.0, score / len(evidence))), 3)
 
 

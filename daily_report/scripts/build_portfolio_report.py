@@ -76,82 +76,54 @@ def _event_date_display(value: Any) -> str:
             return "未知"
 
 
-_STAGE_LABELS = {
-    "materiality_passed": "Materiality 通过",
-    "materiality_rejected": "Materiality 拒绝",
-    "summary_isolated": "摘要/身份隔离",
-    "summarizer_rejected": "摘要器明确拒绝",
-    "reference": "参考页分流",
-    "final_gate_rejected": "最终门拒绝",
-    "accepted": "Accepted",
-}
+
+def _market_cutoff_display(value: Any, snapshot_time: Any) -> str:
+    """Avoid labelling a same-day daily bar as a completed market close."""
+    cutoff = _event_date_display(value)
+    if cutoff in {"—", "未知"}:
+        return cutoff
+    try:
+        snap = _dt.fromisoformat(str(snapshot_time or "").replace("Z", "+00:00"))
+        if snap.tzinfo is None:
+            snap = snap.replace(tzinfo=timezone.utc)
+        berlin = snap.astimezone(ZoneInfo("Europe/Berlin"))
+        if cutoff == berlin.date().isoformat():
+            return f"{cutoff} 最新可用（截至 {berlin:%H:%M} Europe/Berlin，可能含盘中数据）"
+    except (ValueError, TypeError):
+        pass
+    return f"{cutoff} 收盘"
 
 
-def _render_stage_breakdown(
-    title: str,
-    dimension_label: str,
-    rows: dict[str, dict[str, int]] | None,
-) -> str:
-    if not rows:
-        return ""
-    stages = [
-        "materiality_passed", "materiality_rejected", "summary_isolated",
-        "summarizer_rejected", "reference", "final_gate_rejected", "accepted",
-    ]
-    headers = [dimension_label] + [_STAGE_LABELS[s] for s in stages]
-    table_rows = []
-    value_labels = {
-        "official": "官方来源",
-        "regulator": "监管机构",
-        "rating_agency": "评级机构",
-        "major_media": "主流财经媒体",
-        "specialty_media": "专业财经媒体",
-        "aggregator": "聚合站",
-        "unknown": "未知来源",
-        "official_and_news": "官方 + 新闻",
-        "news": "新闻",
-        "theme": "主题",
-        "macro": "宏观",
-    }
-    for key, counts in sorted(
-        rows.items(),
-        key=lambda kv: -sum(int(v or 0) for v in (kv[1] or {}).values()),
-    ):
-        display_key = value_labels.get(str(key), key) if dimension_label != "标的" else key
-        table_rows.append([display_key] + [int((counts or {}).get(stage) or 0) for stage in stages])
-    return f'<h4 style="margin:14px 0 8px">{esc(title)}</h4>' + render_table(headers, table_rows)
-
-
-def _summarizer_reason_zh(reason: str) -> str:
+def _single_search_reason_zh(reason: str) -> str:
     return {
-        "missing_output": "模型漏返回该 Evidence UID",
-        "duplicate_output_uid": "模型重复返回同一 Evidence UID",
-        "identity_mismatch": "模型改写了不可变身份字段",
-        "missing_or_invalid_accept": "accept 字段缺失或不是布尔值",
-        "summarizer_not_configured": "摘要模型未配置",
-        "summarizer_provider_error": "摘要模型调用或解析失败",
+        "evidence_not_list": "模型 evidence 字段不是列表",
+        "ticker_not_allowed": "标的不在本轮 Top-risk 名单",
+        "duplicate_ticker": "同一标的重复返回多条事件",
+        "invalid_or_missing_source_index": "来源索引缺失或格式无效",
+        "source_index_not_in_dashscope_sources": "来源索引不在 DashScope 返回来源中",
+        "source_not_relevant_to_ticker": "来源与该标的没有直接实体关联",
+        "multiple_cited_sources_for_ticker": "模型为同一事件引用了多个无法唯一确定的来源",
+        "source_title_hint_not_matched": "模型提供的来源标题无法匹配 DashScope 实际来源",
+        "source_url_hint_not_in_dashscope_sources": "模型提供的 URL 提示不在 DashScope 实际来源中",
+        "no_relevant_dashscope_source_for_ticker": "DashScope 没有返回与该标的直接相关的来源",
+        "multiple_relevant_sources_require_title_hint": "同一标的存在多个相关来源但模型未提供可匹配标题",
+        "duplicate_source_index": "同一 DashScope 来源被重复使用",
+        "invalid_source_url": "DashScope 来源 URL 无效",
+        "source_not_article_page": "来源是行情、社区、索引或其他非文章页面",
+        "invalid_or_missing_source_date": "DashScope 来源发布日期缺失或格式无效",
+        "future_date": "DashScope 来源日期晚于搜索完成时间",
+        "outside_freshness_window": "事件超出新鲜度窗口",
+        "missing_source_title": "DashScope 来源标题缺失",
+        # Legacy reason labels retained for old cached diagnostics.
+        "invalid_url": "URL 无效",
+        "url_not_in_dashscope_sources": "URL 不在 DashScope 返回来源中",
+        "duplicate_url": "URL 重复",
+        "invalid_or_missing_date": "发布日期缺失或格式无效",
+        "date_source_mismatch": "模型日期与 DashScope 来源日期不一致",
+        "missing_title": "标题缺失",
+        "summary_too_short": "摘要过短",
+        "invalid_json": "模型输出不是有效 JSON",
     }.get(str(reason or ""), str(reason or "未知原因"))
-
-
-def _final_gate_reason_zh(reason: str) -> str:
-    text = str(reason or "")
-    if text.startswith("entity_role_not_accepted:"):
-        return "实体角色不满足正式证据门槛：" + text.split(":", 1)[1]
-    if text.startswith("recency_not_accepted:"):
-        tier = text.split(":", 1)[1]
-        return {
-            "unknown": "发布时间无法确认",
-            "structural": "仅属于结构性背景，超出近期事件门槛",
-            "stale": "证据已过期",
-        }.get(tier, f"时效等级不满足门槛：{tier}")
-    return {
-        "chronology_conflict": "事件时间线存在冲突",
-        "quote_page": "仅为行情/报价页面",
-        "reference_page": "仅为产品或参考页面",
-        "content_not_verified_or_snippet_too_weak": "正文未验证且搜索摘要不足以作为证据",
-        "unspecified_final_gate_rejection": "未满足最终证据门槛（未细分）",
-    }.get(text, text or "未知原因")
-
 
 def build_html(
     snapshot: dict[str, Any],
@@ -194,6 +166,7 @@ def build_html(
     stance = advice.get("portfolio_stance", "balanced")
     is_fallback = str(advice.get("report_mode") or advice.get("ai_analysis_available") == False) == "quantitative_fallback" or advice.get("report_mode") == "quantitative_fallback"
     is_observation = bool(report_quality.get("observation_only") or advice.get("observation_only") or is_fallback)
+    single_search_mode = str(research_diagnostics.get("research_mode") or "") == "dashscope_single_search"
     report_title = "量化投资组合观察报告" if is_observation else "AI 投资组合分析报告"
     final_confidence = _first_not_none(advice.get("final_confidence"), advice.get("confidence"), 0.0)
 
@@ -227,11 +200,14 @@ def build_html(
     news_time_html += f'　|　最新 Accepted Event：{esc(_event_date_display(latest_accepted_date))}'
     if latest_candidate_date:
         news_time_html += f'　|　最新候选事件：{esc(_event_date_display(latest_candidate_date))}'
+    equity_cutoff_display = _market_cutoff_display(price_cutoff, snapshot_time)
+    etf_cutoff_display = _market_cutoff_display(etf_cutoff, snapshot_time)
+    benchmark_cutoff_display = _market_cutoff_display(benchmark_cutoff, snapshot_time)
     cutoff_html = (
         '<div class="data-cutoff">'
         f'数据快照时间：{esc(snapshot_time)}　|　报告完成时间：{esc(rendered_at)}　|　'
-        f'股票行情截止：{esc(price_cutoff)} 收盘　|　ETF/ETC 截止：{esc(etf_cutoff)} 收盘　|　'
-        f'加密资产截止：{esc(crypto_cutoff)}　|　基准截止：{esc(benchmark_cutoff)} 收盘　|　{news_time_html}'
+        f'股票行情截止：{esc(equity_cutoff_display)}　|　ETF/ETC 截止：{esc(etf_cutoff_display)}　|　'
+        f'加密资产截止：{esc(crypto_cutoff)}　|　基准截止：{esc(benchmark_cutoff_display)}　|　{news_time_html}'
         '</div>'
     )
     parts.append(cutoff_html)
@@ -248,33 +224,42 @@ def build_html(
     core_html = (
         f'<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;">{stance_pill}{risk_pill}{conf_pill}</div>'
     )
-    if is_observation and (rej_count > 0 or research_diagnostics):
-        selected_count = int(research_diagnostics.get("selected_evidence_count") or 0)
-        accepted_count = int(research_diagnostics.get("accepted_evidence_count") or len(evidence or []))
-        materiality_stats = research_diagnostics.get("materiality_stats") or {}
-        materiality_rejected = int(materiality_stats.get("rejected_count") or 0)
-        if "summarizer_isolation_count" in research_diagnostics:
-            isolated_count = int(research_diagnostics.get("summarizer_isolation_count") or 0)
+    if is_observation and research_diagnostics:
+        if single_search_mode:
+            source_count = int(research_diagnostics.get("unique_source_count") or 0)
+            relevant_count = int(research_diagnostics.get("relevant_source_count") or 0)
+            article_source_count = int(research_diagnostics.get("relevant_article_source_count") or 0)
+            model_count = int(research_diagnostics.get("model_evidence_count") or 0)
+            accepted_count = int(research_diagnostics.get("valid_evidence_count") or len(evidence or []))
+            model_valid_count = int(research_diagnostics.get("model_valid_evidence_count") or 0)
+            deterministic_count = int(research_diagnostics.get("deterministic_evidence_count") or 0)
+            invalid_count = int(research_diagnostics.get("invalid_evidence_count") or 0)
+            reference_count = int(research_diagnostics.get("reference_evidence_count") or ref_count)
+            undated_reference_count = int(research_diagnostics.get("undated_reference_count") or 0)
+            target_text = "、".join(str(x) for x in (research_diagnostics.get("search_target_tickers") or [])) or "—"
+            pipeline_text = (
+                f"本轮仅执行 1 次 DashScope 内置联网搜索，返回 {source_count} 个唯一来源，"
+                f"其中 {relevant_count} 个与研究标的直接相关、{article_source_count} 个属于可验证文章页；"
+                f"研究目标为 {target_text}。"
+                f"模型提出 {model_count} 条事件证据，其中 {model_valid_count} 条完成来源绑定，"
+                f"{invalid_count} 条被拒绝；本地从已验证来源补充 {deterministic_count} 条决策证据，"
+                f"决策证据合计 {accepted_count} 条；另筛选 {reference_count} 条可引用背景来源"
+                + (f"（其中 {undated_reference_count} 条日期未提供）" if undated_reference_count else "")
+                + "。"
+                "未调用 Serper、未补搜、未重试。"
+            )
+            if research_diagnostics.get("response_json_parse_error"):
+                pipeline_text += "模型输出不是有效 JSON，已直接安全降级。"
         else:
-            # Backward compatibility for legacy diagnostics generated before
-            # per-item Summarizer isolation reasons were recorded.
-            isolated_count = max(0, rej_count - materiality_rejected)
-        summarizer_rejected = int(research_diagnostics.get("summarizer_rejected_count") or 0)
-        final_gate_rejected = int(research_diagnostics.get("final_gate_rejected_count") or 0)
-        pipeline_text = (
-            f"本轮有 {selected_count} 条候选进入研究质量评估，其中 {materiality_rejected} 条未通过 Materiality；"
-            f"最终 Accepted Evidence 为 {accepted_count} 条。"
-        )
-        if isolated_count:
-            pipeline_text += f"另有 {isolated_count} 条在摘要或身份完整性校验中被隔离。"
-        if summarizer_rejected:
-            pipeline_text += f"摘要器明确拒绝 {summarizer_rejected} 条。"
-        if final_gate_rejected:
-            pipeline_text += f"最终 Evidence Gate 拒绝 {final_gate_rejected} 条。"
+            accepted_count = int(research_diagnostics.get("accepted_evidence_count") or len(evidence or []))
+            rejected_count = int(research_diagnostics.get("rejected_evidence_count") or rej_count)
+            pipeline_text = (
+                f"本轮研究产生 {accepted_count} 条可用证据，{rejected_count} 条候选未通过校验。"
+            )
         core_html += (
             '<div class="banner warn">'
             f'{esc(pipeline_text)}'
-            '以下结论主要来自价格、风险贡献和技术指标，不包含基本面新闻判断。</div>'
+            '以下结论主要来自价格、风险贡献和技术指标；只有成功绑定到 DashScope 实际来源的事件可用于联网判断。</div>'
         )
     exec_summary = advice.get("executive_summary") or []
     if exec_summary:
@@ -294,7 +279,7 @@ def build_html(
         "metadata_coverage": "工具元数据覆盖",
         "evidence_coverage": "Accepted Top-risk 覆盖",
         "evidence_freshness": "Accepted 证据新鲜度",
-        "evidence_verification": "证据正文验证（Accepted 正文提取比例）",
+        "evidence_verification": "Accepted 来源验证比例",
     }
     finite_confidence = {
         key: finite_float(value)
@@ -473,58 +458,83 @@ def build_html(
             )
         parts.append(render_section("重点观察详情" if is_observation else "AI 操作建议详情", "🎯", detail_html))
 
-    # ── Evidence Quality 概览 + Top-risk 新闻综合（修改计划第三轮 37/38）──
-    if evidence:
-        by_ticker: dict[str, list[dict]] = {}
-        macro_items = []
-        for e in evidence:
-            t = e.get("ticker")
-            if t:
-                by_ticker.setdefault(t, []).append(e)
-            else:
-                macro_items.append(e)
+    # ── Accepted Evidence + locally verified background sources ──
+    background_evidence = list(reference_evidence or [])
+    if evidence or background_evidence:
+        news_html = ""
+        if evidence:
+            by_ticker: dict[str, list[dict]] = {}
+            macro_items = []
+            for e in evidence:
+                t = e.get("ticker")
+                if t:
+                    by_ticker.setdefault(t, []).append(e)
+                else:
+                    macro_items.append(e)
 
-        # 修改计划第三轮 38：Evidence 质量概览。
-        top_risk_set = set(risk_ranking.get("top_risk_tickers") or [])
-        covered = top_risk_set & set(by_ticker.keys())
-        fresh_events = sum(1 for e in evidence if str(e.get("recency_tier")) == "fresh_event")
-        tier12 = sum(1 for e in evidence if str(e.get("source_quality") or "").startswith("tier_1") or str(e.get("source_quality") or "").startswith("tier_2"))
-        unknown_dates = sum(1 for e in evidence if not e.get("published_date"))
-        verified_articles = sum(1 for e in evidence if e.get("article_fetch_ok"))
-        unverified_snippets = len(evidence) - verified_articles
-        quality_html = (
-            '<div class="evidence-quality">'
-            f'<span>Top-risk 覆盖：{len(covered)}/{len(top_risk_set)}</span>'
-            f'<span>新鲜事件：{fresh_events}</span>'
-            f'<span>Tier 1/2 来源：{tier12}</span>'
-            f'<span>未知日期：{unknown_dates}</span>'
-            f'<span>正文已提取：{verified_articles}</span>'
-            f'<span>未验证摘要：{unverified_snippets}</span>'
-            f'<span>证据总数：{len(evidence)}</span>'
-            '</div>'
-        )
-        if len(covered) < len(top_risk_set):
-            quality_html += '<p class="kpi-sub warn-text">新闻结论可信度有限：部分 Top-risk 标的缺少新闻证据支撑。</p>'
-        if unverified_snippets:
-            quality_html += '<p class="kpi-sub warn-text">“搜索摘要·未验证”仅作为研究线索，可能与落地页正文存在差异，不能支撑高置信度操作。</p>'
+            top_risk_set = set(risk_ranking.get("top_risk_tickers") or [])
+            covered = top_risk_set & set(by_ticker.keys())
+            fresh_events = sum(1 for e in evidence if str(e.get("recency_tier")) == "fresh_event")
+            tier12 = sum(
+                1 for e in evidence
+                if str(e.get("source_quality") or "").startswith(("tier_1", "tier_2"))
+            )
+            unknown_dates = sum(1 for e in evidence if not e.get("published_date"))
+            verified_sources = sum(1 for e in evidence if e.get("article_fetch_ok") or e.get("source_verified"))
+            unverified_sources = len(evidence) - verified_sources
+            news_html += (
+                '<div class="evidence-quality">'
+                f'<span>Accepted Top-risk 覆盖：{len(covered)}/{len(top_risk_set)}</span>'
+                f'<span>新鲜事件：{fresh_events}</span>'
+                f'<span>Tier 1/2 来源：{tier12}</span>'
+                f'<span>未知日期：{unknown_dates}</span>'
+                f'<span>来源已验证：{verified_sources}</span>'
+                f'<span>来源未验证：{unverified_sources}</span>'
+                f'<span>决策证据：{len(evidence)}</span>'
+                '</div>'
+            )
+            if len(covered) < len(top_risk_set):
+                news_html += '<p class="kpi-sub warn-text">联网决策证据覆盖有限；未覆盖标的不据此生成方向性结论。</p>'
 
-        # 修改计划第三轮 37：新闻综合每 ticker 仅保留优先级最高的 2~3 条，避免与来源附录重复堆叠。
-        def _top(items: list[dict], n: int = 3) -> list[dict]:
-            return sorted(items, key=lambda x: -(float(x.get("priority_score") or 0.0)))[:n]
+            def _top(items: list[dict], n: int = 3) -> list[dict]:
+                return sorted(items, key=lambda x: -(float(x.get("priority_score") or 0.0)))[:n]
 
-        news_html = quality_html
-        for t, items in by_ticker.items():
-            news_html += render_news_group(f"{t} 相关新闻（重点 {min(3, len(items))} 条）", _top(items))
-        if macro_items:
-            news_html += render_news_group("宏观 / 系统性因素", _top(macro_items))
-        parts.append(render_section("Top-risk 新闻综合", "📰", news_html))
+            for t, items in by_ticker.items():
+                news_html += render_news_group(f"{t} 相关新闻（Accepted Evidence）", _top(items))
+            if macro_items:
+                news_html += render_news_group("宏观 / 系统性因素（Accepted Evidence）", _top(macro_items))
+        else:
+            news_html += (
+                '<p class="kpi-sub warn-text">本轮没有通过决策门槛的 Accepted Evidence；'
+                '下方仍展示已完成本地实体与 URL 校验的背景来源。若 DashScope 未提供发布日期，'
+                '报告会明确标记“日期未提供”；这些来源不支撑方向性操作。</p>'
+            )
+
+        if background_evidence:
+            background_by_ticker: dict[str, list[dict]] = {}
+            for item in background_evidence:
+                ticker = str(item.get("ticker") or "—")
+                background_by_ticker.setdefault(ticker, []).append(item)
+            news_html += (
+                '<div class="evidence-quality">'
+                f'<span>可引用背景来源：{len(background_evidence)}</span>'
+                '<span>操作用途：仅观察</span>'
+                '<span>不计入 Accepted 覆盖</span>'
+                '</div>'
+            )
+            for ticker, items in background_by_ticker.items():
+                news_html += render_news_group(
+                    f"{ticker} 已验证联网来源（仅作背景）",
+                    sorted(items, key=lambda x: str(x.get("published_date") or ""), reverse=True)[:2],
+                )
+        parts.append(render_section("Top-risk 新闻与已验证来源", "📰", news_html))
     else:
         empty_news_text = (
-            "（本轮没有 Accepted Evidence；新闻候选仅保留在诊断附件中，本报告不据此生成基本面结论。）"
+            "（本轮搜索没有返回可作为决策证据或背景引用的有效来源。）"
             if is_observation else
-            "（新闻研究未返回可发布证据；正式报告质量门槛会阻止操作建议发布。）"
+            "（新闻研究未返回可发布来源；正式报告质量门槛会阻止操作建议发布。）"
         )
-        parts.append(render_section("Top-risk 新闻综合", "📰", f'<p class="kpi-sub">{esc(empty_news_text)}</p>'))
+        parts.append(render_section("Top-risk 新闻与已验证来源", "📰", f'<p class="kpi-sub">{esc(empty_news_text)}</p>'))
 
     # ── 行业、主题与宏观分析（修改计划 17.9）──
     macro_html = ""
@@ -583,29 +593,33 @@ def build_html(
     holdings_html += '<p class="kpi-sub">风险贡献采用正边际贡献归一化口径；负边际风险贡献被归零，因此 0% 不代表该资产本身没有波动或风险。</p>'
     parts.append(render_section("所有持仓技术快照（按风险优先级降序）", "🧮", holdings_html))
 
-    # ── 来源附录（§35 简化：仅列表格，不重复新闻区完整摘要）──
-    if evidence:
+    # ── 来源附录：区分决策证据与可引用背景来源 ──
+    appendix_items = [("决策证据", item) for item in evidence]
+    appendix_items.extend(("背景来源", item) for item in (reference_evidence or []))
+    if appendix_items:
         appendix = (
             '<table class="simple-table"><tr>'
-            '<th>ID</th><th>Ticker</th><th>日期</th><th>来源</th><th>标题</th><th>正文</th>'
+            '<th>类型</th><th>ID</th><th>Ticker</th><th>日期</th><th>来源</th><th>标题</th><th>验证状态</th>'
             '</tr>'
         )
-        for e in evidence[:20]:  # 最多 20 条
+        for item_type, e in appendix_items[:24]:
             url = str(e.get("url") or "")
             title_html = (
-                f'<a href="{esc(url)}" target="_blank" rel="noopener noreferrer">{esc(str(e.get("title", ""))[:60])}</a>'
-                if url else esc(str(e.get("title", ""))[:60])
+                f'<a href="{esc(url)}" target="_blank" rel="noopener noreferrer">{esc(str(e.get("title", ""))[:80])}</a>'
+                if url else esc(str(e.get("title", ""))[:80])
             )
             appendix += (
-                f'<tr><td>{esc(e.get("evidence_id") or "—")}</td>'
+                f'<tr><td>{esc(item_type)}</td>'
+                f'<td>{esc(e.get("evidence_id") or e.get("reference_id") or "—")}</td>'
                 f'<td>{esc(e.get("ticker") or "—")}</td>'
-                f'<td>{esc(str(e.get("published_date") or "")[:10])}</td>'
-                f'<td>{esc(str(e.get("source_name") or "")[:20])}</td>'
+                f'<td>{esc(str(e.get("published_date") or "日期未提供")[:10])}</td>'
+                f'<td>{esc(str(e.get("source_name") or "")[:24])}</td>'
                 f'<td>{title_html}</td>'
-                f'<td>{"已提取" if e.get("article_fetch_ok") else "摘要"}</td></tr>'
+                f'<td>{"正文已提取" if e.get("article_fetch_ok") else ("来源 URL 已验证" if e.get("source_verified") else "未验证")}</td></tr>'
             )
         appendix += '</table>'
-        parts.append(render_section("来源附录（Accepted Evidence）", "🔗", appendix))
+        appendix += '<p class="kpi-sub">背景来源均经过实体与 URL 校验；发布日期缺失时会明确标记。背景来源不计入 Accepted Evidence，也不支撑方向性交易建议。</p>'
+        parts.append(render_section("来源附录（决策证据与背景来源）", "🔗", appendix))
 
     # ── 数据质量与免责声明（修改计划 17.12）──
     quality = snapshot.get("data_quality", {})
@@ -621,142 +635,169 @@ def build_html(
     if limitations:
         dq_html += "<p>AI/数据限制：" + "；".join(esc(x) for x in limitations) + "</p>"
     status_labels = {
-        "success": "成功", "not_configured": "未配置", "provider_error": "提供方请求失败",
-        "no_raw_results": "未返回原始结果", "all_filtered": "全部候选被过滤",
-        "no_recent_evidence": "没有近期证据", "insufficient_coverage": "Top-risk 覆盖不足",
+        "success": "成功",
+        "not_configured": "未配置",
+        "provider_error": "提供方请求失败",
+        "no_valid_evidence": "没有通过本地校验的 Evidence",
+        "source_notes_only": "仅有可引用背景来源",
+        "invalid_model_output": "模型输出格式无效",
     }
     if research_diagnostics:
-        rejected = research_diagnostics.get("rejected") or {}
-        reasons = "、".join(f"{esc(k)} {v}" for k, v in rejected.items() if v) or "无"
-        mat_stats = research_diagnostics.get("materiality_stats") or {}
-        selected_count = int(research_diagnostics.get("selected_evidence_count") or 0)
-        materiality_rejected = int(mat_stats.get("rejected_count") or 0)
-        accepted_count = int(research_diagnostics.get("accepted_evidence_count") or 0)
-        if "summarizer_isolation_count" in research_diagnostics:
-            post_materiality_isolated = int(research_diagnostics.get("summarizer_isolation_count") or 0)
+        if single_search_mode:
+            status = str(research_diagnostics.get("status") or "未知")
+            source_count = int(research_diagnostics.get("unique_source_count") or 0)
+            raw_source_count = int(research_diagnostics.get("raw_source_count") or 0)
+            relevant_source_count = int(research_diagnostics.get("relevant_source_count") or 0)
+            relevant_article_source_count = int(research_diagnostics.get("relevant_article_source_count") or 0)
+            landing_source_count = int(research_diagnostics.get("landing_or_index_source_count") or 0)
+            irrelevant_source_count = int(research_diagnostics.get("irrelevant_source_count") or 0)
+            model_count = int(research_diagnostics.get("model_evidence_count") or 0)
+            valid_count = int(research_diagnostics.get("valid_evidence_count") or 0)
+            model_valid_count = int(research_diagnostics.get("model_valid_evidence_count") or 0)
+            deterministic_count = int(research_diagnostics.get("deterministic_evidence_count") or 0)
+            reference_count = int(research_diagnostics.get("reference_evidence_count") or ref_count)
+            undated_reference_count = int(research_diagnostics.get("undated_reference_count") or 0)
+            invalid_count = int(research_diagnostics.get("invalid_evidence_count") or 0)
+            dq_html += (
+                f'<p>单次联网研究状态：{esc(status_labels.get(status, status))}；'
+                f'搜索调用：{int(research_diagnostics.get("search_call_count") or 0)}/'
+                f'{int(research_diagnostics.get("max_search_calls") or 1)}；'
+                f'外部搜索 API：{int(research_diagnostics.get("external_search_call_count") or 0)}；'
+                f'重试：{int(research_diagnostics.get("retry_count") or 0)}；'
+                f'Gap Search：{int(research_diagnostics.get("gap_search_count") or 0)}；'
+                f'策略：{esc(str(research_diagnostics.get("search_strategy") or "turbo"))}。</p>'
+            )
+            dq_html += (
+                f'<p class="kpi-sub">DashScope 来源：原始 {raw_source_count}，唯一 {source_count}；'
+                f'直接相关 {relevant_source_count}（文章页 {relevant_article_source_count}，'
+                f'导航/索引页 {landing_source_count}），无关或歧义 {irrelevant_source_count}；'
+                f'模型事件：{model_count}；决策证据：{valid_count}；'
+                f'其中模型绑定 {model_valid_count}、本地确定性来源 {deterministic_count}；'
+                f'可引用背景来源：{reference_count}'
+                + (f'（日期未提供 {undated_reference_count}）' if undated_reference_count else '')
+                + f'；拒绝：{invalid_count}。</p>'
+            )
+            search_targets = research_diagnostics.get("search_target_tickers") or []
+            omitted_targets = research_diagnostics.get("omitted_search_tickers") or []
+            if search_targets:
+                target_line = f'本轮单次搜索目标：{"、".join(str(x) for x in search_targets)}。'
+                if omitted_targets:
+                    target_line += (
+                        '为降低单次 Turbo 搜索歧义，未纳入本轮联网检索：'
+                        + "、".join(str(x) for x in omitted_targets)
+                        + '。'
+                    )
+                dq_html += f'<p class="kpi-sub">{esc(target_line)}</p>'
+            target_strategy = str(research_diagnostics.get("search_target_strategy") or "").strip()
+            if target_strategy == "single_exact_entity_for_third_party_model":
+                dq_html += (
+                    '<p class="kpi-sub">检索策略：第三方 DeepSeek 联网搜索固定只检索一个最高风险直接持股公司，'
+                    '避免单次调用中的多公司查询被热门标的垄断。</p>'
+                )
+            dq_html += (
+                f'<p class="kpi-sub">Token：输入 {int(research_diagnostics.get("input_tokens") or 0)}；'
+                f'输出 {int(research_diagnostics.get("output_tokens") or 0)}；'
+                f'合计 {int(research_diagnostics.get("total_tokens") or 0)}；'
+                f'联网耗时 {format_number(research_diagnostics.get("search_elapsed_seconds"), 2)} 秒。</p>'
+            )
+            fetch_count = int(research_diagnostics.get("article_metadata_fetch_count") or 0)
+            fetch_ok = int(research_diagnostics.get("article_metadata_fetch_ok_count") or 0)
+            fetch_dates = int(research_diagnostics.get("article_metadata_date_enriched_count") or 0)
+            if fetch_count:
+                dq_html += (
+                    f'<p class="kpi-sub">来源页面本地校验：抓取 {fetch_count}/'
+                    f'{int(research_diagnostics.get("article_metadata_fetch_max") or fetch_count)}；'
+                    f'成功 {fetch_ok}；补全发布日期 {fetch_dates}；无搜索重试。</p>'
+                )
+            capabilities = research_diagnostics.get("model_search_capabilities") or {}
+            if capabilities and not capabilities.get("supports_freshness"):
+                dq_html += (
+                    '<p class="kpi-sub warn-text">当前模型的百炼第三方联网搜索不提供可靠的 provider-side '
+                    'freshness/citation 保证；时效范围通过显式起始日期、报告日上限和本地页面日期校验执行。</p>'
+                )
+            search_query = str(research_diagnostics.get("search_query") or "").strip()
+            if search_query:
+                dq_html += f'<p class="kpi-sub">实际联网检索指令：{esc(search_query)}</p>'
+            dq_html += (
+                f'<p class="kpi-sub">来源绑定：{esc(str(research_diagnostics.get("source_binding_validation") or "—"))}；'
+                f'URL 注入：{esc(str(research_diagnostics.get("source_url_validation") or "—"))}；'
+                f'日期校验：{esc(str(research_diagnostics.get("date_validation") or "—"))}。</p>'
+            )
+            dashscope_sources = research_diagnostics.get("dashscope_sources") or []
+            if dashscope_sources:
+                source_rows = []
+                for source in dashscope_sources[:20]:
+                    source_rows.append([
+                        source.get("source_index") if source.get("source_index") is not None else "—",
+                        "相关" if source.get("relevance_status") == "relevant" else (
+                            "歧义" if source.get("relevance_status") == "ambiguous" else "无关"
+                        ),
+                        "、".join(str(x) for x in (source.get("matched_tickers") or [])) or "—",
+                        _event_date_display(source.get("published_date")),
+                        source.get("source_domain") or "—",
+                        source.get("page_type") or "—",
+                        source.get("date_provenance") or "—",
+                        (
+                            "成功" if source.get("article_fetch_ok")
+                            else "失败" if source.get("article_fetch_attempted")
+                            else "未抓取"
+                        ),
+                        (
+                            "可引用（日期未知）" if source.get("citable_as_reference") and not source.get("published_date")
+                            else "可引用" if source.get("citable_as_reference")
+                            else "仅诊断"
+                        ),
+                        source.get("title") or "—",
+                        source.get("url") or "—",
+                    ])
+                dq_html += '<h4 style="margin:14px 0 8px">DashScope 实际返回来源</h4>' + render_table(
+                    ["来源索引", "相关性", "匹配标的", "日期", "域名", "页面类型", "日期来源", "页面校验", "发布用途", "标题", "URL"], source_rows,
+                )
+            reasons = research_diagnostics.get("invalid_evidence_reasons") or {}
+            if research_diagnostics.get("response_json_parse_error"):
+                reasons = dict(reasons)
+                reasons["invalid_json"] = max(1, int(reasons.get("invalid_json") or 0))
+            if reasons:
+                reason_text = "、".join(
+                    f"{esc(_single_search_reason_zh(str(reason)))} {count}"
+                    for reason, count in reasons.items() if count
+                )
+                dq_html += f'<p class="kpi-sub warn-text">本地校验拒绝原因：{reason_text}</p>'
+            invalid_items = research_diagnostics.get("invalid_evidence_items") or []
+            if invalid_items:
+                invalid_rows = []
+                for item in invalid_items[:12]:
+                    invalid_rows.append([
+                        item.get("ticker") or "—",
+                        item.get("source_index") if item.get("source_index") is not None else "—",
+                        _event_date_display(item.get("published_date")),
+                        item.get("url") or "—",
+                        "；".join(_single_search_reason_zh(str(x)) for x in (item.get("reasons") or [])) or "未知原因",
+                        item.get("title") or "—",
+                    ])
+                dq_html += '<h4 style="margin:14px 0 8px">本地校验拒绝明细</h4>' + render_table(
+                    ["标的", "来源索引", "日期", "URL", "拒绝原因", "标题"], invalid_rows,
+                )
+            rwc = research_diagnostics.get("accepted_risk_weighted_coverage")
+            top_cov = research_diagnostics.get("accepted_top_risk_coverage")
+            if rwc is not None or top_cov is not None:
+                dq_html += (
+                    f'<p class="kpi-sub">风险加权覆盖率：{format_ratio_as_pct(rwc or 0)}；'
+                    f'Top-risk 覆盖率：{format_ratio_as_pct(top_cov or 0)}。</p>'
+                )
+            dq_html += (
+                f'<p class="kpi-sub">最新通过校验事件：'
+                f'{esc(_event_date_display(research_diagnostics.get("latest_accepted_event_date")))}；'
+                f'最新搜索来源日期：'
+                f'{esc(_event_date_display(research_diagnostics.get("latest_selected_event_date")))}。</p>'
+            )
         else:
-            final_rejected_count = int(research_diagnostics.get("rejected_evidence_count") or 0)
-            post_materiality_isolated = max(0, final_rejected_count - materiality_rejected)
-        summarizer_rejected = int(research_diagnostics.get("summarizer_rejected_count") or 0)
-        final_gate_rejected = int(research_diagnostics.get("final_gate_rejected_count") or 0)
-        dq_html += (
-            f'<p>新闻研究状态：{esc(status_labels.get(str(research_diagnostics.get("status")), str(research_diagnostics.get("status") or "未知")))}；'
-            f'原始结果：{research_diagnostics.get("raw_results_count", 0)}；过滤后：{research_diagnostics.get("filtered_results_count", 0)}；'
-            f'进入 Materiality：{selected_count}；Materiality 拒绝：{materiality_rejected}；'
-            f'摘要/身份隔离：{post_materiality_isolated}；摘要器明确拒绝：{summarizer_rejected}；'
-            f'最终门拒绝：{final_gate_rejected}；Accepted Evidence：{accepted_count}；'
-            f'过滤标签计数（同一结果可能命中多个标签）：{reasons}</p>'
-        )
-        # P0-2: 使用 accepted 口径的覆盖率和最新事件日期
-        rwc = research_diagnostics.get("accepted_risk_weighted_coverage")
-        if rwc is None:
-            rwc = research_diagnostics.get("risk_weighted_coverage")
-        top_cov = research_diagnostics.get("accepted_top_risk_coverage")
-        if top_cov is None:
-            top_cov = research_diagnostics.get("top_risk_coverage") or 0
-        if rwc is not None:
-            dq_html += f'<p class="kpi-sub">风险加权覆盖率：{format_ratio_as_pct(rwc)}；Top-risk 覆盖率：{format_ratio_as_pct(top_cov)}</p>'
-        latest_event = research_diagnostics.get("latest_accepted_event_date")
-        dq_html += f'<p class="kpi-sub">最新 Accepted 事件日期：{esc(_event_date_display(latest_event))}</p>'
-        latest_candidate = research_diagnostics.get("latest_selected_event_date")
-        if latest_candidate:
-            dq_html += f'<p class="kpi-sub">最新候选事件日期：{esc(_event_date_display(latest_candidate))}</p>'
-        # 第六轮：Materiality 统计（修改计划第 16 节）
-        if mat_stats:
+            status = str(research_diagnostics.get("status") or "未知")
             dq_html += (
-                f'<p class="kpi-sub">Materiality 评分：入选 {mat_stats.get("accepted_count", 0)} 条，'
-                f'拒绝 {mat_stats.get("rejected_count", 0)} 条，'
-                f'事件聚类 {mat_stats.get("cluster_count", 0)} 组，'
-                f'平均选择分 {mat_stats.get("avg_selection_score", 0)}；'
-                f'拒绝原因：' + "、".join(f"{esc(k)} {v}" for k, v in (mat_stats.get("rejected_reasons") or {}).items() if v) + '</p>'
+                f'<p>研究状态：{esc(status_labels.get(status, status))}；'
+                f'Accepted Evidence：{int(research_diagnostics.get("accepted_evidence_count") or 0)}；'
+                f'Rejected Evidence：{int(research_diagnostics.get("rejected_evidence_count") or 0)}。</p>'
             )
-
-        isolation_reasons = research_diagnostics.get("summarizer_isolation_reasons") or {}
-        if isolation_reasons:
-            reason_text = "、".join(
-                f"{esc(_summarizer_reason_zh(str(reason)))} {count}"
-                for reason, count in isolation_reasons.items() if count
-            )
-            dq_html += f'<p class="kpi-sub warn-text">摘要隔离原因：{reason_text}</p>'
-
-        isolated_items = research_diagnostics.get("summarizer_isolated_items") or []
-        if isolated_items:
-            isolated_rows = []
-            for item in isolated_items[:12]:
-                isolated_rows.append([
-                    item.get("ticker") or "MACRO",
-                    item.get("source_type") or "unknown",
-                    item.get("lane") or "unknown",
-                    _summarizer_reason_zh(str(item.get("reason") or "")),
-                    item.get("title") or "—",
-                ])
-            dq_html += '<h4 style="margin:14px 0 8px">摘要隔离明细</h4>' + render_table(
-                ["标的", "来源类型", "Lane", "隔离原因", "标题"], isolated_rows,
-            )
-
-        final_gate_reasons = research_diagnostics.get("final_gate_reject_reasons") or {}
-        if final_gate_reasons:
-            reason_text = "、".join(
-                f"{esc(_final_gate_reason_zh(str(reason)))} {count}"
-                for reason, count in final_gate_reasons.items() if count
-            )
-            dq_html += f'<p class="kpi-sub warn-text">最终 Evidence Gate 拒绝原因：{reason_text}</p>'
-
-        final_gate_items = research_diagnostics.get("final_gate_rejected_items") or []
-        if final_gate_items:
-            final_rows = []
-            for item in final_gate_items[:12]:
-                raw_date = item.get("raw_published_date") or "—"
-                normalized_date = _event_date_display(item.get("published_date"))
-                reason_text = "；".join(
-                    _final_gate_reason_zh(str(reason))
-                    for reason in (item.get("reasons") or [])
-                ) or "未知原因"
-                final_rows.append([
-                    item.get("ticker") or "MACRO",
-                    item.get("source_domain") or "unknown",
-                    item.get("source_type") or "unknown",
-                    item.get("lane") or "unknown",
-                    raw_date,
-                    normalized_date,
-                    "是" if item.get("article_fetch_ok") else "否",
-                    "是" if item.get("snippet_fallback_ok") else "否",
-                    item.get("recency_tier") or "unknown",
-                    reason_text,
-                    item.get("title") or "—",
-                ])
-            dq_html += '<h4 style="margin:14px 0 8px">最终 Evidence Gate 拒绝明细</h4>' + render_table(
-                ["标的", "域名", "来源类型", "Lane", "发布时间原值", "标准化日期", "正文提取", "摘要可用", "时效层级", "拒绝原因", "标题"],
-                final_rows,
-            )
-
-        invariant_ok = research_diagnostics.get("stage_count_invariant_ok")
-        if invariant_ok is False:
-            dq_html += '<p class="kpi-sub warn-text">研究阶段计数未闭合，请检查候选去重与阶段聚合。</p>'
-        duplicate_count = int(research_diagnostics.get("diagnostic_duplicate_candidate_count") or 0)
-        if duplicate_count:
-            before_count = int(research_diagnostics.get("diagnostic_candidate_count_before_dedupe") or 0)
-            after_count = int(research_diagnostics.get("diagnostic_candidate_count_after_dedupe") or 0)
-            dq_html += (
-                f'<p class="kpi-sub">跨检索通道重复候选已去重：{duplicate_count} 条；'
-                f'去重前 {before_count} 条，去重后 {after_count} 条。</p>'
-            )
-
-        dq_html += _render_stage_breakdown(
-            "按来源类型的研究阶段统计",
-            "来源类型",
-            research_diagnostics.get("evidence_stage_by_source_type"),
-        )
-        dq_html += _render_stage_breakdown(
-            "按标的的研究阶段统计",
-            "标的",
-            research_diagnostics.get("evidence_stage_by_ticker"),
-        )
-        dq_html += _render_stage_breakdown(
-            "按 Search Lane 的研究阶段统计",
-            "Lane",
-            research_diagnostics.get("evidence_stage_by_lane"),
-        )
     if report_quality:
         # §24: 质量评分为分项展示
         final_conf = _first_not_none(
@@ -782,35 +823,14 @@ def build_html(
             dq_html += '<p class="kpi-sub warn-text">质量提示：' + '；'.join(esc(item) for item in quality_warnings) + '</p>'
     if not dq_html:
         dq_html = '<p class="kpi-sub">数据完整。</p>'
-    # 第六轮：Search Provider 与 Planner 诊断显示（修改计划第 28 节）
-    planner_mode = research_diagnostics.get("planner_mode") if research_diagnostics else None
-    planner_model = research_diagnostics.get("planner_model") if research_diagnostics else None
-    provider_used = research_diagnostics.get("provider_used") if research_diagnostics else None
-    verticals = research_diagnostics.get("verticals_used") if research_diagnostics else None
-    search_lanes = research_diagnostics.get("search_lanes") if research_diagnostics else None
-    gap_mode = research_diagnostics.get("gap_mode") if research_diagnostics else None
-    dq_html += f'<p class="kpi-sub">请求模式：{esc(str(settings.get("search_provider") or "auto"))}；'
-    if provider_used:
-        dq_html += f'实际使用：{esc(str(provider_used))}；'
-    if verticals:
-        dq_html += f'搜索通道：{esc(" + ".join(verticals))}；'
-    if search_lanes:
-        lane_parts = [f"{esc(k)} {v}" for k, v in search_lanes.items() if v and k not in ("official_total", "news_total")]
-        if lane_parts:
-            dq_html += f'Lane 分布：{"、".join(lane_parts)}；'
-    dq_html += f'AI 模型：{esc(str(settings.get("model") or "未配置"))}</p>'
-    if planner_mode:
-        planner_label = "AI Planner" if planner_mode == "ai" else "确定性 Fallback Planner"
-        dq_html += f'<p class="kpi-sub">Planner 模式：{esc(planner_label)}'
-        if planner_model:
-            dq_html += f'；Planner 模型：{esc(str(planner_model))}（与 Portfolio Agent 相同）'
-        fallback_reason = research_diagnostics.get("planner_fallback_reason") if research_diagnostics else None
-        if fallback_reason and planner_mode != "ai":
-            dq_html += f'；降级原因：{esc(str(fallback_reason))}'
-        if gap_mode:
-            gap_label = {"ai": "AI 缺口分析", "deterministic": "确定性补搜", "skipped": "无需补搜"}.get(gap_mode, gap_mode)
-            dq_html += f'；Gap Analyzer：{esc(gap_label)}'
-        dq_html += '</p>'
+    if single_search_mode:
+        dq_html += (
+            f'<p class="kpi-sub">研究模式：DashScope 单次内置联网搜索；'
+            f'AI 模型：{esc(str(research_diagnostics.get("model") or settings.get("model") or "deepseek-v4-flash"))}；'
+            '固定策略：turbo；调用上限：1；Serper：禁用；补搜与重试：禁用。</p>'
+        )
+    else:
+        dq_html += f'<p class="kpi-sub">AI 模型：{esc(str(settings.get("model") or "未配置"))}</p>'
     parts.append(render_section("数据质量与限制", "🛡️", dq_html))
 
     parts.append(render_disclaimer(advice.get("disclaimer") or "本报告仅供研究参考，不构成投资建议。"))

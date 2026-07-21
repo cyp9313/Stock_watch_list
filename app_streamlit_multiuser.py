@@ -1828,15 +1828,9 @@ def render_portfolio_weekly_schedules(user, page, mail_ready, runner_ok):
         if schedule.get("report_kind") == "portfolio" and schedule.get("subject_key") == page.get("id")
     ]
     with st.form(f"portfolio_report_schedule_form_{page.get('id')}"):
-        c_email, c_provider, c_time = st.columns([2, 1, 1])
+        c_email, c_time = st.columns([2, 1])
         with c_email:
             recipient = st.text_input("Recipient email", key=f"portfolio_schedule_email_{page.get('id')}")
-        with c_provider:
-            provider = st.selectbox(
-                "Search provider",
-                ["auto", "priority", "serper", "searxng", "both"],
-                key=f"portfolio_schedule_provider_{page.get('id')}",
-            )
         with c_time:
             local_time = st.time_input(
                 "Send time (Europe/Berlin)",
@@ -1861,7 +1855,7 @@ def render_portfolio_weekly_schedules(user, page, mail_ready, runner_ok):
                 recipient_email=recipient,
                 local_time=local_time,
                 weekdays=selected_weekdays,
-                search_provider=provider,
+                search_provider="dashscope_builtin",
                 settings=page.get("analysis_settings") or {},
             )
             st.success(
@@ -1916,8 +1910,8 @@ def render_portfolio_ai_report(config, page_index, raw_df, user):
     st.divider()
     st.markdown("### AI Portfolio Report")
     st.caption(
-        "Generates a self-contained HTML report with portfolio metrics, risk concentration, top-risk evidence and rule-based action suggestions. "
-        "The fixed research mode is Top-risk news; there is no per-holding daily-report fan-out."
+        "Generates a self-contained HTML report with deterministic portfolio metrics and one DeepSeek-v4-Flash "
+        "DashScope built-in web-search call. The search strategy is fixed to turbo; Serper, retries and gap searches are disabled."
     )
     if not user:
         st.info("Sign in with an administrator-issued account to generate or email Portfolio AI reports.")
@@ -1940,11 +1934,7 @@ def render_portfolio_ai_report(config, page_index, raw_df, user):
     download_tab, email_tab = st.tabs(["Generate & Download", "Generate & Email"])
     with download_tab:
         with st.form(f"portfolio_report_download_form_{page.get('id')}"):
-            search_provider = st.selectbox(
-                "Search provider",
-                ["auto", "priority", "serper", "searxng", "both"],
-                key=f"portfolio_report_download_provider_{page.get('id')}",
-            )
+            st.caption("Research mode: one DashScope built-in search · DeepSeek-v4-Flash · turbo · no retry")
             submitted = st.form_submit_button("Generate Portfolio Report", disabled=not runner_ok)
         if submitted:
             session_id = None
@@ -1958,7 +1948,6 @@ def render_portfolio_ai_report(config, page_index, raw_df, user):
                         owner_key=user["cache_key"],
                         portfolio_page_id=page.get("id"),
                         portfolio_name=page.get("name"),
-                        search_provider=search_provider,
                         market_rows=portfolio_market_rows(raw_df, page),
                         fx_rates=portfolio_report_fx_rates(page, (page.get("analysis_settings") or {}).get("base_currency", "EUR")),
                     )
@@ -1995,10 +1984,10 @@ def render_portfolio_ai_report(config, page_index, raw_df, user):
                     st.info(
                         "Research diagnostics: "
                         f"status={diagnostics.get('status', 'unknown')}, "
-                        f"raw={diagnostics.get('raw_results_count', 0)}, "
-                        f"filtered={diagnostics.get('filtered_results_count', 0)}, "
-                        f"selected={diagnostics.get('selected_evidence_count', 0)}, "
-                        f"top-risk coverage={float(diagnostics.get('top_risk_coverage') or 0):.0%}."
+                        f"search calls={diagnostics.get('search_call_count', 0)}/1, "
+                        f"sources={diagnostics.get('unique_source_count', 0)}, "
+                        f"valid evidence={diagnostics.get('valid_evidence_count', 0)}, "
+                        f"invalid evidence={diagnostics.get('invalid_evidence_count', 0)}."
                     )
                 with st.expander("Generation log", expanded=True):
                     if result.get("stdout"):
@@ -2014,11 +2003,7 @@ def render_portfolio_ai_report(config, page_index, raw_df, user):
         with send_once_tab:
             with st.form(f"portfolio_report_email_form_{page.get('id')}"):
                 recipient = st.text_input("Recipient email", key=f"portfolio_report_email_{page.get('id')}")
-                provider = st.selectbox(
-                    "Search provider",
-                    ["auto", "priority", "serper", "searxng", "both"],
-                    key=f"portfolio_report_email_provider_{page.get('id')}",
-                )
+                st.caption("Research mode: one DashScope built-in search · DeepSeek-v4-Flash · turbo · no retry")
                 queued = st.form_submit_button("Queue Portfolio Report Email", disabled=not mail_ready or not runner_ok)
             if queued:
                 try:
@@ -2027,7 +2012,7 @@ def render_portfolio_ai_report(config, page_index, raw_df, user):
                         portfolio_page_id=page.get("id"),
                         portfolio_name=page.get("name"),
                         recipient_email=recipient,
-                        search_provider=provider,
+                        search_provider="dashscope_builtin",
                         settings=page.get("analysis_settings") or {},
                     )
                     st.success(f"Portfolio job {job['id'][:8]} queued for {job['recipient_masked']}.")

@@ -1,16 +1,10 @@
-"""Central publication and actionability gate for portfolio reports.
+"""Publication and actionability gate for Portfolio AI v2.
 
-第七轮第 7 节扩展：在原有 ticker coverage / fresh count / article fetch / final
-confidence 检查之外，新增 P0 数据完整性阻断条件：
-
-- Evidence UID / 显示 ID 唯一性；
-- 摘要串线（summary identity mismatch）；
-- 被拒绝 / reference 证据泄漏进正式发布列表；
-- accepted 且 material 事件数低于下限；
-- risk-weighted coverage < 0.85 → 仅降级为不可操作（observation），不阻断；
-- 方向性操作（add/trim/reduce/exit）缺乏有效 accepted 证据 → 阻断。
-
-并区分三个状态：publishable / observation_only / directional_action_supported。
+The Portfolio path receives at most one DashScope built-in search response. This
+gate validates accepted-evidence identity, source verification, Top-risk
+coverage, freshness, directional-action support and the hard call budget. Low
+coverage degrades to observation mode; unsafe structure or budget violations
+remain blocking errors.
 """
 from __future__ import annotations
 
@@ -105,7 +99,7 @@ def evaluate_report_quality(
         else diagnostics.get("risk_weighted_coverage") or 0.0
     )
     materiality_accepted_count = accepted_count
-    verified_count = sum(1 for e in accepted if e.get("article_fetch_ok"))
+    verified_count = sum(1 for e in accepted if e.get("article_fetch_ok") or e.get("source_verified"))
 
     final_confidence = float(_first_not_none(
         advice.get("final_confidence"), advice.get("confidence"), 0.0,
@@ -117,43 +111,19 @@ def evaluate_report_quality(
     blocking.extend(diagnostics.get("identity_errors") or [])
     blocking.extend(_check_identity_integrity(accepted))
 
-    # 2) Summarizer 完整性错误按 Evidence 隔离，而不是全局终止报告。
-    #
-    # ``_apply_summaries_by_uid`` 会让每条 Evidence 默认处于隔离状态，只有
-    # UID、不可变身份字段以及显式 accept 均校验通过后才标记
-    # ``summary_integrity_ok=True``。因此：
-    # - 若错误只影响已拒绝/隔离的候选，允许报告以观察型继续发布；
-    # - 若任何不安全 Evidence 仍进入 Accepted 列表，则继续硬阻断。
-    summarizer_errors = [str(e) for e in (diagnostics.get("summarizer_errors") or [])]
-    fatal_summary_tokens = (
-        "mismatch", "duplicate", "unknown", "missing_uid", "missing_accept",
-        "item_missing_uid", "input_missing_uid", "item_not_object",
-    )
-    has_summarizer_integrity_error = any(
-        any(token in error for token in fatal_summary_tokens)
-        for error in summarizer_errors
-    )
-    if has_summarizer_integrity_error:
-        unsafe_accepted = [
-            e for e in accepted
-            if e.get("summary_integrity_ok") is not True
-        ]
-        if unsafe_accepted:
-            blocking.append("summarizer_integrity_error_detected")
-        else:
-            warnings.append(
-                "Summarizer 返回了不完整或无法映射的条目；相关候选已按 Fail-closed 隔离，"
-                "仅保留逐条通过完整性校验的 Accepted Evidence，报告可降级发布"
-            )
-
-    # 3) rejected / reference 泄漏进发布列表（第七轮第 6 节）
+    # 2) rejected / reference 泄漏进发布列表
     if leaked:
         blocking.append(f"rejected_or_reference_evidence_in_publishable_list:count={len(leaked)}")
 
-    # 4) Top-risk 新闻状态与覆盖
+    # 3) Top-risk 联网证据状态与覆盖
     if require_news:
-        if status not in {"success", "insufficient_coverage"}:
-            blocking.append(f"Top-risk 新闻研究状态不是成功：{status}")
+        if status not in {"success", "source_notes_only", "insufficient_coverage", "no_valid_evidence", "invalid_model_output", "provider_error"}:
+            warnings.append(f"单次联网研究状态异常：{status}")
+        elif status != "success":
+            if status == "source_notes_only":
+                warnings.append("单次联网研究仅产出可引用背景来源；未形成决策证据，报告保持量化观察型")
+            else:
+                warnings.append(f"单次联网研究未产出可用证据：{status}；报告转为量化观察型")
         if coverage < min_coverage:
             coverage_message = f"Top-risk 新闻覆盖率 {coverage:.0%} 低于目标 {min_coverage:.0%}"
             if strict_coverage:
@@ -162,29 +132,29 @@ def evaluate_report_quality(
                 warnings.append(coverage_message + "；报告允许降级生成，但操作置信度将受限")
         if accepted_count == 0:
             # 无 accepted 证据 → observation_only，不阻断报告
-            warnings.append("无 accepted（materiality + 摘要通过）证据，报告转为观察型")
+            warnings.append("无通过本地 URL 与日期校验的 accepted 证据，报告转为观察型")
         if fresh_count < min_fresh:
             if accepted_count == 0:
                 warnings.append(f"新鲜 accepted 证据数 0；因无 accepted 证据，观察型报告仍可发布")
             else:
                 blocking.append(f"新鲜 accepted 证据数 {fresh_count} 低于最低要求 {min_fresh}")
 
-    # 5) Beta 可用性
+    # 4) Beta 可用性
     if metrics.get("portfolio_beta_status") != "actual":
         warnings.append("历史组合 Beta 不可用或样本不足")
 
-    # 6) 全部未验证 → 置信度受限
+    # 5) 全部未验证 → 置信度受限
     if accepted and verified_count == 0:
-        warnings.append("新闻证据均为未验证搜索摘要，报告和操作置信度已受限")
+        warnings.append("新闻证据均未通过正文或 DashScope 来源 URL 验证，报告和操作置信度已受限")
 
-    # 7) 风险加权覆盖（< 阈值仅降级为不可操作，不阻断）
+    # 6) 风险加权覆盖（< 阈值仅降级为不可操作，不阻断）
     if risk_weighted_coverage < min_risk_weighted_coverage:
         warnings.append(
             f"风险加权覆盖 {risk_weighted_coverage:.0%} 低于 {min_risk_weighted_coverage:.0%}，"
             f"报告降级为观察型（不可操作）"
         )
 
-    # 8) 方向性操作必须指向有效 accepted 证据（第七轮第 7 节）
+    # 7) 方向性操作必须指向有效 accepted 证据
     accepted_ids = {e.get("evidence_id") for e in accepted}
     directional_actions = [
         a for a in (advice.get("actions") or [])
@@ -200,11 +170,15 @@ def evaluate_report_quality(
                 f"directional_action_without_material_evidence:{a.get('ticker')}:{a.get('action')}"
             )
 
-    # 9) Planner fallback 但未暴露错误
-    if diagnostics.get("planner_mode") == "fallback" and not diagnostics.get("planner_errors"):
-        warnings.append("Planner 降级为 fallback 但未暴露具体校验错误，无法诊断修复")
+    # 8) 单次联网调用预算必须满足产品约束。
+    if int(diagnostics.get("search_call_count") or 0) > 1:
+        blocking.append("dashscope_search_call_budget_exceeded")
+    if int(diagnostics.get("external_search_call_count") or 0) != 0:
+        blocking.append("external_search_call_detected")
+    if int(diagnostics.get("retry_count") or 0) != 0 or int(diagnostics.get("gap_search_count") or 0) != 0:
+        blocking.append("retry_or_gap_search_detected")
 
-    # 10) 结构化校验硬错误
+    # 9) 结构化校验硬错误
     validation_result = validation_result or {}
     blocking.extend(validation_result.get("hard_errors") or [])
 

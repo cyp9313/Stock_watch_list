@@ -126,12 +126,11 @@ def rank_portfolio_risks(snapshot: dict[str, Any], metrics: dict[str, Any]) -> d
         item["weight_rank"] = weight_rank[ticker]
         item["volatility_rank"] = volatility_rank[ticker]
 
-    max_tickers = int(os.environ.get("PORTFOLIO_RESEARCH_MAX_TICKERS", "5") or "5")
-    min_tickers = int(os.environ.get("PORTFOLIO_RESEARCH_MIN_TICKERS", "3") or "3")
+    max_tickers = max(1, min(10, int(os.environ.get("PORTFOLIO_SINGLE_SEARCH_TOP_TICKERS", "5") or "5")))
     configured = snapshot.get("analysis_settings", {}).get("research_max_tickers") if isinstance(snapshot.get("analysis_settings"), dict) else None
     if configured:
-        max_tickers = min(max_tickers, int(configured))
-    count = min(len(ranked), max_tickers, max(1, min_tickers, math.ceil(len(ranked) * 0.25)))
+        max_tickers = min(max_tickers, max(1, int(configured)))
+    count = min(len(ranked), max_tickers)
     return {
         "items": ranked,
         "top_risk_tickers": [item["ticker"] for item in ranked[:count]],

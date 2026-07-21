@@ -348,7 +348,12 @@ def render_news_group(title: str, items: list[dict[str, Any]]) -> str:
         imp = str(e.get("impact_direction") or "neutral").lower()
         imp_cls = {"positive": "imp-positive", "negative": "imp-negative", "neutral": "imp-neutral"}.get(imp, "imp-neutral")
         imp_color = IMPACT_COLORS.get(imp, COLOR_TOKENS["warn"])
-        verification_color = _color("up") if e.get("article_fetch_ok") else _color("warn")
+        if e.get("article_fetch_ok"):
+            verification_color = _color("up")
+        elif e.get("source_verified"):
+            verification_color = COLOR_TOKENS["info"]
+        else:
+            verification_color = _color("warn")
         tier = str(e.get("source_quality") or "tier_3").replace("_", "-")
         # §28 修复：source_quality 显示为中文标签
         _TIER_DISPLAY = {"tier-1": "一级来源", "tier-2": "二级来源", "tier-3": "三级来源"}
@@ -361,7 +366,11 @@ def render_news_group(title: str, items: list[dict[str, Any]]) -> str:
         # 第六轮第 20 节：verification_level 标签（官方原文/监管文件/主流媒体正文已提取/多源交叉确认/单一来源/搜索摘要）
         verification_level_zh = e.get("verification_level_zh")
         if not verification_level_zh:
-            verification_level_zh = "正文已提取" if e.get("article_fetch_ok") else "搜索摘要·未验证"
+            verification_level_zh = (
+                "正文已提取" if e.get("article_fetch_ok")
+                else "来源 URL 已验证" if e.get("source_verified")
+                else "搜索摘要·未验证"
+            )
         # §18: 分离 Planned Need 与 Detected Content Type
         content_type = e.get("content_type") or ""
         event_type = e.get("event_type") or e.get("event_hint") or ""
@@ -369,15 +378,20 @@ def render_news_group(title: str, items: list[dict[str, Any]]) -> str:
         _CONTENT_TYPE_LABELS = {"forecast": "前瞻", "opinion": "分析观点", "news_report": "新闻报道", "press_release": "新闻稿"}
         if content_type in ("opinion", "forecast") and "results" in str(e.get("event_hint") or "") and "preview" not in str(e.get("event_hint") or ""):
             event_type = f"{event_type}_preview"
-        event_date = e.get("event_date") or e.get("published_date") or ""
+        event_date = e.get("event_date") or e.get("published_date") or "日期未提供"
         tags = (
             f'<span class="tier-badge {esc(tier)}">{esc(tier_display)}</span>'
             f'<span class="tier-badge" style="background:{verification_color}22;color:{verification_color};">'
             f'{esc(verification_level_zh)}</span>'
             f'<span class="tier-badge" style="background:{imp_color}22;color:{imp_color};">{esc(impact_zh(imp))}</span>'
             f'<span class="tier-badge" style="background:{COLOR_TOKENS["info"]}22;color:{COLOR_TOKENS["info"]};">{esc(horizon_zh(e.get("impact_horizon")))}</span>'
-            f'<span class="chip">{esc(e.get("evidence_id", ""))}</span>'
+            f'<span class="chip">{esc(e.get("evidence_id") or e.get("reference_id") or "")}</span>'
         )
+        if e.get("source_note_only"):
+            tags += (
+                f'<span class="tier-badge" style="background:{COLOR_TOKENS["muted"]}22;'
+                f'color:{COLOR_TOKENS["muted"]};">背景来源·非决策证据</span>'
+            )
         # 第六轮第 16 节：materiality 评分标签
         selection_score = e.get("selection_score")
         if selection_score is not None:
@@ -388,7 +402,7 @@ def render_news_group(title: str, items: list[dict[str, Any]]) -> str:
         if event_type or event_date:
             detail_lines.append(f'<div class="sc-meta"><span>事件类型：{esc(event_type or "—")}</span><span>事件日期：{esc(event_date or "—")}</span></div>')
         detail_lines.append(
-            f'<div class="sc-meta"><span>来源：{esc(e.get("source_name", ""))}</span><span>日期：{esc(e.get("published_date", ""))}</span>'
+            f'<div class="sc-meta"><span>来源：{esc(e.get("source_name", ""))}</span><span>日期：{esc(e.get("published_date") or "日期未提供")}</span>'
             f'<span>关联：{esc(e.get("ticker") or "—")}</span></div>'
         )
         # 优先用第六轮 Decision Summarizer 字段，回退到旧 summary_zh
@@ -408,7 +422,7 @@ def render_news_group(title: str, items: list[dict[str, Any]]) -> str:
         if supports_action and supports_action != "none":
             action_label = {"reduce": "支持减仓", "trim": "支持小幅减仓", "hold": "支持持有", "watch": "支持观察", "add": "支持加仓"}.get(supports_action, supports_action)
             detail_lines.append(f'<div class="sc-summary"><strong>支持什么建议：</strong>{esc(action_label)}</div>')
-        does_not_prove = e.get("does_not_prove_zh")
+        does_not_prove = e.get("does_not_prove_zh") or e.get("does_not_support")
         if does_not_prove:
             detail_lines.append(f'<div class="sc-summary"><strong>不支持什么结论：</strong>{esc(does_not_prove)}</div>')
         detail_html = "\n".join(detail_lines)

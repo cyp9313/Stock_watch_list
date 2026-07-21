@@ -434,10 +434,13 @@ def validate_portfolio_claims(
             fresh_verified = [
                 eid for eid in eids
                 if str((ev_by_id.get(str(eid)) or {}).get("recency_tier")) in _FRESH_TIERS
-                and bool((ev_by_id.get(str(eid)) or {}).get("article_fetch_ok"))
+                and bool(
+                    (ev_by_id.get(str(eid)) or {}).get("article_fetch_ok")
+                    or (ev_by_id.get(str(eid)) or {}).get("source_verified")
+                )
             ]
             if not fresh_verified:
-                message = f"{a.get('ticker')} 高置信度操作（{conf}）没有新鲜且正文已提取的证据支撑。"
+                message = f"{a.get('ticker')} 高置信度操作（{conf}）没有新鲜且来源已验证的证据支撑。"
                 warnings.append(message)
                 errors.append(message)
 

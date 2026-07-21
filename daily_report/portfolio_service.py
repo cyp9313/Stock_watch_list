@@ -31,17 +31,7 @@ def _extract_runner_failure(combined_output: str) -> tuple[str | None, bool]:
     markers = (
         (
             "Portfolio report quality gate failed:",
-            "报告生成失败：Top-risk 新闻研究或报告质量未达到发布要求。",
-            True,
-        ),
-        (
-            "Portfolio Agent validation failed:",
-            "报告生成失败：AI 输出在修复重试后仍未通过严格校验。",
-            True,
-        ),
-        (
-            "最终 strict 校验未通过：",
-            "报告生成失败：AI 输出未通过最终严格校验。",
+            "报告生成失败：单次联网研究或报告质量未达到发布要求。",
             True,
         ),
     )
@@ -59,7 +49,6 @@ def generate_portfolio_report(
     owner_key: str,
     portfolio_page_id: str | None = None,
     portfolio_name: str | None = None,
-    search_provider: str = "auto",
     market_rows: list[dict] | None = None,
     fx_rates: dict | None = None,
     timeout_seconds: int | None = None,
@@ -100,7 +89,6 @@ def generate_portfolio_report(
         "--portfolio-id", portfolio_page_id,
         "--portfolio-name", portfolio_name,
         "--owner-scope", owner_key,
-        "--search-provider", search_provider or "auto",
         "--run-dir", str(run_dir),
         "--output", str(output_html),
     ]
@@ -188,5 +176,4 @@ def generate_portfolio_report_for_job(job: dict) -> dict:
         owner_key=job["owner_key"],
         portfolio_page_id=portfolio_page.get("id"),
         portfolio_name=portfolio_page.get("name"),
-        search_provider=payload.get("search_provider") or job.get("search_provider") or "auto",
     )

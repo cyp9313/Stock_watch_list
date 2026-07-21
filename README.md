@@ -324,19 +324,32 @@ python daily_report/run_report.py AAPL --months 3 --search-provider auto
 - Portfolio 删除后，worker 不会发送旧持仓快照，相关 job 会失败并显示错误；
 - Portfolio 报告和 ticker 日报共享 `daily_report_jobs.db`、worker、SMTP、Message-ID 幂等、重试和队列容量控制。
 
-Portfolio AI 报告在发布前还会经过统一质量门槛。默认要求 Top-risk 新闻研究可用且至少存在 1 条新鲜证据，并把单项操作置信度限制在报告最终置信度以内。60% 是新闻覆盖目标：低于该目标时报告仍会生成，但会明确标为覆盖不足，按实际覆盖率降低最终置信度，并把未达到可操作门槛的方向性建议转换为观察项；设置 `PORTFOLIO_REPORT_STRICT_NEWS_COVERAGE=true` 可恢复覆盖不足即阻断的严格模式。新闻搜索默认限制在最近 120 天，投资者关系首页、季度结果目录等参考页不作为事件新闻。证据采用分级模式：成功抓取并通过质量校验的正文标为“正文已验证”；日期明确、来源质量合格且包含具体事件信息的搜索摘要可降级进入报告，但会标为“搜索摘要·未验证”，降低报告置信度，并且不能支撑高置信度操作。将 `PORTFOLIO_RESEARCH_REQUIRE_VERIFIED_ARTICLE=true` 可恢复只接受正文的严格模式。新闻完全不可用、没有有效证据或没有新鲜证据时仍会阻断生成。研究过程会在临时运行目录生成 `portfolio_research_diagnostics.json`、原始结果和过滤后结果，便于区分未配置搜索、提供方错误、无结果、全部被过滤、证据过旧、正文未验证和覆盖不足。
+Portfolio AI 报告采用单次联网架构：Python 先计算组合权重、风险贡献、Beta、波动率、回撤与技术广度，再由 `deepseek-v4-flash` 通过 DashScope 内置联网搜索完成一次研究与结构化分析。该路径固定使用 `turbo`，每份报告最多调用一次联网搜索；不会调用 Serper，不运行 Query Planner、Official Lane、Materiality/Summarizer 多阶段链路、Gap Search、补搜或模型重试。
+
+模型返回的事件只有在本地校验通过后才能进入正式报告。DeepSeek 属于百炼第三方模型，其联网搜索不提供可靠的 provider-side freshness 与 citation 保证，因此程序默认把一次调用拆成最多 2 个明确的公司级查询指令，并写入绝对 after/before 日期范围。模型只返回新闻 Evidence，不再同时生成组合动作或大段投资组合分析。URL、标题和日期仍由本地程序控制：模型 URL 仅作为匹配提示，最终身份必须存在于 DashScope `search_info.search_results`。程序还会并行抓取最多 3 个已经由 DashScope 返回的文章页面，用于补全和验证发布日期；这不是第二次搜索，也不重试。新鲜的官方/监管来源或可信媒体重大事件可由本地规则直接转为决策证据，即使模型 JSON 绑定失败；其他真实文章来源作为背景引用。运行目录会输出 `portfolio_research_diagnostics.json`、`portfolio_dashscope_sources.json`、页面日期校验记录、本地拒绝明细和 Token 用量。
 
 相关环境变量为：
 
 ```dotenv
+PORTFOLIO_REPORT_MODEL=deepseek-v4-flash
+PORTFOLIO_REPORT_PROVIDER=dashscope
+PORTFOLIO_RESEARCH_MODE=dashscope_single_search
+PORTFOLIO_SINGLE_SEARCH_TOP_TICKERS=5
+PORTFOLIO_SINGLE_SEARCH_ENTITY_LIMIT=2
+PORTFOLIO_SINGLE_SEARCH_FRESHNESS_DAYS=30
+PORTFOLIO_SOURCE_FETCH_MAX=3
+PORTFOLIO_SOURCE_FETCH_TIMEOUT_SECONDS=5
+PORTFOLIO_REFERENCE_PER_TICKER=2
+PORTFOLIO_REFERENCE_MAX_TOTAL=6
 PORTFOLIO_REPORT_REQUIRE_TOP_RISK_NEWS=true
 PORTFOLIO_REPORT_MIN_NEWS_COVERAGE=0.60
 PORTFOLIO_REPORT_STRICT_NEWS_COVERAGE=false
 PORTFOLIO_REPORT_MIN_FRESH_EVIDENCE=1
 PORTFOLIO_REPORT_MIN_ACTIONABLE_CONFIDENCE=0.50
-PORTFOLIO_RESEARCH_BACKGROUND_DAYS=120
-PORTFOLIO_RESEARCH_REQUIRE_VERIFIED_ARTICLE=false
+PORTFOLIO_REPORT_MIN_RISK_WEIGHTED_COVERAGE=0.85
 ```
+
+产品约束不是可配置的软目标：`search_strategy=turbo`、联网搜索调用上限为 1、外部搜索调用为 0、重试与 Gap Search 为 0。报告会把这些计数和 DashScope 输入/输出 Token 直接显示在“数据质量与限制”中。
 
 报告中的历史组合 Beta、风险评分、目标权重区间、预计释放权重和风险变化均由 Python 确定性计算。风险评分会显示分项、缺失项和评分可信度；历史 Beta 与累计收益目前仍采用本地货币收益近似，并在 HTML 中明确披露未进行逐日历史 FX 对齐。
 
@@ -783,17 +796,30 @@ Each `Portfolios` subpage also supports Portfolio AI reports:
 - if the portfolio is deleted, the worker does not send an old snapshot and the job fails visibly;
 - portfolio reports and ticker reports share `daily_report_jobs.db`, the worker, SMTP delivery, deterministic Message-ID deduplication, retries, and queue capacity controls.
 
-Portfolio AI reports pass through a publication quality gate. By default, Top-risk research must be available and include at least one fresh evidence item, while every action confidence is capped at the final report confidence. Sixty percent is the news-coverage target: lower coverage produces a clearly degraded report, lowers final confidence by the actual coverage ratio, and converts directional recommendations to watch items when the actionable threshold is not met. Set `PORTFOLIO_REPORT_STRICT_NEWS_COVERAGE=true` to make below-target coverage block generation. News search is limited to the most recent 120 days by default, and investor-relations homepages and quarterly-results indexes are treated as reference pages rather than event news. Evidence is graded: successfully fetched and quality-validated bodies are marked as verified; dated, concrete event snippets from acceptable sources may be included as visibly unverified fallback evidence. Unverified snippets lower report confidence and cannot support high-confidence actions. Set `PORTFOLIO_RESEARCH_REQUIRE_VERIFIED_ARTICLE=true` to require verified bodies only. Missing research configuration, provider failure, no valid evidence, or no fresh evidence still blocks publication. Temporary run artifacts distinguish missing search configuration, provider errors, no results, fully filtered results, stale evidence, unverified article bodies, and insufficient coverage.
+Portfolio AI v2 uses a single-call research architecture. Python calculates weights, risk contributions, beta, volatility, drawdown, and technical breadth first. Then `deepseek-v4-flash` performs exactly one DashScope built-in web-search call with the fixed `turbo` strategy and returns both evidence candidates and structured portfolio analysis. The Portfolio path does not call Serper, Query Planner, Official Lane, the old Materiality/Summarizer pipeline, Gap Search, follow-up search, or model retry.
+
+A model event enters the report only after local validation. Because DeepSeek is a third-party Model Studio search model without dependable provider-side freshness or citation guarantees, the single call is expressed as at most two explicit company-level queries with absolute `after:` and `before:` dates. The model returns news evidence only; portfolio actions remain deterministic. Model URLs are matching hints only and must resolve to a real DashScope source. The service can fetch up to three URLs already returned by DashScope, in parallel and without retry, to validate page metadata and publication dates. This is metadata validation rather than a second search. Fresh official/regulatory items or trusted-media material events can be promoted deterministically even when model binding fails; other article sources remain non-decision references. Run artifacts include source objects, local page-date provenance, raw model output, rejection details, call counters, elapsed time, and token usage.
 
 ```dotenv
+PORTFOLIO_REPORT_MODEL=deepseek-v4-flash
+PORTFOLIO_REPORT_PROVIDER=dashscope
+PORTFOLIO_RESEARCH_MODE=dashscope_single_search
+PORTFOLIO_SINGLE_SEARCH_TOP_TICKERS=5
+PORTFOLIO_SINGLE_SEARCH_ENTITY_LIMIT=2
+PORTFOLIO_SINGLE_SEARCH_FRESHNESS_DAYS=30
+PORTFOLIO_SOURCE_FETCH_MAX=3
+PORTFOLIO_SOURCE_FETCH_TIMEOUT_SECONDS=5
+PORTFOLIO_REFERENCE_PER_TICKER=2
+PORTFOLIO_REFERENCE_MAX_TOTAL=6
 PORTFOLIO_REPORT_REQUIRE_TOP_RISK_NEWS=true
 PORTFOLIO_REPORT_MIN_NEWS_COVERAGE=0.60
 PORTFOLIO_REPORT_STRICT_NEWS_COVERAGE=false
 PORTFOLIO_REPORT_MIN_FRESH_EVIDENCE=1
 PORTFOLIO_REPORT_MIN_ACTIONABLE_CONFIDENCE=0.50
-PORTFOLIO_RESEARCH_BACKGROUND_DAYS=120
-PORTFOLIO_RESEARCH_REQUIRE_VERIFIED_ARTICLE=false
+PORTFOLIO_REPORT_MIN_RISK_WEIGHTED_COVERAGE=0.85
 ```
+
+The product invariants are hard-coded rather than configurable: `search_strategy=turbo`, a maximum of one built-in search call, zero external search calls, and zero retries or Gap Search calls.
 
 Historical portfolio beta, the component risk score, target-weight ranges, released weight, and risk-change estimates are calculated deterministically in Python. The report exposes missing score components and score confidence. Historical beta and cumulative-return simulation still use local-currency returns as an approximation and explicitly disclose that daily historical FX alignment is not implemented.
 
