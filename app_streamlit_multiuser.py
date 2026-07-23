@@ -61,6 +61,7 @@ from multiuser_store import (
     save_user_config,
 )
 from ticker_mapping import normalize_yfinance_ticker, stockanalysis_overview_url
+from ticker_search import search_yfinance_candidates
 
 
 _PAGE_ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "survival_hunter_icon.png")
@@ -3486,6 +3487,111 @@ def save_active_config(user, config):
     st.success("Watch list saved")
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def search_ticker_candidates(query):
+    try:
+        return search_yfinance_candidates(query)
+    except Exception:
+        return []
+
+
+def _apply_pending_ticker(target_key):
+    pending = st.session_state.pop(f"{target_key}_picker_pending", None)
+    if pending:
+        st.session_state[target_key] = pending
+
+
+def render_ticker_search_picker(picker_key):
+    """Search Yahoo Finance and let the user explicitly choose a ticker."""
+    candidates_key, query_key = f"{picker_key}_candidates", f"{picker_key}_query_value"
+    with st.form(f"{picker_key}_search_form"):
+        query = st.text_input(
+            "Search company name, ISIN or ticker", key=f"{picker_key}_query",
+            max_chars=120, placeholder="e.g. Apple, US0378331005, Xiaomi",
+        )
+        submitted = st.form_submit_button("Search")
+    if submitted:
+        query = str(query or "").strip()
+        st.session_state[query_key] = query
+        with st.spinner("Searching available securities..."):
+            st.session_state[candidates_key] = search_ticker_candidates(query) if query else []
+    candidates = st.session_state.get(candidates_key) or []
+    if not candidates:
+        if submitted and st.session_state.get(query_key):
+            st.info("No matching security was found. Try an English company name or an exact ticker.")
+        return None
+    by_ticker = {item["ticker"]: item for item in candidates}
+    selected = st.selectbox(
+        "Choose the security", list(by_ticker),
+        format_func=lambda ticker: (
+            f"{ticker} — {by_ticker[ticker]['name']} "
+            f"({by_ticker[ticker]['exchange']}; {by_ticker[ticker]['quote_type']})"
+        ), key=f"{picker_key}_selected",
+    )
+    return by_ticker[selected]
+
+
+def render_ticker_picker_for_input(picker_key, target_key):
+    candidate = render_ticker_search_picker(picker_key)
+    if candidate and st.button("Use selected security", key=f"{picker_key}_use"):
+        st.session_state[f"{target_key}_picker_pending"] = candidate["ticker"]
+        st.rerun()
+
+
+def render_watchlist_security_picker(config, section, page_index, user, version_key):
+    page = config[section][page_index]
+    groups = list(page.get("groups", {})) + ["Add a new group"]
+    selected_group = st.selectbox("Target group", groups, key=f"{section}_{page_index}_picker_group")
+    group = selected_group
+    if selected_group == "Add a new group":
+        group = st.text_input("New group name", key=f"{section}_{page_index}_picker_new_group", max_chars=80).strip()
+    candidate = render_ticker_search_picker(f"{section}_{page_index}_ticker_picker")
+    if candidate and st.button("Add selected security to watch list", key=f"{section}_{page_index}_picker_add"):
+        if not group:
+            st.error("Enter a group name before adding the security.")
+            return config
+        updated = copy.deepcopy(config)
+        tickers = updated[section][page_index].setdefault("groups", {}).setdefault(group, [])
+        if candidate["ticker"] not in tickers:
+            tickers.append(candidate["ticker"])
+        save_active_config(user, updated)
+        st.session_state[version_key] = st.session_state.get(version_key, 0) + 1
+        st.rerun()
+    return config
+
+
+def render_portfolio_security_picker(config, page_index, user, version_key):
+    page = config["portfolio_pages"][page_index]
+    groups = list(dict.fromkeys(str(h.get("group") or "Portfolio") for h in page.get("holdings", []))) + ["Add a new group"]
+    selected_group = st.selectbox("Target group", groups, key=f"portfolio_{page_index}_picker_group")
+    group = selected_group
+    if selected_group == "Add a new group":
+        group = st.text_input("New group name", key=f"portfolio_{page_index}_picker_new_group", max_chars=80).strip()
+    picker_key = f"portfolio_{page_index}_ticker_picker"
+    candidate = render_ticker_search_picker(picker_key)
+    if candidate:
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            price = st.number_input("Buy price", min_value=0.0, value=0.0, step=0.01, key=f"{picker_key}_price")
+        with c2:
+            shares = st.number_input("Shares", min_value=0.0, value=0.0, step=1.0, key=f"{picker_key}_shares")
+        with c3:
+            currency = st.selectbox("Buy currency", ["USD", "EUR", "CNY", "HKD", "GBP", "JPY"], key=f"{picker_key}_currency")
+        if st.button("Add selected security to portfolio", key=f"{picker_key}_add"):
+            if not group:
+                st.error("Enter a group name before adding the security.")
+                return config
+            updated = copy.deepcopy(config)
+            updated["portfolio_pages"][page_index].setdefault("holdings", []).append({
+                "group": group, "ticker": candidate["ticker"], "buy_price": float(price),
+                "shares": float(shares), "buy_currency": currency,
+            })
+            save_active_config(user, updated)
+            st.session_state[version_key] = st.session_state.get(version_key, 0) + 1
+            st.rerun()
+    return config
+
+
 def render_readonly_groups(groups, dark_mode=False):
     theme = get_theme(dark_mode)
     html_table = f"""
@@ -3526,6 +3632,8 @@ def render_page_editor(config, section, page_index, editable, user, dark_mode=Fa
     if editable:
         version_key = f"{section}_{page_index}_editor_version"
         editor_version = st.session_state.get(version_key, 0)
+        with st.expander("Search and add a security", expanded=False):
+            config = render_watchlist_security_picker(config, section, page_index, user, version_key)
 
         with st.form(f"{section}_{page_index}_editor_form_{editor_version}"):
             new_name = st.text_input("Page name", page["name"], key=f"{section}_{page_index}_{editor_version}_name")
@@ -3565,6 +3673,8 @@ def render_portfolio_page_editor(config, page_index, editable, user):
 
     version_key = f"portfolio_pages_{page_index}_editor_version"
     editor_version = st.session_state.get(version_key, 0)
+    with st.expander("Search and add a security", expanded=False):
+        config = render_portfolio_security_picker(config, page_index, user, version_key)
     with st.form(f"portfolio_pages_{page_index}_editor_form_{editor_version}"):
         new_name = st.text_input(
             "Portfolio page name",
@@ -3751,6 +3861,7 @@ def render_portfolio_section(config, raw_df, editable, user, dark_mode=False, di
 
 def render_kline(user, cache_key, display_currency="Local"):
     st.subheader("K-Line Chart")
+    _apply_pending_ticker("kline_ticker")
     c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
     with c1:
         ticker = st.text_input("Ticker", "AAPL", key="kline_ticker").upper()
@@ -3762,6 +3873,9 @@ def render_kline(user, cache_key, display_currency="Local"):
         st.write("")
         st.write("")
         plot = st.button("Plot", width="stretch", key="kline_plot_btn")
+
+    with st.expander("Search and choose a security", expanded=False):
+        render_ticker_picker_for_input("kline_ticker_picker", "kline_ticker")
 
     request_key = f"{cache_key}_{ticker}_{period}_{interval}"
     if plot:
@@ -3936,6 +4050,7 @@ def render_kline(user, cache_key, display_currency="Local"):
 
 
 def render_report_form_fields(key_prefix, default_ticker="AAPL", include_email=False):
+    _apply_pending_ticker(f"{key_prefix}_ticker")
     widths = [2, 2, 1, 1] if include_email else [2, 1, 1]
     columns = st.columns(widths)
     with columns[0]:
@@ -4071,6 +4186,10 @@ def render_weekly_report_schedules(user, runner_ok, mail_ready):
         "Select every day for this ticker in one plan; each account can keep up to seven ticker schedules. "
         "The recipient address remains stored until the schedule is deleted."
     )
+    with st.expander("Search and choose a security", expanded=False):
+        render_ticker_picker_for_input(
+            "daily_report_schedule_ticker_picker", "daily_report_schedule_ticker"
+        )
     with st.form("daily_report_schedule_form"):
         schedule_ticker, schedule_email, schedule_months, schedule_provider, schedule_no_fetch = render_report_form_fields(
             "daily_report_schedule",
@@ -4198,6 +4317,10 @@ def render_daily_report(user):
                 "One active generation and five downloads per account per UTC day are allowed by default. "
                 "A server-wide concurrency limit also applies."
             )
+            with st.expander("Search and choose a security", expanded=False):
+                render_ticker_picker_for_input(
+                    "daily_report_download_ticker_picker", "daily_report_download_ticker"
+                )
             with st.form("daily_report_download_form"):
                 ticker, _, months, search_provider, no_article_fetch = render_report_form_fields("daily_report_download")
                 submitted = st.form_submit_button("Generate Download", disabled=not runner_ok)
@@ -4272,6 +4395,10 @@ def render_daily_report(user):
                 "The job continues in the server worker after this page is closed. "
                 "One active job and three manual submissions per account per UTC day are allowed by default."
             )
+            with st.expander("Search and choose a security", expanded=False):
+                render_ticker_picker_for_input(
+                    "daily_report_email_ticker_picker", "daily_report_email_ticker"
+                )
             with st.form("daily_report_email_form"):
                 email_ticker, recipient_email, email_months, email_provider, email_no_fetch = render_report_form_fields(
                     "daily_report_email",
