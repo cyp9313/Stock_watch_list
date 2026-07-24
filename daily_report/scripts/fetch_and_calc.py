@@ -23,6 +23,7 @@ import numpy as np
 
 # Shared market data service — provides OHLCV snapshot sharing and unified provider layer.
 from market_data_service import MarketDataService
+from report_data_normalization import normalize_dividend_yield_pct
 
 # Optional StockAnalysis.com fundamentals scraper.
 # It is used for valuation / analyst fields because yfinance info can be stale or inaccurate.
@@ -97,20 +98,16 @@ exchange     = info.get('exchange', '—')
 currency     = info.get('currency', 'USD')
 employees    = info.get('fullTimeEmployees', 0) or 0
 beta         = info.get('beta', 0) or 0
-# yfinance dividendYield is usually a decimal ratio (e.g. 0.0141 for 1.41%),
-# but some endpoints/markets may already return a percent-like value. Guard
-# against double-multiplication and obviously broken values.
-raw_div_yield = info.get('dividendYield', 0) or 0
-try:
-    raw_div_yield = float(raw_div_yield)
-except (ValueError, TypeError):
-    raw_div_yield = 0
-if 0 < raw_div_yield <= 1:
-    div_yield = raw_div_yield * 100
-elif 1 < raw_div_yield <= 20:
-    div_yield = raw_div_yield
-else:
-    div_yield = 0
+# Prefer annual cash dividend / current close when available. This resolves
+# provider unit ambiguity and prevents 0.41 from being rendered as 41.00%
+# when it actually represents a 0.41% yield.
+raw_div_yield = info.get('dividendYield', 0)
+annual_dividend = info.get('dividendRate', info.get('trailingAnnualDividendRate', 0))
+div_yield, div_yield_source = normalize_dividend_yield_pct(
+    raw_div_yield,
+    annual_dividend,
+    LAST_CLOSE,
+)
 description  = info.get('longBusinessSummary', '')
 
 # ── 标的类型识别（v5.8）──────────────────────────────────────────────
@@ -556,6 +553,8 @@ result = {
     "ANALYST_CNT":  analyst_cnt,
     "BETA":         beta,
     "DIV_YIELD":    div_yield,
+    "DIV_YIELD_SOURCE": div_yield_source,
+    "ANNUAL_DIVIDEND_RATE": annual_dividend or 0,
     "PEG_RATIO":    peg_ratio,
     "PS_RATIO":     ps_ratio,
     "PB_RATIO":     pb_ratio,

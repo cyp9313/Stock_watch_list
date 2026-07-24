@@ -8,6 +8,7 @@ import re
 import socket
 import ssl
 import time
+from datetime import date as Date
 from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
@@ -2229,6 +2230,28 @@ def _analyst_rating_text_score(text: str) -> float | None:
     return 50.0
 
 
+def _evidence_freshness(note: Any, report_date: str) -> tuple[str, float, int | None]:
+    """Classify an evidence item's age for daily-report scoring.
+
+    The report can still show older material as context, but a daily score must
+    not react to it as if it were current news.  The middle bucket deliberately
+    retains some influence for slow-moving fundamental and ETF-flow context.
+    """
+    source_date = str(getattr(note, "source_date", "") or "").strip()
+    try:
+        source_day = Date.fromisoformat(source_date[:10])
+        report_day = Date.fromisoformat(str(report_date)[:10])
+    except ValueError:
+        return "unknown", 0.5, None
+
+    age_days = (report_day - source_day).days
+    if age_days <= 7:
+        return "recent", 1.0, max(age_days, 0)
+    if age_days <= 30:
+        return "aging", 0.5, age_days
+    return "background", 0.0, age_days
+
+
 def _compute_final_rating_payload(ctx: RunContext, notes: list[Any]) -> dict[str, Any]:
     """Compute v5.8 instrument-aware, auditable multi-factor rating.
 
@@ -2260,10 +2283,26 @@ def _compute_final_rating_payload(ctx: RunContext, notes: list[Any]) -> dict[str
     # --- News score: note balance + evidence quality. Model-note-derived, therefore PARTIAL by design. ---
     non_technical_notes = [n for n in notes if not getattr(n, "is_technical", False)]
     counts = {tag: sum(1 for n in non_technical_notes if getattr(n, "tag", "") == tag) for tag in ["BULL", "BEAR", "MIX"]}
-    ab_notes = sum(1 for n in non_technical_notes if str(getattr(n, "evidence_grade", "")).upper() in {"A", "B"})
+    freshness_records = [
+        (n, *_evidence_freshness(n, ctx.report_date))
+        for n in non_technical_notes
+    ]
+    freshness_counts = {bucket: sum(1 for _, note_bucket, _, _ in freshness_records if note_bucket == bucket) for bucket in ["recent", "aging", "background", "unknown"]}
+    scoring_notes = [(n, weight) for n, _, weight, _ in freshness_records if weight > 0]
+    weighted_counts = {
+        tag: sum(weight for n, weight in scoring_notes if getattr(n, "tag", "") == tag)
+        for tag in ["BULL", "BEAR", "MIX"]
+    }
+    ab_notes = sum(
+        weight for n, weight in scoring_notes
+        if str(getattr(n, "evidence_grade", "")).upper() in {"A", "B"}
+    )
     non_tech_count = len(non_technical_notes)
-    quality_bonus = min(10.0, ab_notes / max(1, non_tech_count) * 10.0)
-    news_score = _clamp_score(50 + (counts["BULL"] - counts["BEAR"]) * 7 + counts["MIX"] * 1.5 + quality_bonus) if non_technical_notes else None
+    effective_note_weight = sum(weight for _, weight in scoring_notes)
+    quality_bonus = min(10.0, ab_notes / max(1.0, effective_note_weight) * 10.0)
+    news_score = _clamp_score(
+        50 + (weighted_counts["BULL"] - weighted_counts["BEAR"]) * 7 + weighted_counts["MIX"] * 1.5 + quality_bonus
+    ) if scoring_notes else None
 
     # --- Valuation: StockAnalysis-first multiples. No peer comparison or historical percentile in v5.8. ---
     valuation_applicable = instrument_type in {"EQUITY", "ETF"}
@@ -2373,7 +2412,7 @@ def _compute_final_rating_payload(ctx: RunContext, notes: list[Any]) -> dict[str
     risk_hits = 0.0
     risk_evidence_examples: list[str] = []
     risk_note_breakdown = {"BEAR": 0, "MIX": 0, "BULL_IGNORED": 0}
-    for n in non_technical_notes:
+    for n, freshness_weight in scoring_notes:
         text = " ".join([str(getattr(n, "title", "")), str(getattr(n, "fact", "")), str(getattr(n, "logic", ""))])
         tag = str(getattr(n, "tag", "") or "").upper()
         has_risk_term = bool(risk_terms.search(text))
@@ -2388,7 +2427,7 @@ def _compute_final_rating_payload(ctx: RunContext, notes: list[Any]) -> dict[str
             # A bullish item may mention capex/debt/rates as context. Do not punish it
             # solely because a risk keyword appears in an otherwise bullish thesis.
             risk_note_breakdown["BULL_IGNORED"] += 1
-        risk_hits += contribution
+        risk_hits += contribution * freshness_weight
         if contribution > 0 and len(risk_evidence_examples) < 5:
             risk_evidence_examples.append(str(getattr(n, "title", "")))
 
@@ -2439,6 +2478,8 @@ def _compute_final_rating_payload(ctx: RunContext, notes: list[Any]) -> dict[str
         "risk_hits_from_notes": round(risk_hits, 2),
         "risk_note_breakdown": risk_note_breakdown,
         "bear_notes": counts["BEAR"],
+        "scored_bear_note_weight": round(weighted_counts["BEAR"], 2),
+        "evidence_freshness": freshness_counts,
         "risk_penalty_parts": risk_penalty_parts,
         "realized_vol_20d_pct": d.get("REALIZED_VOL_20D_PCT"),
         "max_drawdown_63d_pct": d.get("MAX_DRAWDOWN_63D_PCT"),
@@ -2498,7 +2539,7 @@ def _compute_final_rating_payload(ctx: RunContext, notes: list[Any]) -> dict[str
         "fundamental_sources": sources,
         "stockanalysis": {"enabled": d.get("STOCKANALYSIS_ENABLED"), "data": d.get("STOCKANALYSIS_DATA") or {}, "error": d.get("STOCKANALYSIS_ERROR") or ""},
         "technical_score": {"score": round(technical_score, 1) if technical_score is not None else None, "status": score_status["technical_score"], "inputs_used": technical_used, "inputs_missing": d.get("technical_unavailable_components") or [], "note": "Deterministic OHLCV score; unavailable volume/chip components are excluded and weights are renormalized."},
-        "news_score": {"score": round(news_score, 1) if news_score is not None else None, "status": score_status["news_score"], "inputs_used": {"note_counts": counts, "ab_or_tech_evidence_notes": ab_notes, "total_notes": len(notes), "quality_bonus": round(quality_bonus, 1)}, "inputs_missing": ["independent_raw_news_sentiment_classifier"], "note": "Derived from evidence-bound final notes."},
+        "news_score": {"score": round(news_score, 1) if news_score is not None else None, "status": score_status["news_score"], "inputs_used": {"note_counts": counts, "weighted_note_counts": {key: round(value, 2) for key, value in weighted_counts.items()}, "evidence_freshness": freshness_counts, "ab_or_tech_evidence_notes": round(ab_notes, 2), "total_notes": len(notes), "effective_note_weight": round(effective_note_weight, 2), "quality_bonus": round(quality_bonus, 1)}, "inputs_missing": ["independent_raw_news_sentiment_classifier"], "note": "Recent evidence (<=7 days) counts fully; 8-30 day evidence counts at 50%; older evidence is visible background only and excluded from daily news/risk scoring."},
         "valuation_score": {"score": round(valuation_score, 1) if valuation_score is not None else None, "status": valuation_status, "inputs_used": valuation_inputs_used, "inputs_missing": valuation_missing if valuation_applicable else [], "source_preference": "StockAnalysis first; no peer comparison or historical valuation percentile in v5.8.", "note": "Applicable to equities and ETFs only; target price is excluded."},
         "analyst_score": {"score": round(analyst_score, 1) if analyst_score is not None else None, "status": analyst_status, "inputs_used": analyst_inputs_used, "inputs_missing": analyst_missing if analyst_applicable else [], "source_preference": "StockAnalysis consensus/price target first; yfinance coverage and target range fallback."},
         "risk_score": {"score": round(risk_score, 1), "status": "PARTIAL", "inputs_used": risk_inputs_used, "inputs_missing": [], "note": "Combines evidence-bound BEAR/MIX risk notes with realized volatility, drawdown, ATR and available balance-sheet ratios. BULL notes are not penalized merely for containing risk keywords."},
@@ -2517,7 +2558,9 @@ def _compute_final_rating_payload(ctx: RunContext, notes: list[Any]) -> dict[str
         "score_status": score_status,
         "inputs": {
             "note_counts": counts,
-            "ab_or_tech_evidence_notes": ab_notes,
+            "weighted_note_counts": {key: round(value, 2) for key, value in weighted_counts.items()},
+            "evidence_freshness": freshness_counts,
+            "ab_or_tech_evidence_notes": round(ab_notes, 2),
             "non_technical_notes": non_tech_count,
             "target_upside_pct": round(tgt_upside, 1) if tgt_upside is not None else None,
             "valuation_inputs": valuation_inputs_used,
@@ -2754,6 +2797,10 @@ class BuildHtmlReportTool(BaseTool):
             if not ctx.notes_file.exists():
                 return json_dumps({"ok": False, "errors": ["缺少 notes_file，请先调用 save_news_notes，或 use_notes=false。"]})
             args.extend(["--notes", str(ctx.notes_file)])
+            # Keep the report's visible citations tied to the structured,
+            # evidence-gated note records rather than flattening them into text.
+            if ctx.final_notes_json_file.exists():
+                args.extend(["--evidence", str(ctx.final_notes_json_file)])
         result = run_python_script(ctx.paths.scripts_dir / "build_report.py", args, cwd=ctx.run_dir, timeout=180)
         return json_dumps({
             "ok": True,

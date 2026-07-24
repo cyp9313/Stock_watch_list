@@ -90,13 +90,14 @@ class _TagCollector(HTMLParser):
 
 def _render_report(data: dict, chart_html: str = "<div id='chart'>test</div>",
                    report_date: str = "2026-07-11", months: int | None = None,
-                   notes: str = "") -> str:
+                   notes: str = "", evidence: dict | None = None) -> str:
     """Run build_report.py as a subprocess and return the HTML output."""
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         data_file = tmp / "data.json"
         chart_file = tmp / "chart.html"
         notes_file = tmp / "notes.txt"
+        evidence_file = tmp / "final_notes.json"
         output_file = tmp / "report.html"
         data_file.write_text(json.dumps(data), encoding="utf-8")
         chart_file.write_text(chart_html, encoding="utf-8")
@@ -109,6 +110,9 @@ def _render_report(data: dict, chart_html: str = "<div id='chart'>test</div>",
         ]
         if months is not None:
             args.extend(["--months", str(months)])
+        if evidence is not None:
+            evidence_file.write_text(json.dumps(evidence), encoding="utf-8")
+            args.extend(["--evidence", str(evidence_file)])
         completed = subprocess.run(args, capture_output=True, text=True, check=False)
         if completed.returncode != 0:
             raise AssertionError(f"build_report.py failed: {completed.stderr}")

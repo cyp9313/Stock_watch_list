@@ -24,6 +24,7 @@ import sys
 import json
 from datetime import date as Date
 from html import escape as html_escape
+from urllib.parse import urlparse
 
 try:
     from zoneinfo import ZoneInfo
@@ -110,7 +111,7 @@ def allow_value(value, allowed, fallback):
 #  参数解析
 # ─────────────────────────────────────────────────
 if len(sys.argv) < 4:
-    print("用法: python build_report.py <DATA_JSON> <CHART_HTML> <OUTPUT_HTML> [--date YYYY-MM-DD] [--months N] [--notes NOTES_FILE]")
+    print("用法: python build_report.py <DATA_JSON> <CHART_HTML> <OUTPUT_HTML> [--date YYYY-MM-DD] [--months N] [--notes NOTES_FILE] [--evidence FINAL_NOTES_JSON]")
     sys.exit(1)
 
 DATA_FILE  = sys.argv[1]
@@ -119,6 +120,7 @@ OUT_FILE   = sys.argv[3]
 REPORT_DATE = get_market_date()
 MONTHS      = 3
 NOTES_FILE  = None
+EVIDENCE_FILE = None
 
 i = 4
 while i < len(sys.argv):
@@ -128,6 +130,8 @@ while i < len(sys.argv):
         MONTHS = int(sys.argv[i+1]); i += 2
     elif sys.argv[i] == '--notes' and i+1 < len(sys.argv):
         NOTES_FILE = sys.argv[i+1]; i += 2
+    elif sys.argv[i] == '--evidence' and i+1 < len(sys.argv):
+        EVIDENCE_FILE = sys.argv[i+1]; i += 2
     else:
         i += 1
 
@@ -142,22 +146,89 @@ with open(DATA_FILE, 'r', encoding='utf-8') as f:
 with open(CHART_FILE, 'r', encoding='utf-8') as f:
     chart_html = f.read()
 
-# 读取消息面注释（可选）
+# 读取消息面注释（可选）。结构化 evidence 优先，保证 HTML 保留证据 ID、
+# 可点击来源链接和发布日期；纯 notes 文件仅作为向后兼容回退。
+def _safe_external_url(value):
+    value = str(value or '').strip()
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return ''
+    return value if parsed.scheme in {'http', 'https'} and parsed.netloc else ''
+
+
+def _news_style(tag):
+    tag = str(tag or '').upper()
+    if tag == 'BULL':
+        return 'bull', 'tag-bull', '多头 📈'
+    if tag == 'BEAR':
+        return 'bear', 'tag-bear', '空头 📉'
+    return 'mixed', 'tag-mixed', '中性 ⚖'
+
+
+def _freshness_label(source_date, report_date):
+    """Explain when a cited item is background rather than current news."""
+    source_date = str(source_date or '').strip()
+    try:
+        source_day = Date.fromisoformat(source_date[:10])
+        report_day = Date.fromisoformat(str(report_date)[:10])
+    except ValueError:
+        return '日期未知' if not source_date else source_date
+    age_days = (report_day - source_day).days
+    if age_days > 7:
+        return f'背景资料 · {age_days} 天前（{source_date[:10]}）'
+    if age_days >= 0:
+        return f'信息日期 {source_date[:10]}'
+    return f'信息日期 {source_date[:10]}'
+
+
 news_items = []
-if NOTES_FILE:
+if EVIDENCE_FILE:
+    try:
+        with open(EVIDENCE_FILE, 'r', encoding='utf-8') as f:
+            evidence_payload = json.load(f)
+        raw_items = evidence_payload.get('items', []) if isinstance(evidence_payload, dict) else evidence_payload
+        if isinstance(raw_items, list):
+            for item in raw_items:
+                if not isinstance(item, dict):
+                    continue
+                sentiment, tag_cls, tag_label = _news_style(item.get('tag'))
+                title = str(item.get('title') or '').strip()
+                body = ' '.join(str(item.get(key) or '').strip() for key in ('fact', 'logic', 'investment_meaning')).strip()
+                # The link host is authoritative for the visible source label.
+                # This avoids presenting a combined provider label when only one
+                # of those providers has an auditable URL in the report.
+                source = str(item.get('source_domain') or item.get('source') or '').strip()
+                source_date = str(item.get('source_date') or '').strip()
+                evidence_id = str(item.get('evidence_id') or '').strip()
+                url = _safe_external_url(item.get('evidence_url') or item.get('url'))
+                news_items.append({
+                    'sentiment': sentiment, 'tag_cls': tag_cls, 'tag_label': tag_label,
+                    'title': title, 'body': body, 'source': source,
+                    'source_date': source_date, 'evidence_id': evidence_id, 'url': url,
+                })
+    except (OSError, ValueError, json.JSONDecodeError):
+        news_items = []
+
+if NOTES_FILE and not news_items:
     try:
         with open(NOTES_FILE, 'r', encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
                 if not line: continue
                 if line.startswith('[BULL]'):
-                    news_items.append(('bull', 'tag-bull', '多头 📈', line[6:].strip()))
+                    item = ('bull', 'tag-bull', '多头 📈', line[6:].strip())
                 elif line.startswith('[BEAR]'):
-                    news_items.append(('bear', 'tag-bear', '空头 📉', line[6:].strip()))
+                    item = ('bear', 'tag-bear', '空头 📉', line[6:].strip())
                 elif line.startswith('[MIX]'):
-                    news_items.append(('mixed', 'tag-mixed', '中性 ⚖', line[5:].strip()))
+                    item = ('mixed', 'tag-mixed', '中性 ⚖', line[5:].strip())
                 else:
-                    news_items.append(('mixed', 'tag-mixed', '资讯', line))
+                    item = ('mixed', 'tag-mixed', '资讯', line)
+                news_items.append({
+                    'sentiment': item[0], 'tag_cls': item[1], 'tag_label': item[2],
+                    'title': '', 'body': item[3], 'source': '', 'source_date': '',
+                    'evidence_id': '', 'url': '',
+                })
     except FileNotFoundError:
         pass
 
@@ -201,6 +272,8 @@ TARGET_LO  = d['TARGET_LO']
 ANALYST_CNT= d['ANALYST_CNT']
 BETA       = d.get('BETA', 0)
 DIV_YIELD  = d.get('DIV_YIELD', 0)
+DIV_YIELD_SOURCE = str(d.get('DIV_YIELD_SOURCE', 'unavailable') or 'unavailable')
+FUNDAMENTAL_SOURCES = d.get('FUNDAMENTAL_SOURCES') or {}
 pct52      = d['percentile_52w']
 ma5   = d['ma5']; ma10 = d['ma10']; ma20 = d['ma20']
 ma50  = d['ma50']; ma120= d['ma120']; ma200= d['ma200']
@@ -354,21 +427,46 @@ def build_news_html(news_items):
   在文本文件中用 [BULL]/[BEAR]/[MIX] 前缀逐行记录资讯。
 </div>'''
     parts = []
-    for sentiment, tag_cls, tag_label, text in news_items:
-        parts.append(f'''<div class="news-card {sentiment}">
-  <div class="news-tag {tag_cls}">{tag_label}</div>
-  <div class="news-summary">{escape_text(text)}</div>
-</div>''')
+    for item in news_items:
+        title = escape_text(item.get('title') or '')
+        body = escape_text(item.get('body') or '')
+        source = escape_text(item.get('source') or '')
+        evidence_id = escape_text(item.get('evidence_id') or '')
+        freshness = escape_text(_freshness_label(item.get('source_date'), REPORT_DATE))
+        url = item.get('url') or ''
+        source_label = source or '未标注来源'
+        if url:
+            source_html = '<a href="' + escape_text(url) + '" target="_blank" rel="noopener noreferrer">' + source_label + ' ↗</a>'
+        else:
+            source_html = source_label + ' · 未附可核验链接'
+        title_html = '<div class="news-title">' + title + '</div>' if title else ''
+        parts.append(
+            '<div class="news-card ' + item['sentiment'] + '">\n'
+            '  <div class="news-tag ' + item['tag_cls'] + '">' + item['tag_label'] + '</div>\n'
+            '  ' + title_html + '\n'
+            '  <div class="news-summary">' + body + '</div>\n'
+            '  <div class="news-meta">证据 ' + (evidence_id or '—') + ' · ' + source_html + ' · ' + freshness + '</div>\n'
+            '</div>'
+        )
     return '\n'.join(parts)
 
 news_html = build_news_html(news_items)
 
 # 员工数格式
 emp_str = f"{EMPLOYEES//10000}万人" if EMPLOYEES >= 10000 else (f"{EMPLOYEES:,}人" if EMPLOYEES > 0 else '—')
-# 分红
-div_str = f"{DIV_YIELD:.2f}%" if DIV_YIELD > 0 else '—'
-# Beta
-beta_str = fs(BETA, 2) if BETA > 0 else '—'
+# 分红：fetch_and_calc.py 已按年度现金股息/收盘价优先归一化。
+div_str = f"{float(DIV_YIELD):.2f}%" if float(DIV_YIELD or 0) > 0 else 'N/A'
+div_source_labels = {
+    'annual_dividend_rate/current_close': '年度现金股息 ÷ 收盘价（估算）',
+    'provider_dividend_yield': '数据供应商字段',
+    'rejected_outlier': '异常值已拒绝',
+    'unavailable': '未获取',
+}
+div_source_label = div_source_labels.get(DIV_YIELD_SOURCE, '未获取')
+# Beta 缺失时不再错误展示为“低波动”。
+beta_str = fs(BETA, 2) if float(BETA or 0) > 0 else 'N/A'
+beta_desc = '高波动' if float(BETA or 0) > 1.5 else ('中等' if float(BETA or 0) > 0.8 else ('低波动' if float(BETA or 0) > 0 else '未获取；不据此判断波动'))
+ttm_pe_source = escape_text(str(FUNDAMENTAL_SOURCES.get('trailing_pe') or '未获取'))
 # 描述
 desc = d.get('DESCRIPTION', '')
 desc_short = (desc[:200] + '...') if len(desc) > 200 else desc
@@ -425,7 +523,8 @@ CSS = '''  * { box-sizing: border-box; margin: 0; padding: 0; }
   .tag-bull { background: rgba(63,185,80,0.15); color: #3fb950; } .tag-bear { background: rgba(248,81,73,0.15); color: #f85149; } .tag-mixed { background: rgba(210,153,34,0.15); color: #d29922; }
   .news-title { font-size: 14px; font-weight: 600; color: #f0f6fc; margin-bottom: 6px; }
   .news-summary { font-size: 13px; color: #8b949e; line-height: 1.6; }
-  .news-meta { font-size: 11px; color: #6e7681; margin-top: 8px; display: flex; gap: 16px; }
+  .news-meta { font-size: 11px; color: #6e7681; margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap; }
+  .news-meta a { color: #8fb8a4; text-decoration: none; } .news-meta a:hover { color: #b7d7c5; text-decoration: underline; }
   .thesis-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
   .thesis-card { border-radius: 10px; padding: 18px; }
   .thesis-card.bull { background: rgba(63,185,80,0.06); border: 1px solid rgba(63,185,80,0.2); }
@@ -583,8 +682,8 @@ html += '    <div class="section-title"><span class="icon">📑</span> 基本面
 html += '    <table>\n      <thead><tr><th>指标</th><th class="num">数值</th><th>说明</th></tr></thead>\n      <tbody>\n'
 html += '        <tr><td>标的类型</td><td class="num">' + instrument_type + '</td><td>评分模型按标的类型自动切换</td></tr>\n'
 if instrument_type in {'EQUITY', 'ETF'}:
-    html += '        <tr><td>Beta（市场敏感度）</td><td class="num">' + beta_str + '</td><td>' + ('高波动' if BETA > 1.5 else ('中等' if BETA > 0.8 else '低波动')) + '</td></tr>\n'
-    html += '        <tr><td>股息收益率</td><td class="num">' + div_str + '</td><td>' + ('正股息' if DIV_YIELD > 0 else '无/未获取') + '</td></tr>\n'
+    html += '        <tr><td>Beta（市场敏感度）</td><td class="num">' + beta_str + '</td><td>' + beta_desc + '</td></tr>\n'
+    html += '        <tr><td>过去十二个月现金分配收益率（估算）</td><td class="num">' + div_str + '</td><td>' + div_source_label + '；不等同于30日SEC收益率</td></tr>\n'
 if instrument_type == 'EQUITY':
     html += '        <tr><td>目标价区间</td><td class="num">' + format_price(tgt_lo_str, CURRENCY) + ' – ' + format_price(tgt_hi_str, CURRENCY) + '</td><td>' + ana_cnt_str + '位分析师覆盖</td></tr>\n'
 if desc_short:
@@ -592,7 +691,9 @@ if desc_short:
 html += '      </tbody>\n    </table>\n'
 html += '    <div style="margin-top:14px; padding:12px 16px; background:rgba(31,111,235,0.06); border:1px solid rgba(31,111,235,0.2); border-radius:8px; font-size:13px; color:#8b949e;">\n'
 if instrument_type in {'EQUITY', 'ETF'}:
-    html += '      💡 <strong style="color:#58a6ff;">提示：</strong>此区块优先展示 StockAnalysis 估值数据（适用时），并以 yfinance 补充行情与技术数据。'
+    html += '      💡 <strong style="color:#58a6ff;">数据口径：</strong>行情与技术指标来自 yfinance（数据截止 ' + (DATA_END or '未标注') + '）；TTM PE 来源：' + ttm_pe_source + '；估值字段适用时优先使用 StockAnalysis。'
+    if instrument_type == 'ETF':
+        html += ' ETF 日报不使用个股分析师目标价；消息面重点覆盖资金流、持仓展望与宏观风险。'
 else:
     html += '      💡 <strong style="color:#58a6ff;">提示：</strong>指数和加密货币不使用个股估值/分析师评分；行情、成交量、筹码峰和技术指标来自 yfinance。'
 html += '消息面由结构化检索证据生成，并在评分审计文件中记录输入与适用性。\n'
@@ -614,7 +715,7 @@ html += '当前价 ' + format_price(last_str, CURRENCY) + ' · 标的类型 ' + 
 if instrument_type == 'EQUITY' and TARGET_MEAN > 0:
     html += ' · 分析师目标价 ' + format_price(tgt_mean_str, CURRENCY) + ' · 潜在涨幅 <strong style="color:#3fb950;">' + tgt_up_str + '%</strong>'
 html += '</div>\n'
-html += '      <div class="rating-target">评分方法：' + rating_method + ' ｜ 技术多头 ' + str(signals_bull) + '/5 ｜ 均线多头数 ' + str(bull_count) + '/6</div>\n'
+html += '      <div class="rating-target">评分方法：' + rating_method + ' ｜ 综合技术信号 ' + str(signals_bull) + '/5（MACD、RSI、KDJ、均线结构、布林中轨）｜均线多头数 ' + str(bull_count) + '/6</div>\n'
 html += '      <div class="score-grid">\n'
 for key, label in [('technical_score','技术'), ('news_score','消息'), ('valuation_score','估值'), ('analyst_score','分析师'), ('risk_score','风险')]:
     raw_val = rating_subscores.get(key)
@@ -625,6 +726,15 @@ for key, label in [('technical_score','技术'), ('news_score','消息'), ('valu
     status_html = '<div style="font-size:10px;color:#8b949e;margin-top:2px;">' + status + weight_text + '</div>' if (status or weight_text) else ''
     html += '        <div class="score-box"><div class="label">' + label + '</div><div class="value">' + val_text + '</div>' + status_html + '</div>\n'
 html += '      </div>\n'
+html += '      <div style="font-size:11px;color:#8b949e;margin-top:10px;">总分按未舍入子项分数 × 上列有效权重计算；显示的子项已四舍五入，因此与总分可能存在 0.1 分内差异。N/A / 不适用项目不会按中性分填充。</div>\n'
+freshness = (final_rating.get('inputs') or {}).get('evidence_freshness') or {}
+if freshness:
+    def _freshness_count(name):
+        try:
+            return int(freshness.get(name) or 0)
+        except (TypeError, ValueError):
+            return 0
+    html += '      <div style="font-size:11px;color:#8b949e;margin-top:6px;">消息评分时效：近7天 ' + str(_freshness_count('recent')) + ' 条全额计分；8–30天 ' + str(_freshness_count('aging')) + ' 条按50%计分；30天以上 ' + str(_freshness_count('background')) + ' 条仅作背景、不参与消息和风险评分；日期未知 ' + str(_freshness_count('unknown')) + ' 条按50%计分。</div>\n'
 html += '    </div>\n'
 html += '    <div style="padding:14px 18px; background:rgba(31,111,235,0.06); border:1px solid rgba(31,111,235,0.2); border-radius:8px; font-size:13px; color:#e6edf3; line-height:1.8;">\n'
 html += '      <strong style="color:#58a6ff;">📌 技术面：</strong>RSI(' + rsi_str + ') ' + rsi_sig + '；MACD ' + macd_sig + '（柱 ' + hist_str + '）；KDJ ' + kdj_sig + '；均线系统：' + ma_overall + '。\n'
