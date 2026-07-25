@@ -97,6 +97,7 @@ def test_short_term_watchlist_settings_persist_per_account(tmp_path, monkeypatch
             "ema": {"enabled": True, "threshold": 3.0},
             "bollinger": {"enabled": False, "threshold": 10.0},
             "vwap": {"enabled": False, "threshold": 5.0},
+            "vwap_bands": {"enabled": False, "threshold": 5.0},
             "rsi": {"enabled": False, "threshold": 2.0},
         },
         "ticker_enabled": {"AAPL": False},

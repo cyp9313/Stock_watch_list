@@ -56,11 +56,13 @@ def test_defaults_and_legacy_normalization_are_account_safe():
             "ema": {"enabled": False, "threshold": 5.0},
             "bollinger": {"enabled": False, "threshold": 10.0},
             "vwap": {"enabled": False, "threshold": 5.0},
+            "vwap_bands": {"enabled": False, "threshold": 5.0},
             "rsi": {"enabled": False, "threshold": 2.0},
         },
         "ticker_enabled": {},
     }
     assert defaults["settings"]["ma_1"] == {"period": 9, "type": "EMA"}
+    assert defaults["settings"]["atr"] == {"period": 14}
 
     config = normalize_short_term_watchlist({
         "groups": {"Momentum": ["AAPL", "aapl", "MSFT"]},
@@ -71,6 +73,7 @@ def test_defaults_and_legacy_normalization_are_account_safe():
     assert config["settings"]["ma_1"] == {"period": 5, "type": "SMA"}
     assert config["settings"]["ma_2"] == defaults["settings"]["ma_2"]
     assert config["settings"]["rsi"] == {"period": 14}
+    assert config["settings"]["atr"] == {"period": 14}
     assert config["refresh"] == {"enabled": True, "interval_seconds": 20}
     assert config["alerts"] == defaults["alerts"]
     assert short_term_tickers(config) == ["AAPL", "MSFT"]
@@ -99,6 +102,7 @@ def test_alert_normalization_keeps_only_valid_account_safe_values():
             "ema": {"enabled": True, "threshold": 3.0},
             "bollinger": {"enabled": False, "threshold": 10.0},
             "vwap": {"enabled": False, "threshold": 5.0},
+            "vwap_bands": {"enabled": False, "threshold": 5.0},
             "rsi": {"enabled": False, "threshold": 2.0},
         },
         "ticker_enabled": {"AAPL": False},
@@ -117,6 +121,7 @@ def test_history_window_is_two_days_by_default_and_scales_for_long_periods():
             "macd": {"fast": 12, "slow": 26, "signal": 9},
             "bollinger": {"period": 20, "stddev": 2.0},
             "rsi": {"period": 14},
+            "atr": {"period": 14},
         },
     })["settings"]
     assert short_term_history_days(long_settings) == 20
@@ -137,6 +142,7 @@ def test_row_calculates_requested_metrics_and_inline_svg():
     assert row["Volume Ratio"] == pytest.approx(1.0)
     assert row["Diff BB Upper%"] < 0
     assert row["BB Upper Cross (%)"] == pytest.approx(row["Diff BB Upper%"])
+    assert row["BB / Close"].count("stroke-dasharray='3 2'") == 2
     assert row["Diff VWAP%"] > 0
     assert row["RSI"] == pytest.approx(100.0)
     assert "<svg" in row["Candles (15)"]
@@ -146,8 +152,12 @@ def test_row_calculates_requested_metrics_and_inline_svg():
     assert "stroke-dasharray='3 2'" in row["MACD / Signal"]
     assert "<rect" in row["Volume (15)"]
     assert "#0f766e" in row["VWAP / Close"]
+    assert row["VWAP / Close"].count("stroke-dasharray='3 2'") == 2
+    assert row["VWAP Lower Cross (%)"] == pytest.approx(row["VWAP Upper Cross (%)"] + 100.0)
     assert "#7c3aed" in row["RSI (30/70)"]
     assert row["RSI (30/70)"].count("stroke-dasharray='3 2'") == 2
+    assert row["ATR"] > 0
+    assert "#1d4ed8" in row["ATR (15)"]
 
 
 def test_vwap_is_blank_for_zero_volume_or_after_hours_latest_bar():
@@ -245,6 +255,29 @@ def test_bollinger_near_threshold_uses_percent_of_band_width():
     assert short_term_alert_events(far_row, "5m", alerts) == []
 
 
+def test_vwap_band_alerts_are_independently_configured_and_deduplicated():
+    alerts = default_short_term_watchlist()["alerts"]
+    alerts = {
+        **alerts,
+        "enabled": True,
+        "signals": {
+            **alerts["signals"],
+            "vwap_bands": {"enabled": True, "threshold": 5.0},
+        },
+    }
+    row = {
+        "Ticker": "AAPL", "Alert Bar Timestamp": "2026-07-24 10:00",
+        "VWAP Upper Cross (%)": 1.0, "VWAP Upper Cross Previous (%)": -1.0,
+        "VWAP Lower Cross (%)": -2.0, "VWAP Lower Cross Previous (%)": -6.0,
+    }
+    events = short_term_alert_events(row, "5m", alerts)
+    assert [(event["signal"], event["type"]) for event in events] == [
+        ("vwap_upper", "bullish_confirmed"),
+        ("vwap_lower", "bullish_near"),
+    ]
+    assert short_term_alert_events(row, "5m", {**alerts, "signals": {**alerts["signals"], "vwap_bands": {"enabled": False, "threshold": 5.0}}}) == []
+
+
 def test_macd_alert_consumption_bootstraps_and_deduplicates_per_bar():
     alerts = {**default_short_term_watchlist()["alerts"], "enabled": True}
     initial_rows = {
@@ -309,6 +342,7 @@ def test_multiuser_tab_has_its_own_kline_request_and_fragment_refresh():
     assert "Volume bars = light blue" in section
     assert "Close = blue; VWAP = teal" in section
     assert '"Volume Ratio"' in source
+    assert '"BB / Close"' in source
     assert '"VWAP / Close"' in source
     assert '"1D%"' in source
     assert '["Ticker", "Name", "Price", "Candles (20)", "1D%"' in source
@@ -320,6 +354,12 @@ def test_multiuser_tab_has_its_own_kline_request_and_fragment_refresh():
     assert "ticker_background = beta_color" in source
     assert '"MACD Diff‱"' in source
     assert 'short_term_diverging_color(value, clip=15.0)' in source
+    assert '"macd": {"MACD / Signal"}' in source
+    assert '"bollinger_lower": {"BB / Close"}' in source
+    assert '"rsi_upper": {"RSI (30/70)"}' in source
+    assert '"% of VWAP band width"' in source
+    assert '"ATR (15)"' in source
+    assert 'st.number_input("ATR period"' in section
     assert 'return f"{float(value):.2f}" if pd.notna(value) else ""' in source
     assert "short_term_history_days" in source
     assert "history_days=history_days" in section

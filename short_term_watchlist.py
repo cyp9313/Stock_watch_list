@@ -21,8 +21,8 @@ from ticker_mapping import normalize_yfinance_ticker
 
 SHORT_TERM_COLUMNS = (
     "Ticker", "Interval", "Price", "1D%", "Bar Diff%", "Candles (15)", "MA Spread‱", "MA 1 / MA 2",
-    "Volume Ratio", "Volume (15)", "MACD Diff‱", "MACD / Signal", "Diff BB Upper%", "Diff VWAP%",
-    "VWAP / Close", "RSI", "RSI (30/70)",
+    "Volume Ratio", "Volume (15)", "MACD Diff‱", "MACD / Signal", "Diff BB Upper%", "BB / Close", "Diff VWAP%",
+    "VWAP / Close", "RSI", "RSI (30/70)", "ATR", "ATR (15)",
 )
 
 _DEFAULT_SETTINGS = {
@@ -31,6 +31,7 @@ _DEFAULT_SETTINGS = {
     "macd": {"fast": 12, "slow": 26, "signal": 9},
     "bollinger": {"period": 20, "stddev": 2.0},
     "rsi": {"period": 14},
+    "atr": {"period": 14},
 }
 
 _DEFAULT_ALERTS = {
@@ -44,6 +45,7 @@ _DEFAULT_ALERTS = {
         "ema": {"enabled": False, "threshold": 5.0},
         "bollinger": {"enabled": False, "threshold": 10.0},
         "vwap": {"enabled": False, "threshold": 5.0},
+        "vwap_bands": {"enabled": False, "threshold": 5.0},
         "rsi": {"enabled": False, "threshold": 2.0},
     },
     "ticker_enabled": {},
@@ -163,6 +165,7 @@ def normalize_short_term_watchlist(value: Any) -> dict[str, Any]:
                 "stddev": _bounded_float(merged["bollinger"].get("stddev"), "Bollinger standard deviation", minimum=0.1, maximum=10.0),
             },
             "rsi": {"period": _bounded_int(merged["rsi"].get("period"), "RSI period")},
+            "atr": {"period": _bounded_int(merged["atr"].get("period"), "ATR period")},
         }
         if settings["macd"]["fast"] >= settings["macd"]["slow"]:
             raise ValueError("MACD fast period must be smaller than slow period")
@@ -202,6 +205,7 @@ def short_term_history_days(settings: Mapping[str, Any]) -> int:
         normalized["macd"]["slow"] + normalized["macd"]["signal"],
         normalized["bollinger"]["period"],
         normalized["rsi"]["period"] + 1,
+        normalized["atr"]["period"] + 1,
     )
     return min(60, max(2, ceil(required_bars / 26)))
 
@@ -281,6 +285,16 @@ def short_term_alert_events(row: Mapping[str, Any], interval: str, alerts: Mappi
             events.extend(_crossover_events(
                 ticker=ticker, interval=interval, timestamp=timestamp, signal=signal, label=label,
                 current=row.get(current_key), previous=row.get(previous_key), threshold=bb_config["threshold"], alerts=normalized,
+            ))
+    vwap_bands_config = normalized["signals"]["vwap_bands"]
+    if vwap_bands_config["enabled"]:
+        for signal, current_key, previous_key, label in (
+            ("vwap_upper", "VWAP Upper Cross (%)", "VWAP Upper Cross Previous (%)", "VWAP +1σ"),
+            ("vwap_lower", "VWAP Lower Cross (%)", "VWAP Lower Cross Previous (%)", "VWAP -1σ"),
+        ):
+            events.extend(_crossover_events(
+                ticker=ticker, interval=interval, timestamp=timestamp, signal=signal, label=label,
+                current=row.get(current_key), previous=row.get(previous_key), threshold=vwap_bands_config["threshold"], alerts=normalized,
             ))
     return events
 
@@ -437,10 +451,54 @@ def macd_svg(macd_values: list[float], signal_values: list[float]) -> str:
     )
 
 
-def vwap_svg(close_values: list[float], vwap_values: list[float]) -> str:
-    return two_line_svg(
-        close_values, vwap_values,
-        first_color="#2563eb", second_color="#0f766e", label="Close and VWAP",
+def vwap_svg(
+    close_values: list[float], vwap_values: list[float],
+    upper_values: list[float], lower_values: list[float],
+) -> str:
+    """Render close, VWAP, and cumulative one-sigma VWAP bands."""
+    width, height = 80, 30
+    all_values = close_values + vwap_values + upper_values + lower_values
+    finite = np.asarray([value for value in all_values if np.isfinite(value)], dtype=float)
+    if not len(finite):
+        return ""
+    domain = (float(finite.min()), float(finite.max()))
+    close_path = _path(close_values, width, height, domain=domain)
+    vwap_path = _path(vwap_values, width, height, domain=domain)
+    upper_path = _path(upper_values, width, height, domain=domain)
+    lower_path = _path(lower_values, width, height, domain=domain)
+    if not any((close_path, vwap_path, upper_path, lower_path)):
+        return ""
+    return (
+        f"<svg viewBox='0 0 {width} {height}' width='{width}' height='{height}' role='img' "
+        "aria-label='Close, VWAP, and VWAP one standard deviation bands'>"
+        f"<path d='{escape(upper_path, quote=True)}' fill='none' stroke='#94a3b8' stroke-width='0.9' stroke-dasharray='3 2'/>"
+        f"<path d='{escape(lower_path, quote=True)}' fill='none' stroke='#94a3b8' stroke-width='0.9' stroke-dasharray='3 2'/>"
+        f"<path d='{escape(close_path, quote=True)}' fill='none' stroke='#2563eb' stroke-width='1.6'/>"
+        f"<path d='{escape(vwap_path, quote=True)}' fill='none' stroke='#0f766e' stroke-width='1.4'/>"
+        "</svg>"
+    )
+
+
+def bollinger_svg(close_values: list[float], upper_values: list[float], lower_values: list[float]) -> str:
+    """Render close against dashed Bollinger upper and lower bands."""
+    width, height = 80, 30
+    all_values = close_values + upper_values + lower_values
+    finite = np.asarray([value for value in all_values if np.isfinite(value)], dtype=float)
+    if not len(finite):
+        return ""
+    domain = (float(finite.min()), float(finite.max()))
+    close_path = _path(close_values, width, height, domain=domain)
+    upper_path = _path(upper_values, width, height, domain=domain)
+    lower_path = _path(lower_values, width, height, domain=domain)
+    if not any((close_path, upper_path, lower_path)):
+        return ""
+    return (
+        f"<svg viewBox='0 0 {width} {height}' width='{width}' height='{height}' role='img' "
+        "aria-label='Close and Bollinger bands'>"
+        f"<path d='{escape(upper_path, quote=True)}' fill='none' stroke='#94a3b8' stroke-width='0.9' stroke-dasharray='3 2'/>"
+        f"<path d='{escape(lower_path, quote=True)}' fill='none' stroke='#94a3b8' stroke-width='0.9' stroke-dasharray='3 2'/>"
+        f"<path d='{escape(close_path, quote=True)}' fill='none' stroke='#2563eb' stroke-width='1.6'/>"
+        "</svg>"
     )
 
 
@@ -448,6 +506,19 @@ def rsi_svg(rsi_values: list[float]) -> str:
     return two_line_svg(
         rsi_values, [], first_color="#7c3aed", second_color="#7c3aed", label="RSI with 30 and 70 levels",
         reference_lines=(30.0, 70.0),
+    )
+
+
+def atr_svg(atr_values: list[float]) -> str:
+    """Render a compact ATR trend line for the latest 15 bars."""
+    width, height = 80, 30
+    path = _path(atr_values, width, height)
+    if not path:
+        return ""
+    return (
+        f"<svg viewBox='0 0 {width} {height}' width='{width}' height='{height}' role='img' aria-label='ATR'>"
+        f"<path d='{escape(path, quote=True)}' fill='none' stroke='#1d4ed8' stroke-width='1.6'/>"
+        "</svg>"
     )
 
 
@@ -539,6 +610,13 @@ def calculate_short_term_row(ticker: str, kline_data: Mapping[str, Any], setting
     gains = delta.where(delta > 0, 0).rolling(rsi_period).mean()
     losses = -delta.where(delta < 0, 0).rolling(rsi_period).mean()
     rsi = 100 - (100 / (1 + gains / losses))
+    atr_period = normalized["atr"]["period"]
+    previous_closes = close.shift(1)
+    true_range = pd.concat(
+        [frame["high"] - frame["low"], (frame["high"] - previous_closes).abs(), (frame["low"] - previous_closes).abs()],
+        axis=1,
+    ).max(axis=1)
+    atr = true_range.ewm(alpha=1 / atr_period, adjust=False, min_periods=atr_period).mean()
 
     latest_timestamp = frame["timestamp"].iloc[-1]
     latest_volume = float(frame["volume"].iloc[-1]) if pd.notna(frame["volume"].iloc[-1]) else np.nan
@@ -550,18 +628,30 @@ def calculate_short_term_row(ticker: str, kline_data: Mapping[str, Any], setting
         )
     vwap_mask = regular & frame["volume"].gt(0) & frame[["high", "low", "close"]].notna().all(axis=1)
     vwap_series = pd.Series(np.nan, index=frame.index, dtype=float)
+    vwap_upper_series = pd.Series(np.nan, index=frame.index, dtype=float)
+    vwap_lower_series = pd.Series(np.nan, index=frame.index, dtype=float)
     if vwap_mask.any():
         eligible_dates = frame.loc[vwap_mask, "timestamp"].dt.date
         for _, row_indexes in eligible_dates.groupby(eligible_dates).groups.items():
             typical = (frame.loc[row_indexes, "high"] + frame.loc[row_indexes, "low"] + frame.loc[row_indexes, "close"]) / 3
             volume = frame.loc[row_indexes, "volume"]
-            vwap_series.loc[row_indexes] = (typical * volume).cumsum() / volume.cumsum()
+            cumulative_volume = volume.cumsum()
+            session_vwap = (typical * volume).cumsum() / cumulative_volume
+            weighted_variance = ((typical.pow(2) * volume).cumsum() / cumulative_volume - session_vwap.pow(2)).clip(lower=0)
+            session_sigma = np.sqrt(weighted_variance)
+            vwap_series.loc[row_indexes] = session_vwap
+            vwap_upper_series.loc[row_indexes] = session_vwap + session_sigma
+            vwap_lower_series.loc[row_indexes] = session_vwap - session_sigma
     vwap = float(vwap_series.iloc[-1]) if pd.notna(vwap_series.iloc[-1]) else np.nan
+    vwap_upper = float(vwap_upper_series.iloc[-1]) if pd.notna(vwap_upper_series.iloc[-1]) else np.nan
+    vwap_lower = float(vwap_lower_series.iloc[-1]) if pd.notna(vwap_lower_series.iloc[-1]) else np.nan
     latest_regular = bool(regular.iloc[-1]) if len(regular) else False
     vwap_diff = _percent(latest_price - vwap, vwap) if latest_regular and pd.notna(latest_volume) and latest_volume > 0 else np.nan
     volume_ema = frame["volume"].ewm(span=5, adjust=False).mean()
     macd_diff = macd - signal
     previous_vwap = float(vwap_series.iloc[-2]) if pd.notna(vwap_series.iloc[-2]) else np.nan
+    previous_vwap_upper = float(vwap_upper_series.iloc[-2]) if pd.notna(vwap_upper_series.iloc[-2]) else np.nan
+    previous_vwap_lower = float(vwap_lower_series.iloc[-2]) if pd.notna(vwap_lower_series.iloc[-2]) else np.nan
 
     def _cross_bps(current_value, previous_value, current_reference, previous_reference):
         return (
@@ -580,6 +670,16 @@ def calculate_short_term_row(ticker: str, kline_data: Mapping[str, Any], setting
     bb_lower_cross = _band_width_percent(latest_price, bb_lower.iloc[-1], bb_upper.iloc[-1], bb_lower.iloc[-1])
     bb_lower_cross_previous = _band_width_percent(previous_close, bb_lower.iloc[-2], bb_upper.iloc[-2], bb_lower.iloc[-2])
     vwap_cross, vwap_cross_previous = _cross_bps(latest_price, previous_close, vwap, previous_vwap)
+
+    def _vwap_band_position(price, upper, lower):
+        # Signed position: 0% is the upper band and -100% is the lower band.
+        return _percent(float(price) - float(upper), float(upper) - float(lower))
+
+    vwap_band_position = _vwap_band_position(latest_price, vwap_upper, vwap_lower)
+    previous_vwap_band_position = _vwap_band_position(previous_close, previous_vwap_upper, previous_vwap_lower)
+    vwap_upper_cross, vwap_upper_cross_previous = vwap_band_position, previous_vwap_band_position
+    vwap_lower_cross = vwap_band_position + 100.0 if pd.notna(vwap_band_position) else np.nan
+    vwap_lower_cross_previous = previous_vwap_band_position + 100.0 if pd.notna(previous_vwap_band_position) else np.nan
 
     tail = frame.iloc[-15:]
     return {
@@ -605,6 +705,10 @@ def calculate_short_term_row(ticker: str, kline_data: Mapping[str, Any], setting
         "BB Lower Cross Previous (%)": bb_lower_cross_previous,
         "VWAP Cross (bp)": vwap_cross,
         "VWAP Cross Previous (bp)": vwap_cross_previous,
+        "VWAP Upper Cross (%)": vwap_upper_cross,
+        "VWAP Upper Cross Previous (%)": vwap_upper_cross_previous,
+        "VWAP Lower Cross (%)": vwap_lower_cross,
+        "VWAP Lower Cross Previous (%)": vwap_lower_cross_previous,
         "RSI 30 Cross": float(rsi.iloc[-1] - 30.0) if pd.notna(rsi.iloc[-1]) else np.nan,
         "RSI 30 Cross Previous": float(rsi.iloc[-2] - 30.0) if pd.notna(rsi.iloc[-2]) else np.nan,
         "RSI 70 Cross": float(rsi.iloc[-1] - 70.0) if pd.notna(rsi.iloc[-1]) else np.nan,
@@ -612,8 +716,14 @@ def calculate_short_term_row(ticker: str, kline_data: Mapping[str, Any], setting
         "Alert Bar Timestamp": str(dates[-1]),
         "MACD / Signal": macd_svg(macd.iloc[-15:].tolist(), signal.iloc[-15:].tolist()),
         "Diff BB Upper%": _percent(latest_price - float(bb_upper.iloc[-1]), float(bb_upper.iloc[-1] - bb_lower.iloc[-1])) if pd.notna(bb_upper.iloc[-1]) and pd.notna(bb_lower.iloc[-1]) else np.nan,
+        "BB / Close": bollinger_svg(tail["close"].tolist(), bb_upper.iloc[-15:].tolist(), bb_lower.iloc[-15:].tolist()),
         "Diff VWAP%": vwap_diff,
-        "VWAP / Close": vwap_svg(tail["close"].tolist(), vwap_series.iloc[-15:].tolist()),
+        "VWAP / Close": vwap_svg(
+            tail["close"].tolist(), vwap_series.iloc[-15:].tolist(),
+            vwap_upper_series.iloc[-15:].tolist(), vwap_lower_series.iloc[-15:].tolist(),
+        ),
         "RSI": float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else np.nan,
         "RSI (30/70)": rsi_svg(rsi.iloc[-15:].tolist()),
+        "ATR": float(atr.iloc[-1]) if pd.notna(atr.iloc[-1]) else np.nan,
+        "ATR (15)": atr_svg(atr.iloc[-15:].tolist()),
     }

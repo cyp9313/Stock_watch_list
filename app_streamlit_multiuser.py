@@ -2529,21 +2529,21 @@ def _short_term_columns(settings):
     return [
         "Ticker", "Interval", "Price", "1D%", "Bar Diff%", "Candles (15)",
         "MA Spread‱", f"{settings['ma_1']['type']}({settings['ma_1']['period']}) / {settings['ma_2']['type']}({settings['ma_2']['period']})",
-        "Volume Ratio", "Volume (15)", "MACD Diff‱", "MACD / Signal", "Diff BB Upper%", "Diff VWAP%",
-        "VWAP / Close", "RSI", "RSI (30/70)",
+        "Volume Ratio", "Volume (15)", "MACD Diff‱", "MACD / Signal", "Diff BB Upper%", "BB / Close", "Diff VWAP%",
+        "VWAP / Close", "RSI", "RSI (30/70)", "ATR", "ATR (15)",
     ]
 
 
 def _short_term_value_text(key, value, ticker, display_currency):
     if key == "Price":
         return format_money_value(value, ticker, display_currency)
-    if key in {"Candles (15)", "MA 1 / MA 2", "Volume (15)", "MACD / Signal", "VWAP / Close", "RSI (30/70)"}:
+    if key in {"Candles (15)", "MA 1 / MA 2", "Volume (15)", "MACD / Signal", "BB / Close", "VWAP / Close", "RSI (30/70)", "ATR (15)"}:
         return str(value or "")
     if key in {"1D%", "Bar Diff%", "Diff BB Upper%", "Diff VWAP%"}:
         return f"{float(value):.2f}" if pd.notna(value) else ""
     if key in {"MACD Diff‱", "MA Spread‱", "Volume Ratio"}:
         return f"{float(value):.4f}" if pd.notna(value) else ""
-    if key == "RSI":
+    if key in {"RSI", "ATR"}:
         return f"{float(value):.2f}" if pd.notna(value) else ""
     return html.escape(str(value or ""))
 
@@ -2574,21 +2574,23 @@ def render_short_term_table(
     intervals = ("5m", "15m")
     active_alerts = alert_pairs if isinstance(alert_pairs, dict) else {}
     alert_columns = {
-        "macd": {"MACD Diff‱"},
+        "macd": {"MACD / Signal"},
         "ema": {"MA 1 / MA 2"},
-        "bollinger_upper": {"Diff BB Upper%"},
-        "bollinger_lower": {"Candles (15)"},
+        "bollinger_upper": {"BB / Close"},
+        "bollinger_lower": {"BB / Close"},
         "vwap": {"VWAP / Close"},
-        "rsi": {"RSI"},
-        "rsi_upper": {"RSI"},
+        "vwap_upper": {"VWAP / Close"},
+        "vwap_lower": {"VWAP / Close"},
+        "rsi": {"RSI (30/70)"},
+        "rsi_upper": {"RSI (30/70)"},
     }
     html_table = f"""
     <div style="width:100%; max-height:650px; overflow:auto; border:1px solid {theme['table_border']};">
-      <table style="width:1440px; min-width:1440px; table-layout:fixed; border-collapse:collapse;
+      <table style="width:1686px; min-width:1686px; table-layout:fixed; border-collapse:collapse;
                     font-family:Arial; font-size:12px; background-color:{theme['table_bg']}; color:{theme['text']};">
         <thead style="position:sticky; top:0; z-index:10; background-color:{theme['table_header_bg']};"><tr>
     """
-    widths = [68, 48, 82, 64, 68, 88, 82, 88, 76, 88, 76, 88, 88, 80, 88, 58, 88]
+    widths = [68, 48, 82, 64, 68, 88, 82, 88, 76, 88, 76, 88, 88, 88, 80, 88, 58, 88, 70, 88]
     for index, column in enumerate(columns):
         sticky = sticky_first_column_header_style(theme["table_header_bg"]) if index == 0 else ""
         html_table += f"<th title='{html.escape(column, quote=True)}' style='width:{widths[index]}px; padding:4px; text-align:left; {sticky} color:{theme['text']}; border:1px solid {theme['table_border']};'>{html.escape(column)}</th>"
@@ -2612,7 +2614,7 @@ def render_short_term_table(
                     html_table += f"<td rowspan='2' title='{ticker_title}' style='padding:4px; text-align:left; {sticky_first_column_style(ticker_background)} color:{ticker_text_color}; background-color:{ticker_background}; border:1px solid {theme['table_border']}; white-space:nowrap; overflow:hidden;'>{html.escape(ticker)}</td>"
                 for index, (display_column, key) in enumerate(zip(columns[1:], value_keys[1:]), start=1):
                     value = interval if key == "Interval" else row.get(key, np.nan)
-                    if key in {"Candles (15)", "MA 1 / MA 2", "Volume (15)", "MACD / Signal", "VWAP / Close", "RSI (30/70)"}:
+                    if key in {"Candles (15)", "MA 1 / MA 2", "Volume (15)", "MACD / Signal", "BB / Close", "VWAP / Close", "RSI (30/70)", "ATR (15)"}:
                         content = str(value or "")
                     else:
                         content = _short_term_value_text(key, value, ticker, display_currency)
@@ -2643,7 +2645,7 @@ def render_short_term_table(
                     elif key == "Volume Ratio" and pd.notna(value):
                         background = blue_color(value)
                     text_color = theme["text"] if background == theme["table_bg"] else readable_text_color(background)
-                    align = "left" if key in {"Interval", "Candles (15)", "MA 1 / MA 2", "Volume (15)", "MACD / Signal", "VWAP / Close", "RSI (30/70)"} else "right"
+                    align = "left" if key in {"Interval", "Candles (15)", "MA 1 / MA 2", "Volume (15)", "MACD / Signal", "BB / Close", "VWAP / Close", "RSI (30/70)", "ATR (15)"} else "right"
                     active_signals = set((active_alerts.get((ticker, interval)) or {}).get("signals", []))
                     is_alerted = any(key in alert_columns.get(signal, set()) for signal in active_signals)
                     alert_class = " short-term-macd-alert-cell" if is_alerted else ""
@@ -2778,13 +2780,14 @@ def render_short_term_watchlist(config, user, *, stock_data=None, dark_mode=Fals
                         value=short_config["alerts"]["confirmed_enabled"],
                         key=f"short_term_alert_confirmed_{user['id']}_{alert_revision}",
                     )
-                st.caption("Enable each signal independently and set its near-crossover threshold. MACD, MA, and VWAP use ‱ (one ten-thousandth); Bollinger uses % of band width; RSI uses RSI points.")
+                st.caption("Enable each signal independently and set its near-crossover threshold. MACD, MA, and VWAP use ‱ (one ten-thousandth); Bollinger uses % of band width; VWAP ±1σ bands use % of VWAP band width; RSI uses RSI points.")
                 signal_controls = {}
                 for signal_name, label, unit in (
                     ("macd", "MACD / Signal", "‱"),
                     ("ema", "MA 1 / MA 2", "‱"),
                     ("bollinger", "Close / Bollinger upper & lower", "% of BB width"),
                     ("vwap", "Close / VWAP", "‱"),
+                    ("vwap_bands", "Close / VWAP ±1σ bands", "% of VWAP band width"),
                     ("rsi", "RSI / 30 & 70", "points"),
                 ):
                     signal_config = short_config["alerts"]["signals"][signal_name]
@@ -2861,6 +2864,7 @@ def render_short_term_watchlist(config, user, *, stock_data=None, dark_mode=Fals
                 with bb_cols[1]:
                     bb_stddev = float(st.number_input("Bollinger standard deviation", min_value=0.1, max_value=10.0, value=float(short_config["settings"]["bollinger"]["stddev"]), step=0.1, key=f"short_bb_stddev_{form_revision}"))
                 rsi_period = int(st.number_input("RSI period", min_value=1, max_value=500, value=short_config["settings"]["rsi"]["period"], key=f"short_rsi_period_{form_revision}"))
+                atr_period = int(st.number_input("ATR period", min_value=1, max_value=500, value=short_config["settings"]["atr"]["period"], key=f"short_atr_period_{form_revision}"))
                 save_settings = st.form_submit_button("Apply indicator parameters", width="stretch")
             if save_settings:
                 candidate = {
@@ -2871,6 +2875,7 @@ def render_short_term_watchlist(config, user, *, stock_data=None, dark_mode=Fals
                         "macd": {"fast": macd_fast, "slow": macd_slow, "signal": macd_signal},
                         "bollinger": {"period": bb_period, "stddev": bb_stddev},
                         "rsi": {"period": rsi_period},
+                        "atr": {"period": atr_period},
                     },
                     "refresh": short_config["refresh"],
                     "alerts": short_config["alerts"],
@@ -2892,8 +2897,8 @@ def render_short_term_watchlist(config, user, *, stock_data=None, dark_mode=Fals
         "Price cell: green = regular session (including 24/7 crypto), blue = pre-market, yellow = after-hours. "
         "Ticker cell: greener beta is below 1; redder beta is above 1. "
         "Candles: teal = up, red = down. MA 1 = green; MA 2 = purple. Volume bars = light blue. "
-        "MACD = blue; signal = orange; its dashed gray line is 0. Close = blue; VWAP = teal. "
-        "RSI = purple; its dashed gray lines are 30 and 70. VWAP values are blank outside a regular-session bar or when the latest bar has no volume."
+        "MACD = blue; signal = orange; its dashed gray line is 0. Close = blue; VWAP = teal; VWAP ±1σ and Bollinger upper/lower are dashed gray. "
+        "RSI = purple; its dashed gray lines are 30 and 70. ATR = dark blue. VWAP values are blank outside a regular-session bar or when the latest bar has no volume."
     )
     st.caption(f"Indicator history: {history_days} day(s), adjusted automatically for the active indicator periods.")
     # Check every second, then request data only on the selected 10/20/30s
