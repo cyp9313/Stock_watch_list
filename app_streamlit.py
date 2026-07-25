@@ -23,6 +23,7 @@ import colorsys
 from PIL import Image
 from kline_indicator_controls import render_indicator_settings_panel
 from kline_indicators import calculate_configurable_indicators, default_indicator_settings, normalize_indicator_settings
+from kline_fibonacci import add_fibonacci_overlays, calculate_auto_fibonacci
 from ticker_mapping import normalize_yfinance_ticker, stockanalysis_overview_url
 
 # ── Page config ──────────────────────────────────────────────
@@ -810,9 +811,9 @@ def render_grouped_table(df, groups, key_prefix="", dark_mode=False, show_name_c
 
 
 # ── K-line chart builder ─────────────────────────────────────
-def build_kline_chart(kline_data, ticker, fib_levels=None, dark_mode=False, uirevision=None, indicator_settings=None, interval="1d"):
+def build_kline_chart(kline_data, ticker, fibonacci=None, dark_mode=False, uirevision=None, indicator_settings=None, interval="1d"):
     """Build a Plotly candlestick chart with all indicators.
-    fib_levels: optional list of (price, label, color) tuples for Fibonacci lines.
+    fibonacci: structured Auto Fib retracement/extension result.
     """
     if not kline_data or not kline_data.get("success"):
         st.warning("K-line data not available")
@@ -1069,16 +1070,8 @@ def build_kline_chart(kline_data, ticker, fib_levels=None, dark_mode=False, uire
     fig.update_xaxes(row=1, col=1, showgrid=True)
     fig.update_yaxes(row=1, col=1, showgrid=True)
 
-    # ── Fibonacci levels (on main candlestick chart) ──────────
-    if fib_levels:
-        for level, lbl, color in fib_levels:
-            fig.add_hline(
-                y=level, line_dash="dash", line_color=color,
-                annotation_text=f"{lbl}  {level:.2f}",
-                annotation_position="right",
-                annotation_font=dict(size=9, color=color),
-                row=1, col=1,
-            )
+    # ── Auto Fibonacci overlays (anchored segments, not full-chart hlines) ──
+    add_fibonacci_overlays(fig, fibonacci, dates, dark_mode, row=1, col=1)
 
     # ── Layout ────────────────────────────────────────────────
     stable_ui_revision = str(uirevision or ticker)
@@ -1100,7 +1093,7 @@ def build_kline_chart(kline_data, ticker, fib_levels=None, dark_mode=False, uire
     fig.update_layout(
         selectionrevision=stable_ui_revision,
         editrevision=stable_ui_revision,
-        legend=dict(uirevision=stable_ui_revision),
+        legend=dict(uirevision=stable_ui_revision, groupclick="togglegroup"),
     )
     fig.for_each_xaxis(lambda axis: axis.update(uirevision=stable_ui_revision))
     fig.for_each_yaxis(lambda axis: axis.update(uirevision=stable_ui_revision))
@@ -1125,7 +1118,7 @@ def build_kline_chart(kline_data, ticker, fib_levels=None, dark_mode=False, uire
 
 
 def render_persistent_kline_chart(fig, storage_key, height=None):
-    """Render K-line Plotly chart while preserving browser-side zoom across reruns."""
+    """Render K-line Plotly chart while preserving browser-side view preferences."""
     if fig is None:
         return
 
@@ -1133,6 +1126,7 @@ def render_persistent_kline_chart(fig, storage_key, height=None):
     chart_height = max(chart_height, 400)
     fig_json = json.dumps(fig.to_plotly_json(), cls=PlotlyJSONEncoder)
     storage_key_json = json.dumps(f"stock_watchlist:kline_zoom:{storage_key}")
+    legend_storage_key_json = json.dumps(f"stock_watchlist:kline_legend:{storage_key}")
     html_doc = """
 <!doctype html>
 <html>
@@ -1150,6 +1144,7 @@ def render_persistent_kline_chart(fig, storage_key, height=None):
     const chart = document.getElementById("kline-chart");
     const fig = __FIG_JSON__;
     const storageKey = __STORAGE_KEY__;
+    const legendStorageKey = __LEGEND_STORAGE_KEY__;
     const config = { responsive: true, scrollZoom: true, displayModeBar: true };
 
     function readSavedZoom() {
@@ -1215,17 +1210,94 @@ def render_persistent_kline_chart(fig, storage_key, height=None):
       }
     }
 
+    function readSavedLegend() {
+      try {
+        const raw = window.localStorage.getItem(legendStorageKey);
+        return raw ? JSON.parse(raw) : null;
+      } catch (err) {
+        return null;
+      }
+    }
+
+    function writeSavedLegend(value) {
+      try {
+        window.localStorage.setItem(legendStorageKey, JSON.stringify(value));
+      } catch (err) {}
+    }
+
+    function traceKeys(traces) {
+      const occurrences = {};
+      return (traces || []).map((trace) => {
+        const rawName = String((trace && trace.name) || "");
+        const stableName = rawName.startsWith("Latest (") ? "Latest" : rawName;
+        const baseKey = `${(trace && trace.type) || "trace"}:${stableName}`;
+        const occurrence = occurrences[baseKey] || 0;
+        occurrences[baseKey] = occurrence + 1;
+        return `${baseKey}:${occurrence}`;
+      });
+    }
+
+    function saveLegend(eventData) {
+      if (!Array.isArray(eventData) || !eventData.length) {
+        return;
+      }
+      const update = eventData[0] || {};
+      if (!Object.prototype.hasOwnProperty.call(update, "visible")) {
+        return;
+      }
+      const indexes = Array.isArray(eventData[1]) ? eventData[1] : [eventData[1]];
+      const keys = traceKeys(chart.data);
+      const saved = readSavedLegend() || {};
+      let changed = false;
+
+      indexes.forEach((index, position) => {
+        const visible = Array.isArray(update.visible) ? update.visible[position] : update.visible;
+        if (
+          Number.isInteger(index) &&
+          keys[index] &&
+          (visible === true || visible === false || visible === "legendonly")
+        ) {
+          saved[keys[index]] = visible;
+          changed = true;
+        }
+      });
+
+      if (changed) {
+        writeSavedLegend(saved);
+      }
+    }
+
+    function restoreLegend() {
+      const saved = readSavedLegend();
+      if (!saved || Object.keys(saved).length === 0) {
+        return;
+      }
+      const indexes = [];
+      const visibility = [];
+      traceKeys(chart.data).forEach((key, index) => {
+        if (Object.prototype.hasOwnProperty.call(saved, key)) {
+          indexes.push(index);
+          visibility.push(saved[key]);
+        }
+      });
+      if (indexes.length) {
+        Plotly.restyle(chart, { visible: visibility }, indexes);
+      }
+    }
+
     Plotly.newPlot(chart, fig.data || [], fig.layout || {}, config).then(() => {
       restoreZoom();
+      restoreLegend();
       chart.on("plotly_relayout", saveZoom);
+      chart.on("plotly_restyle", saveLegend);
     });
     window.addEventListener("resize", () => Plotly.Plots.resize(chart));
   </script>
 </body>
 </html>
-""".replace("__PLOTLY_JS__", get_plotlyjs()).replace("__FIG_JSON__", fig_json).replace(
+    """.replace("__PLOTLY_JS__", get_plotlyjs()).replace("__FIG_JSON__", fig_json).replace(
         "__STORAGE_KEY__", storage_key_json
-    ).replace("__HEIGHT__", str(chart_height))
+    ).replace("__LEGEND_STORAGE_KEY__", legend_storage_key_json).replace("__HEIGHT__", str(chart_height))
     components.html(html_doc, height=chart_height + 10, scrolling=False)
 
 
@@ -1889,9 +1961,6 @@ if plot_btn:
             st.session_state["auto_refresh_kline_last"] = now
             st.session_state["auto_refresh_kline_last_key"] = request_key
 
-    # Store ticker in session_state for Fibonacci calculation
-    st.session_state["current_ticker"] = ticker
-
 auto_refresh_enabled = st.session_state.get("auto_refresh_kline", False)
 auto_refresh_interval_seconds = int(st.session_state.get("auto_refresh_interval_minutes", 5)) * 60
 if (
@@ -1943,77 +2012,8 @@ def _render_kline_body():
         next_label = next_due.strftime("%Y-%m-%d %H:%M:%S") if isinstance(next_due, datetime.datetime) else "N/A"
         st.caption(f"Last K-line auto-refresh: {label}; next due: {next_label}")
 
-    # Clear fib levels when ticker changes
-    if st.session_state.get("fib_ticker") != ticker:
-        st.session_state.pop("fib_levels", None)
-        st.session_state["fib_ticker"] = ticker
-
     kd = st.session_state.get("kline_data")
     if kd and kd.get("success"):
-        # Handle Fibonacci updates before rendering chart
-        fib_levels = st.session_state.get("fib_levels")
-
-        # ── Fibonacci section ──────────────────────────────────
-        with st.expander("📐 Fibonacci Retracement / Extension", expanded=bool(fib_levels)):
-            st.markdown(
-                """
-                Enter A (swing low), B (swing high), and optionally C (pullback end) prices.
-                - **A + B only** → Retracement (gray lines)
-                - **A + B + C** → Extension (0% at C, >100% in blue)
-                """
-            )
-
-            with st.form(key="fib_form"):
-                fc1, fc2, fc3 = st.columns(3)
-                with fc1:
-                    fib_a = st.number_input("A (Swing Low)", value=0.0, step=0.01, format="%.2f", key="fib_a")
-                with fc2:
-                    fib_b = st.number_input("B (Swing High)", value=0.0, step=0.01, format="%.2f", key="fib_b")
-                with fc3:
-                    fib_c = st.number_input("C (Pullback End, optional)", value=0.0, step=0.01, format="%.2f", key="fib_c")
-
-                fc_btn1, fc_btn2 = st.columns([1, 1])
-                with fc_btn1:
-                    submit_fib = st.form_submit_button(label="Calculate Fibonacci")
-                with fc_btn2:
-                    clear_fib = st.form_submit_button(label="Clear Fibonacci")
-
-            if clear_fib:
-                if "fib_levels" in st.session_state:
-                    st.session_state.pop("fib_levels", None)
-                fib_levels = None
-
-            if submit_fib and fib_a > 0 and fib_b > 0 and fib_a != fib_b:
-                diff = fib_b - fib_a
-
-                if fib_c > 0:
-                    # Extension mode
-                    ratios = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0,
-                               1.272, 1.618, 2.0, 2.618]
-                    labels = ['0%', '23.6%', '38.2%', '50%', '61.8%', '78.6%', '100%',
-                              '127.2%', '161.8%', '200%', '261.8%']
-                    fib_levels = [
-                        (fib_c + diff * r, lbl, "blue" if r >= 1.0 else "gray")
-                        for r, lbl in zip(ratios, labels)
-                    ]
-                else:
-                    # Retracement mode
-                    ratios = [0, 0.236, 0.382, 0.5, 0.618, 1.0]
-                    labels = ['0%', '23.6%', '38.2%', '50%', '61.8%', '100%']
-                    fib_levels = [
-                        (fib_b - diff * r, lbl, "gray")
-                        for r, lbl in zip(ratios, labels)
-                    ]
-                st.session_state["fib_levels"] = fib_levels
-
-            # Display fib levels table from session_state (persists across reruns)
-            if fib_levels:
-                rows_data = []
-                for level, lbl, color in fib_levels:
-                    is_ext = "🔵 Extension" if color == "blue" else "⚫ Retracement"
-                    rows_data.append({"Ratio": lbl, "Price": f"{level:.2f}", "Type": is_ext})
-                st.dataframe(pd.DataFrame(rows_data), width="stretch", hide_index=True)
-
         # Keep configurable indicators beside the chart and retain them for this browser session.
         settings = normalize_indicator_settings(
             st.session_state.get("kline_indicator_settings", default_indicator_settings())
@@ -2030,14 +2030,18 @@ def _render_kline_body():
             if settings_action:
                 st.session_state["kline_indicator_settings"] = updated_settings
                 st.session_state["kline_indicator_form_revision"] = form_revision + 1
-                settings = updated_settings
-                st.success("Indicator parameters applied")
+                # Render the fresh form revision before calculating again.  Without
+                # this rerun, a submitted form can leave this fragment displaying
+                # the previous widget values until the next Apply click.
+                st.rerun()
+
+        fibonacci = calculate_auto_fibonacci(kd["dates"], kd["ohlc"], settings["fibonacci"])
 
         with chart_column:
             fig = build_kline_chart(
                 kd,
                 ticker,
-                fib_levels=fib_levels,
+                fibonacci=fibonacci,
                 dark_mode=dark_mode,
                 uirevision=request_key,
                 indicator_settings=settings,

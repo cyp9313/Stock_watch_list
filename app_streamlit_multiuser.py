@@ -27,6 +27,7 @@ from PIL import Image
 
 from kline_indicator_controls import render_indicator_settings_panel
 from kline_indicators import calculate_configurable_indicators, default_indicator_settings, normalize_indicator_settings
+from kline_fibonacci import add_fibonacci_overlays, calculate_auto_fibonacci
 import stock_watch_list_back_end
 from daily_report.jobs import (
     ActiveJobError,
@@ -2876,7 +2877,7 @@ def display_vix_gauge(kline_data, dark_mode=False):
     st.plotly_chart(build_vix_gauge(value, dark_mode=dark_mode), width="stretch")
 
 
-def build_kline_chart(kline_data, ticker, fib_levels=None, dark_mode=False, uirevision=None, indicator_settings=None, interval="1d"):
+def build_kline_chart(kline_data, ticker, fibonacci=None, dark_mode=False, uirevision=None, indicator_settings=None, interval="1d"):
     if not kline_data or not kline_data.get("success"):
         st.warning("K-line data not available")
         return None
@@ -3163,18 +3164,7 @@ def build_kline_chart(kline_data, ticker, fib_levels=None, dark_mode=False, uire
     fig.update_xaxes(row=1, col=1, showgrid=True)
     fig.update_yaxes(row=1, col=1, showgrid=True)
 
-    if fib_levels:
-        for level, label, color in fib_levels:
-            fig.add_hline(
-                y=level,
-                line_dash="dash",
-                line_color=color,
-                annotation_text=f"{label}  {level:.2f}",
-                annotation_position="right",
-                annotation_font=dict(size=9, color=color),
-                row=1,
-                col=1,
-            )
+    add_fibonacci_overlays(fig, fibonacci, dates, dark_mode, row=1, col=1)
 
     stable_ui_revision = str(uirevision or ticker)
     fig.update_layout(
@@ -3205,7 +3195,7 @@ def build_kline_chart(kline_data, ticker, fib_levels=None, dark_mode=False, uire
     fig.update_layout(
         selectionrevision=stable_ui_revision,
         editrevision=stable_ui_revision,
-        legend=dict(uirevision=stable_ui_revision),
+        legend=dict(uirevision=stable_ui_revision, groupclick="togglegroup"),
     )
     fig.for_each_xaxis(lambda axis: axis.update(uirevision=stable_ui_revision))
     fig.for_each_yaxis(lambda axis: axis.update(uirevision=stable_ui_revision))
@@ -3491,7 +3481,7 @@ def save_active_config(user, config):
 def search_ticker_candidates(query):
     try:
         return search_yfinance_candidates(query)
-    except Exception:
+    except (requests.RequestException, OSError, TypeError, ValueError):
         return []
 
 
@@ -3939,11 +3929,6 @@ def render_kline(user, cache_key, display_currency="Local"):
             next_label = next_due.strftime("%Y-%m-%d %H:%M:%S") if isinstance(next_due, datetime.datetime) else "N/A"
             st.caption(f"Last K-line auto-refresh: {label}; next due: {next_label}")
 
-        fib_scope = f"{ticker}_{display_currency}"
-        if st.session_state.get("fib_ticker") != fib_scope:
-            st.session_state.pop("fib_levels", None)
-            st.session_state["fib_ticker"] = fib_scope
-
         data = st.session_state.get("kline_data")
         if not data:
             st.info("Click 'Plot' to load chart")
@@ -3951,52 +3936,6 @@ def render_kline(user, cache_key, display_currency="Local"):
         if not data.get("success"):
             st.error(data.get("error", "Failed to load K-line data"))
             return
-
-        fib_levels = st.session_state.get("fib_levels")
-        with st.expander("Fibonacci Retracement / Extension", expanded=bool(fib_levels)):
-            st.markdown(
-                """
-                Enter A (swing low), B (swing high), and optionally C (pullback end) prices.
-                - A + B only: retracement lines
-                - A + B + C: extension lines
-                """
-            )
-            with st.form(key="fib_form"):
-                fc1, fc2, fc3 = st.columns(3)
-                with fc1:
-                    fib_a = st.number_input("A (Swing Low)", value=0.0, step=0.01, format="%.2f", key="fib_a")
-                with fc2:
-                    fib_b = st.number_input("B (Swing High)", value=0.0, step=0.01, format="%.2f", key="fib_b")
-                with fc3:
-                    fib_c = st.number_input("C (Pullback End, optional)", value=0.0, step=0.01, format="%.2f", key="fib_c")
-
-                fc_btn1, fc_btn2 = st.columns([1, 1])
-                with fc_btn1:
-                    submit_fib = st.form_submit_button(label="Calculate Fibonacci")
-                with fc_btn2:
-                    clear_fib = st.form_submit_button(label="Clear Fibonacci")
-
-            if clear_fib:
-                st.session_state.pop("fib_levels", None)
-                fib_levels = None
-
-            if submit_fib and fib_a > 0 and fib_b > 0 and fib_a != fib_b:
-                diff = fib_b - fib_a
-                if fib_c > 0:
-                    ratios = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1.0, 1.272, 1.618, 2.0, 2.618]
-                    labels = ["0%", "23.6%", "38.2%", "50%", "61.8%", "78.6%", "100%", "127.2%", "161.8%", "200%", "261.8%"]
-                    fib_levels = [(fib_c + diff * ratio, label, "blue" if ratio >= 1.0 else "gray") for ratio, label in zip(ratios, labels)]
-                else:
-                    ratios = [0, 0.236, 0.382, 0.5, 0.618, 1.0]
-                    labels = ["0%", "23.6%", "38.2%", "50%", "61.8%", "100%"]
-                    fib_levels = [(fib_b - diff * ratio, label, "gray") for ratio, label in zip(ratios, labels)]
-                st.session_state["fib_levels"] = fib_levels
-
-            if fib_levels:
-                rows = []
-                for level, label, color in fib_levels:
-                    rows.append({"Ratio": label, "Price": f"{level:.2f}", "Type": "Extension" if color == "blue" else "Retracement"})
-                st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
         owner = f"user:{user['id']}" if user else "guest"
         if st.session_state.get("kline_indicator_settings_owner") != owner:
@@ -4023,21 +3962,25 @@ def render_kline(user, cache_key, display_currency="Local"):
             if settings_action:
                 st.session_state["kline_indicator_settings"] = updated_settings
                 st.session_state["kline_indicator_form_revision"] = form_revision + 1
-                settings = updated_settings
                 if user:
                     updated_config = get_active_config(user)
                     updated_config["kline_indicator_settings"] = updated_settings
                     st.session_state["watchlist_config"] = normalize_config(updated_config)
                     save_user_config(user["id"], st.session_state["watchlist_config"])
-                    st.success("Indicator parameters saved")
-                else:
-                    st.success("Indicator parameters applied for this guest session")
+                # Render the fresh form revision before calculating again.  Without
+                # this rerun, a submitted form can leave this fragment displaying
+                # the previous widget values until the next Apply click.
+                st.rerun()
+
+        # Calculate after currency conversion so anchors and overlays use exactly
+        # the same displayed price scale as the multi-user chart.
+        fibonacci = calculate_auto_fibonacci(chart_data["dates"], chart_data["ohlc"], settings["fibonacci"])
 
         with chart_column:
             fig = build_kline_chart(
                 chart_data,
                 ticker,
-                fib_levels=fib_levels,
+                fibonacci=fibonacci,
                 dark_mode=dark_mode,
                 uirevision=f"{request_key}_{display_currency}",
                 indicator_settings=settings,

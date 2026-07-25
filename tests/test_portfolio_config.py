@@ -45,6 +45,8 @@ def test_normalize_config_keeps_valid_saved_kline_indicator_settings():
     saved = default_indicator_settings()
     saved["moving_averages"][0] = {"period": 8, "type": "EMA"}
     saved["rsi"] = {"period": 21}
+    saved["fibonacci"]["retracement"] = {"enabled": True, "deviation": 4.5, "depth": 18}
+    saved["fibonacci"]["extension"] = {"enabled": True, "depth": 24}
 
     config = normalize_config({"kline_indicator_settings": saved})
 
@@ -61,6 +63,8 @@ def test_kline_indicator_settings_persist_per_account(tmp_path, monkeypatch):
     config_a = multiuser_store.get_user_config(user_a["id"])
     saved = default_indicator_settings()
     saved["moving_averages"][1] = {"period": 13, "type": "EMA"}
+    saved["fibonacci"]["retracement"] = {"enabled": True, "deviation": 2.5, "depth": 12}
+    saved["fibonacci"]["extension"] = {"enabled": True, "depth": 16}
     config_a["kline_indicator_settings"] = saved
     multiuser_store.save_user_config(user_a["id"], config_a)
 

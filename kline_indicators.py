@@ -26,6 +26,10 @@ _DEFAULT_INDICATOR_SETTINGS = {
     "macd": {"fast": 12, "slow": 26, "signal": 9},
     "kdj": {"period": 9, "k_smoothing": 3, "d_smoothing": 3},
     "rsi": {"period": 14},
+    "fibonacci": {
+        "retracement": {"enabled": False, "deviation": 3.0, "depth": 10},
+        "extension": {"enabled": False, "depth": 10},
+    },
 }
 
 
@@ -40,6 +44,23 @@ def _positive_int(value: Any, label: str) -> int:
     if not 1 <= value <= MAX_PERIOD:
         raise ValueError(f"{label} must be between 1 and {MAX_PERIOD}")
     return value
+
+
+def _bounded_depth(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{label} must be an integer")
+    if not 2 <= value <= 500:
+        raise ValueError(f"{label} must be between 2 and 500")
+    return value
+
+
+def _bounded_deviation(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("Retracement deviation must be a finite number")
+    number = float(value)
+    if not np.isfinite(number) or not 0.1 <= number <= 20.0:
+        raise ValueError("Retracement deviation must be between 0.1 and 20.0")
+    return number
 
 
 def validate_indicator_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
@@ -90,6 +111,18 @@ def validate_indicator_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("RSI settings are invalid")
     rsi_period = _positive_int(rsi.get("period"), "RSI period")
 
+    fibonacci = settings.get("fibonacci")
+    if not isinstance(fibonacci, Mapping):
+        raise ValueError("Fibonacci settings are invalid")
+    retracement = fibonacci.get("retracement")
+    extension = fibonacci.get("extension")
+    if not isinstance(retracement, Mapping) or not isinstance(extension, Mapping):
+        raise ValueError("Fibonacci settings are invalid")
+    retracement_enabled = retracement.get("enabled")
+    extension_enabled = extension.get("enabled")
+    if not isinstance(retracement_enabled, bool) or not isinstance(extension_enabled, bool):
+        raise ValueError("Fibonacci enabled values must be boolean")
+
     return {
         "moving_averages": normalized_mas,
         "macd": {"fast": fast, "slow": slow, "signal": signal},
@@ -99,13 +132,40 @@ def validate_indicator_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
             "d_smoothing": d_smoothing,
         },
         "rsi": {"period": rsi_period},
+        "fibonacci": {
+            "retracement": {
+                "enabled": retracement_enabled,
+                "deviation": _bounded_deviation(retracement.get("deviation")),
+                "depth": _bounded_depth(retracement.get("depth"), "Retracement depth"),
+            },
+            "extension": {
+                "enabled": extension_enabled,
+                "depth": _bounded_depth(extension.get("depth"), "Extension depth"),
+            },
+        },
     }
 
 
 def normalize_indicator_settings(settings: Any) -> dict[str, Any]:
-    """Return defaults when saved configuration is absent or malformed."""
+    """Merge legacy settings with defaults, then validate the complete result."""
+    if not isinstance(settings, Mapping):
+        return default_indicator_settings()
+    merged = default_indicator_settings()
+    for key, value in settings.items():
+        if key not in merged:
+            continue
+        if isinstance(merged[key], dict) and isinstance(value, Mapping):
+            for nested_key, nested_value in value.items():
+                if nested_key not in merged[key]:
+                    continue
+                if isinstance(merged[key][nested_key], dict) and isinstance(nested_value, Mapping):
+                    merged[key][nested_key].update(nested_value)
+                else:
+                    merged[key][nested_key] = deepcopy(nested_value)
+        else:
+            merged[key] = deepcopy(value)
     try:
-        return validate_indicator_settings(settings)
+        return validate_indicator_settings(merged)
     except (TypeError, ValueError):
         return default_indicator_settings()
 

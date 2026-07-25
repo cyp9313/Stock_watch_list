@@ -64,6 +64,28 @@ def test_invalid_settings_are_rejected_and_bad_saved_values_reset_to_defaults():
     assert normalize_indicator_settings({"moving_averages": []}) == default_indicator_settings()
 
 
+def test_fibonacci_defaults_validation_and_legacy_settings_merge():
+    defaults = default_indicator_settings()
+    assert defaults["fibonacci"] == {
+        "retracement": {"enabled": False, "deviation": 3.0, "depth": 10},
+        "extension": {"enabled": False, "depth": 10},
+    }
+
+    legacy = {"moving_averages": [{"period": 7, "type": "EMA"}] + defaults["moving_averages"][1:]}
+    merged = normalize_indicator_settings(legacy)
+    assert merged["moving_averages"][0] == {"period": 7, "type": "EMA"}
+    assert merged["fibonacci"] == defaults["fibonacci"]
+
+    invalid = default_indicator_settings()
+    invalid["fibonacci"]["retracement"]["deviation"] = True
+    with pytest.raises(ValueError, match="deviation"):
+        validate_indicator_settings(invalid)
+    invalid = default_indicator_settings()
+    invalid["fibonacci"]["extension"]["depth"] = 1
+    with pytest.raises(ValueError, match="Extension depth"):
+        validate_indicator_settings(invalid)
+
+
 def test_vwap_ignores_zero_volume_and_resets_for_intraday_sessions():
     dates = ["2026-01-02 09:30", "2026-01-02 16:00", "2026-01-02 18:00", "2026-01-03 09:30"]
     ohlc = {

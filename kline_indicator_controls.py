@@ -67,6 +67,41 @@ def render_indicator_settings_panel(
                 d_smoothing = int(st.number_input("D smooth", min_value=1, max_value=MAX_PERIOD, value=int(active["kdj"]["d_smoothing"]), key=f"{key_prefix}_kdj_d"))
 
             rsi_period = int(st.number_input("RSI period", min_value=1, max_value=MAX_PERIOD, value=int(active["rsi"]["period"]), key=f"{key_prefix}_rsi"))
+            with st.expander("Fibonacci", expanded=False):
+                retracement_enabled = st.checkbox(
+                    "Enable Auto Fib Retracement",
+                    value=bool(active["fibonacci"]["retracement"]["enabled"]),
+                    key=f"{key_prefix}_fib_retracement_enabled",
+                )
+                retracement_deviation = float(st.number_input(
+                    "Retracement Deviation",
+                    min_value=0.1,
+                    max_value=20.0,
+                    value=float(active["fibonacci"]["retracement"]["deviation"]),
+                    step=0.1,
+                    key=f"{key_prefix}_fib_retracement_deviation",
+                ))
+                retracement_depth = int(st.number_input(
+                    "Retracement Depth",
+                    min_value=2,
+                    max_value=500,
+                    value=int(active["fibonacci"]["retracement"]["depth"]),
+                    step=1,
+                    key=f"{key_prefix}_fib_retracement_depth",
+                ))
+                extension_enabled = st.checkbox(
+                    "Enable Auto Fib Extension",
+                    value=bool(active["fibonacci"]["extension"]["enabled"]),
+                    key=f"{key_prefix}_fib_extension_enabled",
+                )
+                extension_depth = int(st.number_input(
+                    "Extension Depth",
+                    min_value=2,
+                    max_value=500,
+                    value=int(active["fibonacci"]["extension"]["depth"]),
+                    step=1,
+                    key=f"{key_prefix}_fib_extension_depth",
+                ))
             apply_col, reset_col = st.columns(2)
             with apply_col:
                 apply = st.form_submit_button(apply_label, width="stretch")
@@ -81,6 +116,14 @@ def render_indicator_settings_panel(
             "macd": {"fast": fast, "slow": slow, "signal": signal},
             "kdj": {"period": kdj_period, "k_smoothing": k_smoothing, "d_smoothing": d_smoothing},
             "rsi": {"period": rsi_period},
+            "fibonacci": {
+                "retracement": {
+                    "enabled": retracement_enabled,
+                    "deviation": retracement_deviation,
+                    "depth": retracement_depth,
+                },
+                "extension": {"enabled": extension_enabled, "depth": extension_depth},
+            },
         }
         try:
             return validate_indicator_settings(candidate), "apply"
