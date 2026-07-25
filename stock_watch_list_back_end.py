@@ -2716,6 +2716,7 @@ def get_stock_data():
                 "Ticker": ticker,
                 "Name": ticker_names.get(ticker),
                 "Price": float(round(latest["Adj Close"], 2)),
+                "Previous Close": float(round(prev["Adj Close"], 2)),
                 "Beta": round(beta, 2) if not pd.isna(beta) else np.nan,
                 "20D Rel%": round(float(ticker_relative_scores.get("20D Rel%")), 2)
                 if pd.notna(ticker_relative_scores.get("20D Rel%", np.nan)) else np.nan,

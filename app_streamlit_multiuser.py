@@ -4,6 +4,7 @@ warnings.filterwarnings("ignore", message="Timestamp.utcnow is deprecated")
 import copy
 import datetime
 import colorsys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import html
 import json
@@ -28,6 +29,13 @@ from PIL import Image
 from kline_indicator_controls import render_indicator_settings_panel
 from kline_indicators import calculate_configurable_indicators, default_indicator_settings, normalize_indicator_settings
 from kline_fibonacci import add_fibonacci_overlays, calculate_auto_fibonacci
+from short_term_watchlist import (
+    SHORT_TERM_COLUMNS,
+    calculate_short_term_row,
+    normalize_short_term_watchlist,
+    short_term_history_days,
+    short_term_tickers,
+)
 import stock_watch_list_back_end
 from daily_report.jobs import (
     ActiveJobError,
@@ -458,6 +466,23 @@ def inject_css(dark_mode=False):
             background-color: #ffffff !important;
             box-shadow: 0 1px 4px rgba(15, 23, 42, 0.45) !important;
         }}
+        div[class*="st-key-short_term_refresh_enabled_"] label[data-baseweb="checkbox"] > div:first-child {{
+            background: #0ea5e9 !important;
+            background-color: #0ea5e9 !important;
+            border-color: #0369a1 !important;
+            box-shadow: inset 0 0 0 1px rgba(255,255,255,0.40), 0 0 8px rgba(14,165,233,0.35) !important;
+        }}
+        div[class*="st-key-short_term_refresh_enabled_"]:has(input:checked) label[data-baseweb="checkbox"] > div:first-child {{
+            background: #ef4444 !important;
+            background-color: #ef4444 !important;
+            border-color: #fecaca !important;
+            box-shadow: inset 0 0 0 1px rgba(255,255,255,0.45), 0 0 12px rgba(239,68,68,0.45) !important;
+        }}
+        div[class*="st-key-short_term_refresh_enabled_"] label[data-baseweb="checkbox"] > div:first-child > div {{
+            background: #ffffff !important;
+            background-color: #ffffff !important;
+            box-shadow: 0 1px 4px rgba(15, 23, 42, 0.45) !important;
+        }}
         div[data-testid="stTextInput"] input,
         div[data-testid="stNumberInput"] input,
         div[data-testid="stTextArea"] textarea,
@@ -777,6 +802,21 @@ def blue_color(value, clip=3.0):
     g = int(200 - 50 * t)
     b = int(255 - 55 * t)
     return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def short_term_diverging_color(value, *, center=0.0, positive_color="#bbf7d0", negative_color="#fecaca", clip=5.0):
+    """Return a white-neutral, two-sided color for short-term percentage cells."""
+    if pd.isna(value):
+        return "white"
+    delta = float(value) - center
+    if abs(delta) < 1e-12:
+        return "white"
+    intensity = min(abs(delta) / max(float(clip), 1e-12), 1.0)
+    # Blend from white into the requested end color so small moves stay readable.
+    target = positive_color if delta > 0 else negative_color
+    target_rgb = tuple(int(target[index:index + 2], 16) for index in (1, 3, 5))
+    rgb = tuple(round(255 + (component - 255) * intensity) for component in target_rgb)
+    return "#" + "".join(f"{component:02x}" for component in rgb)
 
 
 def get_earnings_color(days_until):
@@ -2420,6 +2460,329 @@ def fetch_kline_data(ticker, period, interval, cache_key=""):
         return None
 
 
+def request_short_term_kline(ticker, interval, history_days):
+    """Fetch one intraday series without touching normal K-line/chart caches."""
+    try:
+        response = requests.get(
+            f"{API_BASE}/api/kline_data",
+            params={"ticker": ticker, "period": history_days, "interval": interval},
+            timeout=45,
+        )
+        return response.json() if response.status_code == 200 else None
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def load_short_term_payloads(tickers, intervals, *, history_days, force_refresh=False):
+    """Load only missing intraday payloads; scheduled refreshes explicitly replace them."""
+    cache = st.session_state.setdefault("short_term_kline_payloads", {})
+    requested = [(ticker, interval, history_days) for interval in intervals for ticker in tickers]
+    missing = [pair for pair in requested if force_refresh or pair not in cache]
+    if missing:
+        with ThreadPoolExecutor(max_workers=min(6, len(missing))) as executor:
+            futures = {
+                executor.submit(request_short_term_kline, ticker, interval, requested_days): (ticker, interval, requested_days)
+                for ticker, interval, requested_days in missing
+            }
+            for future in as_completed(futures):
+                pair = futures[future]
+                try:
+                    cache[pair] = future.result()
+                except (OSError, RuntimeError, ValueError):
+                    cache[pair] = None
+    return {pair: cache.get(pair) for pair in requested}
+
+
+def _short_term_columns(settings):
+    return [
+        "Ticker", "Interval", "Price", "1D%", "Bar Diff%", "Candles (15)",
+        "MA Spread%", f"{settings['ma_1']['type']}({settings['ma_1']['period']}) / {settings['ma_2']['type']}({settings['ma_2']['period']})",
+        "Volume Ratio", "Volume (15)", "MACD Diff", "MACD / Signal", "Diff BB Upper%", "Diff VWAP%",
+        "VWAP / Close", "RSI", "RSI (30/70)",
+    ]
+
+
+def _short_term_value_text(key, value, ticker, display_currency):
+    if key == "Price":
+        return format_money_value(value, ticker, display_currency)
+    if key in {"Candles (15)", "MA 1 / MA 2", "Volume (15)", "MACD / Signal", "VWAP / Close", "RSI (30/70)"}:
+        return str(value or "")
+    if key in {"1D%", "Bar Diff%", "MA Spread%", "Diff BB Upper%", "Diff VWAP%"}:
+        return f"{float(value):.2f}%" if pd.notna(value) else ""
+    if key in {"MACD Diff", "Volume Ratio"}:
+        return f"{float(value):.4f}" if pd.notna(value) else ""
+    if key == "RSI":
+        return f"{float(value):.2f}" if pd.notna(value) else ""
+    return html.escape(str(value or ""))
+
+
+def short_term_reference_metrics(stock_data):
+    """Get daily previous-close and beta values from the shared watchlist payload."""
+    if not isinstance(stock_data, pd.DataFrame) or stock_data.empty or "Ticker" not in stock_data:
+        return {}
+    metrics = {}
+    for _, item in stock_data.iterrows():
+        ticker = str(item.get("Ticker") or "")
+        if ticker and ticker not in metrics:
+            metrics[ticker] = {
+                "Previous Close": pd.to_numeric(item.get("Previous Close"), errors="coerce"),
+                "Beta": pd.to_numeric(item.get("Beta"), errors="coerce"),
+            }
+    return metrics
+
+
+def render_short_term_table(rows_by_pair, groups, settings, *, reference_metrics=None, dark_mode=False, display_currency="Local"):
+    """Render paired 5m/15m rows for each ticker in one comparison table."""
+    theme = get_theme(dark_mode)
+    columns = _short_term_columns(settings)
+    value_keys = list(SHORT_TERM_COLUMNS)
+    intervals = ("5m", "15m")
+    html_table = f"""
+    <div style="width:100%; max-height:650px; overflow:auto; border:1px solid {theme['table_border']};">
+      <table style="width:1440px; min-width:1440px; table-layout:fixed; border-collapse:collapse;
+                    font-family:Arial; font-size:12px; background-color:{theme['table_bg']}; color:{theme['text']};">
+        <thead style="position:sticky; top:0; z-index:10; background-color:{theme['table_header_bg']};"><tr>
+    """
+    widths = [68, 48, 82, 64, 68, 88, 82, 88, 76, 88, 76, 88, 88, 80, 88, 58, 88]
+    for index, column in enumerate(columns):
+        sticky = sticky_first_column_header_style(theme["table_header_bg"]) if index == 0 else ""
+        html_table += f"<th style='width:{widths[index]}px; padding:4px; text-align:left; {sticky} color:{theme['text']}; border:1px solid {theme['table_border']};'>{html.escape(column)}</th>"
+    html_table += "</tr></thead><tbody>"
+
+    for group_name, tickers in groups.items():
+        html_table += f"<tr><td colspan='{len(columns)}' style='padding:5px; font-weight:bold; background-color:{theme['table_group_bg']}; color:{theme['text']}; border:1px solid {theme['table_border']};'>{html.escape(group_name)}</td></tr>"
+        for ticker in tickers:
+            for interval_index, interval in enumerate(intervals):
+                row = dict(rows_by_pair.get((ticker, interval), {"Ticker": ticker, "Error": "No intraday data"}))
+                reference = (reference_metrics or {}).get(ticker, {})
+                previous_daily_close = reference.get("Previous Close", np.nan)
+                row["Beta"] = reference.get("Beta", np.nan)
+                if pd.notna(row.get("Price", np.nan)) and pd.notna(previous_daily_close) and float(previous_daily_close) != 0:
+                    row["1D%"] = (float(row["Price"]) - float(previous_daily_close)) / float(previous_daily_close) * 100.0
+                html_table += "<tr>"
+                if interval_index == 0:
+                    ticker_background = beta_color(row.get("Beta", np.nan))
+                    ticker_title = html.escape(str(row.get("Error") or ""), quote=True)
+                    ticker_text_color = theme["text"] if ticker_background == theme["table_bg"] else readable_text_color(ticker_background)
+                    html_table += f"<td rowspan='2' title='{ticker_title}' style='padding:4px; text-align:left; {sticky_first_column_style(ticker_background)} color:{ticker_text_color}; background-color:{ticker_background}; border:1px solid {theme['table_border']}; white-space:nowrap; overflow:hidden;'>{html.escape(ticker)}</td>"
+                for index, (display_column, key) in enumerate(zip(columns[1:], value_keys[1:]), start=1):
+                    value = interval if key == "Interval" else row.get(key, np.nan)
+                    if key in {"Candles (15)", "MA 1 / MA 2", "Volume (15)", "MACD / Signal", "VWAP / Close", "RSI (30/70)"}:
+                        content = str(value or "")
+                    else:
+                        content = _short_term_value_text(key, value, ticker, display_currency)
+
+                    background = theme["table_bg"]
+                    if key == "Price" and pd.notna(value):
+                        source = str(row.get("Price Source", "")).lower()
+                        if source.startswith("pre-market"):
+                            background = "#dbeafe"
+                        elif source.startswith("after-hours"):
+                            background = "#fef3c7"
+                        elif source == "regular":
+                            background = "#dcfce7"
+                    elif key == "RSI" and pd.notna(value):
+                        background = rsi_color(value)
+                    elif key == "1D%" and pd.notna(value):
+                        background = red_green(value)
+                    elif key in {"Bar Diff%", "MA Spread%", "Diff VWAP%"} and pd.notna(value):
+                        background = short_term_diverging_color(value, clip=5.0)
+                    elif key == "Diff BB Upper%" and pd.notna(value):
+                        background = short_term_diverging_color(
+                            value, center=-50.0, positive_color="#fecaca", negative_color="#bbf7d0", clip=50.0,
+                        )
+                    elif key == "Volume Ratio" and pd.notna(value):
+                        background = blue_color(value)
+                    text_color = theme["text"] if background == theme["table_bg"] else readable_text_color(background)
+                    align = "left" if key in {"Interval", "Candles (15)", "MA 1 / MA 2", "Volume (15)", "MACD / Signal", "VWAP / Close", "RSI (30/70)"} else "right"
+                    html_table += f"<td style='padding:4px; text-align:{align}; color:{text_color}; background-color:{background}; border:1px solid {theme['table_border']}; white-space:nowrap; overflow:hidden;'>{content}</td>"
+                html_table += "</tr>"
+    html_table += "</tbody></table></div>"
+    st.markdown(html_table, unsafe_allow_html=True)
+
+
+def _save_short_term_config(user, config, short_config):
+    updated = copy.deepcopy(config)
+    updated["short_term_watchlist"] = normalize_short_term_watchlist(short_config)
+    st.session_state["watchlist_config"] = normalize_config(updated)
+    save_user_config(user["id"], st.session_state["watchlist_config"])
+
+
+def render_short_term_watchlist(config, user, *, stock_data=None, dark_mode=False, display_currency="Local"):
+    """Render account-scoped 5m/15m watchlists with an independent fragment refresh."""
+    st.subheader("Short-term Watchlist")
+    st.caption("5-minute and 15-minute signals use the existing K-line API. Its refresh is independent of Auto-refresh stocks.")
+    short_config = normalize_short_term_watchlist(config.get("short_term_watchlist"))
+    if not user:
+        st.info("Sign in to configure and auto-refresh a short-term watchlist.")
+        return config
+
+    form_revision = int(st.session_state.get("short_term_settings_form_revision", 0))
+    controls_col, settings_col = st.columns([3, 2])
+    with controls_col:
+        with st.expander("Short-term watchlist editor", expanded=False):
+            st.caption("Search and add a security")
+            group_options = list(short_config["groups"]) + ["Add a new group"]
+            selected_group = st.selectbox(
+                "Target group", group_options, key=f"short_term_picker_group_{form_revision}",
+            )
+            target_group = selected_group
+            if selected_group == "Add a new group":
+                target_group = st.text_input(
+                    "New group name", key=f"short_term_picker_new_group_{form_revision}", max_chars=80,
+                ).strip()
+            picker_key = f"short_term_ticker_picker_{form_revision}"
+            candidate = render_ticker_search_picker(picker_key)
+            if candidate and st.button("Add selected security to short-term watchlist", key=f"{picker_key}_add"):
+                if not target_group:
+                    st.error("Enter a group name before adding the security.")
+                else:
+                    updated_groups = copy.deepcopy(short_config["groups"])
+                    selected_tickers = updated_groups.setdefault(target_group, [])
+                    if candidate["ticker"] not in selected_tickers:
+                        selected_tickers.append(candidate["ticker"])
+                    _save_short_term_config(user, config, {**short_config, "groups": updated_groups})
+                    st.session_state["short_term_settings_form_revision"] = form_revision + 1
+                    st.rerun()
+
+            with st.form(f"short_term_groups_form_{form_revision}"):
+                groups_text = st.text_area(
+                    "Groups",
+                    value=groups_to_editor_text(short_config["groups"]),
+                    key=f"short_term_groups_{form_revision}",
+                    height=160,
+                    help="One line per group: Group | AAPL, MSFT, NVDA",
+                )
+                save_groups = st.form_submit_button("Save short-term tickers")
+            if save_groups:
+                _save_short_term_config(user, config, {**short_config, "groups": editor_text_to_groups(groups_text)})
+                st.session_state["short_term_settings_form_revision"] = form_revision + 1
+                st.rerun()
+
+        refresh_revision = int(st.session_state.get("short_term_refresh_revision", 0))
+        refresh_enabled = st.toggle(
+            "Auto-refresh short-term watchlist",
+            value=short_config["refresh"]["enabled"],
+            key=f"short_term_refresh_enabled_{user['id']}_{refresh_revision}",
+        )
+        refresh_seconds = st.selectbox(
+            "Short-term refresh interval",
+            [10, 20, 30],
+            index=[10, 20, 30].index(short_config["refresh"]["interval_seconds"]),
+            format_func=lambda seconds: f"{seconds} seconds",
+            key=f"short_term_refresh_seconds_{user['id']}_{refresh_revision}",
+        )
+        if refresh_enabled != short_config["refresh"]["enabled"] or refresh_seconds != short_config["refresh"]["interval_seconds"]:
+            _save_short_term_config(user, config, {**short_config, "refresh": {"enabled": refresh_enabled, "interval_seconds": refresh_seconds}})
+            st.session_state.pop("short_term_next_due", None)
+            st.session_state["short_term_refresh_revision"] = refresh_revision + 1
+            st.rerun()
+
+    with settings_col:
+        with st.form(f"short_term_indicator_form_{form_revision}"):
+            st.caption("Indicator parameters")
+            ma_cols = st.columns(2)
+            with ma_cols[0]:
+                ma_1_type = st.selectbox("MA 1 type", ["SMA", "EMA"], index=["SMA", "EMA"].index(short_config["settings"]["ma_1"]["type"]), key=f"short_ma_1_type_{form_revision}")
+                ma_1_period = int(st.number_input("MA 1 period", min_value=1, max_value=500, value=short_config["settings"]["ma_1"]["period"], key=f"short_ma_1_period_{form_revision}"))
+            with ma_cols[1]:
+                ma_2_type = st.selectbox("MA 2 type", ["SMA", "EMA"], index=["SMA", "EMA"].index(short_config["settings"]["ma_2"]["type"]), key=f"short_ma_2_type_{form_revision}")
+                ma_2_period = int(st.number_input("MA 2 period", min_value=1, max_value=500, value=short_config["settings"]["ma_2"]["period"], key=f"short_ma_2_period_{form_revision}"))
+            macd_cols = st.columns(3)
+            with macd_cols[0]:
+                macd_fast = int(st.number_input("MACD fast", min_value=1, max_value=500, value=short_config["settings"]["macd"]["fast"], key=f"short_macd_fast_{form_revision}"))
+            with macd_cols[1]:
+                macd_slow = int(st.number_input("MACD slow", min_value=1, max_value=500, value=short_config["settings"]["macd"]["slow"], key=f"short_macd_slow_{form_revision}"))
+            with macd_cols[2]:
+                macd_signal = int(st.number_input("MACD signal", min_value=1, max_value=500, value=short_config["settings"]["macd"]["signal"], key=f"short_macd_signal_{form_revision}"))
+            bb_cols = st.columns(2)
+            with bb_cols[0]:
+                bb_period = int(st.number_input("Bollinger period", min_value=1, max_value=500, value=short_config["settings"]["bollinger"]["period"], key=f"short_bb_period_{form_revision}"))
+            with bb_cols[1]:
+                bb_stddev = float(st.number_input("Bollinger standard deviation", min_value=0.1, max_value=10.0, value=float(short_config["settings"]["bollinger"]["stddev"]), step=0.1, key=f"short_bb_stddev_{form_revision}"))
+            rsi_period = int(st.number_input("RSI period", min_value=1, max_value=500, value=short_config["settings"]["rsi"]["period"], key=f"short_rsi_period_{form_revision}"))
+            save_settings = st.form_submit_button("Apply indicator parameters", width="stretch")
+        if save_settings:
+            candidate = {
+                "groups": short_config["groups"],
+                "settings": {
+                    "ma_1": {"type": ma_1_type, "period": ma_1_period},
+                    "ma_2": {"type": ma_2_type, "period": ma_2_period},
+                    "macd": {"fast": macd_fast, "slow": macd_slow, "signal": macd_signal},
+                    "bollinger": {"period": bb_period, "stddev": bb_stddev},
+                    "rsi": {"period": rsi_period},
+                },
+                "refresh": short_config["refresh"],
+            }
+            normalized_candidate = normalize_short_term_watchlist(candidate)
+            if normalized_candidate["settings"] != candidate["settings"]:
+                st.error("MACD fast period must be smaller than slow period, and all parameters must be valid.")
+            else:
+                _save_short_term_config(user, config, normalized_candidate)
+                st.session_state["short_term_settings_form_revision"] = form_revision + 1
+                st.rerun()
+
+    tickers = short_term_tickers(short_config)
+    if not tickers:
+        st.info("Add at least one ticker in the Short-term watchlist editor.")
+        return config
+    history_days = short_term_history_days(short_config["settings"])
+    st.caption(
+        "Price cell: green = regular session (including 24/7 crypto), blue = pre-market, yellow = after-hours. "
+        "Ticker cell: greener beta is below 1; redder beta is above 1. "
+        "Candles: teal = up, red = down. MA 1 = green; MA 2 = purple. Volume bars = light blue. "
+        "MACD = blue; signal = orange; its dashed gray line is 0. Close = blue; VWAP = teal. "
+        "RSI = purple; its dashed gray lines are 30 and 70. VWAP values are blank outside a regular-session bar or when the latest bar has no volume."
+    )
+    st.caption(f"Indicator history: {history_days} day(s), adjusted automatically for the active indicator periods.")
+    # Check every second, then request data only on the selected 10/20/30s
+    # deadline ourselves. This keeps the toggle reliable when Streamlit recreates
+    # a fragment after a settings change and avoids a one-tick 10s overshoot.
+    run_every = 1 if short_config["refresh"]["enabled"] else None
+
+    @st.fragment(run_every=run_every)
+    def _render_short_term_tables():
+        now = datetime.datetime.now()
+        force_refresh = False
+        if short_config["refresh"]["enabled"]:
+            next_due = st.session_state.get("short_term_next_due")
+            if not isinstance(next_due, datetime.datetime) or now >= next_due:
+                force_refresh = True
+                st.session_state["short_term_last_refresh"] = now.strftime("%Y-%m-%d %H:%M:%S")
+                st.session_state["short_term_next_due"] = now + datetime.timedelta(seconds=short_config["refresh"]["interval_seconds"])
+        payloads = load_short_term_payloads(
+            tickers, ("5m", "15m"), history_days=history_days, force_refresh=force_refresh,
+        )
+        if st.session_state.get("short_term_last_refresh"):
+            st.caption(f"Last short-term refresh: {st.session_state['short_term_last_refresh']}")
+        if short_config["refresh"]["enabled"]:
+            next_due = st.session_state.get("short_term_next_due")
+            if isinstance(next_due, datetime.datetime):
+                st.caption(f"Automatic refresh is ON; next refresh: {next_due.strftime('%Y-%m-%d %H:%M:%S')}")
+        else:
+            st.caption("Automatic refresh is OFF.")
+        rows_by_pair = {}
+        for interval in ("5m", "15m"):
+            for ticker in tickers:
+                payload = payloads.get((ticker, interval, history_days))
+                if not payload or not payload.get("success"):
+                    rows_by_pair[(ticker, interval)] = {"Ticker": ticker, "Error": (payload or {}).get("error", "K-line data unavailable")}
+                    continue
+                display_payload = convert_kline_data_for_display(payload, ticker, display_currency)
+                rows_by_pair[(ticker, interval)] = calculate_short_term_row(ticker, display_payload, short_config["settings"])
+        render_short_term_table(
+            rows_by_pair,
+            short_config["groups"],
+            short_config["settings"],
+            reference_metrics=short_term_reference_metrics(stock_data),
+            dark_mode=dark_mode,
+            display_currency=display_currency,
+        )
+
+    _render_short_term_tables()
+    return config
+
+
 def build_breadth_chart(
     breadth_data,
     dark_mode=False,
@@ -3405,13 +3768,13 @@ def render_persistent_kline_chart(fig, storage_key, height=None):
 
 
 def reset_kline_indicator_session_state():
-    """Remove account-scoped chart settings/widgets before an identity change."""
+    """Remove account-scoped chart and short-term-watchlist state before an identity change."""
     for key in list(st.session_state):
         if key in {
             "kline_indicator_settings",
             "kline_indicator_settings_owner",
             "kline_indicator_form_revision",
-        } or key.startswith("multi_kline_indicator_"):
+        } or key.startswith("multi_kline_indicator_") or key.startswith("short_term_"):
             st.session_state.pop(key, None)
 
 
@@ -4494,6 +4857,7 @@ config_json = json.dumps({
     "stocks_pages": config["stocks_pages"],
     "broad_pages": config["broad_pages"],
     "portfolio_pages": config["portfolio_pages"],
+    "short_term_watchlist": config["short_term_watchlist"],
 }, sort_keys=True)
 with st.spinner("Loading watch list data..."):
     stock_payload = fetch_stock_data(config_json, cache_key)
@@ -4505,13 +4869,22 @@ if _stock_data_ok:
 else:
     display_df = pd.DataFrame()
 
-main_tabs = st.tabs([
+main_tab_labels = [
     SECTION_META["stocks_pages"]["tab"],
     SECTION_META["broad_pages"]["tab"],
     "Market Breadth",
     SECTION_META["portfolio_pages"]["tab"],
     "AI Stock Reports",
-])
+]
+if editable:
+    # This is deliberately absent for guests, rather than rendered as a
+    # disabled tab, because intraday data and its refresh preference are
+    # account-scoped features.
+    main_tab_labels.insert(2, "Short-term Watchlist")
+main_tabs = st.tabs(main_tab_labels)
+market_breadth_tab_index = 3 if editable else 2
+portfolio_tab_index = 4 if editable else 3
+ai_reports_tab_index = 5 if editable else 4
 with main_tabs[0]:
     if not _stock_data_ok:
         st.error(stock_payload.get("error", "Failed to load stock data"))
@@ -4542,7 +4915,17 @@ with main_tabs[1]:
             display_currency=display_currency,
         )
 
-with main_tabs[2]:
+if editable:
+    with main_tabs[2]:
+        config = render_short_term_watchlist(
+            config,
+            user,
+            stock_data=raw_df if _stock_data_ok else None,
+            dark_mode=dark_mode,
+            display_currency=display_currency,
+        )
+
+with main_tabs[market_breadth_tab_index]:
     st.subheader("Market Breadth")
     st.caption("Calculates the percentage of S&P 500 and Nasdaq 100 constituents above their 20/50/200-day moving averages. Use Refresh Breadth in the sidebar to download and recalculate this shared market dataset.")
     breadth = st.session_state.get("breadth_data")
@@ -4589,7 +4972,7 @@ with main_tabs[2]:
     else:
         st.warning(breadth.get("error", "Failed to load market breadth data") if isinstance(breadth, dict) else "Failed to load market breadth data")
 
-with main_tabs[3]:
+with main_tabs[portfolio_tab_index]:
     if not _stock_data_ok:
         st.error(stock_payload.get("error", "Failed to load stock data"))
     else:
@@ -4602,7 +4985,7 @@ with main_tabs[3]:
             display_currency=display_currency,
         )
 
-with main_tabs[4]:
+with main_tabs[ai_reports_tab_index]:
     render_daily_report(user)
 
 st.divider()

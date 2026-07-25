@@ -179,15 +179,15 @@ class TestStockDataFailureCreatesAllTabs:
         )
 
     def test_ai_agent_reports_tab_not_gated_by_stock_data(self):
-        """The AI Stock Reports tab (main_tabs[4]) should not check _stock_data_ok."""
+        """The AI Stock Reports tab should not check _stock_data_ok."""
         lines = _SOURCE.splitlines()
-        # Find the main_tabs[4] section
+        # Find the account-aware AI report tab section.
         ai_tab_idx = None
         for i, line in enumerate(lines):
-            if "main_tabs[4]" in line:
+            if "main_tabs[ai_reports_tab_index]" in line:
                 ai_tab_idx = i
                 break
-        assert ai_tab_idx is not None, "Could not find main_tabs[4] (AI Stock Reports tab)"
+        assert ai_tab_idx is not None, "Could not find the AI Stock Reports tab"
         # Check the next few lines -- should NOT contain _stock_data_ok check
         section = "\n".join(lines[ai_tab_idx:ai_tab_idx + 5])
         assert "_stock_data_ok" not in section, (
@@ -198,12 +198,16 @@ class TestStockDataFailureCreatesAllTabs:
             "AI Stock Reports tab should call render_daily_report(user)"
         )
 
-    def test_all_five_tabs_exist(self):
-        """All 5 tabs must be created: Stocks, Broad Market, Market Breadth, Portfolios, AI Stock Reports."""
+    def test_short_term_tab_is_added_only_for_authenticated_users(self):
+        """Guests must not see the account-scoped intraday watchlist tab."""
         assert "main_tabs[0]" in _SOURCE, "Tab 0 (Stocks) missing"
         assert "main_tabs[1]" in _SOURCE, "Tab 1 (Broad Market) missing"
-        assert "main_tabs[2]" in _SOURCE, "Tab 2 (Market Breadth) missing"
-        assert "main_tabs[3]" in _SOURCE, "Tab 3 (Portfolios) missing"
+        assert '"Short-term Watchlist"' in _SOURCE, "Tab 2 (Short-term Watchlist) missing"
+        assert 'if editable:\n    # This is deliberately absent for guests' in _SOURCE
+        assert 'main_tab_labels.insert(2, "Short-term Watchlist")' in _SOURCE
+        assert "market_breadth_tab_index = 3 if editable else 2" in _SOURCE
+        assert "portfolio_tab_index = 4 if editable else 3" in _SOURCE
+        assert "ai_reports_tab_index = 5 if editable else 4" in _SOURCE
         assert "\"AI Stock Reports\"" in _SOURCE, "AI Stock Reports tab label missing"
 
 

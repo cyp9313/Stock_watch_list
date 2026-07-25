@@ -13,6 +13,7 @@ import sqlite3
 import uuid
 
 from kline_indicators import normalize_indicator_settings
+from short_term_watchlist import normalize_short_term_watchlist
 from ticker_mapping import normalize_yfinance_ticker
 
 
@@ -107,6 +108,9 @@ def normalize_config(config):
         ),
         "kline_indicator_settings": normalize_indicator_settings(
             config.get("kline_indicator_settings")
+        ),
+        "short_term_watchlist": normalize_short_term_watchlist(
+            config.get("short_term_watchlist")
         ),
     }
 
@@ -602,6 +606,11 @@ def config_to_api_groups(config):
                 portfolio_groups.setdefault(group_name, []).append(ticker)
         for group_name, tickers in portfolio_groups.items():
             groups[f"P:{page.get('id', page['name'])}:{page['name']}:{group_name}"] = list(dict.fromkeys(tickers))
+    # Short-term rows reuse the established daily data for beta ticker coloring
+    # and previous-close 1D% calculations. They remain separate from visible
+    # watchlist pages, but must be available in the common data payload.
+    for group_name, tickers in config.get("short_term_watchlist", {}).get("groups", {}).items():
+        groups[f"ST:{group_name}"] = tickers
     return groups
 
 
