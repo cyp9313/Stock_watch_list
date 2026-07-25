@@ -136,6 +136,7 @@ def test_multiuser_tab_has_its_own_kline_request_and_fragment_refresh():
     assert "render_short_term_table(" in section
     assert "Search and add a security" in section
     assert section.index("Search and add a security") < section.index('with st.form(f"short_term_groups_form_')
+    assert 'with st.expander("Indicator parameters", expanded=False):' in section
     assert "Volume bars = light blue" in section
     assert "Close = blue; VWAP = teal" in section
     assert '"Volume Ratio"' in source
@@ -143,5 +144,6 @@ def test_multiuser_tab_has_its_own_kline_request_and_fragment_refresh():
     assert '"1D%"' in source
     assert "short_term_reference_metrics(stock_data)" in section
     assert "ticker_background = beta_color" in source
+    assert '"MACD Diff", "Diff VWAP%"' in source
     assert "short_term_history_days" in source
     assert "history_days=history_days" in section

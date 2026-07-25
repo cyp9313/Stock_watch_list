@@ -2585,7 +2585,7 @@ def render_short_term_table(rows_by_pair, groups, settings, *, reference_metrics
                         background = rsi_color(value)
                     elif key == "1D%" and pd.notna(value):
                         background = red_green(value)
-                    elif key in {"Bar Diff%", "MA Spread%", "Diff VWAP%"} and pd.notna(value):
+                    elif key in {"Bar Diff%", "MA Spread%", "MACD Diff", "Diff VWAP%"} and pd.notna(value):
                         background = short_term_diverging_color(value, clip=5.0)
                     elif key == "Diff BB Upper%" and pd.notna(value):
                         background = short_term_diverging_color(
@@ -2679,48 +2679,48 @@ def render_short_term_watchlist(config, user, *, stock_data=None, dark_mode=Fals
             st.rerun()
 
     with settings_col:
-        with st.form(f"short_term_indicator_form_{form_revision}"):
-            st.caption("Indicator parameters")
-            ma_cols = st.columns(2)
-            with ma_cols[0]:
-                ma_1_type = st.selectbox("MA 1 type", ["SMA", "EMA"], index=["SMA", "EMA"].index(short_config["settings"]["ma_1"]["type"]), key=f"short_ma_1_type_{form_revision}")
-                ma_1_period = int(st.number_input("MA 1 period", min_value=1, max_value=500, value=short_config["settings"]["ma_1"]["period"], key=f"short_ma_1_period_{form_revision}"))
-            with ma_cols[1]:
-                ma_2_type = st.selectbox("MA 2 type", ["SMA", "EMA"], index=["SMA", "EMA"].index(short_config["settings"]["ma_2"]["type"]), key=f"short_ma_2_type_{form_revision}")
-                ma_2_period = int(st.number_input("MA 2 period", min_value=1, max_value=500, value=short_config["settings"]["ma_2"]["period"], key=f"short_ma_2_period_{form_revision}"))
-            macd_cols = st.columns(3)
-            with macd_cols[0]:
-                macd_fast = int(st.number_input("MACD fast", min_value=1, max_value=500, value=short_config["settings"]["macd"]["fast"], key=f"short_macd_fast_{form_revision}"))
-            with macd_cols[1]:
-                macd_slow = int(st.number_input("MACD slow", min_value=1, max_value=500, value=short_config["settings"]["macd"]["slow"], key=f"short_macd_slow_{form_revision}"))
-            with macd_cols[2]:
-                macd_signal = int(st.number_input("MACD signal", min_value=1, max_value=500, value=short_config["settings"]["macd"]["signal"], key=f"short_macd_signal_{form_revision}"))
-            bb_cols = st.columns(2)
-            with bb_cols[0]:
-                bb_period = int(st.number_input("Bollinger period", min_value=1, max_value=500, value=short_config["settings"]["bollinger"]["period"], key=f"short_bb_period_{form_revision}"))
-            with bb_cols[1]:
-                bb_stddev = float(st.number_input("Bollinger standard deviation", min_value=0.1, max_value=10.0, value=float(short_config["settings"]["bollinger"]["stddev"]), step=0.1, key=f"short_bb_stddev_{form_revision}"))
-            rsi_period = int(st.number_input("RSI period", min_value=1, max_value=500, value=short_config["settings"]["rsi"]["period"], key=f"short_rsi_period_{form_revision}"))
-            save_settings = st.form_submit_button("Apply indicator parameters", width="stretch")
-        if save_settings:
-            candidate = {
-                "groups": short_config["groups"],
-                "settings": {
-                    "ma_1": {"type": ma_1_type, "period": ma_1_period},
-                    "ma_2": {"type": ma_2_type, "period": ma_2_period},
-                    "macd": {"fast": macd_fast, "slow": macd_slow, "signal": macd_signal},
-                    "bollinger": {"period": bb_period, "stddev": bb_stddev},
-                    "rsi": {"period": rsi_period},
-                },
-                "refresh": short_config["refresh"],
-            }
-            normalized_candidate = normalize_short_term_watchlist(candidate)
-            if normalized_candidate["settings"] != candidate["settings"]:
-                st.error("MACD fast period must be smaller than slow period, and all parameters must be valid.")
-            else:
-                _save_short_term_config(user, config, normalized_candidate)
-                st.session_state["short_term_settings_form_revision"] = form_revision + 1
-                st.rerun()
+        with st.expander("Indicator parameters", expanded=False):
+            with st.form(f"short_term_indicator_form_{form_revision}"):
+                ma_cols = st.columns(2)
+                with ma_cols[0]:
+                    ma_1_type = st.selectbox("MA 1 type", ["SMA", "EMA"], index=["SMA", "EMA"].index(short_config["settings"]["ma_1"]["type"]), key=f"short_ma_1_type_{form_revision}")
+                    ma_1_period = int(st.number_input("MA 1 period", min_value=1, max_value=500, value=short_config["settings"]["ma_1"]["period"], key=f"short_ma_1_period_{form_revision}"))
+                with ma_cols[1]:
+                    ma_2_type = st.selectbox("MA 2 type", ["SMA", "EMA"], index=["SMA", "EMA"].index(short_config["settings"]["ma_2"]["type"]), key=f"short_ma_2_type_{form_revision}")
+                    ma_2_period = int(st.number_input("MA 2 period", min_value=1, max_value=500, value=short_config["settings"]["ma_2"]["period"], key=f"short_ma_2_period_{form_revision}"))
+                macd_cols = st.columns(3)
+                with macd_cols[0]:
+                    macd_fast = int(st.number_input("MACD fast", min_value=1, max_value=500, value=short_config["settings"]["macd"]["fast"], key=f"short_macd_fast_{form_revision}"))
+                with macd_cols[1]:
+                    macd_slow = int(st.number_input("MACD slow", min_value=1, max_value=500, value=short_config["settings"]["macd"]["slow"], key=f"short_macd_slow_{form_revision}"))
+                with macd_cols[2]:
+                    macd_signal = int(st.number_input("MACD signal", min_value=1, max_value=500, value=short_config["settings"]["macd"]["signal"], key=f"short_macd_signal_{form_revision}"))
+                bb_cols = st.columns(2)
+                with bb_cols[0]:
+                    bb_period = int(st.number_input("Bollinger period", min_value=1, max_value=500, value=short_config["settings"]["bollinger"]["period"], key=f"short_bb_period_{form_revision}"))
+                with bb_cols[1]:
+                    bb_stddev = float(st.number_input("Bollinger standard deviation", min_value=0.1, max_value=10.0, value=float(short_config["settings"]["bollinger"]["stddev"]), step=0.1, key=f"short_bb_stddev_{form_revision}"))
+                rsi_period = int(st.number_input("RSI period", min_value=1, max_value=500, value=short_config["settings"]["rsi"]["period"], key=f"short_rsi_period_{form_revision}"))
+                save_settings = st.form_submit_button("Apply indicator parameters", width="stretch")
+            if save_settings:
+                candidate = {
+                    "groups": short_config["groups"],
+                    "settings": {
+                        "ma_1": {"type": ma_1_type, "period": ma_1_period},
+                        "ma_2": {"type": ma_2_type, "period": ma_2_period},
+                        "macd": {"fast": macd_fast, "slow": macd_slow, "signal": macd_signal},
+                        "bollinger": {"period": bb_period, "stddev": bb_stddev},
+                        "rsi": {"period": rsi_period},
+                    },
+                    "refresh": short_config["refresh"],
+                }
+                normalized_candidate = normalize_short_term_watchlist(candidate)
+                if normalized_candidate["settings"] != candidate["settings"]:
+                    st.error("MACD fast period must be smaller than slow period, and all parameters must be valid.")
+                else:
+                    _save_short_term_config(user, config, normalized_candidate)
+                    st.session_state["short_term_settings_form_revision"] = form_revision + 1
+                    st.rerun()
 
     tickers = short_term_tickers(short_config)
     if not tickers:
