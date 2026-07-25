@@ -19,6 +19,7 @@ import pytz
 import fear_and_greed 
 import requests_cache
 from stockanalysis_scraper import scrape_batch, should_query_forward_pe
+from short_term_watchlist import candlestick_svg
 from ticker_mapping import normalize_yfinance_ticker
 
 RELATIVE_RETURN_BENCHMARK = "^GSPC"
@@ -121,6 +122,10 @@ def _create_schema(conn):
             date        TEXT    NOT NULL,
             adj_close   REAL,
             volume      REAL,
+            open_price  REAL,
+            high_price  REAL,
+            low_price   REAL,
+            close_price REAL,
             PRIMARY KEY (ticker, date)
         )
     """)
@@ -185,6 +190,13 @@ _SAD_MIGRATION_COLUMNS = [
     ("pb_ratio", "REAL"),
 ]
 
+_PRICE_CACHE_MIGRATION_COLUMNS = [
+    ("open_price", "REAL"),
+    ("high_price", "REAL"),
+    ("low_price", "REAL"),
+    ("close_price", "REAL"),
+]
+
 
 def _run_migrations(conn):
     """Run schema migrations (add missing columns). Idempotent.
@@ -201,6 +213,14 @@ def _run_migrations(conn):
                     f"ALTER TABLE stock_analysis_data ADD COLUMN {col_name} {col_type}"
                 )
                 print(f"[DB] 已添加 {col_name} 列到 stock_analysis_data 表")
+            else:
+                raise
+    for col_name, col_type in _PRICE_CACHE_MIGRATION_COLUMNS:
+        try:
+            conn.execute(f"SELECT {col_name} FROM price_cache LIMIT 0")
+        except sqlite3.OperationalError as exc:
+            if "no such column" in str(exc).lower():
+                conn.execute(f"ALTER TABLE price_cache ADD COLUMN {col_name} {col_type}")
             else:
                 raise
 
@@ -1180,6 +1200,9 @@ def _save_to_price_cache(conn, df, tickers):
                 rows_data.append(('adj_close', df[('Adj Close', ticker)]))
             if ('Volume', ticker) in df.columns:
                 rows_data.append(('volume', df[('Volume', ticker)]))
+            for source, target in (("Open", "open_price"), ("High", "high_price"), ("Low", "low_price"), ("Close", "close_price")):
+                if (source, ticker) in df.columns:
+                    rows_data.append((target, df[(source, ticker)]))
 
             if not rows_data:
                 continue
@@ -1193,11 +1216,18 @@ def _save_to_price_cache(conn, df, tickers):
                     ticker, date_str,
                     _safe_float(row.get('adj_close')),
                     _safe_float(row.get('volume')),
+                    _safe_float(row.get('open_price')),
+                    _safe_float(row.get('high_price')),
+                    _safe_float(row.get('low_price')),
+                    _safe_float(row.get('close_price')),
                 ))
     elif len(tickers) == 1:
         # 单标的格式：列如 'Adj Close', 'Volume', ...
         ticker = tickers[0]
-        col_map = {'Adj Close': 'adj_close', 'Volume': 'volume'}
+        col_map = {
+            'Adj Close': 'adj_close', 'Volume': 'volume', 'Open': 'open_price',
+            'High': 'high_price', 'Low': 'low_price', 'Close': 'close_price',
+        }
         available = {col_map[c]: df[c] for c in df.columns if c in col_map}
         if not available:
             return
@@ -1209,13 +1239,23 @@ def _save_to_price_cache(conn, df, tickers):
                 ticker, date_str,
                 _safe_float(row.get('adj_close')),
                 _safe_float(row.get('volume')),
+                _safe_float(row.get('open_price')),
+                _safe_float(row.get('high_price')),
+                _safe_float(row.get('low_price')),
+                _safe_float(row.get('close_price')),
             ))
 
     if all_rows:
         conn.executemany(
-            "INSERT OR REPLACE INTO price_cache "
-            "(ticker, date, adj_close, volume) "
-            "VALUES (?, ?, ?, ?)",
+            "INSERT INTO price_cache "
+            "(ticker, date, adj_close, volume, open_price, high_price, low_price, close_price) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(ticker, date) DO UPDATE SET "
+            "adj_close=excluded.adj_close, volume=excluded.volume, "
+            "open_price=COALESCE(excluded.open_price, price_cache.open_price), "
+            "high_price=COALESCE(excluded.high_price, price_cache.high_price), "
+            "low_price=COALESCE(excluded.low_price, price_cache.low_price), "
+            "close_price=COALESCE(excluded.close_price, price_cache.close_price)",
             all_rows
         )
         print(f"[PriceCache] 写入 {len(all_rows)} 条记录 ({len(tickers)} 个标的)")
@@ -1232,7 +1272,7 @@ def _load_from_price_cache(conn, tickers):
 
     placeholders = ','.join('?' * len(tickers))
     rows = conn.execute(
-        f"SELECT ticker, date, adj_close, volume "
+        f"SELECT ticker, date, adj_close, volume, open_price, high_price, low_price, close_price "
         f"FROM price_cache WHERE ticker IN ({placeholders}) ORDER BY ticker, date",
         tickers
     ).fetchall()
@@ -1241,11 +1281,12 @@ def _load_from_price_cache(conn, tickers):
         return pd.DataFrame()
 
     records = []
-    for ticker, date_str, ac, v in rows:
+    for ticker, date_str, ac, v, o, h, l, c in rows:
         records.append({
             'date': pd.Timestamp(date_str),
             'ticker': ticker,
-            'Adj Close': ac, 'Volume': v
+            'Adj Close': ac, 'Volume': v,
+            'Open': o, 'High': h, 'Low': l, 'Close': c,
         })
 
     df = pd.DataFrame(records)
@@ -1254,6 +1295,36 @@ def _load_from_price_cache(conn, tickers):
     # 这与 yf.download(group_by='column') 格式一致（仅含 Adj Close 和 Volume）
     df = df.sort_index(axis=1, level=0)
     return df
+
+
+def _backfill_recent_ohlc(conn, tickers, minimum_bars=15):
+    """Populate enough cached daily OHLC data to render a 15-candle sparkline.
+
+    Older installations stored only adjusted close and volume.  This one-time,
+    batched backfill keeps the normal watchlist request path intact and avoids
+    issuing a separate request for every rendered table row.
+    """
+    if not tickers:
+        return
+    cutoff = (datetime.date.today() - datetime.timedelta(days=75)).isoformat()
+    placeholders = ",".join("?" * len(tickers))
+    rows = conn.execute(
+        f"SELECT ticker, COUNT(*) FROM price_cache "
+        f"WHERE ticker IN ({placeholders}) AND date >= ? "
+        "AND open_price IS NOT NULL AND high_price IS NOT NULL "
+        "AND low_price IS NOT NULL AND close_price IS NOT NULL "
+        "GROUP BY ticker",
+        [*tickers, cutoff],
+    ).fetchall()
+    counts = dict(rows)
+    missing = [ticker for ticker in tickers if int(counts.get(ticker, 0)) < minimum_bars]
+    for batch in _chunks(missing, YF_DOWNLOAD_BATCH_SIZE):
+        data = yf.download(
+            tickers=batch, period="2mo", interval="1d", auto_adjust=False,
+            group_by="column", threads=True, progress=False, timeout=20,
+        )
+        if data is not None and not data.empty:
+            _save_to_price_cache(conn, data, batch)
 
 
 def get_prices_with_cache(tickers, period="2y", delete_stale=False):
@@ -1364,6 +1435,7 @@ def get_prices_with_cache(tickers, period="2y", delete_stale=False):
                 if df_inc is not None and not df_inc.empty:
                     _save_to_price_cache(conn, df_inc, sub_batch)
 
+    _backfill_recent_ohlc(conn, tickers)
     conn.commit()
 
     # 6. 从 DB 加载完整数据
@@ -2458,6 +2530,10 @@ def get_stock_data():
             else:
                 adj_close = pd.DataFrame()
             volumes = df['Volume'].copy() if 'Volume' in top_fields else pd.DataFrame()
+            daily_ohlc = {
+                field: df[field].copy() if field in top_fields else pd.DataFrame()
+                for field in ("Open", "High", "Low", "Close")
+            }
         else:
             if 'Adj Close' in df.columns:
                 price_col = 'Adj Close'
@@ -2466,6 +2542,10 @@ def get_stock_data():
             only_ticker = price_tickers[0]
             adj_close = df[[price_col]].rename(columns={price_col: only_ticker})
             volumes = pd.DataFrame({only_ticker: df['Volume']}) if 'Volume' in df.columns else pd.DataFrame()
+            daily_ohlc = {
+                field: pd.DataFrame({only_ticker: df[field]}) if field in df.columns else pd.DataFrame()
+                for field in ("Open", "High", "Low", "Close")
+            }
 
         extended_updates = update_extended_hours_price_cache(price_tickers)
         if extended_updates:
@@ -2740,6 +2820,21 @@ def get_stock_data():
                 "Market Cap": market_cap,
                 "Price Source": extended_updates.get(ticker, {}).get("source"),
             }
+
+            candle_parts = []
+            for field in ("Open", "High", "Low", "Close"):
+                field_data = daily_ohlc[field]
+                series = field_data[ticker] if not field_data.empty and ticker in field_data else pd.Series(dtype=float)
+                candle_parts.append(pd.to_numeric(series, errors="coerce"))
+            if all(len(series) for series in candle_parts):
+                candle_frame = pd.concat(candle_parts, axis=1).dropna().tail(20)
+                row["Candles (20)"] = candlestick_svg(
+                    candle_frame.iloc[:, 0].tolist(), candle_frame.iloc[:, 1].tolist(),
+                    candle_frame.iloc[:, 2].tolist(), candle_frame.iloc[:, 3].tolist(),
+                    width=96, height=36,
+                )
+            else:
+                row["Candles (20)"] = ""
 
             for n in [5, 10, 20, 50, 100, 200]:
                 ema = latest.get(f"EMA{n}", np.nan)

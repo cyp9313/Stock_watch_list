@@ -163,9 +163,12 @@ def _path(values: list[float], width: int, height: int, padding: int = 3, domain
     return " ".join(pieces)
 
 
-def candlestick_svg(open_values: list[float], high_values: list[float], low_values: list[float], close_values: list[float]) -> str:
-    """Return an inline SVG for up to 15 candles, with no untrusted markup."""
-    width, height, padding = 80, 30, 2
+def candlestick_svg(
+    open_values: list[float], high_values: list[float], low_values: list[float], close_values: list[float],
+    *, width: int = 80, height: int = 30,
+) -> str:
+    """Return an inline SVG for the supplied candles, with no untrusted markup."""
+    width, height, padding = max(int(width), 16), max(int(height), 16), 2
     if not open_values or not (len(open_values) == len(high_values) == len(low_values) == len(close_values)):
         return ""
     low = np.nanmin(np.asarray(low_values, dtype=float))
@@ -189,7 +192,7 @@ def candlestick_svg(open_values: list[float], high_values: list[float], low_valu
         body_height = max(1.0, bottom - top)
         pieces.append(f"<line x1='{x:.1f}' y1='{y(high_price):.1f}' x2='{x:.1f}' y2='{y(low_price):.1f}' stroke='{color}' stroke-width='1'/>")
         pieces.append(f"<rect x='{x - rect_width / 2:.1f}' y='{top:.1f}' width='{rect_width:.1f}' height='{body_height:.1f}' fill='{color}'/>")
-    return f"<svg viewBox='0 0 {width} {height}' width='{width}' height='{height}' role='img' aria-label='Last 15 candles'>{''.join(pieces)}</svg>"
+    return f"<svg viewBox='0 0 {width} {height}' width='{width}' height='{height}' role='img' aria-label='Last {len(open_values)} candles'>{''.join(pieces)}</svg>"
 
 
 def two_line_svg(

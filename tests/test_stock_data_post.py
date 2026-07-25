@@ -125,15 +125,17 @@ def _mock_prices():
     import pandas as pd
     import numpy as np
     dates = pd.date_range("2024-01-01", periods=260, freq="B")
-    arrays = [
-        ["Adj Close"] * 2 + ["Volume"] * 2,
-        ["AAPL", "MSFT"] * 2,
-    ]
     data = {}
     data[("Adj Close", "AAPL")] = np.linspace(150, 180, 260)
     data[("Adj Close", "MSFT")] = np.linspace(300, 350, 260)
     data[("Volume", "AAPL")] = np.full(260, 1_000_000)
     data[("Volume", "MSFT")] = np.full(260, 2_000_000)
+    for ticker, base in (("AAPL", 150), ("MSFT", 300)):
+        close = np.linspace(base, base + 30, 260)
+        data[("Open", ticker)] = close - 0.5
+        data[("High", ticker)] = close + 1.0
+        data[("Low", ticker)] = close - 1.0
+        data[("Close", ticker)] = close
     return pd.DataFrame(data, index=dates)
 
 
@@ -169,6 +171,9 @@ def test_post_valid_json(client, valid_payload):
     data = resp.get_json()
     assert data["success"] is True
     assert isinstance(data["data"], list)
+    assert "<svg" in data["data"][0]["Candles (20)"]
+    assert "width='96' height='36'" in data["data"][0]["Candles (20)"]
+    assert data["data"][0]["Candles (20)"].count("<rect") == 20
 
 
 # ──────────────────────────────────────────────────────────────

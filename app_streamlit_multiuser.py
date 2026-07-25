@@ -103,52 +103,53 @@ PORTFOLIO_CHANGE_PERIODS = [
     ("1M%", "P/L 1M"),
 ]
 COLUMNS = (
-    ["Ticker", "Name", "Price", "1D%", "5D%", "1M%", "YTD%"]
+    ["Ticker", "Name", "Price", "Candles (20)", "1D%", "5D%", "1M%", "YTD%"]
     + RELATIVE_RETURN_COLUMNS
     + [RELATIVE_MOMENTUM_COLUMN]
     + EMA_DIFF_COLUMNS
     + ["Diff_BB_Up%", "Diff_BB_Low%", "RSI", "Volume_Ratio"]
     + FINANCIAL_COLUMNS
 )
-DEFAULT_COLUMN_WIDTH = 78
+DEFAULT_COLUMN_WIDTH = 70
 COLUMN_WIDTHS = {
-    "Ticker": 78,
-    "Name": 260,
-    "Price": 86,
-    "1D%": 58,
-    "5D%": 58,
-    "1M%": 58,
+    "Ticker": 68,
+    "Name": 200,
+    "Price": 82,
+    "Candles (20)": 104,
+    "1D%": 56,
+    "5D%": 56,
+    "1M%": 56,
     "YTD%": 62,
-    "20D Rel%": 76,
-    "60D Rel%": 76,
-    "120D Rel%": 84,
-    "3/6/12M Rel%": 98,
-    "Diff_BB_Up%": 88,
-    "Diff_BB_Low%": 92,
-    "RSI": 54,
-    "Volume_Ratio": 86,
-    "Next Earnings": 98,
-    "Trailing PE": 82,
-    "Forward PE": 84,
-    "PEG Ratio": 74,
-    "Analysts": 88,
-    "Price Target": 96,
-    "Market Cap": 96,
-    "Buy Price": 96,
-    "Shares": 76,
-    "Market Value": 116,
-    "P/L": 96,
-    "P/L 1D": 96,
-    "P/L 5D": 96,
-    "P/L 1M": 96,
-    "P/L%": 72,
+    "20D Rel%": 70,
+    "60D Rel%": 70,
+    "120D Rel%": 76,
+    "3/6/12M Rel%": 86,
+    "Diff_BB_Up%": 80,
+    "Diff_BB_Low%": 80,
+    "RSI": 52,
+    "Volume_Ratio": 72,
+    "Next Earnings": 90,
+    "Trailing PE": 74,
+    "Forward PE": 76,
+    "PEG Ratio": 70,
+    "Analysts": 78,
+    "Price Target": 86,
+    "Market Cap": 86,
+    "Buy Price": 84,
+    "Shares": 66,
+    "Market Value": 100,
+    "P/L": 84,
+    "P/L 1D": 84,
+    "P/L 5D": 84,
+    "P/L 1M": 84,
+    "P/L%": 64,
 }
 for _ema_column in EMA_DIFF_COLUMNS:
-    COLUMN_WIDTHS[_ema_column] = 76
+    COLUMN_WIDTHS[_ema_column] = 70
 RIGHT_ALIGNED_COLUMNS = {
     col
     for col in COLUMNS
-    if col not in {"Ticker", "Name", "Next Earnings"}
+    if col not in {"Ticker", "Name", "Candles (20)", "Next Earnings"}
 }
 
 SECTION_META = {
@@ -1005,6 +1006,8 @@ def build_grouped_df(df, groups, display_currency="Local"):
                     disp = f"{float(val):.2f}" if pd.notna(val) else ""
                 elif col == "Price":
                     disp = format_money_value(val, ticker, display_currency)
+                elif col == "Candles (20)":
+                    disp = str(val) if isinstance(val, str) else ""
                 elif col in ("RSI", "Volume_Ratio"):
                     disp = f"{float(val):.2f}" if pd.notna(val) else ""
                 elif col == "Next Earnings":
@@ -1047,7 +1050,7 @@ def apply_cell_colors(df_display, df_raw, groups, columns=None):
                 val = row[col] if col in row else np.nan
                 if col == "Ticker":
                     cell_colors[(row_index, col_index)] = beta_color(row.get("Beta", np.nan))
-                elif col == "Name":
+                elif col in {"Name", "Candles (20)"}:
                     continue
                 elif col == "Price":
                     source = str(row.get("Price Source", "") or "").lower()
@@ -1139,7 +1142,7 @@ def render_grouped_table(
     html_table = f"""
     <div style="width:100%; max-height:600px; overflow:auto;
                 border:1px solid {theme['table_border']};">
-        <table style="width:{table_width}px; min-width:100%; table-layout:fixed; border-collapse:collapse;
+        <table style="width:{table_width}px; min-width:{table_width}px; table-layout:fixed; border-collapse:collapse;
                       font-family:Arial; font-size:12px;
                       background-color:{theme['table_bg']};
                       color:{theme['text']};">
@@ -1234,12 +1237,13 @@ def render_grouped_table(
             )
             sticky_style = sticky_first_column_style(bg_color) if col_index == 0 else ""
 
+            cell_content = val if col == "Candles (20)" else html.escape(val)
             html_table += (
                 f"<td{title_attr} style='padding:4px; text-align:{align}; "
                 f"{sticky_style}color:{text_color}; background-color:{bg_color}; "
                 f"white-space:nowrap; overflow:hidden; text-overflow:ellipsis; "
                 f"border:1px solid {theme['table_border']};'>"
-                f"{html.escape(val)}</td>"
+                f"{cell_content}</td>"
             )
 
         html_table += "</tr>"
@@ -1558,7 +1562,7 @@ def render_portfolio_table(
     html_table = f"""
     <div style="width:100%; max-height:650px; overflow:auto;
                 border:1px solid {theme['table_border']};">
-        <table style="width:{table_width}px; min-width:100%; table-layout:fixed; border-collapse:collapse;
+        <table style="width:{table_width}px; min-width:{table_width}px; table-layout:fixed; border-collapse:collapse;
                       font-family:Arial; font-size:12px;
                       background-color:{theme['table_bg']};
                       color:{theme['text']};">
@@ -1611,11 +1615,12 @@ def render_portfolio_table(
             font_weight = "font-weight:bold;" if is_total else ""
             title_attr = f" title='{html.escape(val, quote=True)}'" if col == "Name" and val else ""
             sticky_style = sticky_first_column_style(bg_color) if col_index == 0 else ""
+            cell_content = val if col == "Candles (20)" else html.escape(val)
             html_table += (
                 f"<td{title_attr} style='padding:4px; text-align:{align}; {font_weight}"
                 f"{sticky_style}color:{text_color}; background-color:{bg_color}; white-space:nowrap; "
                 f"overflow:hidden; text-overflow:ellipsis; border:1px solid {theme['table_border']};'>"
-                f"{html.escape(val)}</td>"
+                f"{cell_content}</td>"
             )
         html_table += "</tr>"
 
@@ -4088,7 +4093,7 @@ def render_section(section_title, section_key, config, raw_df, editable, user, d
                     ),
                 )
 
-            with display_col2:
+            with display_col3:
                 show_relative_momentum_columns = st.toggle(
                     "Show relative momentum columns",
                     value=False,
@@ -4099,7 +4104,7 @@ def render_section(section_title, section_key, config, raw_df, editable, user, d
                     ),
                 )
 
-            with display_col3:
+            with display_col4:
                 show_financial_columns = st.toggle(
                     "Show financial columns",
                     value=False,
@@ -4110,7 +4115,7 @@ def render_section(section_title, section_key, config, raw_df, editable, user, d
                     ),
                 )
 
-            with display_col4:
+            with display_col2:
                 show_ema_columns = st.toggle(
                     "Show EMA deviation columns",
                     value=False,
@@ -4163,7 +4168,7 @@ def render_portfolio_section(config, raw_df, editable, user, dark_mode=False, di
                         "display-name column between Ticker and Price."
                     ),
                 )
-            with display_col2:
+            with display_col3:
                 show_relative_momentum_columns = st.toggle(
                     "Show relative momentum columns",
                     value=False,
@@ -4173,7 +4178,7 @@ def render_portfolio_section(config, raw_df, editable, user, dark_mode=False, di
                         "and the weighted 3/6/12M relative momentum column."
                     ),
                 )
-            with display_col3:
+            with display_col4:
                 show_financial_columns = st.toggle(
                     "Show financial columns",
                     value=False,
@@ -4183,7 +4188,7 @@ def render_portfolio_section(config, raw_df, editable, user, dark_mode=False, di
                         "and Market Cap columns."
                     ),
                 )
-            with display_col4:
+            with display_col2:
                 show_ema_columns = st.toggle(
                     "Show EMA deviation columns",
                     value=False,

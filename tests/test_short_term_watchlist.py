@@ -142,8 +142,15 @@ def test_multiuser_tab_has_its_own_kline_request_and_fragment_refresh():
     assert '"Volume Ratio"' in source
     assert '"VWAP / Close"' in source
     assert '"1D%"' in source
+    assert '["Ticker", "Name", "Price", "Candles (20)", "1D%"' in source
+    assert 'cell_content = val if col == "Candles (20)" else html.escape(val)' in source
+    assert 'elif col in {"Name", "Candles (20)"}:' in source
+    assert '"Candles (20)": 104' in source
+    assert "min-width:100%" not in source
     assert "short_term_reference_metrics(stock_data)" in section
     assert "ticker_background = beta_color" in source
     assert '"MACD Diff", "Diff VWAP%"' in source
     assert "short_term_history_days" in source
     assert "history_days=history_days" in section
+    assert source.count('with display_col2:\n                show_ema_columns = st.toggle(') == 2
+    assert source.count('with display_col3:\n                show_relative_momentum_columns = st.toggle(') == 2
