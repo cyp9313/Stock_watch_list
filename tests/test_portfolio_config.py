@@ -86,6 +86,21 @@ def test_short_term_watchlist_settings_persist_per_account(tmp_path, monkeypatch
     short_term["groups"] = {"Momentum": ["AAPL", "MSFT"]}
     short_term["settings"]["ma_1"] = {"period": 5, "type": "SMA"}
     short_term["refresh"] = {"enabled": True, "interval_seconds": 20}
+    short_term["alerts"] = {
+        "enabled": True,
+        "intervals": {"5m": True, "15m": False},
+        "near_enabled": True,
+        "confirmed_enabled": False,
+        "duration_seconds": 30,
+        "signals": {
+            "macd": {"enabled": True, "threshold": 5.0},
+            "ema": {"enabled": True, "threshold": 3.0},
+            "bollinger": {"enabled": False, "threshold": 10.0},
+            "vwap": {"enabled": False, "threshold": 5.0},
+            "rsi": {"enabled": False, "threshold": 2.0},
+        },
+        "ticker_enabled": {"AAPL": False},
+    }
     config_a["short_term_watchlist"] = short_term
     multiuser_store.save_user_config(user_a["id"], config_a)
 

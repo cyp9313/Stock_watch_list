@@ -5,9 +5,12 @@ import pytest
 
 from short_term_watchlist import (
     calculate_short_term_row,
+    consume_macd_alert_events,
     default_short_term_watchlist,
+    macd_alert_event,
     normalize_short_term_watchlist,
     short_term_history_days,
+    short_term_alert_events,
     short_term_tickers,
 )
 
@@ -42,6 +45,21 @@ def test_defaults_and_legacy_normalization_are_account_safe():
     defaults = default_short_term_watchlist()
     assert defaults["groups"] == {"Short-term": []}
     assert defaults["refresh"] == {"enabled": False, "interval_seconds": 10}
+    assert defaults["alerts"] == {
+        "enabled": False,
+        "intervals": {"5m": True, "15m": True},
+        "near_enabled": True,
+        "confirmed_enabled": True,
+        "duration_seconds": 15,
+        "signals": {
+            "macd": {"enabled": True, "threshold": 5.0},
+            "ema": {"enabled": False, "threshold": 5.0},
+            "bollinger": {"enabled": False, "threshold": 10.0},
+            "vwap": {"enabled": False, "threshold": 5.0},
+            "rsi": {"enabled": False, "threshold": 2.0},
+        },
+        "ticker_enabled": {},
+    }
     assert defaults["settings"]["ma_1"] == {"period": 9, "type": "EMA"}
 
     config = normalize_short_term_watchlist({
@@ -54,7 +72,39 @@ def test_defaults_and_legacy_normalization_are_account_safe():
     assert config["settings"]["ma_2"] == defaults["settings"]["ma_2"]
     assert config["settings"]["rsi"] == {"period": 14}
     assert config["refresh"] == {"enabled": True, "interval_seconds": 20}
+    assert config["alerts"] == defaults["alerts"]
     assert short_term_tickers(config) == ["AAPL", "MSFT"]
+
+
+def test_alert_normalization_keeps_only_valid_account_safe_values():
+    config = normalize_short_term_watchlist({
+        "alerts": {
+            "enabled": True,
+            "intervals": {"5m": False, "15m": True},
+            "near_enabled": False,
+            "confirmed_enabled": True,
+            "duration_seconds": 30,
+            "signals": {"ema": {"enabled": True, "threshold": 3.0}},
+            "ticker_enabled": {"AAPL": False},
+        },
+    })
+    assert config["alerts"] == {
+        "enabled": True,
+        "intervals": {"5m": False, "15m": True},
+        "near_enabled": False,
+        "confirmed_enabled": True,
+        "duration_seconds": 30,
+        "signals": {
+            "macd": {"enabled": True, "threshold": 5.0},
+            "ema": {"enabled": True, "threshold": 3.0},
+            "bollinger": {"enabled": False, "threshold": 10.0},
+            "vwap": {"enabled": False, "threshold": 5.0},
+            "rsi": {"enabled": False, "threshold": 2.0},
+        },
+        "ticker_enabled": {"AAPL": False},
+    }
+    assert normalize_short_term_watchlist({"alerts": {"signals": {"macd": {"threshold": 9999}}}})["alerts"]["signals"]["macd"]["threshold"] == 5.0
+    assert normalize_short_term_watchlist({"alerts": {"duration_seconds": 7}})["alerts"]["duration_seconds"] == 15
 
 
 def test_history_window_is_two_days_by_default_and_scales_for_long_periods():
@@ -78,10 +128,12 @@ def test_row_calculates_requested_metrics_and_inline_svg():
 
     assert row["Price"] == pytest.approx(103.9)
     assert row["Bar Diff%"] == pytest.approx((103.9 - 103.8) / 103.8 * 100)
-    assert row["MA Spread%"] > 0
+    assert row["MA Spread‱"] > 0
     assert "#16a34a" in row["MA 1 / MA 2"]
     assert "#9333ea" in row["MA 1 / MA 2"]
-    assert row["MACD Diff"] > 0
+    assert row["MACD Diff‱"] > 0
+    assert row["MACD Diff Previous‱"] > 0
+    assert row["Alert Bar Timestamp"] == "2026-07-24 12:45"
     assert row["Volume Ratio"] == pytest.approx(1.0)
     assert row["Diff BB Upper%"] < 0
     assert row["Diff VWAP%"] > 0
@@ -118,6 +170,99 @@ def test_invalid_or_short_payload_is_non_fatal():
     assert normalize_short_term_watchlist({"settings": {"macd": {"fast": 30, "slow": 10, "signal": 9}}})["settings"] == default_short_term_watchlist()["settings"]
 
 
+def test_macd_alert_events_cover_near_confirmed_and_invalid_rows():
+    alerts = {**default_short_term_watchlist()["alerts"], "enabled": True}
+    near_bullish = {
+        "Ticker": "AAPL", "MACD Diff‱": -2.0,
+        "MACD Diff Previous‱": -5.0, "Alert Bar Timestamp": "2026-07-24 10:00",
+    }
+    event = macd_alert_event(near_bullish, "5m", alerts)
+    assert event and event["type"] == "bullish_near"
+
+    confirmed_bearish = {
+        "Ticker": "AAPL", "MACD Diff‱": -1.0,
+        "MACD Diff Previous‱": 2.0, "Alert Bar Timestamp": "2026-07-24 10:05",
+    }
+    event = macd_alert_event(confirmed_bearish, "15m", alerts)
+    assert event and event["type"] == "bearish_confirmed"
+
+    far_from_cross = {**near_bullish, "MACD Diff‱": -20.0}
+    assert macd_alert_event(far_from_cross, "5m", alerts) is None
+    assert macd_alert_event({"Ticker": "AAPL"}, "5m", alerts) is None
+    assert macd_alert_event(near_bullish, "5m", default_short_term_watchlist()["alerts"]) is None
+    assert macd_alert_event(near_bullish, "5m", {**alerts, "intervals": {"5m": False, "15m": True}}) is None
+
+
+def test_other_short_term_alert_signals_and_ticker_switches_are_independent():
+    alerts = default_short_term_watchlist()["alerts"]
+    alerts = {
+        **alerts,
+        "enabled": True,
+        "signals": {
+            **alerts["signals"],
+            "macd": {"enabled": False, "threshold": 5.0},
+            "ema": {"enabled": True, "threshold": 5.0},
+            "bollinger": {"enabled": True, "threshold": 10.0},
+            "vwap": {"enabled": True, "threshold": 5.0},
+            "rsi": {"enabled": True, "threshold": 2.0},
+        },
+    }
+    row = {
+        "Ticker": "AAPL", "Alert Bar Timestamp": "2026-07-24 10:00",
+        "MA Cross (bp)": 1.0, "MA Cross Previous (bp)": -1.0,
+        "BB Upper Cross (bp)": 11.0, "BB Upper Cross Previous (bp)": -2.0,
+        "BB Lower Cross (bp)": -11.0, "BB Lower Cross Previous (bp)": 2.0,
+        "VWAP Cross (bp)": 1.0, "VWAP Cross Previous (bp)": -1.0,
+        "RSI 30 Cross": 1.0, "RSI 30 Cross Previous": -1.0,
+        "RSI 70 Cross": -1.0, "RSI 70 Cross Previous": 1.0,
+    }
+    signals = {event["signal"] for event in short_term_alert_events(row, "5m", alerts)}
+    assert signals == {"ema", "bollinger_upper", "bollinger_lower", "vwap", "rsi", "rsi_upper"}
+    assert short_term_alert_events(row, "5m", {**alerts, "ticker_enabled": {"AAPL": False}}) == []
+
+
+def test_macd_alert_consumption_bootstraps_and_deduplicates_per_bar():
+    alerts = {**default_short_term_watchlist()["alerts"], "enabled": True}
+    initial_rows = {
+        ("AAPL", "5m"): {
+            "Ticker": "AAPL", "MACD Diff‱": -2.0,
+            "MACD Diff Previous‱": -5.0, "Alert Bar Timestamp": "2026-07-24 10:00",
+        },
+    }
+    events, state = consume_macd_alert_events(
+        initial_rows, alerts, None, monitoring_enabled=True, signal_signature="settings-v1",
+    )
+    assert events == []  # Loading a page must not replay an already-present signal.
+
+    events, state = consume_macd_alert_events(
+        initial_rows, alerts, state, monitoring_enabled=True, signal_signature="settings-v1",
+    )
+    assert events == []
+
+    refreshed_rows = {
+        ("AAPL", "5m"): {
+            **initial_rows[("AAPL", "5m")],
+            "MACD Diff‱": 1.0,
+            "MACD Diff Previous‱": -2.0,
+            "Alert Bar Timestamp": "2026-07-24 10:05",
+        },
+    }
+    events, state = consume_macd_alert_events(
+        refreshed_rows, alerts, state, monitoring_enabled=True, signal_signature="settings-v1",
+    )
+    assert [event["type"] for event in events] == ["bullish_confirmed"]
+
+    events, _ = consume_macd_alert_events(
+        refreshed_rows, alerts, state, monitoring_enabled=True, signal_signature="settings-v1",
+    )
+    assert events == []
+
+    events, state = consume_macd_alert_events(
+        refreshed_rows, alerts, state, monitoring_enabled=False, signal_signature="settings-v2",
+    )
+    assert events == []
+
+
 def test_multiuser_tab_has_its_own_kline_request_and_fragment_refresh():
     source = (REPO_ROOT / "app_streamlit_multiuser.py").read_text(encoding="utf-8")
     assert '"Short-term Watchlist"' in source
@@ -149,8 +294,32 @@ def test_multiuser_tab_has_its_own_kline_request_and_fragment_refresh():
     assert "min-width:100%" not in source
     assert "short_term_reference_metrics(stock_data)" in section
     assert "ticker_background = beta_color" in source
-    assert '"MACD Diff", "Diff VWAP%"' in source
+    assert '"MACD Diff‱"' in source
+    assert 'short_term_diverging_color(value, clip=15.0)' in source
+    assert 'return f"{float(value):.2f}" if pd.notna(value) else ""' in source
     assert "short_term_history_days" in source
     assert "history_days=history_days" in section
+    assert "Short-term audio alerts" in section
+    assert 'with st.form(f"short_term_alert_form_' in section
+    assert 'st.form_submit_button("Apply MACD alert settings"' in section
+    assert 'div[class*="st-key-short_term_alert_"]:has(input:checked)' in source
+    assert '"Alert sound and table highlight duration"' in section
+    assert 'alert_pairs=active_alerts' in section
+    assert "short-term-macd-alert-cell" in source
+    assert "white-space:normal; overflow-wrap:anywhere; line-height:1.12;" in source
+    assert source.count("<th title='{html.escape(") >= 3
+    plot_start = source.index('plot = st.button("Plot"')
+    plot_end = source.index("auto_refresh_enabled =", plot_start)
+    plot_section = source[plot_start:plot_end]
+    assert 'with st.spinner(f"Refreshing {ticker} K-line data..."):' in plot_section
+    assert "fetch_kline_data.clear()" in plot_section
+    assert "render_macd_audio_alert(" in section
+    assert "consume_macd_alert_events(" in section
+    assert "force_refresh and short_config[\"refresh\"][\"enabled\"]" in section
+    assert (REPO_ROOT / "macd_audio_alert_component" / "index.html").exists()
+    component_source = (REPO_ROOT / "macd_audio_alert_component" / "index.html").read_text(encoding="utf-8")
+    assert "streamlit:componentReady" in component_source
+    assert "AudioContext" in component_source
+    assert "playRepeatingAlert" in component_source
     assert source.count('with display_col2:\n                show_ema_columns = st.toggle(') == 2
     assert source.count('with display_col3:\n                show_relative_momentum_columns = st.toggle(') == 2

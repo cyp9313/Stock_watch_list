@@ -20,8 +20,8 @@ from ticker_mapping import normalize_yfinance_ticker
 
 
 SHORT_TERM_COLUMNS = (
-    "Ticker", "Interval", "Price", "1D%", "Bar Diff%", "Candles (15)", "MA Spread%", "MA 1 / MA 2",
-    "Volume Ratio", "Volume (15)", "MACD Diff", "MACD / Signal", "Diff BB Upper%", "Diff VWAP%",
+    "Ticker", "Interval", "Price", "1D%", "Bar Diff%", "Candles (15)", "MA Spread‱", "MA 1 / MA 2",
+    "Volume Ratio", "Volume (15)", "MACD Diff‱", "MACD / Signal", "Diff BB Upper%", "Diff VWAP%",
     "VWAP / Close", "RSI", "RSI (30/70)",
 )
 
@@ -33,10 +33,27 @@ _DEFAULT_SETTINGS = {
     "rsi": {"period": 14},
 }
 
+_DEFAULT_ALERTS = {
+    "enabled": False,
+    "intervals": {"5m": True, "15m": True},
+    "near_enabled": True,
+    "confirmed_enabled": True,
+    "duration_seconds": 15,
+    "signals": {
+        "macd": {"enabled": True, "threshold": 5.0},
+        "ema": {"enabled": False, "threshold": 5.0},
+        "bollinger": {"enabled": False, "threshold": 10.0},
+        "vwap": {"enabled": False, "threshold": 5.0},
+        "rsi": {"enabled": False, "threshold": 2.0},
+    },
+    "ticker_enabled": {},
+}
+
 _DEFAULT_SHORT_TERM_WATCHLIST = {
     "groups": {"Short-term": []},
     "settings": _DEFAULT_SETTINGS,
     "refresh": {"enabled": False, "interval_seconds": 10},
+    "alerts": _DEFAULT_ALERTS,
 }
 
 
@@ -57,6 +74,54 @@ def _bounded_float(value: Any, label: str, *, minimum: float, maximum: float) ->
     if not isfinite(number) or not minimum <= number <= maximum:
         raise ValueError(f"{label} must be between {minimum} and {maximum}")
     return number
+
+
+def normalize_short_term_alerts(value: Any) -> dict[str, Any]:
+    """Return a valid, backward-compatible MACD alert configuration."""
+    source = value if isinstance(value, Mapping) else {}
+    raw_intervals = source.get("intervals") if isinstance(source.get("intervals"), Mapping) else {}
+    raw_signals = source.get("signals") if isinstance(source.get("signals"), Mapping) else {}
+    legacy_macd_threshold = source.get("near_threshold_percent")
+    signals = {}
+    for signal_name, defaults in _DEFAULT_ALERTS["signals"].items():
+        raw_signal = raw_signals.get(signal_name) if isinstance(raw_signals.get(signal_name), Mapping) else {}
+        default_threshold = defaults["threshold"]
+        if signal_name == "macd" and legacy_macd_threshold is not None and "threshold" not in raw_signal:
+            try:
+                default_threshold = float(legacy_macd_threshold) * 100.0
+            except (TypeError, ValueError):
+                pass
+        try:
+            threshold = _bounded_float(
+                raw_signal.get("threshold", default_threshold), f"{signal_name} alert threshold", minimum=0.01, maximum=1000.0,
+            )
+        except (TypeError, ValueError):
+            threshold = defaults["threshold"]
+        signals[signal_name] = {
+            "enabled": raw_signal.get("enabled") if isinstance(raw_signal.get("enabled"), bool) else defaults["enabled"],
+            "threshold": threshold,
+        }
+    duration = source.get("duration_seconds", _DEFAULT_ALERTS["duration_seconds"])
+    if duration not in {5, 10, 15, 30, 60}:
+        duration = _DEFAULT_ALERTS["duration_seconds"]
+    raw_ticker_enabled = source.get("ticker_enabled") if isinstance(source.get("ticker_enabled"), Mapping) else {}
+    ticker_enabled = {
+        normalize_yfinance_ticker(ticker): enabled
+        for ticker, enabled in raw_ticker_enabled.items()
+        if isinstance(enabled, bool) and normalize_yfinance_ticker(ticker)
+    }
+    return {
+        "enabled": source.get("enabled") if isinstance(source.get("enabled"), bool) else _DEFAULT_ALERTS["enabled"],
+        "intervals": {
+            interval: raw_intervals.get(interval) if isinstance(raw_intervals.get(interval), bool) else _DEFAULT_ALERTS["intervals"][interval]
+            for interval in ("5m", "15m")
+        },
+        "near_enabled": source.get("near_enabled") if isinstance(source.get("near_enabled"), bool) else _DEFAULT_ALERTS["near_enabled"],
+        "confirmed_enabled": source.get("confirmed_enabled") if isinstance(source.get("confirmed_enabled"), bool) else _DEFAULT_ALERTS["confirmed_enabled"],
+        "duration_seconds": duration,
+        "signals": signals,
+        "ticker_enabled": ticker_enabled,
+    }
 
 
 def normalize_short_term_watchlist(value: Any) -> dict[str, Any]:
@@ -114,6 +179,7 @@ def normalize_short_term_watchlist(value: Any) -> dict[str, Any]:
         "groups": groups,
         "settings": settings,
         "refresh": {"enabled": refresh_enabled, "interval_seconds": refresh_interval},
+        "alerts": normalize_short_term_alerts(source.get("alerts")),
     }
 
 
@@ -140,10 +206,138 @@ def short_term_history_days(settings: Mapping[str, Any]) -> int:
     return min(60, max(2, ceil(required_bars / 26)))
 
 
+def _crossover_events(
+    *, ticker: str, interval: str, timestamp: str, signal: str, label: str,
+    current: Any, previous: Any, threshold: float, alerts: Mapping[str, Any],
+) -> list[dict[str, str]]:
+    """Create at most one near/confirmed directional event for a zero-centered series."""
+    try:
+        current, previous = float(current), float(previous)
+    except (TypeError, ValueError):
+        return []
+    if not all(isfinite(value) for value in (current, previous)):
+        return []
+    event_type = None
+    if alerts["confirmed_enabled"]:
+        if previous <= 0 < current:
+            event_type = "bullish_confirmed"
+        elif previous >= 0 > current:
+            event_type = "bearish_confirmed"
+    if event_type is None and alerts["near_enabled"] and abs(current) <= threshold:
+        if current <= 0 and current > previous:
+            event_type = "bullish_near"
+        elif current >= 0 and current < previous:
+            event_type = "bearish_near"
+    if event_type is None:
+        return []
+    direction, state = event_type.split("_", 1)
+    return [{
+        "id": f"{ticker}|{interval}|{signal}|{event_type}|{timestamp}",
+        "ticker": ticker,
+        "interval": interval,
+        "signal": signal,
+        "type": event_type,
+        "label": f"{label}: {direction.title()} crossover {state}",
+        "timestamp": timestamp,
+    }]
+
+
+def short_term_alert_events(row: Mapping[str, Any], interval: str, alerts: Mapping[str, Any]) -> list[dict[str, str]]:
+    """Return enabled MACD, MA, Bollinger, VWAP, and RSI alert events for one row."""
+    normalized = normalize_short_term_alerts(alerts)
+    if not normalized["enabled"] or interval not in normalized["intervals"] or not normalized["intervals"][interval]:
+        return []
+    ticker = str(row.get("Ticker") or "").strip()
+    timestamp = str(row.get("Alert Bar Timestamp") or "").strip()
+    if not ticker or not timestamp or normalized["ticker_enabled"].get(ticker, True) is False:
+        return []
+
+    events = []
+    signal_fields = {
+        "macd": ("MACD Diff‱", "MACD Diff Previous‱", "MACD"),
+        "ema": ("MA Cross (bp)", "MA Cross Previous (bp)", "MA 1 / MA 2"),
+        "vwap": ("VWAP Cross (bp)", "VWAP Cross Previous (bp)", "VWAP / Close"),
+        "rsi": ("RSI 30 Cross", "RSI 30 Cross Previous", "RSI 30"),
+    }
+    for signal, (current_key, previous_key, label) in signal_fields.items():
+        config = normalized["signals"][signal]
+        if config["enabled"]:
+            events.extend(_crossover_events(
+                ticker=ticker, interval=interval, timestamp=timestamp, signal=signal, label=label,
+                current=row.get(current_key), previous=row.get(previous_key), threshold=config["threshold"], alerts=normalized,
+            ))
+    rsi_config = normalized["signals"]["rsi"]
+    if rsi_config["enabled"]:
+        events.extend(_crossover_events(
+            ticker=ticker, interval=interval, timestamp=timestamp, signal="rsi_upper", label="RSI 70",
+            current=row.get("RSI 70 Cross"), previous=row.get("RSI 70 Cross Previous"), threshold=rsi_config["threshold"], alerts=normalized,
+        ))
+    bb_config = normalized["signals"]["bollinger"]
+    if bb_config["enabled"]:
+        for signal, current_key, previous_key, label in (
+            ("bollinger_upper", "BB Upper Cross (bp)", "BB Upper Cross Previous (bp)", "Bollinger upper"),
+            ("bollinger_lower", "BB Lower Cross (bp)", "BB Lower Cross Previous (bp)", "Bollinger lower"),
+        ):
+            events.extend(_crossover_events(
+                ticker=ticker, interval=interval, timestamp=timestamp, signal=signal, label=label,
+                current=row.get(current_key), previous=row.get(previous_key), threshold=bb_config["threshold"], alerts=normalized,
+            ))
+    return events
+
+
+def macd_alert_event(row: Mapping[str, Any], interval: str, alerts: Mapping[str, Any]) -> dict[str, str] | None:
+    """Backward-compatible helper returning the first MACD event, if present."""
+    return next((event for event in short_term_alert_events(row, interval, alerts) if event["signal"] == "macd"), None)
+
+
+def consume_macd_alert_events(
+    rows_by_pair: Mapping[tuple[str, str], Mapping[str, Any]],
+    alerts: Mapping[str, Any],
+    previous_state: Any,
+    *,
+    monitoring_enabled: bool,
+    signal_signature: Any,
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    """Return new alert events and a compact session-only de-duplication state."""
+    candidates = []
+    for (ticker, interval), row in rows_by_pair.items():
+        candidates.extend(short_term_alert_events({"Ticker": ticker, **dict(row)}, interval, alerts))
+    candidates.sort(key=lambda item: (item["interval"], item["ticker"], item["signal"], item["type"]))
+
+    state = previous_state if isinstance(previous_state, Mapping) else {}
+    seen = [str(value) for value in state.get("seen_event_ids", []) if isinstance(value, str)]
+    candidate_ids = [event["id"] for event in candidates]
+    same_signal_definition = state.get("signal_signature") == signal_signature
+    initialized = bool(state.get("initialized")) and same_signal_definition
+    if not initialized:
+        return [], {
+            "initialized": True,
+            "signal_signature": signal_signature,
+            "seen_event_ids": candidate_ids[-500:],
+        }
+
+    seen_set = set(seen)
+    new_events = candidates if monitoring_enabled else []
+    if monitoring_enabled:
+        new_events = [event for event in candidates if event["id"] not in seen_set]
+    merged_seen = list(dict.fromkeys([*seen, *candidate_ids]))[-500:]
+    return new_events, {
+        "initialized": True,
+        "signal_signature": signal_signature,
+        "seen_event_ids": merged_seen,
+    }
+
+
 def _percent(numerator: float, denominator: float) -> float:
     if not np.isfinite(numerator) or not np.isfinite(denominator) or denominator == 0:
         return np.nan
     return (numerator / denominator) * 100.0
+
+
+def _basis_points(numerator: float, denominator: float) -> float:
+    if not np.isfinite(numerator) or not np.isfinite(denominator) or denominator == 0:
+        return np.nan
+    return (numerator / denominator) * 10_000.0
 
 
 def _path(values: list[float], width: int, height: int, padding: int = 3, domain: tuple[float, float] | None = None) -> str:
@@ -366,6 +560,25 @@ def calculate_short_term_row(ticker: str, kline_data: Mapping[str, Any], setting
     latest_regular = bool(regular.iloc[-1]) if len(regular) else False
     vwap_diff = _percent(latest_price - vwap, vwap) if latest_regular and pd.notna(latest_volume) and latest_volume > 0 else np.nan
     volume_ema = frame["volume"].ewm(span=5, adjust=False).mean()
+    macd_diff = macd - signal
+    previous_vwap = float(vwap_series.iloc[-2]) if pd.notna(vwap_series.iloc[-2]) else np.nan
+
+    def _cross_bps(current_value, previous_value, current_reference, previous_reference):
+        return (
+            _basis_points(float(current_value) - float(current_reference), float(current_reference)),
+            _basis_points(float(previous_value) - float(previous_reference), float(previous_reference)),
+        )
+
+    ma_cross, ma_cross_previous = _cross_bps(
+        ma_series[0].iloc[-1], ma_series[0].iloc[-2], ma_series[1].iloc[-1], ma_series[1].iloc[-2],
+    )
+    bb_upper_cross, bb_upper_cross_previous = _cross_bps(
+        latest_price, previous_close, bb_upper.iloc[-1], bb_upper.iloc[-2],
+    )
+    bb_lower_cross, bb_lower_cross_previous = _cross_bps(
+        latest_price, previous_close, bb_lower.iloc[-1], bb_lower.iloc[-2],
+    )
+    vwap_cross, vwap_cross_previous = _cross_bps(latest_price, previous_close, vwap, previous_vwap)
 
     tail = frame.iloc[-15:]
     return {
@@ -374,14 +587,28 @@ def calculate_short_term_row(ticker: str, kline_data: Mapping[str, Any], setting
         "Price Source": _price_source(ticker, latest_timestamp, latest_volume),
         "Bar Diff%": _percent(latest_price - previous_close, previous_close),
         "Candles (15)": candlestick_svg(tail["open"].tolist(), tail["high"].tolist(), tail["low"].tolist(), tail["close"].tolist()),
-        "MA Spread%": _percent(float(ma_series[0].iloc[-1]) - float(ma_series[1].iloc[-1]), float(ma_series[1].iloc[-1])) if pd.notna(ma_series[0].iloc[-1]) and pd.notna(ma_series[1].iloc[-1]) else np.nan,
+        "MA Spread‱": _basis_points(float(ma_series[0].iloc[-1]) - float(ma_series[1].iloc[-1]), float(ma_series[1].iloc[-1])) if pd.notna(ma_series[0].iloc[-1]) and pd.notna(ma_series[1].iloc[-1]) else np.nan,
         "MA 1 / MA 2": two_line_svg(
             ma_series[0].iloc[-15:].tolist(), ma_series[1].iloc[-15:].tolist(),
             first_color="#16a34a", second_color="#9333ea", label="Moving averages",
         ),
         "Volume Ratio": float(latest_volume / volume_ema.iloc[-1]) if pd.notna(latest_volume) and pd.notna(volume_ema.iloc[-1]) and volume_ema.iloc[-1] > 0 else np.nan,
         "Volume (15)": volume_svg(tail["volume"].tolist()),
-        "MACD Diff": float((macd - signal).iloc[-1]) if pd.notna((macd - signal).iloc[-1]) else np.nan,
+        "MACD Diff‱": _basis_points(float(macd_diff.iloc[-1]), latest_price) if pd.notna(macd_diff.iloc[-1]) else np.nan,
+        "MACD Diff Previous‱": _basis_points(float(macd_diff.iloc[-2]), previous_close) if pd.notna(macd_diff.iloc[-2]) else np.nan,
+        "MA Cross (bp)": ma_cross,
+        "MA Cross Previous (bp)": ma_cross_previous,
+        "BB Upper Cross (bp)": bb_upper_cross,
+        "BB Upper Cross Previous (bp)": bb_upper_cross_previous,
+        "BB Lower Cross (bp)": bb_lower_cross,
+        "BB Lower Cross Previous (bp)": bb_lower_cross_previous,
+        "VWAP Cross (bp)": vwap_cross,
+        "VWAP Cross Previous (bp)": vwap_cross_previous,
+        "RSI 30 Cross": float(rsi.iloc[-1] - 30.0) if pd.notna(rsi.iloc[-1]) else np.nan,
+        "RSI 30 Cross Previous": float(rsi.iloc[-2] - 30.0) if pd.notna(rsi.iloc[-2]) else np.nan,
+        "RSI 70 Cross": float(rsi.iloc[-1] - 70.0) if pd.notna(rsi.iloc[-1]) else np.nan,
+        "RSI 70 Cross Previous": float(rsi.iloc[-2] - 70.0) if pd.notna(rsi.iloc[-2]) else np.nan,
+        "Alert Bar Timestamp": str(dates[-1]),
         "MACD / Signal": macd_svg(macd.iloc[-15:].tolist(), signal.iloc[-15:].tolist()),
         "Diff BB Upper%": _percent(latest_price - float(bb_upper.iloc[-1]), float(bb_upper.iloc[-1] - bb_lower.iloc[-1])) if pd.notna(bb_upper.iloc[-1]) and pd.notna(bb_lower.iloc[-1]) else np.nan,
         "Diff VWAP%": vwap_diff,

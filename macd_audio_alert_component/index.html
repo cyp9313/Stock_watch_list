@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <style>
+    :root { color-scheme: light dark; }
+    body { margin: 0; font-family: Arial, sans-serif; }
+    #panel { min-height: 42px; display: flex; align-items: center; gap: 10px; padding: 4px 0; }
+    button { border: 1px solid #0369a1; border-radius: 6px; background: #0ea5e9; color: #fff; cursor: pointer; font-weight: 700; padding: 7px 10px; }
+    button.enabled { background: #047857; border-color: #065f46; }
+    #status { font-size: 12px; color: #475569; }
+  </style>
+</head>
+<body>
+  <div id="panel">
+    <button id="enable" type="button">Enable sound &amp; test</button>
+    <span id="status">Click once to allow browser audio alerts.</span>
+  </div>
+  <script>
+    let audioContext = null;
+    let soundEnabled = false;
+    let lastBatchId = "";
+    let monitoringEnabled = false;
+    let repeatingAlertTimer = null;
+    const button = document.getElementById("enable");
+    const status = document.getElementById("status");
+
+    function postToStreamlit(type, data) {
+      window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type }, data || {}), "*");
+    }
+
+    function setStatus(message) {
+      status.textContent = message;
+    }
+
+    function tone(startTime, frequency, duration, gainAmount) {
+      if (!audioContext || audioContext.state !== "running") return;
+      const oscillator = audioContext.createOscillator();
+      const gain = audioContext.createGain();
+      oscillator.type = "sine";
+      oscillator.frequency.setValueAtTime(frequency, startTime);
+      gain.gain.setValueAtTime(0.0001, startTime);
+      gain.gain.exponentialRampToValueAtTime(gainAmount, startTime + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.0001, startTime + duration);
+      oscillator.connect(gain).connect(audioContext.destination);
+      oscillator.start(startTime);
+      oscillator.stop(startTime + duration + 0.02);
+    }
+
+    function playEvent(event, offset) {
+      if (!audioContext || audioContext.state !== "running") return;
+      const kind = String(event.type || "");
+      const bullish = kind.startsWith("bullish");
+      const confirmed = kind.endsWith("confirmed");
+      const base = audioContext.currentTime + offset;
+      const first = bullish ? 660 : 440;
+      const second = bullish ? 880 : 300;
+      const duration = confirmed ? 0.18 : 0.11;
+      tone(base, first, duration, confirmed ? 0.14 : 0.09);
+      tone(base + duration + 0.04, second, duration, confirmed ? 0.14 : 0.09);
+    }
+
+    function stopRepeatingAlert() {
+      if (repeatingAlertTimer !== null) {
+        window.clearInterval(repeatingAlertTimer);
+        repeatingAlertTimer = null;
+      }
+    }
+
+    function playRepeatingAlert(events, durationSeconds) {
+      stopRepeatingAlert();
+      const playBatch = () => events.slice(0, 3).forEach((event, index) => playEvent(event, index * 0.42));
+      const endsAt = Date.now() + durationSeconds * 1000;
+      playBatch();
+      repeatingAlertTimer = window.setInterval(() => {
+        if (Date.now() >= endsAt) {
+          stopRepeatingAlert();
+          setStatus("Alert sound finished. Waiting for new MACD alerts.");
+          return;
+        }
+        playBatch();
+      }, 1400);
+    }
+
+    function handleRender(data) {
+      const args = (data && data.args) || {};
+      monitoringEnabled = Boolean(args.monitoring_enabled);
+      const events = Array.isArray(args.events) ? args.events : [];
+      const batchId = String(args.batch_id || "");
+      if (!batchId || batchId === lastBatchId || !events.length) return;
+      lastBatchId = batchId;
+      const first = events[0] || {};
+      const summary = `${first.ticker || "Ticker"} ${first.interval || ""}: ${first.label || "MACD alert"}`;
+      if (!monitoringEnabled) {
+        setStatus(`Alert detected but monitoring is off: ${summary}`);
+        return;
+      }
+      if (!soundEnabled || !audioContext || audioContext.state !== "running") {
+        setStatus(`Alert detected — enable sound to hear it: ${summary}`);
+        return;
+      }
+      const durationSeconds = Math.max(1, Number(args.duration_seconds) || 15);
+      playRepeatingAlert(events, durationSeconds);
+      const suffix = events.length > 1 ? ` (+${events.length - 1} more)` : "";
+      setStatus(`${summary}${suffix}; repeating for ${durationSeconds}s.`);
+    }
+
+    button.addEventListener("click", async () => {
+      try {
+        audioContext = audioContext || new (window.AudioContext || window.webkitAudioContext)();
+        await audioContext.resume();
+        soundEnabled = audioContext.state === "running";
+        if (soundEnabled) {
+          button.classList.add("enabled");
+          button.textContent = "Sound enabled — play test";
+          playEvent({ type: "bullish_confirmed" }, 0);
+          setStatus(monitoringEnabled ? "Sound is enabled. Waiting for MACD alerts." : "Sound is enabled. Turn on MACD alerts and auto-refresh to monitor.");
+        }
+      } catch (error) {
+        setStatus("Browser blocked audio. Check the site and system sound permissions.");
+      }
+    });
+
+    window.addEventListener("message", (event) => {
+      if (event.data && event.data.type === "streamlit:render") handleRender(event.data);
+    });
+    postToStreamlit("streamlit:componentReady", { apiVersion: 1 });
+    postToStreamlit("streamlit:setFrameHeight", { height: 48 });
+  </script>
+</body>
+</html>

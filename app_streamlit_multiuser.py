@@ -32,10 +32,12 @@ from kline_fibonacci import add_fibonacci_overlays, calculate_auto_fibonacci
 from short_term_watchlist import (
     SHORT_TERM_COLUMNS,
     calculate_short_term_row,
+    consume_macd_alert_events,
     normalize_short_term_watchlist,
     short_term_history_days,
     short_term_tickers,
 )
+from macd_audio_alert_component import render_macd_audio_alert
 import stock_watch_list_back_end
 from daily_report.jobs import (
     ActiveJobError,
@@ -483,6 +485,32 @@ def inject_css(dark_mode=False):
             background: #ffffff !important;
             background-color: #ffffff !important;
             box-shadow: 0 1px 4px rgba(15, 23, 42, 0.45) !important;
+        }}
+        div[class*="st-key-short_term_alert_"] label[data-baseweb="checkbox"] > div:first-child {{
+            background: #cbd5e1 !important;
+            background-color: #cbd5e1 !important;
+            border-color: #94a3b8 !important;
+            box-shadow: inset 0 0 0 1px rgba(255,255,255,0.35) !important;
+        }}
+        div[class*="st-key-short_term_alert_"]:has(input:checked) label[data-baseweb="checkbox"] > div:first-child {{
+            background: #16a34a !important;
+            background-color: #16a34a !important;
+            border-color: #166534 !important;
+            box-shadow: inset 0 0 0 1px rgba(255,255,255,0.42), 0 0 9px rgba(22,163,74,0.35) !important;
+        }}
+        div[class*="st-key-short_term_alert_"] label[data-baseweb="checkbox"] > div:first-child > div {{
+            background: #ffffff !important;
+            background-color: #ffffff !important;
+            box-shadow: 0 1px 4px rgba(15, 23, 42, 0.45) !important;
+        }}
+        @keyframes short-term-macd-alert-pulse {{
+            0%, 100% {{ outline: 1px solid #f59e0b; box-shadow: inset 0 0 0 1px #fef3c7, 0 0 5px rgba(245,158,11,0.55); }}
+            50% {{ outline: 3px solid #ef4444; box-shadow: inset 0 0 0 2px #fee2e2, 0 0 15px rgba(239,68,68,0.85); }}
+        }}
+        .short-term-macd-alert-cell {{
+            animation: short-term-macd-alert-pulse 0.9s ease-in-out infinite !important;
+            position: relative;
+            z-index: 1;
         }}
         div[data-testid="stTextInput"] input,
         div[data-testid="stNumberInput"] input,
@@ -1162,9 +1190,8 @@ def render_grouped_table(
     for col_index, col in enumerate(visible_columns):
         sticky_style = sticky_first_column_header_style(theme["table_header_bg"]) if col_index == 0 else ""
         html_table += (
-            f"<th style='padding:4px; text-align:left; {sticky_style}"
-            f"color:{theme['text']}; "
-            f"white-space:nowrap; overflow:hidden; text-overflow:ellipsis; "
+            f"<th title='{html.escape(col, quote=True)}' style='padding:4px; text-align:left; {sticky_style}"
+            f"color:{theme['text']}; white-space:normal; overflow-wrap:anywhere; line-height:1.12; "
             f"border:1px solid {theme['table_border']};'>"
             f"{html.escape(col)}</th>"
         )
@@ -1579,8 +1606,8 @@ def render_portfolio_table(
     for col_index, col in enumerate(visible_columns):
         sticky_style = sticky_first_column_header_style(theme["table_header_bg"]) if col_index == 0 else ""
         html_table += (
-            f"<th style='padding:4px; text-align:left; {sticky_style}color:{theme['text']}; "
-            f"white-space:nowrap; overflow:hidden; text-overflow:ellipsis; "
+            f"<th title='{html.escape(col, quote=True)}' style='padding:4px; text-align:left; {sticky_style}color:{theme['text']}; "
+            f"white-space:normal; overflow-wrap:anywhere; line-height:1.12; "
             f"border:1px solid {theme['table_border']};'>{html.escape(col)}</th>"
         )
     html_table += "</tr></thead><tbody>"
@@ -2501,8 +2528,8 @@ def load_short_term_payloads(tickers, intervals, *, history_days, force_refresh=
 def _short_term_columns(settings):
     return [
         "Ticker", "Interval", "Price", "1D%", "Bar Diff%", "Candles (15)",
-        "MA Spread%", f"{settings['ma_1']['type']}({settings['ma_1']['period']}) / {settings['ma_2']['type']}({settings['ma_2']['period']})",
-        "Volume Ratio", "Volume (15)", "MACD Diff", "MACD / Signal", "Diff BB Upper%", "Diff VWAP%",
+        "MA Spread‱", f"{settings['ma_1']['type']}({settings['ma_1']['period']}) / {settings['ma_2']['type']}({settings['ma_2']['period']})",
+        "Volume Ratio", "Volume (15)", "MACD Diff‱", "MACD / Signal", "Diff BB Upper%", "Diff VWAP%",
         "VWAP / Close", "RSI", "RSI (30/70)",
     ]
 
@@ -2512,9 +2539,9 @@ def _short_term_value_text(key, value, ticker, display_currency):
         return format_money_value(value, ticker, display_currency)
     if key in {"Candles (15)", "MA 1 / MA 2", "Volume (15)", "MACD / Signal", "VWAP / Close", "RSI (30/70)"}:
         return str(value or "")
-    if key in {"1D%", "Bar Diff%", "MA Spread%", "Diff BB Upper%", "Diff VWAP%"}:
-        return f"{float(value):.2f}%" if pd.notna(value) else ""
-    if key in {"MACD Diff", "Volume Ratio"}:
+    if key in {"1D%", "Bar Diff%", "Diff BB Upper%", "Diff VWAP%"}:
+        return f"{float(value):.2f}" if pd.notna(value) else ""
+    if key in {"MACD Diff‱", "MA Spread‱", "Volume Ratio"}:
         return f"{float(value):.4f}" if pd.notna(value) else ""
     if key == "RSI":
         return f"{float(value):.2f}" if pd.notna(value) else ""
@@ -2536,12 +2563,25 @@ def short_term_reference_metrics(stock_data):
     return metrics
 
 
-def render_short_term_table(rows_by_pair, groups, settings, *, reference_metrics=None, dark_mode=False, display_currency="Local"):
+def render_short_term_table(
+    rows_by_pair, groups, settings, *, reference_metrics=None, alert_pairs=None,
+    dark_mode=False, display_currency="Local",
+):
     """Render paired 5m/15m rows for each ticker in one comparison table."""
     theme = get_theme(dark_mode)
     columns = _short_term_columns(settings)
     value_keys = list(SHORT_TERM_COLUMNS)
     intervals = ("5m", "15m")
+    active_alerts = alert_pairs if isinstance(alert_pairs, dict) else {}
+    alert_columns = {
+        "macd": {"MACD Diff‱"},
+        "ema": {"MA 1 / MA 2"},
+        "bollinger_upper": {"Diff BB Upper%"},
+        "bollinger_lower": {"Candles (15)"},
+        "vwap": {"VWAP / Close"},
+        "rsi": {"RSI"},
+        "rsi_upper": {"RSI"},
+    }
     html_table = f"""
     <div style="width:100%; max-height:650px; overflow:auto; border:1px solid {theme['table_border']};">
       <table style="width:1440px; min-width:1440px; table-layout:fixed; border-collapse:collapse;
@@ -2551,7 +2591,7 @@ def render_short_term_table(rows_by_pair, groups, settings, *, reference_metrics
     widths = [68, 48, 82, 64, 68, 88, 82, 88, 76, 88, 76, 88, 88, 80, 88, 58, 88]
     for index, column in enumerate(columns):
         sticky = sticky_first_column_header_style(theme["table_header_bg"]) if index == 0 else ""
-        html_table += f"<th style='width:{widths[index]}px; padding:4px; text-align:left; {sticky} color:{theme['text']}; border:1px solid {theme['table_border']};'>{html.escape(column)}</th>"
+        html_table += f"<th title='{html.escape(column, quote=True)}' style='width:{widths[index]}px; padding:4px; text-align:left; {sticky} color:{theme['text']}; border:1px solid {theme['table_border']};'>{html.escape(column)}</th>"
     html_table += "</tr></thead><tbody>"
 
     for group_name, tickers in groups.items():
@@ -2590,7 +2630,11 @@ def render_short_term_table(rows_by_pair, groups, settings, *, reference_metrics
                         background = rsi_color(value)
                     elif key == "1D%" and pd.notna(value):
                         background = red_green(value)
-                    elif key in {"Bar Diff%", "MA Spread%", "MACD Diff", "Diff VWAP%"} and pd.notna(value):
+                    elif key == "MACD Diff‱" and pd.notna(value):
+                        background = short_term_diverging_color(value, clip=15.0)
+                    elif key == "MA Spread‱" and pd.notna(value):
+                        background = short_term_diverging_color(value, clip=15.0)
+                    elif key in {"Bar Diff%", "Diff VWAP%"} and pd.notna(value):
                         background = short_term_diverging_color(value, clip=5.0)
                     elif key == "Diff BB Upper%" and pd.notna(value):
                         background = short_term_diverging_color(
@@ -2600,7 +2644,10 @@ def render_short_term_table(rows_by_pair, groups, settings, *, reference_metrics
                         background = blue_color(value)
                     text_color = theme["text"] if background == theme["table_bg"] else readable_text_color(background)
                     align = "left" if key in {"Interval", "Candles (15)", "MA 1 / MA 2", "Volume (15)", "MACD / Signal", "VWAP / Close", "RSI (30/70)"} else "right"
-                    html_table += f"<td style='padding:4px; text-align:{align}; color:{text_color}; background-color:{background}; border:1px solid {theme['table_border']}; white-space:nowrap; overflow:hidden;'>{content}</td>"
+                    active_signals = set((active_alerts.get((ticker, interval)) or {}).get("signals", []))
+                    is_alerted = any(key in alert_columns.get(signal, set()) for signal in active_signals)
+                    alert_class = " short-term-macd-alert-cell" if is_alerted else ""
+                    html_table += f"<td class='{alert_class.strip()}' style='padding:4px; text-align:{align}; color:{text_color}; background-color:{background}; border:1px solid {theme['table_border']}; white-space:nowrap; overflow:hidden;'>{content}</td>"
                 html_table += "</tr>"
     html_table += "</tbody></table></div>"
     st.markdown(html_table, unsafe_allow_html=True)
@@ -2613,6 +2660,18 @@ def _save_short_term_config(user, config, short_config):
     save_user_config(user["id"], st.session_state["watchlist_config"])
 
 
+def _short_term_alert_signature(short_config, tickers):
+    """Return a stable definition of signals whose changes should reset alert baselines."""
+    return json.dumps(
+        {
+            "tickers": list(tickers),
+            "macd": short_config["settings"]["macd"],
+            "alerts": short_config["alerts"],
+        },
+        sort_keys=True,
+    )
+
+
 def render_short_term_watchlist(config, user, *, stock_data=None, dark_mode=False, display_currency="Local"):
     """Render account-scoped 5m/15m watchlists with an independent fragment refresh."""
     st.subheader("Short-term Watchlist")
@@ -2622,6 +2681,7 @@ def render_short_term_watchlist(config, user, *, stock_data=None, dark_mode=Fals
         st.info("Sign in to configure and auto-refresh a short-term watchlist.")
         return config
 
+    configured_tickers = short_term_tickers(short_config)
     form_revision = int(st.session_state.get("short_term_settings_form_revision", 0))
     controls_col, settings_col = st.columns([3, 2])
     with controls_col:
@@ -2683,6 +2743,101 @@ def render_short_term_watchlist(config, user, *, stock_data=None, dark_mode=Fals
             st.session_state["short_term_refresh_revision"] = refresh_revision + 1
             st.rerun()
 
+        alert_revision = int(st.session_state.get("short_term_alert_revision", 0))
+        with st.expander("Short-term audio alerts", expanded=False):
+            st.caption("Sounds play only while this page is open and Short-term auto-refresh is on.")
+            with st.form(f"short_term_alert_form_{user['id']}_{alert_revision}"):
+                alert_enabled = st.toggle(
+                    "Enable short-term audio alerts",
+                    value=short_config["alerts"]["enabled"],
+                    key=f"short_term_alert_enabled_{user['id']}_{alert_revision}",
+                )
+                interval_cols = st.columns(2)
+                with interval_cols[0]:
+                    alert_5m = st.toggle(
+                        "Listen to 5-minute signals",
+                        value=short_config["alerts"]["intervals"]["5m"],
+                        key=f"short_term_alert_5m_{user['id']}_{alert_revision}",
+                    )
+                with interval_cols[1]:
+                    alert_15m = st.toggle(
+                        "Listen to 15-minute signals",
+                        value=short_config["alerts"]["intervals"]["15m"],
+                        key=f"short_term_alert_15m_{user['id']}_{alert_revision}",
+                    )
+                type_cols = st.columns(2)
+                with type_cols[0]:
+                    near_enabled = st.toggle(
+                        "Warn when crossover is near",
+                        value=short_config["alerts"]["near_enabled"],
+                        key=f"short_term_alert_near_{user['id']}_{alert_revision}",
+                    )
+                with type_cols[1]:
+                    confirmed_enabled = st.toggle(
+                        "Alert on confirmed crossover",
+                        value=short_config["alerts"]["confirmed_enabled"],
+                        key=f"short_term_alert_confirmed_{user['id']}_{alert_revision}",
+                    )
+                st.caption("Enable each signal independently and set its near-crossover threshold. Price-based thresholds use ‱ (one ten-thousandth); RSI uses RSI points.")
+                signal_controls = {}
+                for signal_name, label, unit in (
+                    ("macd", "MACD / Signal", "‱"),
+                    ("ema", "MA 1 / MA 2", "‱"),
+                    ("bollinger", "Close / Bollinger upper & lower", "‱"),
+                    ("vwap", "Close / VWAP", "‱"),
+                    ("rsi", "RSI / 30 & 70", "points"),
+                ):
+                    signal_config = short_config["alerts"]["signals"][signal_name]
+                    signal_cols = st.columns([3, 2])
+                    with signal_cols[0]:
+                        signal_enabled = st.toggle(
+                            f"Monitor {label}", value=signal_config["enabled"],
+                            key=f"short_term_alert_signal_{signal_name}_{user['id']}_{alert_revision}",
+                        )
+                    with signal_cols[1]:
+                        signal_threshold = float(st.number_input(
+                            f"{label} threshold ({unit})", min_value=0.01, max_value=1000.0,
+                            value=float(signal_config["threshold"]), step=0.5, format="%.2f",
+                            key=f"short_term_alert_signal_threshold_{signal_name}_{user['id']}_{alert_revision}",
+                        ))
+                    signal_controls[signal_name] = {"enabled": signal_enabled, "threshold": signal_threshold}
+                if configured_tickers:
+                    st.caption("Choose which short-term tickers may play sounds and flash.")
+                    ticker_enabled = {}
+                    ticker_columns = st.columns(min(4, len(configured_tickers)))
+                    for index, watched_ticker in enumerate(configured_tickers):
+                        with ticker_columns[index % len(ticker_columns)]:
+                            ticker_enabled[watched_ticker] = st.toggle(
+                                watched_ticker,
+                                value=short_config["alerts"]["ticker_enabled"].get(watched_ticker, True),
+                                key=f"short_term_alert_ticker_{watched_ticker}_{user['id']}_{alert_revision}",
+                            )
+                else:
+                    ticker_enabled = {}
+                alert_duration = st.selectbox(
+                    "Alert sound and table highlight duration",
+                    [5, 10, 15, 30, 60],
+                    index=[5, 10, 15, 30, 60].index(short_config["alerts"]["duration_seconds"]),
+                    format_func=lambda seconds: f"{seconds} seconds",
+                    key=f"short_term_alert_duration_{user['id']}_{alert_revision}",
+                )
+                save_alerts = st.form_submit_button("Apply MACD alert settings", width="stretch")
+            if save_alerts:
+                candidate_alerts = {
+                    "enabled": alert_enabled,
+                    "intervals": {"5m": alert_5m, "15m": alert_15m},
+                    "near_enabled": near_enabled,
+                    "confirmed_enabled": confirmed_enabled,
+                    "duration_seconds": alert_duration,
+                    "signals": signal_controls,
+                    "ticker_enabled": ticker_enabled,
+                }
+                normalized_alerts = normalize_short_term_watchlist({"alerts": candidate_alerts})["alerts"]
+                _save_short_term_config(user, config, {**short_config, "alerts": normalized_alerts})
+                st.session_state["short_term_alert_revision"] = alert_revision + 1
+                st.rerun()
+            st.caption("Use the sound player above the table to enable browser audio and play a test tone.")
+
     with settings_col:
         with st.expander("Indicator parameters", expanded=False):
             with st.form(f"short_term_indicator_form_{form_revision}"):
@@ -2718,6 +2873,7 @@ def render_short_term_watchlist(config, user, *, stock_data=None, dark_mode=Fals
                         "rsi": {"period": rsi_period},
                     },
                     "refresh": short_config["refresh"],
+                    "alerts": short_config["alerts"],
                 }
                 normalized_candidate = normalize_short_term_watchlist(candidate)
                 if normalized_candidate["settings"] != candidate["settings"]:
@@ -2727,7 +2883,7 @@ def render_short_term_watchlist(config, user, *, stock_data=None, dark_mode=Fals
                     st.session_state["short_term_settings_form_revision"] = form_revision + 1
                     st.rerun()
 
-    tickers = short_term_tickers(short_config)
+    tickers = configured_tickers
     if not tickers:
         st.info("Add at least one ticker in the Short-term watchlist editor.")
         return config
@@ -2775,11 +2931,65 @@ def render_short_term_watchlist(config, user, *, stock_data=None, dark_mode=Fals
                     continue
                 display_payload = convert_kline_data_for_display(payload, ticker, display_currency)
                 rows_by_pair[(ticker, interval)] = calculate_short_term_row(ticker, display_payload, short_config["settings"])
+        alert_state_key = f"short_term_macd_alert_state_{user['id']}"
+        monitoring_enabled = bool(
+            force_refresh and short_config["refresh"]["enabled"] and short_config["alerts"]["enabled"]
+        )
+        alert_events, alert_state = consume_macd_alert_events(
+            rows_by_pair,
+            short_config["alerts"],
+            st.session_state.get(alert_state_key),
+            monitoring_enabled=monitoring_enabled,
+            signal_signature=_short_term_alert_signature(short_config, tickers),
+        )
+        st.session_state[alert_state_key] = alert_state
+        alert_batch_id = ""
+        if alert_events:
+            alert_sequence_key = f"short_term_macd_alert_sequence_{user['id']}"
+            sequence = int(st.session_state.get(alert_sequence_key, 0)) + 1
+            st.session_state[alert_sequence_key] = sequence
+            alert_batch_id = f"{user['id']}-{sequence}"
+            summary = "; ".join(
+                f"{event['ticker']} {event['interval']}: {event['label']}" for event in alert_events
+            )
+            st.session_state[f"short_term_macd_alert_last_{user['id']}"] = summary
+        active_alert_key = f"short_term_macd_alert_active_{user['id']}"
+        now = datetime.datetime.now()
+        active_alerts = st.session_state.get(active_alert_key, {})
+        active_alerts = {
+            pair: alert_state
+            for pair, alert_state in active_alerts.items()
+            if isinstance(pair, tuple)
+            and isinstance(alert_state, dict)
+            and isinstance(alert_state.get("expires_at"), datetime.datetime)
+            and alert_state["expires_at"] > now
+        } if isinstance(active_alerts, dict) else {}
+        active_until = now + datetime.timedelta(seconds=short_config["alerts"]["duration_seconds"])
+        for event in alert_events:
+            pair = (event["ticker"], event["interval"])
+            existing_signals = set((active_alerts.get(pair) or {}).get("signals", []))
+            active_alerts[pair] = {
+                "expires_at": active_until,
+                "signals": sorted(existing_signals | {event["signal"]}),
+            }
+        st.session_state[active_alert_key] = active_alerts
+        st.caption("MACD alert sound")
+        render_macd_audio_alert(
+            alert_events,
+            monitoring_enabled=bool(short_config["refresh"]["enabled"] and short_config["alerts"]["enabled"]),
+            batch_id=alert_batch_id,
+            duration_seconds=short_config["alerts"]["duration_seconds"],
+            key=f"short_term_macd_audio_{user['id']}",
+        )
+        last_alert = st.session_state.get(f"short_term_macd_alert_last_{user['id']}")
+        if last_alert:
+            st.caption(f"Last MACD alert: {last_alert}")
         render_short_term_table(
             rows_by_pair,
             short_config["groups"],
             short_config["settings"],
             reference_metrics=short_term_reference_metrics(stock_data),
+            alert_pairs=active_alerts,
             dark_mode=dark_mode,
             display_currency=display_currency,
         )
@@ -4237,14 +4447,14 @@ def render_kline(user, cache_key, display_currency="Local"):
 
     request_key = f"{cache_key}_{ticker}_{period}_{interval}"
     if plot:
-        if "kline_data" not in st.session_state or st.session_state.get("kline_cache_key") != request_key:
-            with st.spinner(f"Loading {ticker} K-line data..."):
-                now = datetime.datetime.now()
-                st.session_state["kline_data"] = fetch_kline_data(ticker, period, interval, cache_key)
-                st.session_state["kline_cache_key"] = request_key
-                st.session_state["kline_ticker_cache"] = ticker
-                st.session_state["auto_refresh_kline_last"] = now
-                st.session_state["auto_refresh_kline_last_key"] = request_key
+        with st.spinner(f"Refreshing {ticker} K-line data..."):
+            now = datetime.datetime.now()
+            fetch_kline_data.clear()
+            st.session_state["kline_data"] = fetch_kline_data(ticker, period, interval, cache_key)
+            st.session_state["kline_cache_key"] = request_key
+            st.session_state["kline_ticker_cache"] = ticker
+            st.session_state["auto_refresh_kline_last"] = now
+            st.session_state["auto_refresh_kline_last_key"] = request_key
         st.session_state["current_ticker"] = ticker
 
     auto_refresh_enabled = st.session_state.get("auto_refresh_kline", False)

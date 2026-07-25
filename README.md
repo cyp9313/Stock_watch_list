@@ -20,17 +20,20 @@ Stock Watch List 是一个可部署的股票与跨市场监控应用，而不只
 - Market Breadth：S&P 500 与 Nasdaq 100 的 20/50/200 日均线上方比例、历史图和 treemap。Breadth 只在手动点击 **Refresh Breadth** 时重新下载与计算。
 - K 线图：周期与 SMA/EMA 可配；支持 VWAP、MACD、RSI、KDJ、布林带、成交量、60 天筹码峰、Auto Fibonacci Retracement 与 Extension。
 - 多用户版的 K 线自动刷新会恢复同一浏览器、同一 ticker/周期/间隔/币种下的 zoom/pan 与 Plotly 图例隐藏/显示偏好。
+- 即使 ticker、周期与间隔未变，手动点击 **Plot** 也会强制重新拉取 K 线数据。
 
 #### Short-term Watchlist（多用户登录后）
 
 Short-term Watchlist 位于 **Market Dashboard** 与 **Market Breadth** 之间，仅对登录用户开放。每个标的在同一张表中占两行，分别显示 5m 与 15m 信号，便于直接对照：
 
 - Price、`1D%`（最新价相对上一交易日复权收盘价）、`Bar Diff%`、15 根 K 线蜡烛图。
-- 两条可配置的 SMA/EMA、MA Spread%、均线对比图。
-- Volume Ratio、近 15 根成交量柱图、MACD Diff、MACD/Signal 图（含 0 轴虚线）。
+- 两条可配置的 SMA/EMA、以万分之一符号 `‱` 显示的 MA Spread、均线对比图。
+- Volume Ratio、近 15 根成交量柱图、以万分之一符号 `‱` 显示的 MACD Diff、MACD/Signal 图（含 0 轴虚线）。
 - 距离布林上轨、VWAP 距离、Close/VWAP 图、RSI 与 RSI 30/70 参考线图。
 - 标的列沿用主 Watchlist 的 Beta 着色；价格、涨跌与指标列采用对应的市场状态或数值着色规则。
 - 组、标的、指标参数和 10/20/30 秒自动刷新偏好按账号保存。自动刷新独立于侧边栏的 **Auto-refresh stocks**。
+- 可选短线浏览器音频提醒：可分别监听 5m/15m 的 MACD、两条可配置 MA、Close 与布林带上下轨、Close 与 VWAP 的交叉，以及 RSI 穿越 30/70；每类指标均可独立启用并设置阈值，也可按 ticker 启用/关闭。需开启短线自动刷新，并在当前浏览器点击 **Enable sound & test** 授权声音。每次新提醒会循环短音并闪烁对应指标单元格，持续时间可设为 5/10/15/30/60 秒（默认 15 秒）。提醒偏好按账号保存，已触发提醒仅在当前浏览器会话去重。
+- 主 Watchlist、Market Dashboard 与 Portfolios & Reports 的表格会在窄列中自动换行表头；将鼠标悬停在任一表头上可查看完整列名。
 
 默认情况下它请求最近 2 天的 5m/15m K 线。所需历史窗口会按当前最大指标周期自动增加；例如更长的 MA/BB/RSI/MACD 设置会请求更多天数。短线 K 线只保存在当前 Streamlit 会话内，自动刷新会覆盖该会话数据，不写入账户数据库。
 
@@ -246,17 +249,20 @@ Stock Watch List is a deployable market-monitoring and AI-reporting application,
 - CNN Fear & Greed, VIX, and Crypto Fear & Greed cards; on-demand S&P 500/Nasdaq 100 market-breadth charts and treemaps.
 - Configurable K-line charts with SMA/EMA, VWAP, MACD, RSI, KDJ, Bollinger Bands, volume, chip peak, and Auto Fibonacci retracement/extension.
 - In the multi-user app, K-line auto-refresh restores browser-local zoom/pan and Plotly legend visibility for the same ticker, period, interval, and currency.
+- Clicking **Plot** always refetches K-line data, even when the ticker, period, and interval are unchanged.
 
 #### Short-term Watchlist (authenticated multi-user app)
 
 The Short-term Watchlist sits between **Market Dashboard** and **Market Breadth**. Each ticker has adjacent 5m and 15m rows in one comparison table. It includes:
 
 - Price, 1D% versus the prior trading day's adjusted close, bar change, and a 15-candle SVG.
-- Two configurable SMA/EMA lines, MA spread, and an MA comparison sparkline.
-- Volume ratio, a 15-bar volume sparkline, MACD diff, and MACD/signal with a dashed zero reference.
+- Two configurable SMA/EMA lines, MA spread in per-ten-thousand units (`‱`), and an MA comparison sparkline.
+- Volume ratio, a 15-bar volume sparkline, MACD Diff in per-ten-thousand units (`‱`), and MACD/signal with a dashed zero reference.
 - Bollinger-upper distance, VWAP distance, close/VWAP sparkline, RSI, and RSI 30/70 references.
 - Main-watchlist beta coloring for ticker cells and matching numeric/status color semantics.
 - Account-scoped groups, ticker search/add, indicator parameters, and independent 10/20/30-second refresh.
+- Optional short-term browser audio alerts for near and confirmed MACD, configurable-MA, close/Bollinger upper-lower, close/VWAP, and RSI 30/70 crossovers. Each signal has its own enable switch and threshold, and alerts can be enabled per ticker. They require short-term auto-refresh plus a one-time **Enable sound & test** browser gesture. Each new alert repeats short tones and flashes its relevant table cell for a configurable 5/10/15/30/60 seconds (15 by default); preferences are account-scoped and de-duplication is browser-session-only.
+- In the main Watchlist, Market Dashboard, and Portfolios & Reports tables, narrow headers wrap automatically; hover any header to see its full column title.
 
 The default history request is two days. The request window scales automatically when the active MA, MACD, Bollinger, or RSI periods require more history. Intraday payloads are session-only; they are overwritten on refresh and are not stored in the account database.
 
