@@ -275,8 +275,8 @@ def short_term_alert_events(row: Mapping[str, Any], interval: str, alerts: Mappi
     bb_config = normalized["signals"]["bollinger"]
     if bb_config["enabled"]:
         for signal, current_key, previous_key, label in (
-            ("bollinger_upper", "BB Upper Cross (bp)", "BB Upper Cross Previous (bp)", "Bollinger upper"),
-            ("bollinger_lower", "BB Lower Cross (bp)", "BB Lower Cross Previous (bp)", "Bollinger lower"),
+            ("bollinger_upper", "BB Upper Cross (%)", "BB Upper Cross Previous (%)", "Bollinger upper"),
+            ("bollinger_lower", "BB Lower Cross (%)", "BB Lower Cross Previous (%)", "Bollinger lower"),
         ):
             events.extend(_crossover_events(
                 ticker=ticker, interval=interval, timestamp=timestamp, signal=signal, label=label,
@@ -572,12 +572,13 @@ def calculate_short_term_row(ticker: str, kline_data: Mapping[str, Any], setting
     ma_cross, ma_cross_previous = _cross_bps(
         ma_series[0].iloc[-1], ma_series[0].iloc[-2], ma_series[1].iloc[-1], ma_series[1].iloc[-2],
     )
-    bb_upper_cross, bb_upper_cross_previous = _cross_bps(
-        latest_price, previous_close, bb_upper.iloc[-1], bb_upper.iloc[-2],
-    )
-    bb_lower_cross, bb_lower_cross_previous = _cross_bps(
-        latest_price, previous_close, bb_lower.iloc[-1], bb_lower.iloc[-2],
-    )
+    def _band_width_percent(price, boundary, upper, lower):
+        return _percent(float(price) - float(boundary), float(upper) - float(lower))
+
+    bb_upper_cross = _band_width_percent(latest_price, bb_upper.iloc[-1], bb_upper.iloc[-1], bb_lower.iloc[-1])
+    bb_upper_cross_previous = _band_width_percent(previous_close, bb_upper.iloc[-2], bb_upper.iloc[-2], bb_lower.iloc[-2])
+    bb_lower_cross = _band_width_percent(latest_price, bb_lower.iloc[-1], bb_upper.iloc[-1], bb_lower.iloc[-1])
+    bb_lower_cross_previous = _band_width_percent(previous_close, bb_lower.iloc[-2], bb_upper.iloc[-2], bb_lower.iloc[-2])
     vwap_cross, vwap_cross_previous = _cross_bps(latest_price, previous_close, vwap, previous_vwap)
 
     tail = frame.iloc[-15:]
@@ -598,10 +599,10 @@ def calculate_short_term_row(ticker: str, kline_data: Mapping[str, Any], setting
         "MACD Diff Previous‱": _basis_points(float(macd_diff.iloc[-2]), previous_close) if pd.notna(macd_diff.iloc[-2]) else np.nan,
         "MA Cross (bp)": ma_cross,
         "MA Cross Previous (bp)": ma_cross_previous,
-        "BB Upper Cross (bp)": bb_upper_cross,
-        "BB Upper Cross Previous (bp)": bb_upper_cross_previous,
-        "BB Lower Cross (bp)": bb_lower_cross,
-        "BB Lower Cross Previous (bp)": bb_lower_cross_previous,
+        "BB Upper Cross (%)": bb_upper_cross,
+        "BB Upper Cross Previous (%)": bb_upper_cross_previous,
+        "BB Lower Cross (%)": bb_lower_cross,
+        "BB Lower Cross Previous (%)": bb_lower_cross_previous,
         "VWAP Cross (bp)": vwap_cross,
         "VWAP Cross Previous (bp)": vwap_cross_previous,
         "RSI 30 Cross": float(rsi.iloc[-1] - 30.0) if pd.notna(rsi.iloc[-1]) else np.nan,

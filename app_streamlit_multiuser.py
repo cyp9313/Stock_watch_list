@@ -2778,12 +2778,12 @@ def render_short_term_watchlist(config, user, *, stock_data=None, dark_mode=Fals
                         value=short_config["alerts"]["confirmed_enabled"],
                         key=f"short_term_alert_confirmed_{user['id']}_{alert_revision}",
                     )
-                st.caption("Enable each signal independently and set its near-crossover threshold. Price-based thresholds use ‱ (one ten-thousandth); RSI uses RSI points.")
+                st.caption("Enable each signal independently and set its near-crossover threshold. MACD, MA, and VWAP use ‱ (one ten-thousandth); Bollinger uses % of band width; RSI uses RSI points.")
                 signal_controls = {}
                 for signal_name, label, unit in (
                     ("macd", "MACD / Signal", "‱"),
                     ("ema", "MA 1 / MA 2", "‱"),
-                    ("bollinger", "Close / Bollinger upper & lower", "‱"),
+                    ("bollinger", "Close / Bollinger upper & lower", "% of BB width"),
                     ("vwap", "Close / VWAP", "‱"),
                     ("rsi", "RSI / 30 & 70", "points"),
                 ):

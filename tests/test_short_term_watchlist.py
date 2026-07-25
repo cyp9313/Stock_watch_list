@@ -136,6 +136,7 @@ def test_row_calculates_requested_metrics_and_inline_svg():
     assert row["Alert Bar Timestamp"] == "2026-07-24 12:45"
     assert row["Volume Ratio"] == pytest.approx(1.0)
     assert row["Diff BB Upper%"] < 0
+    assert row["BB Upper Cross (%)"] == pytest.approx(row["Diff BB Upper%"])
     assert row["Diff VWAP%"] > 0
     assert row["RSI"] == pytest.approx(100.0)
     assert "<svg" in row["Candles (15)"]
@@ -210,8 +211,8 @@ def test_other_short_term_alert_signals_and_ticker_switches_are_independent():
     row = {
         "Ticker": "AAPL", "Alert Bar Timestamp": "2026-07-24 10:00",
         "MA Cross (bp)": 1.0, "MA Cross Previous (bp)": -1.0,
-        "BB Upper Cross (bp)": 11.0, "BB Upper Cross Previous (bp)": -2.0,
-        "BB Lower Cross (bp)": -11.0, "BB Lower Cross Previous (bp)": 2.0,
+        "BB Upper Cross (%)": 11.0, "BB Upper Cross Previous (%)": -2.0,
+        "BB Lower Cross (%)": -11.0, "BB Lower Cross Previous (%)": 2.0,
         "VWAP Cross (bp)": 1.0, "VWAP Cross Previous (bp)": -1.0,
         "RSI 30 Cross": 1.0, "RSI 30 Cross Previous": -1.0,
         "RSI 70 Cross": -1.0, "RSI 70 Cross Previous": 1.0,
@@ -219,6 +220,29 @@ def test_other_short_term_alert_signals_and_ticker_switches_are_independent():
     signals = {event["signal"] for event in short_term_alert_events(row, "5m", alerts)}
     assert signals == {"ema", "bollinger_upper", "bollinger_lower", "vwap", "rsi", "rsi_upper"}
     assert short_term_alert_events(row, "5m", {**alerts, "ticker_enabled": {"AAPL": False}}) == []
+
+
+def test_bollinger_near_threshold_uses_percent_of_band_width():
+    alerts = default_short_term_watchlist()["alerts"]
+    alerts = {
+        **alerts,
+        "enabled": True,
+        "confirmed_enabled": False,
+        "signals": {
+            **alerts["signals"],
+            "bollinger": {"enabled": True, "threshold": 10.0},
+        },
+    }
+    row = {
+        "Ticker": "AAPL", "Alert Bar Timestamp": "2026-07-24 10:00",
+        "BB Upper Cross (%)": -9.0, "BB Upper Cross Previous (%)": -20.0,
+        "BB Lower Cross (%)": 40.0, "BB Lower Cross Previous (%)": 35.0,
+    }
+    events = short_term_alert_events(row, "5m", alerts)
+    assert [(event["signal"], event["type"]) for event in events] == [("bollinger_upper", "bullish_near")]
+
+    far_row = {**row, "BB Upper Cross (%)": -11.0}
+    assert short_term_alert_events(far_row, "5m", alerts) == []
 
 
 def test_macd_alert_consumption_bootstraps_and_deduplicates_per_bar():
