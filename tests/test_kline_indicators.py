@@ -138,4 +138,6 @@ def test_multiuser_kline_loads_option_walls_only_on_manual_plot():
     assert 'calculate_dealer_gex(nearest.get("gamma_legs", []), latest_price' in source
     assert 'calculate_dealer_gex(three_month.get("gamma_legs", []), latest_price' in source
     assert 'Gamma is recalculated from the cached option OI/IV whenever the K-line price refreshes.' in source
+    assert 'shared_xaxes="all"' in source
+    assert 'option_walls_figure = build_option_walls_grid(' in source
     assert 'name=f"ATR({indicator_settings[\'atr\'][\'period\']})"' in source

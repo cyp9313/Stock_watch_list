@@ -3935,6 +3935,76 @@ def build_dealer_gex_wall(rows, title, dark_mode=False, latest_price=None):
     return fig
 
 
+def build_option_walls_grid(
+    nearest_oi_figure,
+    horizon_oi_figure,
+    nearest_gex_figure,
+    horizon_gex_figure,
+    ticker,
+    horizon_months,
+    dark_mode=False,
+    latest_price=None,
+):
+    """Combine OI and GEX walls into one 2×2 figure with a shared strike axis."""
+    sources = [
+        (nearest_oi_figure, 1, 1),
+        (horizon_oi_figure, 1, 2),
+        (nearest_gex_figure, 2, 1),
+        (horizon_gex_figure, 2, 2),
+    ]
+    if not any(figure is not None for figure, _, _ in sources):
+        return None
+    theme = get_theme(dark_mode)
+    fig = make_subplots(
+        rows=2,
+        cols=2,
+        shared_xaxes="all",
+        vertical_spacing=0.10,
+        horizontal_spacing=0.08,
+        subplot_titles=(
+            "Nearest Open-Interest", f"{horizon_months}-month Open-Interest",
+            "Nearest Dealer-GEX", f"{horizon_months}-month Dealer-GEX",
+        ),
+    )
+    for source, row, col in sources:
+        if source is None:
+            continue
+        for trace in source.data:
+            copied_trace = copy.deepcopy(trace)
+            if col == 2 and copied_trace.name in {"Calls", "Puts"}:
+                copied_trace.showlegend = False
+            fig.add_trace(copied_trace, row=row, col=col)
+    fig.update_layout(
+        barmode="group",
+        height=720,
+        hovermode="x unified",
+        template=theme["plot_template"],
+        paper_bgcolor=theme["page_bg"],
+        plot_bgcolor=theme["plot_bg"],
+        font=dict(color=theme["text"]),
+        margin=dict(l=65, r=25, t=80, b=70),
+        legend=dict(orientation="h", yanchor="bottom", y=1.03, xanchor="right", x=1),
+        uirevision=f"option_walls:{ticker}:{horizon_months}",
+    )
+    fig.update_xaxes(title_text="Strike", tickangle=-45, showgrid=False)
+    fig.update_yaxes(title_text="Open interest", row=1, gridcolor=theme["grid"], zerolinecolor=theme["grid"])
+    fig.update_yaxes(title_text="Dealer GEX (1% move)", row=2, gridcolor=theme["grid"], zeroline=True, zerolinecolor=theme["text"])
+    fig.for_each_xaxis(lambda axis: axis.update(uirevision=f"option_walls:{ticker}:{horizon_months}"))
+    try:
+        last_price = float(latest_price)
+    except (TypeError, ValueError):
+        last_price = np.nan
+    if np.isfinite(last_price):
+        for row in (1, 2):
+            for col in (1, 2):
+                fig.add_vline(
+                    x=last_price, row=row, col=col, line_dash="dash", line_color="#ef4444", line_width=1.5,
+                    annotation_text=f"Latest {last_price:.2f}", annotation_position="top",
+                    annotation_font_color="#ef4444",
+                )
+    return fig
+
+
 def render_option_oi_walls(option_data, ticker, dark_mode=False, latest_price=None):
     """Render snapshots already loaded by a manual Plot action; never fetch here."""
     if not isinstance(option_data, dict):
@@ -3972,25 +4042,20 @@ def render_option_oi_walls(option_data, ticker, dark_mode=False, latest_price=No
     long_term_gex_figure = build_dealer_gex_wall(
         long_term_gex, f"{months}-month Dealer-GEX wall — through {three_month.get('through') or 'N/A'}", dark_mode, latest_price,
     )
-    near_column, horizon_column = st.columns(2)
-    with near_column:
-        if nearest_figure:
-            st.plotly_chart(nearest_figure, width="stretch", key=f"option_oi_near_{ticker}")
-        else:
-            st.caption("No open-interest data is available for the nearest expiry.")
-        if nearest_gex_figure:
-            st.plotly_chart(nearest_gex_figure, width="stretch", key=f"option_gex_near_{ticker}")
-        else:
-            st.caption("No valid IV/OI contracts are available for the nearest-expiry Dealer-GEX wall.")
-    with horizon_column:
-        if three_month_figure:
-            st.plotly_chart(three_month_figure, width="stretch", key=f"option_oi_3m_{ticker}")
-        else:
-            st.caption("No open-interest data is available through the selected horizon.")
-        if long_term_gex_figure:
-            st.plotly_chart(long_term_gex_figure, width="stretch", key=f"option_gex_horizon_{ticker}")
-        else:
-            st.caption("No valid IV/OI contracts are available for the selected Dealer-GEX horizon.")
+    option_walls_figure = build_option_walls_grid(
+        nearest_figure,
+        three_month_figure,
+        nearest_gex_figure,
+        long_term_gex_figure,
+        ticker,
+        months,
+        dark_mode,
+        latest_price,
+    )
+    if option_walls_figure:
+        st.plotly_chart(option_walls_figure, width="stretch", key=f"option_walls_{ticker}_{months}")
+    else:
+        st.caption("No valid Open-Interest or IV data is available for the selected option horizon.")
     if option_data.get("unavailable_expirations"):
         st.caption("Some option expirations could not be retrieved; displayed walls use the available chains.")
 
