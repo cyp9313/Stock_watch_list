@@ -140,4 +140,9 @@ def test_multiuser_kline_loads_option_walls_only_on_manual_plot():
     assert 'Gamma is recalculated from the cached option OI/IV whenever the K-line price refreshes.' in source
     assert 'shared_xaxes="all"' in source
     assert 'option_walls_figure = build_option_walls_grid(' in source
+    assert 'legendgroup="oi_calls"' in source
+    assert 'legendgroup="oi_puts"' in source
+    assert 'legendgroup="gex_positive"' in source
+    assert 'legendgroup="gex_negative"' in source
+    assert 'groupclick="togglegroup"' in source
     assert 'name=f"ATR({indicator_settings[\'atr\'][\'period\']})"' in source

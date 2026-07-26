@@ -3844,8 +3844,12 @@ def build_option_oi_wall(rows, title, dark_mode=False, latest_price=None):
     theme = get_theme(dark_mode)
     strikes = [strike for strike, _, _ in parsed]
     fig = go.Figure()
-    fig.add_bar(name="Calls", x=strikes, y=[calls for _, calls, _ in parsed], marker_color="#16a34a")
-    fig.add_bar(name="Puts", x=strikes, y=[puts for _, _, puts in parsed], marker_color="#dc2626")
+    fig.add_bar(
+        name="Calls", legendgroup="oi_calls", x=strikes, y=[calls for _, calls, _ in parsed], marker_color="#16a34a",
+    )
+    fig.add_bar(
+        name="Puts", legendgroup="oi_puts", x=strikes, y=[puts for _, _, puts in parsed], marker_color="#dc2626",
+    )
     fig.update_layout(
         title=dict(text=title, x=0.01, xanchor="left", font=dict(color=theme["text"], size=16)),
         barmode="group",
@@ -3895,14 +3899,25 @@ def build_dealer_gex_wall(rows, title, dark_mode=False, latest_price=None):
     parsed.sort(key=lambda item: item[0])
     theme = get_theme(dark_mode)
     strikes = [strike for strike, _, _, _ in parsed]
-    values = [gex for _, gex, _, _ in parsed]
-    colors = ["#16a34a" if value >= 0 else "#dc2626" for value in values]
     fig = go.Figure()
     fig.add_bar(
-        name="Dealer GEX",
+        name="Positive Dealer GEX",
+        legendgroup="gex_positive",
         x=strikes,
-        y=values,
-        marker_color=colors,
+        y=[gex if gex >= 0 else None for _, gex, _, _ in parsed],
+        marker_color="#16a34a",
+        customdata=[[call, put] for _, _, call, put in parsed],
+        hovertemplate=(
+            "Strike %{x:.2f}<br>Dealer GEX %{y:,.0f}"
+            "<br>Call GEX %{customdata[0]:,.0f}<br>Put GEX %{customdata[1]:,.0f}<extra></extra>"
+        ),
+    )
+    fig.add_bar(
+        name="Negative Dealer GEX",
+        legendgroup="gex_negative",
+        x=strikes,
+        y=[gex if gex < 0 else None for _, gex, _, _ in parsed],
+        marker_color="#dc2626",
         customdata=[[call, put] for _, _, call, put in parsed],
         hovertemplate=(
             "Strike %{x:.2f}<br>Dealer GEX %{y:,.0f}"
@@ -3918,7 +3933,7 @@ def build_dealer_gex_wall(rows, title, dark_mode=False, latest_price=None):
         plot_bgcolor=theme["plot_bg"],
         font=dict(color=theme["text"]),
         margin=dict(l=55, r=25, t=55, b=70),
-        showlegend=False,
+        showlegend=True,
     )
     fig.update_xaxes(title_text="Strike", tickangle=-45, showgrid=False)
     fig.update_yaxes(title_text="Dealer GEX (1% move)", gridcolor=theme["grid"], zeroline=True, zerolinecolor=theme["text"])
@@ -3971,8 +3986,8 @@ def build_option_walls_grid(
             continue
         for trace in source.data:
             copied_trace = copy.deepcopy(trace)
-            if col == 2 and copied_trace.name in {"Calls", "Puts"}:
-                copied_trace.showlegend = False
+            if copied_trace.name in {"Calls", "Puts", "Positive Dealer GEX", "Negative Dealer GEX"}:
+                copied_trace.showlegend = col == 1
             fig.add_trace(copied_trace, row=row, col=col)
     fig.update_layout(
         barmode="group",
@@ -3983,7 +3998,7 @@ def build_option_walls_grid(
         plot_bgcolor=theme["plot_bg"],
         font=dict(color=theme["text"]),
         margin=dict(l=65, r=25, t=80, b=70),
-        legend=dict(orientation="h", yanchor="bottom", y=1.03, xanchor="right", x=1),
+        legend=dict(orientation="h", yanchor="bottom", y=1.03, xanchor="right", x=1, groupclick="togglegroup"),
         uirevision=f"option_walls:{ticker}:{horizon_months}",
     )
     fig.update_xaxes(title_text="Strike", tickangle=-45, showgrid=False)
