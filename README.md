@@ -18,7 +18,7 @@ Stock Watch List 是一个可部署的股票与跨市场监控应用，而不只
 - 日线市场数据：价格、最近 20 根日线 K 线蜡烛图、`1D%` / `5D%` / `1M%` / `YTD%`、RSI、成交量比、EMA 偏离、布林带、相对 `^GSPC` 的收益/动量、估值、分析师评级、目标价、市值和 Beta。
 - 顶部市场情绪卡片：CNN Fear & Greed、VIX 和 Crypto Fear & Greed。
 - Market Breadth：S&P 500 与 Nasdaq 100 的 20/50/200 日均线上方比例、历史图和 treemap。Breadth 只在手动点击 **Refresh Breadth** 时重新下载与计算。
-- K 线图：周期与 SMA/EMA 可配；支持 VWAP、MACD、RSI、KDJ、布林带、成交量、60 天筹码峰、Auto Fibonacci Retracement 与 Extension。
+- K 线图：周期与 SMA/EMA/ATR 可配；支持 VWAP、MACD、RSI、KDJ、布林带、成交量、60 天筹码峰、Auto Fibonacci Retracement 与 Extension；多用户版还会在手动 Plot 时显示最近可用到期日及可配置未来 1–12 个月汇总的 Call/Put Open Interest 墙，以及 Dealer-GEX 墙（Call 为正、Put 为负的仓位代理）。调整 OI 覆盖月份会重新下载 OI/IV；K 线自动刷新不会下载期权链，但会使用缓存 OI/IV 与最新股价重算 GEX 并移动价格线。
 - 多用户版的 K 线自动刷新会恢复同一浏览器、同一 ticker/周期/间隔/币种下的 zoom/pan 与 Plotly 图例隐藏/显示偏好。
 - 即使 ticker、周期与间隔未变，手动点击 **Plot** 也会强制重新拉取 K 线数据。
 
@@ -247,7 +247,7 @@ Stock Watch List is a deployable market-monitoring and AI-reporting application,
 - Editable grouped watchlists, market dashboards, and portfolio pages with Yahoo Finance ticker search, dark mode, and local/EUR display.
 - Daily-market metrics including price, a 20-bar daily candlestick SVG, 1D/5D/1M/YTD returns, RSI, volume ratio, EMA and Bollinger distances, relative returns/momentum versus `^GSPC`, valuation, analyst data, targets, market cap, and beta.
 - CNN Fear & Greed, VIX, and Crypto Fear & Greed cards; on-demand S&P 500/Nasdaq 100 market-breadth charts and treemaps.
-- Configurable K-line charts with SMA/EMA, VWAP, MACD, RSI, KDJ, Bollinger Bands, volume, chip peak, and Auto Fibonacci retracement/extension.
+- Configurable K-line charts with SMA/EMA/ATR, VWAP, MACD, RSI, KDJ, Bollinger Bands, volume, chip peak, and Auto Fibonacci retracement/extension. In the multi-user app, a manual Plot also loads Call/Put open-interest walls and Dealer-GEX walls (positive calls, negative puts as a positioning proxy) for the nearest available expiry and an aggregate over a configurable 1–12-month horizon. Changing the OI horizon reloads OI/IV; K-line auto-refresh never reloads option chains, but recomputes GEX from cached OI/IV using the latest stock price and moves the price marker.
 - In the multi-user app, K-line auto-refresh restores browser-local zoom/pan and Plotly legend visibility for the same ticker, period, interval, and currency.
 - Clicking **Plot** always refetches K-line data, even when the ticker, period, and interval are unchanged.
 

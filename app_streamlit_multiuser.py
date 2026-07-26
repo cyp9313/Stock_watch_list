@@ -29,6 +29,7 @@ from PIL import Image
 from kline_indicator_controls import render_indicator_settings_panel
 from kline_indicators import calculate_configurable_indicators, default_indicator_settings, normalize_indicator_settings
 from kline_fibonacci import add_fibonacci_overlays, calculate_auto_fibonacci
+from options_open_interest import calculate_dealer_gex
 from short_term_watchlist import (
     SHORT_TERM_COLUMNS,
     calculate_short_term_row,
@@ -2492,6 +2493,18 @@ def fetch_kline_data(ticker, period, interval, cache_key=""):
         return None
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_options_open_interest(ticker, months):
+    """Fetch a manually refreshed option-OI snapshot for the plotted ticker."""
+    try:
+        response = requests.get(
+            f"{API_BASE}/api/options_open_interest", params={"ticker": ticker, "months": months}, timeout=120,
+        )
+        return response.json() if response.status_code == 200 else None
+    except (requests.RequestException, ValueError):
+        return None
+
+
 def request_short_term_kline(ticker, interval, history_days):
     """Fetch one intraday series without touching normal K-line/chart caches."""
     try:
@@ -3531,15 +3544,16 @@ def build_kline_chart(kline_data, ticker, fibonacci=None, dark_mode=False, uirev
             buy_count = 0
 
     fig = make_subplots(
-        rows=6,
+        rows=7,
         cols=2,
         shared_xaxes=True,
         vertical_spacing=0.02,
         horizontal_spacing=0.03,
-        row_heights=[0.4, 0.12, 0.12, 0.12, 0.12, 0.12],
+        row_heights=[0.36, 0.10, 0.11, 0.11, 0.10, 0.10, 0.12],
         column_widths=[0.78, 0.22],
         specs=[
             [{"secondary_y": False}, {"secondary_y": False}],
+            [{"secondary_y": False}, None],
             [{"secondary_y": False}, None],
             [{"secondary_y": False}, None],
             [{"secondary_y": False}, None],
@@ -3711,8 +3725,13 @@ def build_kline_chart(kline_data, ticker, fibonacci=None, dark_mode=False, uirev
     fig.update_yaxes(title_text="RSI", row=5, col=1, showgrid=True)
     fig.update_xaxes(row=5, col=1, showgrid=True)
 
-    fig.add_trace(go.Bar(x=dates, y=td_sell, name="TD Sell", marker_color="red", showlegend=False), row=6, col=1)
-    fig.add_trace(go.Bar(x=dates, y=[-value for value in td_buy], name="TD Buy", marker_color="green", showlegend=False), row=6, col=1)
+    if calculated.get("atr"):
+        fig.add_trace(go.Scatter(x=dates, y=calculated["atr"], name=f"ATR({indicator_settings['atr']['period']})", line=dict(color="#1d4ed8", width=1)), row=6, col=1)
+    fig.update_yaxes(title_text="ATR", row=6, col=1, showgrid=True)
+    fig.update_xaxes(row=6, col=1, showgrid=True)
+
+    fig.add_trace(go.Bar(x=dates, y=td_sell, name="TD Sell", marker_color="red", showlegend=False), row=7, col=1)
+    fig.add_trace(go.Bar(x=dates, y=[-value for value in td_buy], name="TD Buy", marker_color="green", showlegend=False), row=7, col=1)
     for i in range(n):
         if 0 < td_sell[i] <= 9:
             fig.add_trace(
@@ -3725,7 +3744,7 @@ def build_kline_chart(kline_data, ticker, fibonacci=None, dark_mode=False, uirev
                     textfont=dict(color="red", size=11, family="Arial Black" if td_sell[i] == 9 else "Arial"),
                     showlegend=False,
                 ),
-                row=6,
+                row=7,
                 col=1,
             )
         if 0 < td_buy[i] <= 9:
@@ -3739,11 +3758,11 @@ def build_kline_chart(kline_data, ticker, fibonacci=None, dark_mode=False, uirev
                     textfont=dict(color="green", size=11, family="Arial Black" if td_buy[i] == 9 else "Arial"),
                     showlegend=False,
                 ),
-                row=6,
+                row=7,
                 col=1,
             )
-    fig.update_yaxes(title_text="TD Seq", row=6, col=1, range=[-13, 13], showgrid=True)
-    fig.update_xaxes(row=6, col=1, showgrid=True)
+    fig.update_yaxes(title_text="TD Seq", row=7, col=1, range=[-13, 13], showgrid=True)
+    fig.update_xaxes(row=7, col=1, showgrid=True)
     fig.update_xaxes(row=1, col=1, showgrid=True)
     fig.update_yaxes(row=1, col=1, showgrid=True)
 
@@ -3752,7 +3771,7 @@ def build_kline_chart(kline_data, ticker, fibonacci=None, dark_mode=False, uirev
     stable_ui_revision = str(uirevision or ticker)
     fig.update_layout(
         title=dict(text=title, x=0.01, xanchor="left", font=dict(color=theme["text"], size=15)),
-        height=1100,
+        height=1200,
         showlegend=True,
         legend=dict(
             orientation="h",
@@ -3797,10 +3816,183 @@ def build_kline_chart(kline_data, ticker, fibonacci=None, dark_mode=False, uirev
             showarrow=False,
         )
 
-    for row in range(1, 6):
+    for row in range(1, 7):
         fig.update_xaxes(showticklabels=False, row=row, col=1)
 
     return fig
+
+
+def build_option_oi_wall(rows, title, dark_mode=False, latest_price=None):
+    """Build a grouped Calls/Puts open-interest wall from a validated API payload."""
+    if not isinstance(rows, list):
+        return None
+    parsed = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        try:
+            strike = float(item.get("strike"))
+            calls = max(0, float(item.get("calls", 0)))
+            puts = max(0, float(item.get("puts", 0)))
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(strike) and np.isfinite(calls) and np.isfinite(puts):
+            parsed.append((strike, calls, puts))
+    if not parsed:
+        return None
+    parsed.sort(key=lambda item: item[0])
+    theme = get_theme(dark_mode)
+    strikes = [strike for strike, _, _ in parsed]
+    fig = go.Figure()
+    fig.add_bar(name="Calls", x=strikes, y=[calls for _, calls, _ in parsed], marker_color="#16a34a")
+    fig.add_bar(name="Puts", x=strikes, y=[puts for _, _, puts in parsed], marker_color="#dc2626")
+    fig.update_layout(
+        title=dict(text=title, x=0.01, xanchor="left", font=dict(color=theme["text"], size=16)),
+        barmode="group",
+        height=350,
+        hovermode="x unified",
+        template=theme["plot_template"],
+        paper_bgcolor=theme["page_bg"],
+        plot_bgcolor=theme["plot_bg"],
+        font=dict(color=theme["text"]),
+        margin=dict(l=45, r=25, t=55, b=70),
+        legend=dict(orientation="h", yanchor="bottom", y=1.04, xanchor="right", x=1),
+    )
+    fig.update_xaxes(title_text="Strike", tickangle=-45, showgrid=False)
+    fig.update_yaxes(title_text="Open interest", gridcolor=theme["grid"], zerolinecolor=theme["grid"])
+    try:
+        last_price = float(latest_price)
+    except (TypeError, ValueError):
+        last_price = np.nan
+    if np.isfinite(last_price):
+        fig.add_vline(
+            x=last_price, line_dash="dash", line_color="#ef4444", line_width=1.5,
+            annotation_text=f"Latest {last_price:.2f}", annotation_position="top",
+            annotation_font_color="#ef4444",
+        )
+    return fig
+
+
+def build_dealer_gex_wall(rows, title, dark_mode=False, latest_price=None):
+    """Build a net Dealer-GEX wall. Positive calls / negative puts are a proxy assumption."""
+    if not isinstance(rows, list):
+        return None
+    parsed = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        try:
+            strike = float(item.get("strike"))
+            dealer_gex = float(item.get("dealer_gex"))
+            call_gex = float(item.get("call_gex", 0))
+            put_gex = float(item.get("put_gex", 0))
+        except (TypeError, ValueError):
+            continue
+        if all(np.isfinite(value) for value in (strike, dealer_gex, call_gex, put_gex)):
+            parsed.append((strike, dealer_gex, call_gex, put_gex))
+    if not parsed:
+        return None
+    parsed.sort(key=lambda item: item[0])
+    theme = get_theme(dark_mode)
+    strikes = [strike for strike, _, _, _ in parsed]
+    values = [gex for _, gex, _, _ in parsed]
+    colors = ["#16a34a" if value >= 0 else "#dc2626" for value in values]
+    fig = go.Figure()
+    fig.add_bar(
+        name="Dealer GEX",
+        x=strikes,
+        y=values,
+        marker_color=colors,
+        customdata=[[call, put] for _, _, call, put in parsed],
+        hovertemplate=(
+            "Strike %{x:.2f}<br>Dealer GEX %{y:,.0f}"
+            "<br>Call GEX %{customdata[0]:,.0f}<br>Put GEX %{customdata[1]:,.0f}<extra></extra>"
+        ),
+    )
+    fig.update_layout(
+        title=dict(text=title, x=0.01, xanchor="left", font=dict(color=theme["text"], size=16)),
+        height=350,
+        hovermode="x unified",
+        template=theme["plot_template"],
+        paper_bgcolor=theme["page_bg"],
+        plot_bgcolor=theme["plot_bg"],
+        font=dict(color=theme["text"]),
+        margin=dict(l=55, r=25, t=55, b=70),
+        showlegend=False,
+    )
+    fig.update_xaxes(title_text="Strike", tickangle=-45, showgrid=False)
+    fig.update_yaxes(title_text="Dealer GEX (1% move)", gridcolor=theme["grid"], zeroline=True, zerolinecolor=theme["text"])
+    try:
+        last_price = float(latest_price)
+    except (TypeError, ValueError):
+        last_price = np.nan
+    if np.isfinite(last_price):
+        fig.add_vline(
+            x=last_price, line_dash="dash", line_color="#ef4444", line_width=1.5,
+            annotation_text=f"Latest {last_price:.2f}", annotation_position="top",
+            annotation_font_color="#ef4444",
+        )
+    return fig
+
+
+def render_option_oi_walls(option_data, ticker, dark_mode=False, latest_price=None):
+    """Render snapshots already loaded by a manual Plot action; never fetch here."""
+    if not isinstance(option_data, dict):
+        return
+    if not option_data.get("success"):
+        st.info("Option open-interest data is unavailable for this ticker.")
+        return
+    if option_data.get("ticker") != ticker:
+        return
+    nearest = option_data.get("nearest") if isinstance(option_data.get("nearest"), dict) else {}
+    three_month = option_data.get("three_month") if isinstance(option_data.get("three_month"), dict) else {}
+    nearest_expiry = nearest.get("expiration")
+    nearest_label = "Same-day" if nearest.get("label") == "same-day" else "Next available expiry"
+    nearest_figure = build_option_oi_wall(
+        nearest.get("rows"), f"{nearest_label} Open-Interest wall — {nearest_expiry or 'N/A'}", dark_mode, latest_price,
+    )
+    months = three_month.get("months", 3)
+    three_month_figure = build_option_oi_wall(
+        three_month.get("rows"), f"{months}-month Open-Interest wall — through {three_month.get('through') or 'N/A'}", dark_mode, latest_price,
+    )
+
+    assumptions = option_data.get("gamma_assumptions") if isinstance(option_data.get("gamma_assumptions"), dict) else {}
+    risk_free_rate = assumptions.get("risk_free_rate", 0.0)
+    dividend_yield = assumptions.get("dividend_yield", 0.0)
+    nearest_gex = calculate_dealer_gex(nearest.get("gamma_legs", []), latest_price, risk_free_rate, dividend_yield)
+    long_term_gex = calculate_dealer_gex(three_month.get("gamma_legs", []), latest_price, risk_free_rate, dividend_yield)
+    st.markdown("#### Option Open-Interest and Dealer-GEX walls")
+    st.caption(
+        "Calls are treated as positive and puts as negative Dealer-GEX; this is a market-positioning proxy, not observed dealer inventory. "
+        "Gamma is recalculated from the cached option OI/IV whenever the K-line price refreshes."
+    )
+    nearest_gex_figure = build_dealer_gex_wall(
+        nearest_gex, f"{nearest_label} Dealer-GEX wall — {nearest_expiry or 'N/A'}", dark_mode, latest_price,
+    )
+    long_term_gex_figure = build_dealer_gex_wall(
+        long_term_gex, f"{months}-month Dealer-GEX wall — through {three_month.get('through') or 'N/A'}", dark_mode, latest_price,
+    )
+    near_column, horizon_column = st.columns(2)
+    with near_column:
+        if nearest_figure:
+            st.plotly_chart(nearest_figure, width="stretch", key=f"option_oi_near_{ticker}")
+        else:
+            st.caption("No open-interest data is available for the nearest expiry.")
+        if nearest_gex_figure:
+            st.plotly_chart(nearest_gex_figure, width="stretch", key=f"option_gex_near_{ticker}")
+        else:
+            st.caption("No valid IV/OI contracts are available for the nearest-expiry Dealer-GEX wall.")
+    with horizon_column:
+        if three_month_figure:
+            st.plotly_chart(three_month_figure, width="stretch", key=f"option_oi_3m_{ticker}")
+        else:
+            st.caption("No open-interest data is available through the selected horizon.")
+        if long_term_gex_figure:
+            st.plotly_chart(long_term_gex_figure, width="stretch", key=f"option_gex_horizon_{ticker}")
+        else:
+            st.caption("No valid IV/OI contracts are available for the selected Dealer-GEX horizon.")
+    if option_data.get("unavailable_expirations"):
+        st.caption("Some option expirations could not be retrieved; displayed walls use the available chains.")
 
 
 def render_persistent_kline_chart(fig, storage_key, height=None):
@@ -3994,6 +4186,9 @@ def reset_kline_indicator_session_state():
             "kline_indicator_settings",
             "kline_indicator_settings_owner",
             "kline_indicator_form_revision",
+            "kline_options_oi",
+            "kline_options_ticker",
+            "kline_options_months",
         } or key.startswith("multi_kline_indicator_") or key.startswith("short_term_"):
             st.session_state.pop(key, None)
 
@@ -4435,7 +4630,7 @@ def render_portfolio_section(config, raw_df, editable, user, dark_mode=False, di
 def render_kline(user, cache_key, display_currency="Local"):
     st.subheader("K-Line Chart")
     _apply_pending_ticker("kline_ticker")
-    c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+    c1, c2, c3, c4, c5 = st.columns([2, 1, 1, 1, 1])
     with c1:
         ticker = st.text_input("Ticker", "AAPL", key="kline_ticker").upper()
     with c2:
@@ -4443,6 +4638,11 @@ def render_kline(user, cache_key, display_currency="Local"):
     with c3:
         interval = st.selectbox("Interval", ["1d", "1wk", "1h", "4h", "15m", "5m"], index=0, key="kline_interval")
     with c4:
+        oi_horizon_months = int(st.selectbox(
+            "Open-Interest horizon (months)", list(range(1, 13)), index=2, key="kline_oi_horizon_months",
+            help="Reloads the option Open-Interest walls for the plotted ticker when changed.",
+        ))
+    with c5:
         st.write("")
         st.write("")
         plot = st.button("Plot", width="stretch", key="kline_plot_btn")
@@ -4460,7 +4660,25 @@ def render_kline(user, cache_key, display_currency="Local"):
             st.session_state["kline_ticker_cache"] = ticker
             st.session_state["auto_refresh_kline_last"] = now
             st.session_state["auto_refresh_kline_last_key"] = request_key
+        if (
+            st.session_state.get("kline_options_ticker") != ticker
+            or st.session_state.get("kline_options_months") != oi_horizon_months
+        ):
+            with st.spinner(f"Loading {ticker} option open interest..."):
+                st.session_state["kline_options_oi"] = fetch_options_open_interest(ticker, oi_horizon_months)
+                st.session_state["kline_options_ticker"] = ticker
+                st.session_state["kline_options_months"] = oi_horizon_months
         st.session_state["current_ticker"] = ticker
+
+    if (
+        not plot
+        and st.session_state.get("kline_ticker_cache") == ticker
+        and st.session_state.get("kline_options_ticker") == ticker
+        and st.session_state.get("kline_options_months") != oi_horizon_months
+    ):
+        with st.spinner(f"Updating {ticker} {oi_horizon_months}-month option open interest..."):
+            st.session_state["kline_options_oi"] = fetch_options_open_interest(ticker, oi_horizon_months)
+            st.session_state["kline_options_months"] = oi_horizon_months
 
     auto_refresh_enabled = st.session_state.get("auto_refresh_kline", False)
     auto_refresh_interval_seconds = int(st.session_state.get("auto_refresh_interval_minutes", 5)) * 60
@@ -4571,6 +4789,9 @@ def render_kline(user, cache_key, display_currency="Local"):
             )
             if fig:
                 render_persistent_kline_chart(fig, f"{request_key}_{display_currency}")
+            raw_closes = data.get("ohlc", {}).get("close") if isinstance(data.get("ohlc"), dict) else []
+            latest_option_price = raw_closes[-1] if raw_closes else None
+            render_option_oi_walls(st.session_state.get("kline_options_oi"), ticker, dark_mode, latest_option_price)
 
     _render_kline_body()
 

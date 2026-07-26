@@ -1,4 +1,5 @@
 import math
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -39,6 +40,8 @@ def test_default_calculations_match_existing_indicator_formulas():
     delta = close.diff()
     expected_rsi = 100 - 100 / (1 + delta.where(delta > 0, 0).rolling(14).mean() / -delta.where(delta < 0, 0).rolling(14).mean())
     assert result["rsi"][-1] == pytest.approx(expected_rsi.iloc[-1])
+    true_range = pd.concat([close + 2 - (close - 1), (close + 2 - close.shift(1)).abs(), (close - 1 - close.shift(1)).abs()], axis=1).max(axis=1)
+    assert result["atr"][-1] == pytest.approx(true_range.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean().iloc[-1])
 
 
 def test_custom_ema_and_indicator_parameters_are_applied():
@@ -47,12 +50,14 @@ def test_custom_ema_and_indicator_parameters_are_applied():
     settings["macd"] = {"fast": 3, "slow": 6, "signal": 2}
     settings["kdj"] = {"period": 3, "k_smoothing": 2, "d_smoothing": 2}
     settings["rsi"] = {"period": 3}
+    settings["atr"] = {"period": 3}
     values = [10, 12, 11, 14, 16, 15]
     result = calculate_configurable_indicators([f"2026-01-0{i + 1}" for i in range(6)], _ohlcv(values), settings, "1d")
 
     assert result["moving_averages"][0][-1] == pytest.approx(pd.Series(values).ewm(span=3, adjust=False).mean().iloc[-1])
     assert not math.isnan(result["kdj_k"][-1])
     assert not math.isnan(result["rsi"][-1])
+    assert not math.isnan(result["atr"][-1])
 
 
 def test_invalid_settings_are_rejected_and_bad_saved_values_reset_to_defaults():
@@ -70,6 +75,7 @@ def test_fibonacci_defaults_validation_and_legacy_settings_merge():
         "retracement": {"enabled": False, "deviation": 3.0, "depth": 10},
         "extension": {"enabled": False, "depth": 10},
     }
+    assert defaults["atr"] == {"period": 14}
 
     legacy = {"moving_averages": [{"period": 7, "type": "EMA"}] + defaults["moving_averages"][1:]}
     merged = normalize_indicator_settings(legacy)
@@ -114,3 +120,22 @@ def test_non_intraday_vwap_is_cumulative_over_the_loaded_range():
     first = (12 + 9 + 10) / 3
     second = (22 + 19 + 20) / 3
     assert result["vwap"] == pytest.approx([first, (first * 100 + second * 300) / 400])
+
+
+def test_multiuser_kline_loads_option_walls_only_on_manual_plot():
+    source = (Path(__file__).resolve().parents[1] / "app_streamlit_multiuser.py").read_text(encoding="utf-8")
+    plot_start = source.index("    if plot:\n", source.index("def render_kline"))
+    auto_start = source.index("    auto_refresh_enabled =", plot_start)
+    assert "fetch_options_open_interest(ticker, oi_horizon_months)" in source[plot_start:auto_start]
+    body_start = source.index("    def _render_kline_body():", auto_start)
+    body_end = source.index("\ndef render_report_form_fields", body_start)
+    assert "fetch_options_open_interest(ticker, oi_horizon_months)" not in source[body_start:body_end]
+    assert '"Open-Interest horizon (months)"' in source
+    assert 'fig.add_vline(' in source
+    assert 'latest_option_price = raw_closes[-1] if raw_closes else None' in source
+    assert 'marker_color="#16a34a"' in source
+    assert 'marker_color="#dc2626"' in source
+    assert 'calculate_dealer_gex(nearest.get("gamma_legs", []), latest_price' in source
+    assert 'calculate_dealer_gex(three_month.get("gamma_legs", []), latest_price' in source
+    assert 'Gamma is recalculated from the cached option OI/IV whenever the K-line price refreshes.' in source
+    assert 'name=f"ATR({indicator_settings[\'atr\'][\'period\']})"' in source

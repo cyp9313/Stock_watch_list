@@ -66,7 +66,11 @@ def render_indicator_settings_panel(
             with kdj_cols[2]:
                 d_smoothing = int(st.number_input("D smooth", min_value=1, max_value=MAX_PERIOD, value=int(active["kdj"]["d_smoothing"]), key=f"{key_prefix}_kdj_d"))
 
-            rsi_period = int(st.number_input("RSI period", min_value=1, max_value=MAX_PERIOD, value=int(active["rsi"]["period"]), key=f"{key_prefix}_rsi"))
+            rsi_atr_cols = st.columns(2)
+            with rsi_atr_cols[0]:
+                rsi_period = int(st.number_input("RSI period", min_value=1, max_value=MAX_PERIOD, value=int(active["rsi"]["period"]), key=f"{key_prefix}_rsi"))
+            with rsi_atr_cols[1]:
+                atr_period = int(st.number_input("ATR period", min_value=1, max_value=MAX_PERIOD, value=int(active["atr"]["period"]), key=f"{key_prefix}_atr"))
             with st.expander("Fibonacci", expanded=False):
                 retracement_enabled = st.checkbox(
                     "Enable Auto Fib Retracement",
@@ -116,6 +120,7 @@ def render_indicator_settings_panel(
             "macd": {"fast": fast, "slow": slow, "signal": signal},
             "kdj": {"period": kdj_period, "k_smoothing": k_smoothing, "d_smoothing": d_smoothing},
             "rsi": {"period": rsi_period},
+            "atr": {"period": atr_period},
             "fibonacci": {
                 "retracement": {
                     "enabled": retracement_enabled,

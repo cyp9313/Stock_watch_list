@@ -26,6 +26,7 @@ _DEFAULT_INDICATOR_SETTINGS = {
     "macd": {"fast": 12, "slow": 26, "signal": 9},
     "kdj": {"period": 9, "k_smoothing": 3, "d_smoothing": 3},
     "rsi": {"period": 14},
+    "atr": {"period": 14},
     "fibonacci": {
         "retracement": {"enabled": False, "deviation": 3.0, "depth": 10},
         "extension": {"enabled": False, "depth": 10},
@@ -111,6 +112,11 @@ def validate_indicator_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("RSI settings are invalid")
     rsi_period = _positive_int(rsi.get("period"), "RSI period")
 
+    atr = settings.get("atr")
+    if not isinstance(atr, Mapping):
+        raise ValueError("ATR settings are invalid")
+    atr_period = _positive_int(atr.get("period"), "ATR period")
+
     fibonacci = settings.get("fibonacci")
     if not isinstance(fibonacci, Mapping):
         raise ValueError("Fibonacci settings are invalid")
@@ -132,6 +138,7 @@ def validate_indicator_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
             "d_smoothing": d_smoothing,
         },
         "rsi": {"period": rsi_period},
+        "atr": {"period": atr_period},
         "fibonacci": {
             "retracement": {
                 "enabled": retracement_enabled,
@@ -231,6 +238,13 @@ def calculate_configurable_indicators(
     loss = -delta.where(delta < 0, 0).rolling(rsi_period).mean()
     rsi = 100 - (100 / (1 + gain / loss))
 
+    atr_period = normalized["atr"]["period"]
+    previous_close = close.shift(1)
+    true_range = pd.concat(
+        [high - low, (high - previous_close).abs(), (low - previous_close).abs()], axis=1,
+    ).max(axis=1)
+    atr = true_range.ewm(alpha=1 / atr_period, adjust=False, min_periods=atr_period).mean()
+
     typical_price = (high + low + close) / 3
     valid_volume = volume.gt(0) & typical_price.notna()
     vwap = pd.Series(np.nan, index=close.index, dtype="float64")
@@ -253,5 +267,6 @@ def calculate_configurable_indicators(
         "kdj_d": d_value.tolist(),
         "kdj_j": (3 * k_value - 2 * d_value).tolist(),
         "rsi": rsi.tolist(),
+        "atr": atr.tolist(),
         "vwap": vwap.tolist(),
     }

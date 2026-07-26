@@ -21,6 +21,7 @@ import requests_cache
 from stockanalysis_scraper import scrape_batch, should_query_forward_pe
 from short_term_watchlist import candlestick_svg
 from ticker_mapping import normalize_yfinance_ticker
+from options_open_interest import aggregate_open_interest, option_gamma_legs, select_option_expirations
 
 RELATIVE_RETURN_BENCHMARK = "^GSPC"
 DEFAULT_BETA_BENCHMARK = "^GSPC"
@@ -3179,6 +3180,113 @@ def get_kline_data():
         return jsonify({"success": False, "error": str(e)})
     finally:
         CURRENT_DB_PATH.reset(cache_token)
+
+
+def _option_gamma_assumptions(ticker_info):
+    """Return conservative market-input proxies for the manually loaded GEX view."""
+    assumptions = {
+        "risk_free_rate": 0.0,
+        "dividend_yield": 0.0,
+        "risk_free_rate_source": "0% fallback",
+        "dividend_yield_source": "0% fallback",
+    }
+    try:
+        treasury_history = yf.Ticker("^IRX").history(period="5d", auto_adjust=False)
+        close_values = treasury_history.get("Close") if isinstance(treasury_history, pd.DataFrame) else None
+        closes = pd.to_numeric(close_values, errors="coerce").dropna() if isinstance(close_values, pd.Series) else pd.Series(dtype="float64")
+        if not closes.empty and np.isfinite(float(closes.iloc[-1])):
+            simple_rate = max(0.0, float(closes.iloc[-1]) / 100.0)
+            assumptions["risk_free_rate"] = float(np.log1p(simple_rate))
+            assumptions["risk_free_rate_source"] = "^IRX proxy (continuously compounded)"
+    except (requests.RequestException, AttributeError, KeyError, TypeError, ValueError, RuntimeError, OSError):
+        pass
+    try:
+        info = ticker_info.get_info()
+        raw_yield = info.get("dividendYield", info.get("trailingAnnualDividendYield")) if isinstance(info, dict) else None
+        yield_rate = float(raw_yield)
+        if np.isfinite(yield_rate) and yield_rate >= 0:
+            assumptions["dividend_yield"] = yield_rate / 100.0 if yield_rate > 1 else yield_rate
+            assumptions["dividend_yield_source"] = "yfinance dividend yield"
+    except (requests.RequestException, AttributeError, KeyError, TypeError, ValueError, RuntimeError, OSError):
+        pass
+    return assumptions
+
+
+@app.route('/api/options_open_interest', methods=['GET'])
+def get_options_open_interest():
+    """Return nearest-expiry and configurable-horizon option OI walls for one ticker."""
+    ticker = normalize_yfinance_ticker(request.args.get('ticker', ''))
+    if not ticker:
+        return jsonify({"success": False, "error": "A ticker is required"}), 400
+    try:
+        horizon_months = int(request.args.get("months", 3))
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "error": "Months must be an integer from 1 to 12"}), 400
+    if not 1 <= horizon_months <= 12:
+        return jsonify({"success": False, "error": "Months must be an integer from 1 to 12"}), 400
+    try:
+        ticker_info = yf.Ticker(ticker)
+        as_of = datetime.date.today()
+        nearest_candidate, horizon_expirations, horizon_end = select_option_expirations(
+            list(ticker_info.options or ()), as_of, horizon_months,
+        )
+        if not nearest_candidate:
+            return jsonify({"success": False, "error": "No future option expirations are available", "ticker": ticker})
+
+        chains: dict[str, object] = {}
+        failures: list[str] = []
+
+        def load_chain(expiration: str):
+            if expiration not in chains:
+                try:
+                    chains[expiration] = ticker_info.option_chain(expiration)
+                except (requests.RequestException, KeyError, TypeError, ValueError, RuntimeError, OSError):
+                    failures.append(expiration)
+                    chains[expiration] = None
+            return chains[expiration]
+
+        nearest_expiry = None
+        nearest_rows: list[dict[str, float | int]] = []
+        nearest_legs: list[dict[str, float | int | str]] = []
+        for expiration in [nearest_candidate, *[item for item in horizon_expirations if item != nearest_candidate]]:
+            chain = load_chain(expiration)
+            rows = aggregate_open_interest([chain]) if chain is not None else []
+            if rows:
+                nearest_expiry, nearest_rows = expiration, rows
+                nearest_legs = option_gamma_legs(chain, expiration)
+                break
+
+        long_term_chains = [load_chain(expiration) for expiration in horizon_expirations]
+        long_term_rows = aggregate_open_interest(chain for chain in long_term_chains if chain is not None)
+        long_term_legs = [
+            leg
+            for expiration, chain in zip(horizon_expirations, long_term_chains)
+            if chain is not None
+            for leg in option_gamma_legs(chain, expiration)
+        ]
+        return jsonify({
+            "success": True,
+            "ticker": ticker,
+            "as_of": as_of.isoformat(),
+            "nearest": {
+                "expiration": nearest_expiry,
+                "rows": nearest_rows,
+                "gamma_legs": nearest_legs,
+                "label": "same-day" if nearest_expiry == as_of.isoformat() else "next available expiry",
+            },
+            "three_month": {
+                "months": horizon_months,
+                "through": horizon_end,
+                "expirations": horizon_expirations,
+                "rows": long_term_rows,
+                "gamma_legs": long_term_legs,
+            },
+            "gamma_assumptions": _option_gamma_assumptions(ticker_info),
+            "unavailable_expirations": failures,
+        })
+    except (requests.RequestException, KeyError, TypeError, ValueError, RuntimeError, OSError):
+        return jsonify({"success": False, "error": "Option open-interest data is unavailable", "ticker": ticker})
+
 
 @app.route('/api/fear_greed', methods=['GET'])
 def get_fear_greed():
