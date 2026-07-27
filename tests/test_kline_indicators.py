@@ -42,6 +42,7 @@ def test_default_calculations_match_existing_indicator_formulas():
     assert result["rsi"][-1] == pytest.approx(expected_rsi.iloc[-1])
     true_range = pd.concat([close + 2 - (close - 1), (close + 2 - close.shift(1)).abs(), (close - 1 - close.shift(1)).abs()], axis=1).max(axis=1)
     assert result["atr"][-1] == pytest.approx(true_range.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean().iloc[-1])
+    assert result["adx"][-1] == pytest.approx(100.0)
 
 
 def test_custom_ema_and_indicator_parameters_are_applied():
@@ -51,6 +52,7 @@ def test_custom_ema_and_indicator_parameters_are_applied():
     settings["kdj"] = {"period": 3, "k_smoothing": 2, "d_smoothing": 2}
     settings["rsi"] = {"period": 3}
     settings["atr"] = {"period": 3}
+    settings["adx"] = {"period": 3}
     values = [10, 12, 11, 14, 16, 15]
     result = calculate_configurable_indicators([f"2026-01-0{i + 1}" for i in range(6)], _ohlcv(values), settings, "1d")
 
@@ -58,6 +60,7 @@ def test_custom_ema_and_indicator_parameters_are_applied():
     assert not math.isnan(result["kdj_k"][-1])
     assert not math.isnan(result["rsi"][-1])
     assert not math.isnan(result["atr"][-1])
+    assert not math.isnan(result["adx"][-1])
 
 
 def test_invalid_settings_are_rejected_and_bad_saved_values_reset_to_defaults():
@@ -76,6 +79,7 @@ def test_fibonacci_defaults_validation_and_legacy_settings_merge():
         "extension": {"enabled": False, "depth": 10},
     }
     assert defaults["atr"] == {"period": 14}
+    assert defaults["adx"] == {"period": 14}
 
     legacy = {"moving_averages": [{"period": 7, "type": "EMA"}] + defaults["moving_averages"][1:]}
     merged = normalize_indicator_settings(legacy)
@@ -146,3 +150,5 @@ def test_multiuser_kline_loads_option_walls_only_on_manual_plot():
     assert 'legendgroup="gex_negative"' in source
     assert 'groupclick="togglegroup"' in source
     assert 'name=f"ATR({indicator_settings[\'atr\'][\'period\']})"' in source
+    assert 'name=f"ADX({indicator_settings[\'adx\'][\'period\']})"' in source
+    assert 'st.number_input("ADX period"' in source

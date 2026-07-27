@@ -20,6 +20,7 @@ import fear_and_greed
 import requests_cache
 from stockanalysis_scraper import scrape_batch, should_query_forward_pe
 from short_term_watchlist import candlestick_svg
+from kline_indicators import calculate_adx_series
 from ticker_mapping import normalize_yfinance_ticker
 from options_open_interest import aggregate_open_interest, option_gamma_legs, select_option_expirations
 
@@ -2664,6 +2665,12 @@ def get_stock_data():
                 vol_series_raw = pd.Series(index=price_series.index, data=np.nan)
 
             d = pd.DataFrame({"Adj Close": price_series}).join(vol_series_raw.rename('Volume'), how='left')
+            for ohlc_field in ("High", "Low", "Close"):
+                field_data = daily_ohlc.get(ohlc_field, pd.DataFrame())
+                if isinstance(field_data, pd.DataFrame) and ticker in field_data:
+                    d[ohlc_field] = pd.to_numeric(field_data[ticker], errors="coerce").reindex(d.index)
+                else:
+                    d[ohlc_field] = np.nan
 
             try:
                 base_price = d.loc[d.index <= base_date, "Adj Close"].iloc[-1]
@@ -2679,6 +2686,7 @@ def get_stock_data():
             d["BB_Up"] = d["BB_Mid"] + 2 * d["BB_Std"]
             d["BB_Low"] = d["BB_Mid"] - 2 * d["BB_Std"]
             d["RSI"] = compute_rsi_series(d["Adj Close"])
+            d["ADX"] = calculate_adx_series(d["High"], d["Low"], d["Close"], 14)
 
             latest = d.iloc[-1]
             prev = d.iloc[-2] if len(d) > 1 else latest
@@ -2811,6 +2819,7 @@ def get_stock_data():
                 "1M%": pct(latest["Adj Close"], d.iloc[-21]["Adj Close"]) if len(d) > 21 else np.nan,
                 "YTD%": pct(latest["Adj Close"], base_price) if pd.notna(base_price) else np.nan,
                 "RSI": round(float(latest["RSI"]), 2) if pd.notna(latest.get("RSI", np.nan)) else np.nan,
+                "ADX": round(float(latest["ADX"]), 2) if pd.notna(latest.get("ADX", np.nan)) else np.nan,
                 "Volume_Ratio": (latest["Volume"] / latest["Volume_EMA5"]) if pd.notna(latest.get("Volume_EMA5")) and latest.get("Volume_EMA5") not in (0, None) else np.nan,
                 "Next Earnings": next_earnings.strftime('%Y-%m-%d') if next_earnings and not pd.isna(next_earnings) else None,
                 "Trailing PE": trailing_PE,
@@ -2836,7 +2845,6 @@ def get_stock_data():
                 )
             else:
                 row["Candles (20)"] = ""
-
             for n in [5, 10, 20, 50, 100, 200]:
                 ema = latest.get(f"EMA{n}", np.nan)
                 row[f"Diff_EMA{n}%"] = pct(latest["Adj Close"], ema) if pd.notna(ema) and ema != 0 else np.nan

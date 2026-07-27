@@ -27,6 +27,7 @@ _DEFAULT_INDICATOR_SETTINGS = {
     "kdj": {"period": 9, "k_smoothing": 3, "d_smoothing": 3},
     "rsi": {"period": 14},
     "atr": {"period": 14},
+    "adx": {"period": 14},
     "fibonacci": {
         "retracement": {"enabled": False, "deviation": 3.0, "depth": 10},
         "extension": {"enabled": False, "depth": 10},
@@ -117,6 +118,11 @@ def validate_indicator_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("ATR settings are invalid")
     atr_period = _positive_int(atr.get("period"), "ATR period")
 
+    adx = settings.get("adx")
+    if not isinstance(adx, Mapping):
+        raise ValueError("ADX settings are invalid")
+    adx_period = _positive_int(adx.get("period"), "ADX period")
+
     fibonacci = settings.get("fibonacci")
     if not isinstance(fibonacci, Mapping):
         raise ValueError("Fibonacci settings are invalid")
@@ -139,6 +145,7 @@ def validate_indicator_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
         },
         "rsi": {"period": rsi_period},
         "atr": {"period": atr_period},
+        "adx": {"period": adx_period},
         "fibonacci": {
             "retracement": {
                 "enabled": retracement_enabled,
@@ -182,6 +189,24 @@ def _ohlcv_series(ohlc: Mapping[str, Sequence[Any]], key: str, length: int) -> p
     if not isinstance(values, Sequence) or isinstance(values, (str, bytes)) or len(values) != length:
         raise ValueError(f"OHLC field {key} must match dates length")
     return pd.to_numeric(pd.Series(values, dtype="object"), errors="coerce")
+
+
+def calculate_adx_series(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
+    """Return Wilder's Average Directional Index for aligned OHLC series."""
+    prior_close = close.shift(1)
+    true_range = pd.concat(
+        [high - low, (high - prior_close).abs(), (low - prior_close).abs()], axis=1,
+    ).max(axis=1)
+    upward_move = high.diff()
+    downward_move = -low.diff()
+    plus_dm = upward_move.where((upward_move > downward_move) & (upward_move > 0), 0.0)
+    minus_dm = downward_move.where((downward_move > upward_move) & (downward_move > 0), 0.0)
+    atr = true_range.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=1 / period, adjust=False, min_periods=period).mean() / atr
+    minus_di = 100 * minus_dm.ewm(alpha=1 / period, adjust=False, min_periods=period).mean() / atr
+    directional_sum = (plus_di + minus_di).replace(0, np.nan)
+    dx = 100 * (plus_di - minus_di).abs() / directional_sum
+    return dx.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
 
 
 def _session_keys(dates: Sequence[Any], interval: str) -> pd.Series:
@@ -244,6 +269,7 @@ def calculate_configurable_indicators(
         [high - low, (high - previous_close).abs(), (low - previous_close).abs()], axis=1,
     ).max(axis=1)
     atr = true_range.ewm(alpha=1 / atr_period, adjust=False, min_periods=atr_period).mean()
+    adx = calculate_adx_series(high, low, close, normalized["adx"]["period"])
 
     typical_price = (high + low + close) / 3
     valid_volume = volume.gt(0) & typical_price.notna()
@@ -268,5 +294,6 @@ def calculate_configurable_indicators(
         "kdj_j": (3 * k_value - 2 * d_value).tolist(),
         "rsi": rsi.tolist(),
         "atr": atr.tolist(),
+        "adx": adx.tolist(),
         "vwap": vwap.tolist(),
     }

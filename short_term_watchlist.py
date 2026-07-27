@@ -17,10 +17,11 @@ import numpy as np
 import pandas as pd
 
 from ticker_mapping import normalize_yfinance_ticker
+from kline_indicators import calculate_adx_series
 
 
 SHORT_TERM_COLUMNS = (
-    "Ticker", "Interval", "Price", "1D%", "Bar Diff%", "Candles (15)", "MA Spread‱", "MA 1 / MA 2",
+    "Ticker", "Interval", "Price", "1D%", "Bar Diff%", "Candles (15)", "ADX", "ADX (15)", "MA Spread‱", "MA 1 / MA 2",
     "Volume Ratio", "Volume (15)", "MACD Diff‱", "MACD / Signal", "Diff BB Upper%", "BB / Close", "Diff VWAP%",
     "VWAP / Close", "RSI", "RSI (30/70)", "ATR", "ATR (15)",
 )
@@ -32,6 +33,7 @@ _DEFAULT_SETTINGS = {
     "bollinger": {"period": 20, "stddev": 2.0},
     "rsi": {"period": 14},
     "atr": {"period": 14},
+    "adx": {"period": 14},
 }
 
 _DEFAULT_ALERTS = {
@@ -166,6 +168,7 @@ def normalize_short_term_watchlist(value: Any) -> dict[str, Any]:
             },
             "rsi": {"period": _bounded_int(merged["rsi"].get("period"), "RSI period")},
             "atr": {"period": _bounded_int(merged["atr"].get("period"), "ATR period")},
+            "adx": {"period": _bounded_int(merged["adx"].get("period"), "ADX period")},
         }
         if settings["macd"]["fast"] >= settings["macd"]["slow"]:
             raise ValueError("MACD fast period must be smaller than slow period")
@@ -206,6 +209,7 @@ def short_term_history_days(settings: Mapping[str, Any]) -> int:
         normalized["bollinger"]["period"],
         normalized["rsi"]["period"] + 1,
         normalized["atr"]["period"] + 1,
+        normalized["adx"]["period"] * 2,
     )
     return min(60, max(2, ceil(required_bars / 26)))
 
@@ -522,6 +526,26 @@ def atr_svg(atr_values: list[float]) -> str:
     )
 
 
+def adx_svg(adx_values: list[float]) -> str:
+    """Render a compact ADX trend line for the latest 15 bars."""
+    width, height, padding = 80, 30, 3
+    clipped_values = [min(50.0, max(0.0, float(value))) if np.isfinite(value) else value for value in adx_values]
+    path = _path(clipped_values, width, height, padding=padding, domain=(0.0, 50.0))
+    if not path:
+        return ""
+    def threshold_y(value: float) -> float:
+        return height - padding - (height - padding * 2) * value / 50.0
+
+    x_start, x_end = float(padding), float(width - padding)
+    return (
+        f"<svg viewBox='0 0 {width} {height}' width='{width}' height='{height}' role='img' aria-label='ADX'>"
+        f"<path d='M {x_start:.1f},{threshold_y(20):.1f} L {x_end:.1f},{threshold_y(20):.1f}' fill='none' stroke='#94a3b8' stroke-width='0.8' stroke-dasharray='3 2'/>"
+        f"<path d='M {x_start:.1f},{threshold_y(25):.1f} L {x_end:.1f},{threshold_y(25):.1f}' fill='none' stroke='#059669' stroke-width='0.8' stroke-dasharray='3 2'/>"
+        f"<path d='{escape(path, quote=True)}' fill='none' stroke='#059669' stroke-width='1.6'/>"
+        "</svg>"
+    )
+
+
 def volume_svg(volume_values: list[float]) -> str:
     """Return a compact bar sparkline for the last 15 K-line volumes."""
     width, height, padding = 80, 30, 2
@@ -617,6 +641,7 @@ def calculate_short_term_row(ticker: str, kline_data: Mapping[str, Any], setting
         axis=1,
     ).max(axis=1)
     atr = true_range.ewm(alpha=1 / atr_period, adjust=False, min_periods=atr_period).mean()
+    adx = calculate_adx_series(frame["high"], frame["low"], close, normalized["adx"]["period"])
 
     latest_timestamp = frame["timestamp"].iloc[-1]
     latest_volume = float(frame["volume"].iloc[-1]) if pd.notna(frame["volume"].iloc[-1]) else np.nan
@@ -688,6 +713,8 @@ def calculate_short_term_row(ticker: str, kline_data: Mapping[str, Any], setting
         "Price Source": _price_source(ticker, latest_timestamp, latest_volume),
         "Bar Diff%": _percent(latest_price - previous_close, previous_close),
         "Candles (15)": candlestick_svg(tail["open"].tolist(), tail["high"].tolist(), tail["low"].tolist(), tail["close"].tolist()),
+        "ADX": float(adx.iloc[-1]) if pd.notna(adx.iloc[-1]) else np.nan,
+        "ADX (15)": adx_svg(adx.iloc[-15:].tolist()),
         "MA Spread‱": _basis_points(float(ma_series[0].iloc[-1]) - float(ma_series[1].iloc[-1]), float(ma_series[1].iloc[-1])) if pd.notna(ma_series[0].iloc[-1]) and pd.notna(ma_series[1].iloc[-1]) else np.nan,
         "MA 1 / MA 2": two_line_svg(
             ma_series[0].iloc[-15:].tolist(), ma_series[1].iloc[-15:].tolist(),

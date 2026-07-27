@@ -106,7 +106,7 @@ PORTFOLIO_CHANGE_PERIODS = [
     ("1M%", "P/L 1M"),
 ]
 COLUMNS = (
-    ["Ticker", "Name", "Price", "Candles (20)", "1D%", "5D%", "1M%", "YTD%"]
+    ["Ticker", "Name", "Price", "Candles (20)", "ADX", "1D%", "5D%", "1M%", "YTD%"]
     + RELATIVE_RETURN_COLUMNS
     + [RELATIVE_MOMENTUM_COLUMN]
     + EMA_DIFF_COLUMNS
@@ -119,6 +119,7 @@ COLUMN_WIDTHS = {
     "Name": 200,
     "Price": 82,
     "Candles (20)": 104,
+    "ADX": 54,
     "1D%": 56,
     "5D%": 56,
     "1M%": 56,
@@ -154,6 +155,7 @@ RIGHT_ALIGNED_COLUMNS = {
     for col in COLUMNS
     if col not in {"Ticker", "Name", "Candles (20)", "Next Earnings"}
 }
+BREADTH_WATCHLIST_COLUMNS = ("Ticker", "Price", "1D%", "5D%", "1M%")
 
 SECTION_META = {
     "stocks_pages": {
@@ -834,6 +836,13 @@ def blue_color(value, clip=3.0):
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
+def adx_color(value):
+    """Color ADX around the 20–25 trend-strength transition zone."""
+    if pd.isna(value):
+        return "white"
+    return red_green(float(value) - 22.5, neg_clip=-12.5, pos_clip=22.5)
+
+
 def short_term_diverging_color(value, *, center=0.0, positive_color="#bbf7d0", negative_color="#fecaca", clip=5.0):
     """Return a white-neutral, two-sided color for short-term percentage cells."""
     if pd.isna(value):
@@ -1037,7 +1046,7 @@ def build_grouped_df(df, groups, display_currency="Local"):
                     disp = format_money_value(val, ticker, display_currency)
                 elif col == "Candles (20)":
                     disp = str(val) if isinstance(val, str) else ""
-                elif col in ("RSI", "Volume_Ratio"):
+                elif col in ("RSI", "ADX", "Volume_Ratio"):
                     disp = f"{float(val):.2f}" if pd.notna(val) else ""
                 elif col == "Next Earnings":
                     disp = val if isinstance(val, str) else val.strftime("%Y-%m-%d") if not pd.isna(val) else ""
@@ -1094,6 +1103,8 @@ def apply_cell_colors(df_display, df_raw, groups, columns=None):
                         cell_colors[(row_index, col_index)] = blue_color(val)
                     elif col == "RSI":
                         cell_colors[(row_index, col_index)] = rsi_color(val)
+                    elif col == "ADX":
+                        cell_colors[(row_index, col_index)] = adx_color(val)
                     elif col in RELATIVE_MOMENTUM_COLUMNS:
                         cell_colors[(row_index, col_index)] = red_green(val, neg_clip=-50.0, pos_clip=50.0)
                     elif col == "Next Earnings":
@@ -1131,6 +1142,8 @@ def render_grouped_table(
     show_relative_momentum_columns=False,
     show_ema_columns=False,
     show_financial_columns=True,
+    columns=None,
+    column_widths=None,
 ):
     if df.empty:
         st.info("No data available")
@@ -1160,13 +1173,14 @@ def render_grouped_table(
     if not show_financial_columns:
         hidden_columns.update(FINANCIAL_COLUMNS)
 
-    visible_columns = [
+    visible_columns = list(columns) if columns is not None else [
         col for col in COLUMNS
         if col not in hidden_columns
     ]
+    width_overrides = column_widths or {}
 
     theme = get_theme(dark_mode)
-    table_width = sum(COLUMN_WIDTHS.get(col, DEFAULT_COLUMN_WIDTH) for col in visible_columns)
+    table_width = sum(width_overrides.get(col, COLUMN_WIDTHS.get(col, DEFAULT_COLUMN_WIDTH)) for col in visible_columns)
 
     html_table = f"""
     <div style="width:100%; max-height:600px; overflow:auto;
@@ -1179,7 +1193,7 @@ def render_grouped_table(
     """
 
     for col in visible_columns:
-        html_table += f"<col style='width:{COLUMN_WIDTHS.get(col, DEFAULT_COLUMN_WIDTH)}px;'>"
+        html_table += f"<col style='width:{width_overrides.get(col, COLUMN_WIDTHS.get(col, DEFAULT_COLUMN_WIDTH))}px;'>"
 
     html_table += f"""
             </colgroup>
@@ -1258,11 +1272,10 @@ def render_grouped_table(
                 or (val and val[0] in "+-$0123456789")
                 else "left"
             )
-            title_attr = (
-                f" title='{html.escape(val, quote=True)}'"
-                if col == "Name" and val
-                else ""
-            )
+            ticker_name = row.get("Name", "")
+            ticker_name = str(ticker_name).strip() if pd.notna(ticker_name) else ""
+            tooltip_text = ticker_name if col == "Ticker" else val if col == "Name" else ""
+            title_attr = f" title='{html.escape(tooltip_text, quote=True)}'" if tooltip_text else ""
             sticky_style = sticky_first_column_style(bg_color) if col_index == 0 else ""
 
             cell_content = val if col == "Candles (20)" else html.escape(val)
@@ -1641,7 +1654,10 @@ def render_portfolio_table(
 
             align = "right" if col in RIGHT_ALIGNED_COLUMNS or col in PORTFOLIO_EXTRA_COLUMNS or (val and val[0] in "+-$€¥0123456789") else "left"
             font_weight = "font-weight:bold;" if is_total else ""
-            title_attr = f" title='{html.escape(val, quote=True)}'" if col == "Name" and val else ""
+            ticker_name = row.get("Name", "")
+            ticker_name = str(ticker_name).strip() if pd.notna(ticker_name) else ""
+            tooltip_text = ticker_name if col == "Ticker" else val if col == "Name" else ""
+            title_attr = f" title='{html.escape(tooltip_text, quote=True)}'" if tooltip_text else ""
             sticky_style = sticky_first_column_style(bg_color) if col_index == 0 else ""
             cell_content = val if col == "Candles (20)" else html.escape(val)
             html_table += (
@@ -2540,7 +2556,7 @@ def load_short_term_payloads(tickers, intervals, *, history_days, force_refresh=
 
 def _short_term_columns(settings):
     return [
-        "Ticker", "Interval", "Price", "1D%", "Bar Diff%", "Candles (15)",
+        "Ticker", "Interval", "Price", "1D%", "Bar Diff%", "Candles (15)", "ADX", "ADX (15)",
         "MA Spread‱", f"{settings['ma_1']['type']}({settings['ma_1']['period']}) / {settings['ma_2']['type']}({settings['ma_2']['period']})",
         "Volume Ratio", "Volume (15)", "MACD Diff‱", "MACD / Signal", "Diff BB Upper%", "BB / Close", "Diff VWAP%",
         "VWAP / Close", "RSI", "RSI (30/70)", "ATR", "ATR (15)",
@@ -2550,13 +2566,13 @@ def _short_term_columns(settings):
 def _short_term_value_text(key, value, ticker, display_currency):
     if key == "Price":
         return format_money_value(value, ticker, display_currency)
-    if key in {"Candles (15)", "MA 1 / MA 2", "Volume (15)", "MACD / Signal", "BB / Close", "VWAP / Close", "RSI (30/70)", "ATR (15)"}:
+    if key in {"Candles (15)", "ADX (15)", "MA 1 / MA 2", "Volume (15)", "MACD / Signal", "BB / Close", "VWAP / Close", "RSI (30/70)", "ATR (15)"}:
         return str(value or "")
     if key in {"1D%", "Bar Diff%", "Diff BB Upper%", "Diff VWAP%"}:
         return f"{float(value):.2f}" if pd.notna(value) else ""
     if key in {"MACD Diff‱", "MA Spread‱", "Volume Ratio"}:
         return f"{float(value):.4f}" if pd.notna(value) else ""
-    if key in {"RSI", "ATR"}:
+    if key in {"RSI", "ATR", "ADX"}:
         return f"{float(value):.2f}" if pd.notna(value) else ""
     return html.escape(str(value or ""))
 
@@ -2569,9 +2585,11 @@ def short_term_reference_metrics(stock_data):
     for _, item in stock_data.iterrows():
         ticker = str(item.get("Ticker") or "")
         if ticker and ticker not in metrics:
+            name = item.get("Name")
             metrics[ticker] = {
                 "Previous Close": pd.to_numeric(item.get("Previous Close"), errors="coerce"),
                 "Beta": pd.to_numeric(item.get("Beta"), errors="coerce"),
+                "Name": str(name).strip() if pd.notna(name) else "",
             }
     return metrics
 
@@ -2599,11 +2617,11 @@ def render_short_term_table(
     }
     html_table = f"""
     <div style="width:100%; max-height:650px; overflow:auto; border:1px solid {theme['table_border']};">
-      <table style="width:1686px; min-width:1686px; table-layout:fixed; border-collapse:collapse;
+      <table style="width:1828px; min-width:1828px; table-layout:fixed; border-collapse:collapse;
                     font-family:Arial; font-size:12px; background-color:{theme['table_bg']}; color:{theme['text']};">
         <thead style="position:sticky; top:0; z-index:10; background-color:{theme['table_header_bg']};"><tr>
     """
-    widths = [68, 48, 82, 64, 68, 88, 82, 88, 76, 88, 76, 88, 88, 88, 80, 88, 58, 88, 70, 88]
+    widths = [68, 48, 82, 64, 68, 88, 54, 88, 82, 88, 76, 88, 76, 88, 88, 88, 80, 88, 58, 88, 70, 88]
     for index, column in enumerate(columns):
         sticky = sticky_first_column_header_style(theme["table_header_bg"]) if index == 0 else ""
         html_table += f"<th title='{html.escape(column, quote=True)}' style='width:{widths[index]}px; padding:4px; text-align:left; {sticky} color:{theme['text']}; border:1px solid {theme['table_border']};'>{html.escape(column)}</th>"
@@ -2622,12 +2640,15 @@ def render_short_term_table(
                 html_table += "<tr>"
                 if interval_index == 0:
                     ticker_background = beta_color(row.get("Beta", np.nan))
-                    ticker_title = html.escape(str(row.get("Error") or ""), quote=True)
+                    ticker_name = str(reference.get("Name") or "").strip()
+                    ticker_error = str(row.get("Error") or "").strip()
+                    ticker_tooltip = " — ".join(part for part in (ticker_name, ticker_error) if part)
+                    ticker_title = html.escape(ticker_tooltip, quote=True)
                     ticker_text_color = theme["text"] if ticker_background == theme["table_bg"] else readable_text_color(ticker_background)
                     html_table += f"<td rowspan='2' title='{ticker_title}' style='padding:4px; text-align:left; {sticky_first_column_style(ticker_background)} color:{ticker_text_color}; background-color:{ticker_background}; border:1px solid {theme['table_border']}; white-space:nowrap; overflow:hidden;'>{html.escape(ticker)}</td>"
                 for index, (display_column, key) in enumerate(zip(columns[1:], value_keys[1:]), start=1):
                     value = interval if key == "Interval" else row.get(key, np.nan)
-                    if key in {"Candles (15)", "MA 1 / MA 2", "Volume (15)", "MACD / Signal", "BB / Close", "VWAP / Close", "RSI (30/70)", "ATR (15)"}:
+                    if key in {"Candles (15)", "ADX (15)", "MA 1 / MA 2", "Volume (15)", "MACD / Signal", "BB / Close", "VWAP / Close", "RSI (30/70)", "ATR (15)"}:
                         content = str(value or "")
                     else:
                         content = _short_term_value_text(key, value, ticker, display_currency)
@@ -2643,6 +2664,8 @@ def render_short_term_table(
                             background = "#dcfce7"
                     elif key == "RSI" and pd.notna(value):
                         background = rsi_color(value)
+                    elif key == "ADX" and pd.notna(value):
+                        background = adx_color(value)
                     elif key == "1D%" and pd.notna(value):
                         background = red_green(value)
                     elif key == "MACD Diff‱" and pd.notna(value):
@@ -2658,7 +2681,7 @@ def render_short_term_table(
                     elif key == "Volume Ratio" and pd.notna(value):
                         background = blue_color(value)
                     text_color = theme["text"] if background == theme["table_bg"] else readable_text_color(background)
-                    align = "left" if key in {"Interval", "Candles (15)", "MA 1 / MA 2", "Volume (15)", "MACD / Signal", "BB / Close", "VWAP / Close", "RSI (30/70)", "ATR (15)"} else "right"
+                    align = "left" if key in {"Interval", "Candles (15)", "ADX (15)", "MA 1 / MA 2", "Volume (15)", "MACD / Signal", "BB / Close", "VWAP / Close", "RSI (30/70)", "ATR (15)"} else "right"
                     active_signals = set((active_alerts.get((ticker, interval)) or {}).get("signals", []))
                     is_alerted = any(key in alert_columns.get(signal, set()) for signal in active_signals)
                     alert_class = " short-term-macd-alert-cell" if is_alerted else ""
@@ -2878,6 +2901,7 @@ def render_short_term_watchlist(config, user, *, stock_data=None, dark_mode=Fals
                     bb_stddev = float(st.number_input("Bollinger standard deviation", min_value=0.1, max_value=10.0, value=float(short_config["settings"]["bollinger"]["stddev"]), step=0.1, key=f"short_bb_stddev_{form_revision}"))
                 rsi_period = int(st.number_input("RSI period", min_value=1, max_value=500, value=short_config["settings"]["rsi"]["period"], key=f"short_rsi_period_{form_revision}"))
                 atr_period = int(st.number_input("ATR period", min_value=1, max_value=500, value=short_config["settings"]["atr"]["period"], key=f"short_atr_period_{form_revision}"))
+                adx_period = int(st.number_input("ADX period", min_value=1, max_value=500, value=short_config["settings"]["adx"]["period"], key=f"short_adx_period_{form_revision}"))
                 save_settings = st.form_submit_button("Apply indicator parameters", width="stretch")
             if save_settings:
                 candidate = {
@@ -2889,6 +2913,7 @@ def render_short_term_watchlist(config, user, *, stock_data=None, dark_mode=Fals
                         "bollinger": {"period": bb_period, "stddev": bb_stddev},
                         "rsi": {"period": rsi_period},
                         "atr": {"period": atr_period},
+                        "adx": {"period": adx_period},
                     },
                     "refresh": short_config["refresh"],
                     "alerts": short_config["alerts"],
@@ -2911,7 +2936,8 @@ def render_short_term_watchlist(config, user, *, stock_data=None, dark_mode=Fals
         "Ticker cell: greener beta is below 1; redder beta is above 1. "
         "Candles: teal = up, red = down. MA 1 = green; MA 2 = purple. Volume bars = light blue. "
         "MACD = blue; signal = orange; its dashed gray line is 0. Close = blue; VWAP = teal; VWAP ±1σ and Bollinger upper/lower are dashed gray. "
-        "RSI = purple; its dashed gray lines are 30 and 70. ATR = dark blue. VWAP values are blank outside a regular-session bar or when the latest bar has no volume."
+        "RSI = purple; its dashed gray lines are 30 and 70. ATR = dark blue. ADX = green; below 20 is range-like and above 25 is trend-like. "
+        "VWAP values are blank outside a regular-session bar or when the latest bar has no volume."
     )
     st.caption(f"Indicator history: {history_days} day(s), adjusted automatically for the active indicator periods.")
     # Check every second, then request data only on the selected 10/20/30s
@@ -3544,15 +3570,16 @@ def build_kline_chart(kline_data, ticker, fibonacci=None, dark_mode=False, uirev
             buy_count = 0
 
     fig = make_subplots(
-        rows=7,
+        rows=8,
         cols=2,
         shared_xaxes=True,
         vertical_spacing=0.02,
         horizontal_spacing=0.03,
-        row_heights=[0.36, 0.10, 0.11, 0.11, 0.10, 0.10, 0.12],
+        row_heights=[0.33, 0.09, 0.10, 0.10, 0.09, 0.09, 0.09, 0.11],
         column_widths=[0.78, 0.22],
         specs=[
             [{"secondary_y": False}, {"secondary_y": False}],
+            [{"secondary_y": False}, None],
             [{"secondary_y": False}, None],
             [{"secondary_y": False}, None],
             [{"secondary_y": False}, None],
@@ -3730,8 +3757,15 @@ def build_kline_chart(kline_data, ticker, fibonacci=None, dark_mode=False, uirev
     fig.update_yaxes(title_text="ATR", row=6, col=1, showgrid=True)
     fig.update_xaxes(row=6, col=1, showgrid=True)
 
-    fig.add_trace(go.Bar(x=dates, y=td_sell, name="TD Sell", marker_color="red", showlegend=False), row=7, col=1)
-    fig.add_trace(go.Bar(x=dates, y=[-value for value in td_buy], name="TD Buy", marker_color="green", showlegend=False), row=7, col=1)
+    if calculated.get("adx"):
+        fig.add_trace(go.Scatter(x=dates, y=calculated["adx"], name=f"ADX({indicator_settings['adx']['period']})", line=dict(color="#059669", width=1)), row=7, col=1)
+    fig.add_hline(y=20, line_dash="dash", line_color="gray", row=7, col=1)
+    fig.add_hline(y=25, line_dash="dash", line_color="#059669", row=7, col=1)
+    fig.update_yaxes(title_text="ADX", row=7, col=1, showgrid=True)
+    fig.update_xaxes(row=7, col=1, showgrid=True)
+
+    fig.add_trace(go.Bar(x=dates, y=td_sell, name="TD Sell", marker_color="red", showlegend=False), row=8, col=1)
+    fig.add_trace(go.Bar(x=dates, y=[-value for value in td_buy], name="TD Buy", marker_color="green", showlegend=False), row=8, col=1)
     for i in range(n):
         if 0 < td_sell[i] <= 9:
             fig.add_trace(
@@ -3744,7 +3778,7 @@ def build_kline_chart(kline_data, ticker, fibonacci=None, dark_mode=False, uirev
                     textfont=dict(color="red", size=11, family="Arial Black" if td_sell[i] == 9 else "Arial"),
                     showlegend=False,
                 ),
-                row=7,
+                row=8,
                 col=1,
             )
         if 0 < td_buy[i] <= 9:
@@ -3758,11 +3792,11 @@ def build_kline_chart(kline_data, ticker, fibonacci=None, dark_mode=False, uirev
                     textfont=dict(color="green", size=11, family="Arial Black" if td_buy[i] == 9 else "Arial"),
                     showlegend=False,
                 ),
-                row=7,
+                row=8,
                 col=1,
             )
-    fig.update_yaxes(title_text="TD Seq", row=7, col=1, range=[-13, 13], showgrid=True)
-    fig.update_xaxes(row=7, col=1, showgrid=True)
+    fig.update_yaxes(title_text="TD Seq", row=8, col=1, range=[-13, 13], showgrid=True)
+    fig.update_xaxes(row=8, col=1, showgrid=True)
     fig.update_xaxes(row=1, col=1, showgrid=True)
     fig.update_yaxes(row=1, col=1, showgrid=True)
 
@@ -3771,7 +3805,7 @@ def build_kline_chart(kline_data, ticker, fibonacci=None, dark_mode=False, uirev
     stable_ui_revision = str(uirevision or ticker)
     fig.update_layout(
         title=dict(text=title, x=0.01, xanchor="left", font=dict(color=theme["text"], size=15)),
-        height=1200,
+        height=1300,
         showlegend=True,
         legend=dict(
             orientation="h",
@@ -3816,7 +3850,7 @@ def build_kline_chart(kline_data, ticker, fibonacci=None, dark_mode=False, uirev
             showarrow=False,
         )
 
-    for row in range(1, 7):
+    for row in range(1, 8):
         fig.update_xaxes(showticklabels=False, row=row, col=1)
 
     return fig
@@ -5463,7 +5497,13 @@ with main_tabs[market_breadth_tab_index]:
                 f"({counts.get('sp500', 'N/A')} S&P 500, {counts.get('nasdaq100', 'N/A')} Nasdaq 100, "
                 f"{counts.get('overlap', 'N/A')} overlap)."
             )
-        render_grouped_table(pd.DataFrame(breadth["data"]), BREADTH_GROUPS, dark_mode=dark_mode)
+        render_grouped_table(
+            pd.DataFrame(breadth["data"]),
+            BREADTH_GROUPS,
+            dark_mode=dark_mode,
+            columns=BREADTH_WATCHLIST_COLUMNS,
+            column_widths={"Ticker": 140},
+        )
         st.divider()
         fig = build_breadth_chart(breadth, dark_mode=dark_mode)
         ndx_fig = build_breadth_chart(

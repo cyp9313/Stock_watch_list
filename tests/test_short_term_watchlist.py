@@ -63,6 +63,7 @@ def test_defaults_and_legacy_normalization_are_account_safe():
     }
     assert defaults["settings"]["ma_1"] == {"period": 9, "type": "EMA"}
     assert defaults["settings"]["atr"] == {"period": 14}
+    assert defaults["settings"]["adx"] == {"period": 14}
 
     config = normalize_short_term_watchlist({
         "groups": {"Momentum": ["AAPL", "aapl", "MSFT"]},
@@ -74,6 +75,7 @@ def test_defaults_and_legacy_normalization_are_account_safe():
     assert config["settings"]["ma_2"] == defaults["settings"]["ma_2"]
     assert config["settings"]["rsi"] == {"period": 14}
     assert config["settings"]["atr"] == {"period": 14}
+    assert config["settings"]["adx"] == {"period": 14}
     assert config["refresh"] == {"enabled": True, "interval_seconds": 20}
     assert config["alerts"] == defaults["alerts"]
     assert short_term_tickers(config) == ["AAPL", "MSFT"]
@@ -158,6 +160,10 @@ def test_row_calculates_requested_metrics_and_inline_svg():
     assert row["RSI (30/70)"].count("stroke-dasharray='3 2'") == 2
     assert row["ATR"] > 0
     assert "#1d4ed8" in row["ATR (15)"]
+    assert row["ADX"] > 25
+    assert "#059669" in row["ADX (15)"]
+    assert "M 3.0,17.4 L 77.0,17.4" in row["ADX (15)"]
+    assert "M 3.0,15.0 L 77.0,15.0" in row["ADX (15)"]
 
 
 def test_vwap_is_blank_for_zero_volume_or_after_hours_latest_bar():
@@ -345,13 +351,16 @@ def test_multiuser_tab_has_its_own_kline_request_and_fragment_refresh():
     assert '"BB / Close"' in source
     assert '"VWAP / Close"' in source
     assert '"1D%"' in source
-    assert '["Ticker", "Name", "Price", "Candles (20)", "1D%"' in source
+    assert '["Ticker", "Name", "Price", "Candles (20)", "ADX", "1D%"' in source
     assert 'cell_content = val if col == "Candles (20)" else html.escape(val)' in source
     assert 'elif col in {"Name", "Candles (20)"}:' in source
     assert '"Candles (20)": 104' in source
     assert "min-width:100%" not in source
     assert "short_term_reference_metrics(stock_data)" in section
     assert "ticker_background = beta_color" in source
+    assert source.count('tooltip_text = ticker_name if col == "Ticker"') == 2
+    assert '"Name": str(name).strip() if pd.notna(name) else ""' in source
+    assert 'ticker_tooltip = " — ".join(part for part in (ticker_name, ticker_error) if part)' in source
     assert '"MACD Diff‱"' in source
     assert 'short_term_diverging_color(value, clip=15.0)' in source
     assert '"macd": {"MACD / Signal"}' in source
@@ -360,6 +369,9 @@ def test_multiuser_tab_has_its_own_kline_request_and_fragment_refresh():
     assert '"% of VWAP band width"' in source
     assert '"ATR (15)"' in source
     assert 'st.number_input("ATR period"' in section
+    assert '"ADX (15)"' in source
+    assert 'st.number_input("ADX period"' in section
+    assert "adx_color(value)" in source
     assert 'return f"{float(value):.2f}" if pd.notna(value) else ""' in source
     assert "short_term_history_days" in source
     assert "history_days=history_days" in section
