@@ -1116,6 +1116,22 @@ def _timestamp_to_ny(ts):
     return ts.tz_convert('America/New_York')
 
 
+def _price_timestamp_label(value, source=""):
+    """Return a display-safe timestamp for the price represented in a table row."""
+    try:
+        timestamp = pd.Timestamp(value)
+    except (TypeError, ValueError):
+        return ""
+    if pd.isna(timestamp):
+        return ""
+    if source:
+        timestamp_ny = _timestamp_to_ny(timestamp)
+        return f"{source}: {timestamp_ny.strftime('%Y-%m-%d %H:%M %Z')}"
+    # Daily bars represent a trading-date close; do not convert a date-only
+    # timestamp between timezones and accidentally show the previous date.
+    return f"Daily price date: {timestamp.strftime('%Y-%m-%d')}"
+
+
 def _align_timestamp_to_index_tz(ts, index):
     ts = pd.Timestamp(ts)
     index_tz = getattr(index, "tz", None)
@@ -2801,10 +2817,14 @@ def get_stock_data():
 
             ticker_relative_scores = relative_return_scores.get(ticker, {})
 
+            price_update = extended_updates.get(ticker, {})
+            price_source = price_update.get("source")
+            price_timestamp = price_update.get("effective_timestamp") or latest.name
             row = {
                 "Ticker": ticker,
                 "Name": ticker_names.get(ticker),
                 "Price": float(round(latest["Adj Close"], 2)),
+                "Price Timestamp": _price_timestamp_label(price_timestamp, price_source),
                 "Previous Close": float(round(prev["Adj Close"], 2)),
                 "Beta": round(beta, 2) if not pd.isna(beta) else np.nan,
                 "20D Rel%": round(float(ticker_relative_scores.get("20D Rel%")), 2)
@@ -2828,7 +2848,7 @@ def get_stock_data():
                 "Analysts": analyst_rating if pd.notna(analyst_rating) else None,
                 "Price Target": price_target if pd.notna(price_target) else None,
                 "Market Cap": market_cap,
-                "Price Source": extended_updates.get(ticker, {}).get("source"),
+                "Price Source": price_source,
             }
 
             candle_parts = []

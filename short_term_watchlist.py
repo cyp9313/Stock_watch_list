@@ -710,6 +710,7 @@ def calculate_short_term_row(ticker: str, kline_data: Mapping[str, Any], setting
     return {
         "Ticker": ticker,
         "Price": latest_price,
+        "Price Timestamp": latest_timestamp.strftime("%Y-%m-%d %H:%M %Z"),
         "Price Source": _price_source(ticker, latest_timestamp, latest_volume),
         "Bar Diff%": _percent(latest_price - previous_close, previous_close),
         "Candles (15)": candlestick_svg(tail["open"].tolist(), tail["high"].tolist(), tail["low"].tolist(), tail["close"].tolist()),

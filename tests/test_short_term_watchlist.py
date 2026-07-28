@@ -134,6 +134,7 @@ def test_row_calculates_requested_metrics_and_inline_svg():
     row = calculate_short_term_row("AAPL", _payload(), config["settings"])
 
     assert row["Price"] == pytest.approx(103.9)
+    assert row["Price Timestamp"] == "2026-07-24 12:45 EDT"
     assert row["Bar Diff%"] == pytest.approx((103.9 - 103.8) / 103.8 * 100)
     assert row["MA Spread‱"] > 0
     assert "#16a34a" in row["MA 1 / MA 2"]
@@ -358,7 +359,8 @@ def test_multiuser_tab_has_its_own_kline_request_and_fragment_refresh():
     assert "min-width:100%" not in source
     assert "short_term_reference_metrics(stock_data)" in section
     assert "ticker_background = beta_color" in source
-    assert source.count('tooltip_text = ticker_name if col == "Ticker"') == 2
+    assert source.count('if col == "Ticker":\n                tooltip_text = ticker_name') == 2
+    assert source.count('price_timestamp_tooltip(') >= 4
     assert '"Name": str(name).strip() if pd.notna(name) else ""' in source
     assert 'ticker_tooltip = " — ".join(part for part in (ticker_name, ticker_error) if part)' in source
     assert '"MACD Diff‱"' in source

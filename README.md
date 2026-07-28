@@ -14,7 +14,7 @@ Stock Watch List 是一个可部署的股票与跨市场监控应用，而不只
 
 #### Watchlists、市场与图表
 
-- 可编辑的股票 Watchlist、Market Dashboard 和 Portfolio 页面；支持按组管理标的、Yahoo Finance 搜索添加标的、暗色模式和本币/EUR 显示。
+- 可编辑的股票 Watchlist、Market Dashboard 和 Portfolio 页面；支持按组管理标的、Yahoo Finance 搜索添加标的、暗色模式和本币/EUR 显示。Ticker 列会完整显示长代码；将鼠标悬停在 Price 上可查看该价格对应的交易日期，盘前/盘后估算价还会显示美国东部时间。
 - 日线市场数据：价格、最近 20 根日线 K 线蜡烛图、`1D%` / `5D%` / `1M%` / `YTD%`、RSI、成交量比、EMA 偏离、布林带、相对 `^GSPC` 的收益/动量、估值、分析师评级、目标价、市值和 Beta。
 - 顶部市场情绪卡片：CNN Fear & Greed、VIX 和 Crypto Fear & Greed。
 - Market Breadth：S&P 500 与 Nasdaq 100 的 20/50/200 日均线上方比例、历史图和 treemap。Breadth 只在手动点击 **Refresh Breadth** 时重新下载与计算。
@@ -244,7 +244,7 @@ Stock Watch List is a deployable market-monitoring and AI-reporting application,
 
 #### Watchlists, market dashboard, and charts
 
-- Editable grouped watchlists, market dashboards, and portfolio pages with Yahoo Finance ticker search, dark mode, and local/EUR display.
+- Editable grouped watchlists, market dashboards, and portfolio pages with Yahoo Finance ticker search, dark mode, and local/EUR display. Ticker cells wrap instead of truncating long symbols; hovering a Price cell shows its trading date, or the US Eastern timestamp for a pre-/after-hours estimate.
 - Daily-market metrics including price, a 20-bar daily candlestick SVG, 1D/5D/1M/YTD returns, RSI, volume ratio, EMA and Bollinger distances, relative returns/momentum versus `^GSPC`, valuation, analyst data, targets, market cap, and beta.
 - CNN Fear & Greed, VIX, and Crypto Fear & Greed cards; on-demand S&P 500/Nasdaq 100 market-breadth charts and treemaps.
 - Configurable K-line charts with SMA/EMA/ATR/ADX, VWAP, MACD, RSI, KDJ, Bollinger Bands, volume, chip peak, and Auto Fibonacci retracement/extension. In the multi-user app, a manual Plot also loads Call/Put open-interest walls and Dealer-GEX walls (positive calls, negative puts as a positioning proxy) for the nearest available expiry and an aggregate over a configurable 1–12-month horizon. Changing the OI horizon reloads OI/IV; K-line auto-refresh never reloads option chains, but recomputes GEX from cached OI/IV using the latest stock price and moves the price marker.

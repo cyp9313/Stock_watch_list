@@ -115,7 +115,7 @@ COLUMNS = (
 )
 DEFAULT_COLUMN_WIDTH = 70
 COLUMN_WIDTHS = {
-    "Ticker": 68,
+    "Ticker": 128,
     "Name": 200,
     "Price": 82,
     "Candles (20)": 104,
@@ -972,6 +972,16 @@ def format_currency_value(value, currency):
     return f"{prefix}{formatted}{suffix}"
 
 
+def price_timestamp_tooltip(row):
+    """Return the backend's price-date label for a native browser tooltip."""
+    if not isinstance(row, (dict, pd.Series)):
+        return ""
+    value = row.get("Price Timestamp", "")
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    return str(value).strip()
+
+
 def convert_currency_value(value, from_currency, to_currency):
     if value is None or pd.isna(value):
         return np.nan
@@ -1178,6 +1188,10 @@ def render_grouped_table(
         if col not in hidden_columns
     ]
     width_overrides = column_widths or {}
+    raw_by_ticker = (
+        df.drop_duplicates(subset="Ticker", keep="first").set_index("Ticker")
+        if "Ticker" in df and not df.empty else pd.DataFrame()
+    )
 
     theme = get_theme(dark_mode)
     table_width = sum(width_overrides.get(col, COLUMN_WIDTHS.get(col, DEFAULT_COLUMN_WIDTH)) for col in visible_columns)
@@ -1274,15 +1288,21 @@ def render_grouped_table(
             )
             ticker_name = row.get("Name", "")
             ticker_name = str(ticker_name).strip() if pd.notna(ticker_name) else ""
-            tooltip_text = ticker_name if col == "Ticker" else val if col == "Name" else ""
+            if col == "Ticker":
+                tooltip_text = ticker_name
+            elif col == "Price" and not raw_by_ticker.empty and str(row["Ticker"]) in raw_by_ticker.index:
+                tooltip_text = price_timestamp_tooltip(raw_by_ticker.loc[str(row["Ticker"])])
+            else:
+                tooltip_text = val if col == "Name" else ""
             title_attr = f" title='{html.escape(tooltip_text, quote=True)}'" if tooltip_text else ""
             sticky_style = sticky_first_column_style(bg_color) if col_index == 0 else ""
+            ticker_cell_style = "white-space:normal; overflow-wrap:anywhere; word-break:break-word;" if col == "Ticker" else "white-space:nowrap; overflow:hidden; text-overflow:ellipsis;"
 
             cell_content = val if col == "Candles (20)" else html.escape(val)
             html_table += (
                 f"<td{title_attr} style='padding:4px; text-align:{align}; "
                 f"{sticky_style}color:{text_color}; background-color:{bg_color}; "
-                f"white-space:nowrap; overflow:hidden; text-overflow:ellipsis; "
+                f"{ticker_cell_style} "
                 f"border:1px solid {theme['table_border']};'>"
                 f"{cell_content}</td>"
             )
@@ -1386,6 +1406,7 @@ def build_portfolio_enriched_df(raw_df, page):
         row = {col: base_row.get(col, np.nan) for col in COLUMNS}
         row["Ticker"] = ticker
         row["Beta"] = base_row.get("Beta", np.nan)
+        row["Price Timestamp"] = base_row.get("Price Timestamp", "")
         row["Price Source"] = base_row.get("Price Source", "")
 
         buy_currency = normalize_currency_code(holding.get("buy_currency"))
@@ -1656,14 +1677,20 @@ def render_portfolio_table(
             font_weight = "font-weight:bold;" if is_total else ""
             ticker_name = row.get("Name", "")
             ticker_name = str(ticker_name).strip() if pd.notna(ticker_name) else ""
-            tooltip_text = ticker_name if col == "Ticker" else val if col == "Name" else ""
+            if col == "Ticker":
+                tooltip_text = ticker_name
+            elif col == "Price" and not extra_by_ticker.empty and ticker in extra_by_ticker.index:
+                tooltip_text = price_timestamp_tooltip(extra_by_ticker.loc[ticker])
+            else:
+                tooltip_text = val if col == "Name" else ""
             title_attr = f" title='{html.escape(tooltip_text, quote=True)}'" if tooltip_text else ""
             sticky_style = sticky_first_column_style(bg_color) if col_index == 0 else ""
             cell_content = val if col == "Candles (20)" else html.escape(val)
+            ticker_cell_style = "white-space:normal; overflow-wrap:anywhere; word-break:break-word;" if col == "Ticker" else "white-space:nowrap; overflow:hidden; text-overflow:ellipsis;"
             html_table += (
                 f"<td{title_attr} style='padding:4px; text-align:{align}; {font_weight}"
-                f"{sticky_style}color:{text_color}; background-color:{bg_color}; white-space:nowrap; "
-                f"overflow:hidden; text-overflow:ellipsis; border:1px solid {theme['table_border']};'>"
+                f"{sticky_style}color:{text_color}; background-color:{bg_color}; {ticker_cell_style} "
+                f"border:1px solid {theme['table_border']};'>"
                 f"{cell_content}</td>"
             )
         html_table += "</tr>"
@@ -2617,11 +2644,11 @@ def render_short_term_table(
     }
     html_table = f"""
     <div style="width:100%; max-height:650px; overflow:auto; border:1px solid {theme['table_border']};">
-      <table style="width:1828px; min-width:1828px; table-layout:fixed; border-collapse:collapse;
+      <table style="width:1888px; min-width:1888px; table-layout:fixed; border-collapse:collapse;
                     font-family:Arial; font-size:12px; background-color:{theme['table_bg']}; color:{theme['text']};">
         <thead style="position:sticky; top:0; z-index:10; background-color:{theme['table_header_bg']};"><tr>
     """
-    widths = [68, 48, 82, 64, 68, 88, 54, 88, 82, 88, 76, 88, 76, 88, 88, 88, 80, 88, 58, 88, 70, 88]
+    widths = [128, 48, 82, 64, 68, 88, 54, 88, 82, 88, 76, 88, 76, 88, 88, 88, 80, 88, 58, 88, 70, 88]
     for index, column in enumerate(columns):
         sticky = sticky_first_column_header_style(theme["table_header_bg"]) if index == 0 else ""
         html_table += f"<th title='{html.escape(column, quote=True)}' style='width:{widths[index]}px; padding:4px; text-align:left; {sticky} color:{theme['text']}; border:1px solid {theme['table_border']};'>{html.escape(column)}</th>"
@@ -2645,7 +2672,7 @@ def render_short_term_table(
                     ticker_tooltip = " — ".join(part for part in (ticker_name, ticker_error) if part)
                     ticker_title = html.escape(ticker_tooltip, quote=True)
                     ticker_text_color = theme["text"] if ticker_background == theme["table_bg"] else readable_text_color(ticker_background)
-                    html_table += f"<td rowspan='2' title='{ticker_title}' style='padding:4px; text-align:left; {sticky_first_column_style(ticker_background)} color:{ticker_text_color}; background-color:{ticker_background}; border:1px solid {theme['table_border']}; white-space:nowrap; overflow:hidden;'>{html.escape(ticker)}</td>"
+                    html_table += f"<td rowspan='2' title='{ticker_title}' style='padding:4px; text-align:left; {sticky_first_column_style(ticker_background)} color:{ticker_text_color}; background-color:{ticker_background}; border:1px solid {theme['table_border']}; white-space:normal; overflow-wrap:anywhere; word-break:break-word;'>{html.escape(ticker)}</td>"
                 for index, (display_column, key) in enumerate(zip(columns[1:], value_keys[1:]), start=1):
                     value = interval if key == "Interval" else row.get(key, np.nan)
                     if key in {"Candles (15)", "ADX (15)", "MA 1 / MA 2", "Volume (15)", "MACD / Signal", "BB / Close", "VWAP / Close", "RSI (30/70)", "ATR (15)"}:
@@ -2685,7 +2712,9 @@ def render_short_term_table(
                     active_signals = set((active_alerts.get((ticker, interval)) or {}).get("signals", []))
                     is_alerted = any(key in alert_columns.get(signal, set()) for signal in active_signals)
                     alert_class = " short-term-macd-alert-cell" if is_alerted else ""
-                    html_table += f"<td class='{alert_class.strip()}' style='padding:4px; text-align:{align}; color:{text_color}; background-color:{background}; border:1px solid {theme['table_border']}; white-space:nowrap; overflow:hidden;'>{content}</td>"
+                    price_title = price_timestamp_tooltip(row) if key == "Price" else ""
+                    title_attr = f" title='{html.escape(price_title, quote=True)}'" if price_title else ""
+                    html_table += f"<td{title_attr} class='{alert_class.strip()}' style='padding:4px; text-align:{align}; color:{text_color}; background-color:{background}; border:1px solid {theme['table_border']}; white-space:nowrap; overflow:hidden;'>{content}</td>"
                 html_table += "</tr>"
     html_table += "</tbody></table></div>"
     st.markdown(html_table, unsafe_allow_html=True)
