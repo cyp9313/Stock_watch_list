@@ -8,4 +8,4 @@ def test_market_breadth_watchlist_uses_only_compact_market_columns():
     breadth_end = source.index('with main_tabs[portfolio_tab_index]:', breadth_start)
     section = source[breadth_start:breadth_end]
     assert "columns=BREADTH_WATCHLIST_COLUMNS" in section
-    assert 'column_widths={"Ticker": 140}' in section
+    assert "column_widths=" not in section

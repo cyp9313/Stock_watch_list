@@ -174,6 +174,8 @@ def test_post_valid_json(client, valid_payload):
     assert "<svg" in data["data"][0]["Candles (20)"]
     assert "width='96' height='36'" in data["data"][0]["Candles (20)"]
     assert data["data"][0]["Candles (20)"].count("<rect") == 20
+    for column in ("20D Rel (20)", "60D Rel (20)", "120D Rel (20)", "3/6/12M Rel (20)"):
+        assert column in data["data"][0]
     assert data["data"][0]["ADX"] > 25
     assert "ADX (20)" not in data["data"][0]
 

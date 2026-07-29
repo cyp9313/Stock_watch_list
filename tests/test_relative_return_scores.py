@@ -16,6 +16,7 @@ from stock_watch_list_back_end import (  # noqa: E402
     RELATIVE_RETURN_BENCHMARK,
     _is_legacy_truncated_ticker_name,
     _short_ticker_name,
+    compute_relative_indicator_sparklines,
     compute_rsi_series,
     compute_relative_return_scores,
 )
@@ -43,6 +44,21 @@ def test_relative_return_scores_are_excess_return_percentages():
         assert scores["AAA"][column] == pytest.approx(20.0)
         assert scores["BBB"][column] == pytest.approx(5.0)
         assert scores["^GSPC"][column] == pytest.approx(0.0)
+
+
+def test_relative_indicator_sparklines_include_each_relative_metric_and_zero_line():
+    dates = pd.bdate_range("2025-01-01", periods=300)
+    benchmark = 100.0 + np.linspace(0.0, 30.0, len(dates))
+    ticker = 100.0 + np.linspace(0.0, 55.0, len(dates)) + np.sin(np.arange(len(dates)))
+    data = pd.DataFrame({"^GSPC": benchmark, "AAA": ticker}, index=dates)
+
+    sparklines = compute_relative_indicator_sparklines(data, ["AAA", "^GSPC"])
+
+    for column in ("20D Rel (20)", "60D Rel (20)", "120D Rel (20)", "3/6/12M Rel (20)"):
+        svg = sparklines["AAA"][column]
+        assert "<svg" in svg
+        assert "stroke-dasharray='2 2'" in svg
+        assert "<polyline" in svg
 
 
 def test_compute_rsi_series_uses_14_day_average_gain_loss():

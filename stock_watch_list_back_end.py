@@ -40,6 +40,12 @@ RELATIVE_RETURN_COLUMNS = {
     120: "120D Rel%",
 }
 RELATIVE_MOMENTUM_COLUMN = "3/6/12M Rel%"
+RELATIVE_INDICATOR_SPARKLINE_COLUMNS = {
+    "20D Rel%": "20D Rel (20)",
+    "60D Rel%": "60D Rel (20)",
+    "120D Rel%": "120D Rel (20)",
+    RELATIVE_MOMENTUM_COLUMN: "3/6/12M Rel (20)",
+}
 
 # 加载 .env 文件中的环境变量（CWD 无关，始终从项目根目录加载）
 load_project_env()
@@ -416,6 +422,101 @@ def compute_relative_return_scores(
             scores[ticker][column] = float((ticker_latest / ticker_ref - 1.0 - benchmark_return) * 100.0)
 
     return scores
+
+
+def _relative_excess_return_series(prices, benchmark_prices, window):
+    """Return the rolling N-day excess return series in percentage points."""
+    aligned = pd.concat(
+        [
+            pd.to_numeric(prices, errors="coerce").rename("ticker"),
+            pd.to_numeric(benchmark_prices, errors="coerce").rename("benchmark"),
+        ],
+        axis=1,
+    ).dropna()
+    if aligned.empty:
+        return pd.Series(dtype=float)
+    return (aligned["ticker"].pct_change(window) - aligned["benchmark"].pct_change(window)) * 100.0
+
+
+def _relative_indicator_sparkline(values, aria_label):
+    """Render a compact, zero-referenced SVG line chart for a relative indicator."""
+    series = pd.to_numeric(pd.Series(values), errors="coerce").dropna().tail(20)
+    if len(series) < 2:
+        return ""
+
+    width, height, pad = 88, 32, 3
+    low = min(float(series.min()), 0.0)
+    high = max(float(series.max()), 0.0)
+    span = high - low
+    if span == 0:
+        span = max(abs(high), 1.0)
+        low -= span / 2
+        high += span / 2
+        span = high - low
+
+    def y_for(value):
+        return pad + (high - float(value)) * (height - 2 * pad) / span
+
+    x_step = (width - 2 * pad) / (len(series) - 1)
+    points = " ".join(
+        f"{pad + index * x_step:.1f},{y_for(value):.1f}"
+        for index, value in enumerate(series)
+    )
+    latest = float(series.iloc[-1])
+    line_color = "#16a34a" if latest >= 0 else "#dc2626"
+    zero_y = y_for(0.0)
+    return (
+        f"<svg viewBox='0 0 {width} {height}' width='{width}' height='{height}' role='img' "
+        f"aria-label='{aria_label}'><line x1='{pad}' y1='{zero_y:.1f}' x2='{width - pad}' "
+        f"y2='{zero_y:.1f}' stroke='#94a3b8' stroke-width='0.8' stroke-dasharray='2 2'/>"
+        f"<polyline fill='none' stroke='{line_color}' stroke-width='1.5' points='{points}'/></svg>"
+    )
+
+
+def compute_relative_indicator_sparklines(
+    adj_close,
+    tickers,
+    benchmark_ticker=RELATIVE_RETURN_BENCHMARK,
+):
+    """Build 20-bar trend sparklines for every displayed relative-momentum metric."""
+    tickers = list(dict.fromkeys(tickers))
+    empty = {
+        ticker: {column: "" for column in RELATIVE_INDICATOR_SPARKLINE_COLUMNS.values()}
+        for ticker in tickers
+    }
+    if adj_close is None or adj_close.empty or benchmark_ticker not in adj_close.columns:
+        return empty
+
+    benchmark_prices = pd.to_numeric(adj_close[benchmark_ticker], errors="coerce").dropna()
+    if benchmark_prices.empty:
+        return empty
+
+    for ticker in tickers:
+        if ticker not in adj_close.columns:
+            continue
+        prices = pd.to_numeric(adj_close[ticker], errors="coerce").dropna()
+        if prices.empty:
+            continue
+
+        for window, metric_column in RELATIVE_RETURN_COLUMNS.items():
+            values = _relative_excess_return_series(prices, benchmark_prices, window)
+            empty[ticker][RELATIVE_INDICATOR_SPARKLINE_COLUMNS[metric_column]] = _relative_indicator_sparkline(
+                values,
+                f"Last 20 values of {metric_column}",
+            )
+
+        m3m = _relative_excess_return_series(prices, benchmark_prices, 63)
+        m6m = _relative_excess_return_series(prices, benchmark_prices, 126)
+        m12m = _relative_excess_return_series(prices, benchmark_prices, 252)
+        momentum = pd.concat([m3m.rename("m3m"), m6m.rename("m6m"), m12m.rename("m12m")], axis=1).dropna()
+        if not momentum.empty:
+            weighted = 0.2 * momentum["m3m"] + 0.3 * momentum["m6m"] + 0.5 * momentum["m12m"]
+            empty[ticker][RELATIVE_INDICATOR_SPARKLINE_COLUMNS[RELATIVE_MOMENTUM_COLUMN]] = _relative_indicator_sparkline(
+                weighted,
+                f"Last 20 values of {RELATIVE_MOMENTUM_COLUMN}",
+            )
+
+    return empty
 
 
 def compute_rsi_series(prices, window=14):
@@ -2662,6 +2763,7 @@ def get_stock_data():
         beta_cache = get_cached_betas(all_tickers, today_str)
         beta_updates = []
         relative_return_scores = compute_relative_return_scores(adj_close, all_tickers)
+        relative_indicator_sparklines = compute_relative_indicator_sparklines(adj_close, all_tickers)
         beta_benchmark_prices = {}
         for benchmark_ticker in beta_benchmark_tickers:
             if not adj_close.empty and benchmark_ticker in adj_close.columns:
@@ -2816,6 +2918,7 @@ def get_stock_data():
                                 beta_updates.append((ticker, today_str, beta, len(common_idx)))
 
             ticker_relative_scores = relative_return_scores.get(ticker, {})
+            ticker_relative_sparklines = relative_indicator_sparklines.get(ticker, {})
 
             price_update = extended_updates.get(ticker, {})
             price_source = price_update.get("source")
@@ -2834,6 +2937,7 @@ def get_stock_data():
                 "120D Rel%": round(float(ticker_relative_scores.get("120D Rel%")), 2)
                 if pd.notna(ticker_relative_scores.get("120D Rel%", np.nan)) else np.nan,
                 RELATIVE_MOMENTUM_COLUMN: round(float(relative_momentum), 2) if not pd.isna(relative_momentum) else np.nan,
+                **ticker_relative_sparklines,
                 "1D%": pct(latest["Adj Close"], prev["Adj Close"]),
                 "5D%": pct(latest["Adj Close"], d.iloc[-6]["Adj Close"]) if len(d) > 6 else np.nan,
                 "1M%": pct(latest["Adj Close"], d.iloc[-21]["Adj Close"]) if len(d) > 21 else np.nan,

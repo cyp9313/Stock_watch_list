@@ -353,16 +353,16 @@ def test_multiuser_tab_has_its_own_kline_request_and_fragment_refresh():
     assert '"VWAP / Close"' in source
     assert '"1D%"' in source
     assert '["Ticker", "Name", "Price", "Candles (20)", "ADX", "1D%"' in source
-    assert 'cell_content = val if col == "Candles (20)" else html.escape(val)' in source
-    assert 'elif col in {"Name", "Candles (20)"}:' in source
+    assert 'cell_content = val if col == "Candles (20)" or col in RELATIVE_SPARKLINE_COLUMNS else html.escape(val)' in source
+    assert 'elif col in {"Name", "Candles (20)", *RELATIVE_SPARKLINE_COLUMNS}:' in source
     assert '"Candles (20)": 104' in source
     assert "min-width:100%" not in source
     assert "short_term_reference_metrics(stock_data)" in section
     assert "ticker_background = beta_color" in source
-    assert source.count('if col == "Ticker":\n                tooltip_text = ticker_name') == 2
+    assert source.count('tooltip_text = ticker_tooltip(ticker_name,') == 2
     assert source.count('price_timestamp_tooltip(') >= 4
     assert '"Name": str(name).strip() if pd.notna(name) else ""' in source
-    assert 'ticker_tooltip = " — ".join(part for part in (ticker_name, ticker_error) if part)' in source
+    assert 'ticker_tooltip(ticker_name, row.get("Beta", np.nan), ticker_error)' in source
     assert '"MACD Diff‱"' in source
     assert 'short_term_diverging_color(value, clip=15.0)' in source
     assert '"macd": {"MACD / Signal"}' in source

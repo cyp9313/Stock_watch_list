@@ -89,7 +89,19 @@ st.set_page_config(
 API_BASE = os.environ.get("STOCK_API_BASE_URL", "http://127.0.0.1:5000")
 RELATIVE_RETURN_COLUMNS = ["20D Rel%", "60D Rel%", "120D Rel%"]
 RELATIVE_MOMENTUM_COLUMN = "3/6/12M Rel%"
-RELATIVE_MOMENTUM_COLUMNS = RELATIVE_RETURN_COLUMNS + [RELATIVE_MOMENTUM_COLUMN]
+RELATIVE_MOMENTUM_VALUE_COLUMNS = RELATIVE_RETURN_COLUMNS + [RELATIVE_MOMENTUM_COLUMN]
+RELATIVE_SPARKLINE_BY_METRIC = {
+    "20D Rel%": "20D Rel (20)",
+    "60D Rel%": "60D Rel (20)",
+    "120D Rel%": "120D Rel (20)",
+    RELATIVE_MOMENTUM_COLUMN: "3/6/12M Rel (20)",
+}
+RELATIVE_SPARKLINE_COLUMNS = list(RELATIVE_SPARKLINE_BY_METRIC.values())
+RELATIVE_MOMENTUM_COLUMNS = [
+    column
+    for metric_column in RELATIVE_MOMENTUM_VALUE_COLUMNS
+    for column in (metric_column, RELATIVE_SPARKLINE_BY_METRIC[metric_column])
+]
 EMA_DIFF_COLUMNS = [f"Diff_EMA{n}%" for n in [5, 10, 20, 50, 100, 200]]
 FINANCIAL_COLUMNS = [
     "Next Earnings", "Trailing PE", "Forward PE", "PEG Ratio",
@@ -107,15 +119,14 @@ PORTFOLIO_CHANGE_PERIODS = [
 ]
 COLUMNS = (
     ["Ticker", "Name", "Price", "Candles (20)", "ADX", "1D%", "5D%", "1M%", "YTD%"]
-    + RELATIVE_RETURN_COLUMNS
-    + [RELATIVE_MOMENTUM_COLUMN]
+    + RELATIVE_MOMENTUM_COLUMNS
     + EMA_DIFF_COLUMNS
     + ["Diff_BB_Up%", "Diff_BB_Low%", "RSI", "Volume_Ratio"]
     + FINANCIAL_COLUMNS
 )
 DEFAULT_COLUMN_WIDTH = 70
 COLUMN_WIDTHS = {
-    "Ticker": 128,
+    "Ticker": 68,
     "Name": 200,
     "Price": 82,
     "Candles (20)": 104,
@@ -148,12 +159,14 @@ COLUMN_WIDTHS = {
     "P/L 1M": 84,
     "P/L%": 64,
 }
+for _relative_sparkline_column in RELATIVE_SPARKLINE_COLUMNS:
+    COLUMN_WIDTHS[_relative_sparkline_column] = 96
 for _ema_column in EMA_DIFF_COLUMNS:
     COLUMN_WIDTHS[_ema_column] = 70
 RIGHT_ALIGNED_COLUMNS = {
     col
     for col in COLUMNS
-    if col not in {"Ticker", "Name", "Candles (20)", "Next Earnings"}
+    if col not in {"Ticker", "Name", "Candles (20)", "Next Earnings", *RELATIVE_SPARKLINE_COLUMNS}
 }
 BREADTH_WATCHLIST_COLUMNS = ("Ticker", "Price", "1D%", "5D%", "1M%")
 
@@ -982,6 +995,28 @@ def price_timestamp_tooltip(row):
     return str(value).strip()
 
 
+def ticker_tooltip(name, beta, error=""):
+    """Return a compact native tooltip with a ticker's name and current beta."""
+    parts = []
+    name = str(name).strip() if pd.notna(name) else ""
+    if name:
+        parts.append(name)
+    beta = pd.to_numeric(beta, errors="coerce")
+    if pd.notna(beta):
+        parts.append(f"Beta: {float(beta):.2f}")
+    error = str(error).strip() if pd.notna(error) else ""
+    if error:
+        parts.append(error)
+    return "\n".join(parts)
+
+
+def ticker_column_width(tickers):
+    """Size a ticker column to its longest visible ticker plus compact padding."""
+    symbols = [str(ticker).strip() for ticker in tickers if str(ticker).strip()]
+    longest = max((len(symbol) for symbol in symbols), default=0)
+    return max(64, longest * 8 + 16)
+
+
 def convert_currency_value(value, from_currency, to_currency):
     if value is None or pd.isna(value):
         return np.nan
@@ -1048,10 +1083,10 @@ def build_grouped_df(df, groups, display_currency="Local"):
                     disp = ticker
                 elif col == "Name":
                     disp = str(val) if pd.notna(val) and val is not None else ""
-                elif col == RELATIVE_MOMENTUM_COLUMN:
+                elif col in RELATIVE_MOMENTUM_VALUE_COLUMNS:
                     disp = f"{float(val):.2f}" if pd.notna(val) else ""
-                elif col in RELATIVE_RETURN_COLUMNS:
-                    disp = f"{float(val):.2f}" if pd.notna(val) else ""
+                elif col in RELATIVE_SPARKLINE_COLUMNS:
+                    disp = str(val) if isinstance(val, str) else ""
                 elif col == "Price":
                     disp = format_money_value(val, ticker, display_currency)
                 elif col == "Candles (20)":
@@ -1098,7 +1133,7 @@ def apply_cell_colors(df_display, df_raw, groups, columns=None):
                 val = row[col] if col in row else np.nan
                 if col == "Ticker":
                     cell_colors[(row_index, col_index)] = beta_color(row.get("Beta", np.nan))
-                elif col in {"Name", "Candles (20)"}:
+                elif col in {"Name", "Candles (20)", *RELATIVE_SPARKLINE_COLUMNS}:
                     continue
                 elif col == "Price":
                     source = str(row.get("Price Source", "") or "").lower()
@@ -1115,7 +1150,7 @@ def apply_cell_colors(df_display, df_raw, groups, columns=None):
                         cell_colors[(row_index, col_index)] = rsi_color(val)
                     elif col == "ADX":
                         cell_colors[(row_index, col_index)] = adx_color(val)
-                    elif col in RELATIVE_MOMENTUM_COLUMNS:
+                    elif col in RELATIVE_MOMENTUM_VALUE_COLUMNS:
                         cell_colors[(row_index, col_index)] = red_green(val, neg_clip=-50.0, pos_clip=50.0)
                     elif col == "Next Earnings":
                         if isinstance(val, str):
@@ -1187,7 +1222,11 @@ def render_grouped_table(
         col for col in COLUMNS
         if col not in hidden_columns
     ]
-    width_overrides = column_widths or {}
+    width_overrides = dict(column_widths or {})
+    if "Ticker" in visible_columns:
+        width_overrides["Ticker"] = ticker_column_width(
+            ticker for tickers in groups.values() for ticker in tickers
+        )
     raw_by_ticker = (
         df.drop_duplicates(subset="Ticker", keep="first").set_index("Ticker")
         if "Ticker" in df and not df.empty else pd.DataFrame()
@@ -1281,15 +1320,17 @@ def render_grouped_table(
                 continue
 
             align = (
-                "right"
-                if col in RIGHT_ALIGNED_COLUMNS
-                or (val and val[0] in "+-$0123456789")
+                "left"
+                if col in {"Ticker", "Name"}
+                else "right"
+                if col in RIGHT_ALIGNED_COLUMNS or (val and val[0] in "+-$0123456789")
                 else "left"
             )
             ticker_name = row.get("Name", "")
             ticker_name = str(ticker_name).strip() if pd.notna(ticker_name) else ""
             if col == "Ticker":
-                tooltip_text = ticker_name
+                raw_ticker_row = raw_by_ticker.loc[str(row["Ticker"])] if not raw_by_ticker.empty and str(row["Ticker"]) in raw_by_ticker.index else {}
+                tooltip_text = ticker_tooltip(ticker_name, raw_ticker_row.get("Beta", np.nan))
             elif col == "Price" and not raw_by_ticker.empty and str(row["Ticker"]) in raw_by_ticker.index:
                 tooltip_text = price_timestamp_tooltip(raw_by_ticker.loc[str(row["Ticker"])])
             else:
@@ -1298,7 +1339,7 @@ def render_grouped_table(
             sticky_style = sticky_first_column_style(bg_color) if col_index == 0 else ""
             ticker_cell_style = "white-space:normal; overflow-wrap:anywhere; word-break:break-word;" if col == "Ticker" else "white-space:nowrap; overflow:hidden; text-overflow:ellipsis;"
 
-            cell_content = val if col == "Candles (20)" else html.escape(val)
+            cell_content = val if col == "Candles (20)" or col in RELATIVE_SPARKLINE_COLUMNS else html.escape(val)
             html_table += (
                 f"<td{title_attr} style='padding:4px; text-align:{align}; "
                 f"{sticky_style}color:{text_color}; background-color:{bg_color}; "
@@ -1582,8 +1623,13 @@ def render_portfolio_table(
         hidden_columns.update(FINANCIAL_COLUMNS)
 
     visible_columns = [col for col in (COLUMNS + PORTFOLIO_EXTRA_COLUMNS) if col not in hidden_columns]
+    table_column_widths = dict(COLUMN_WIDTHS)
+    if "Ticker" in visible_columns:
+        table_column_widths["Ticker"] = ticker_column_width(
+            ticker for tickers in groups.values() for ticker in tickers
+        )
     theme = get_theme(dark_mode)
-    table_width = sum(COLUMN_WIDTHS.get(col, DEFAULT_COLUMN_WIDTH) for col in visible_columns)
+    table_width = sum(table_column_widths.get(col, DEFAULT_COLUMN_WIDTH) for col in visible_columns)
     cell_colors = apply_cell_colors(df_display, enriched_df, groups, columns=visible_columns)
 
     for row_index in range(len(df_display)):
@@ -1631,7 +1677,7 @@ def render_portfolio_table(
             <colgroup>
     """
     for col in visible_columns:
-        html_table += f"<col style='width:{COLUMN_WIDTHS.get(col, DEFAULT_COLUMN_WIDTH)}px;'>"
+        html_table += f"<col style='width:{table_column_widths.get(col, DEFAULT_COLUMN_WIDTH)}px;'>"
     html_table += f"""
             </colgroup>
             <thead style="position:sticky; top:0; z-index:10;
@@ -1673,19 +1719,26 @@ def render_portfolio_table(
             if is_header:
                 continue
 
-            align = "right" if col in RIGHT_ALIGNED_COLUMNS or col in PORTFOLIO_EXTRA_COLUMNS or (val and val[0] in "+-$€¥0123456789") else "left"
+            align = (
+                "left"
+                if col in {"Ticker", "Name"}
+                else "right"
+                if col in RIGHT_ALIGNED_COLUMNS or col in PORTFOLIO_EXTRA_COLUMNS or (val and val[0] in "+-$€¥0123456789")
+                else "left"
+            )
             font_weight = "font-weight:bold;" if is_total else ""
             ticker_name = row.get("Name", "")
             ticker_name = str(ticker_name).strip() if pd.notna(ticker_name) else ""
             if col == "Ticker":
-                tooltip_text = ticker_name
+                beta = total_row.get("Beta", np.nan) if is_total else extra_by_ticker.loc[ticker].get("Beta", np.nan) if not extra_by_ticker.empty and ticker in extra_by_ticker.index else np.nan
+                tooltip_text = ticker_tooltip(ticker_name, beta)
             elif col == "Price" and not extra_by_ticker.empty and ticker in extra_by_ticker.index:
                 tooltip_text = price_timestamp_tooltip(extra_by_ticker.loc[ticker])
             else:
                 tooltip_text = val if col == "Name" else ""
             title_attr = f" title='{html.escape(tooltip_text, quote=True)}'" if tooltip_text else ""
             sticky_style = sticky_first_column_style(bg_color) if col_index == 0 else ""
-            cell_content = val if col == "Candles (20)" else html.escape(val)
+            cell_content = val if col == "Candles (20)" or col in RELATIVE_SPARKLINE_COLUMNS else html.escape(val)
             ticker_cell_style = "white-space:normal; overflow-wrap:anywhere; word-break:break-word;" if col == "Ticker" else "white-space:nowrap; overflow:hidden; text-overflow:ellipsis;"
             html_table += (
                 f"<td{title_attr} style='padding:4px; text-align:{align}; {font_weight}"
@@ -2642,13 +2695,17 @@ def render_short_term_table(
         "rsi": {"RSI (30/70)"},
         "rsi_upper": {"RSI (30/70)"},
     }
+    widths = [
+        ticker_column_width(ticker for tickers in groups.values() for ticker in tickers),
+        48, 82, 64, 68, 88, 54, 88, 82, 88, 76, 88, 76, 88, 88, 88, 80, 88, 58, 88, 70, 88,
+    ]
+    table_width = sum(widths)
     html_table = f"""
     <div style="width:100%; max-height:650px; overflow:auto; border:1px solid {theme['table_border']};">
-      <table style="width:1888px; min-width:1888px; table-layout:fixed; border-collapse:collapse;
+      <table style="width:{table_width}px; min-width:{table_width}px; table-layout:fixed; border-collapse:collapse;
                     font-family:Arial; font-size:12px; background-color:{theme['table_bg']}; color:{theme['text']};">
         <thead style="position:sticky; top:0; z-index:10; background-color:{theme['table_header_bg']};"><tr>
     """
-    widths = [128, 48, 82, 64, 68, 88, 54, 88, 82, 88, 76, 88, 76, 88, 88, 88, 80, 88, 58, 88, 70, 88]
     for index, column in enumerate(columns):
         sticky = sticky_first_column_header_style(theme["table_header_bg"]) if index == 0 else ""
         html_table += f"<th title='{html.escape(column, quote=True)}' style='width:{widths[index]}px; padding:4px; text-align:left; {sticky} color:{theme['text']}; border:1px solid {theme['table_border']};'>{html.escape(column)}</th>"
@@ -2669,8 +2726,10 @@ def render_short_term_table(
                     ticker_background = beta_color(row.get("Beta", np.nan))
                     ticker_name = str(reference.get("Name") or "").strip()
                     ticker_error = str(row.get("Error") or "").strip()
-                    ticker_tooltip = " — ".join(part for part in (ticker_name, ticker_error) if part)
-                    ticker_title = html.escape(ticker_tooltip, quote=True)
+                    ticker_title = html.escape(
+                        ticker_tooltip(ticker_name, row.get("Beta", np.nan), ticker_error),
+                        quote=True,
+                    )
                     ticker_text_color = theme["text"] if ticker_background == theme["table_bg"] else readable_text_color(ticker_background)
                     html_table += f"<td rowspan='2' title='{ticker_title}' style='padding:4px; text-align:left; {sticky_first_column_style(ticker_background)} color:{ticker_text_color}; background-color:{ticker_background}; border:1px solid {theme['table_border']}; white-space:normal; overflow-wrap:anywhere; word-break:break-word;'>{html.escape(ticker)}</td>"
                 for index, (display_column, key) in enumerate(zip(columns[1:], value_keys[1:]), start=1):
@@ -5531,7 +5590,6 @@ with main_tabs[market_breadth_tab_index]:
             BREADTH_GROUPS,
             dark_mode=dark_mode,
             columns=BREADTH_WATCHLIST_COLUMNS,
-            column_widths={"Ticker": 140},
         )
         st.divider()
         fig = build_breadth_chart(breadth, dark_mode=dark_mode)

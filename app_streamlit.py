@@ -299,7 +299,7 @@ BROAD_MARKET_TICKERS = list(dict.fromkeys(
 # COLUMNS (EXACTLY matching tkinter version)
 # ════════════════════════════════════════════════════════════
 COLUMNS = (
-    ["Ticker", "Name", "Price", "1D%", "5D%", "1M%", "YTD%", "3/6/12M Rel%"] +
+    ["Ticker", "Name", "Price", "1D%", "5D%", "1M%", "YTD%", "3/6/12M Rel%", "3/6/12M Rel (20)"] +
     [f"Diff_EMA{n}%" for n in [5, 10, 20, 50, 100, 200]] +
     ["Diff_BB_Up%", "Diff_BB_Low%", "RSI", "Volume_Ratio", "Next Earnings", "Trailing PE", "Forward PE", "PEG Ratio", "Analysts", "Price Target", "Market Cap"]
 )
@@ -313,6 +313,7 @@ COLUMN_WIDTHS = {
     "1M%": 58,
     "YTD%": 62,
     "3/6/12M Rel%": 98,
+    "3/6/12M Rel (20)": 96,
     "Diff_BB_Up%": 88,
     "Diff_BB_Low%": 92,
     "RSI": 54,
@@ -327,6 +328,25 @@ COLUMN_WIDTHS = {
 }
 for _ema_column in [f"Diff_EMA{n}%" for n in [5, 10, 20, 50, 100, 200]]:
     COLUMN_WIDTHS[_ema_column] = 76
+
+
+def ticker_column_width(tickers):
+    """Size a ticker column to its longest visible ticker plus compact padding."""
+    symbols = [str(ticker).strip() for ticker in tickers if str(ticker).strip()]
+    longest = max((len(symbol) for symbol in symbols), default=0)
+    return max(64, longest * 8 + 16)
+
+
+def ticker_tooltip(name, beta):
+    """Return a compact native tooltip with a ticker's name and current beta."""
+    parts = []
+    name = str(name).strip() if pd.notna(name) else ""
+    if name:
+        parts.append(name)
+    beta = pd.to_numeric(beta, errors="coerce")
+    if pd.notna(beta):
+        parts.append(f"Beta: {float(beta):.2f}")
+    return "\n".join(parts)
 
 
 # ── Color helpers (EXACTLY matching tkinter version) ─────────
@@ -618,6 +638,8 @@ def build_grouped_df(df, groups):
                         disp = str(val) if pd.notna(val) and val is not None else ""
                     elif col == "3/6/12M Rel%":
                         disp = f"{float(val):.2f}" if pd.notna(val) else ""
+                    elif col == "3/6/12M Rel (20)":
+                        disp = str(val) if isinstance(val, str) else ""
                     elif col in ("Price", "RSI", "Volume_Ratio"):
                         disp = f"{float(val):.2f}" if pd.notna(val) else ""
                     elif col == "Next Earnings":
@@ -677,7 +699,7 @@ def apply_cell_colors(df_display, df_raw, groups, columns=None):
                 if col == "Ticker":
                     beta_val = row.get("Beta", np.nan)
                     cell_colors[(r, j)] = beta_color(beta_val)
-                elif col == "Name":
+                elif col in {"Name", "3/6/12M Rel (20)"}:
                     continue
                 elif pd.notna(val) and df_display.iloc[r][col] != "" and col != "Price":
                     if col == "Volume_Ratio":
@@ -732,17 +754,26 @@ def render_grouped_table(df, groups, key_prefix="", dark_mode=False, show_name_c
         return
     
     visible_columns = COLUMNS if show_name_column else [col for col in COLUMNS if col != "Name"]
+    raw_by_ticker = (
+        df.drop_duplicates(subset="Ticker", keep="first").set_index("Ticker")
+        if "Ticker" in df and not df.empty else pd.DataFrame()
+    )
+    table_column_widths = dict(COLUMN_WIDTHS)
+    if "Ticker" in visible_columns:
+        table_column_widths["Ticker"] = ticker_column_width(
+            ticker for tickers in groups.values() for ticker in tickers
+        )
     theme = get_theme(dark_mode)
-    table_width = sum(COLUMN_WIDTHS.get(col, DEFAULT_COLUMN_WIDTH) for col in visible_columns)
+    table_width = sum(table_column_widths.get(col, DEFAULT_COLUMN_WIDTH) for col in visible_columns)
     # Display using HTML table with fixed header using CSS
     html_table = f"""
     <div style="width:100%; max-height:600px; overflow:auto; border:1px solid {theme['table_border']};">
-        <table style="width:{table_width}px; min-width:100%; table-layout:fixed; border-collapse:collapse; font-family:Arial; font-size:12px; background-color:{theme['table_bg']}; color:{theme['text']};">
+        <table style="width:{table_width}px; min-width:{table_width}px; table-layout:fixed; border-collapse:collapse; font-family:Arial; font-size:12px; background-color:{theme['table_bg']}; color:{theme['text']};">
             <colgroup>
     """
 
     for col in visible_columns:
-        html_table += f"<col style='width:{COLUMN_WIDTHS.get(col, DEFAULT_COLUMN_WIDTH)}px;'>"
+        html_table += f"<col style='width:{table_column_widths.get(col, DEFAULT_COLUMN_WIDTH)}px;'>"
 
     html_table += f"""
             </colgroup>
@@ -785,18 +816,25 @@ def render_grouped_table(df, groups, key_prefix="", dark_mode=False, show_name_c
                 continue
             
             # Data row styling
-            align = "right" if isinstance(val, (int, float)) or (isinstance(val, str) and val and val[0] in "+-$0123456789") else "left"
-            title_attr = (
-                f" title='{html.escape(str(val), quote=True)}'"
-                if col == "Name" and val
-                else ""
+            align = (
+                "left"
+                if col in {"Ticker", "Name"}
+                else "right"
+                if isinstance(val, (int, float)) or (isinstance(val, str) and val and val[0] in "+-$0123456789")
+                else "left"
             )
+            if col == "Ticker":
+                raw_ticker_row = raw_by_ticker.loc[str(row["Ticker"])] if not raw_by_ticker.empty and str(row["Ticker"]) in raw_by_ticker.index else {}
+                tooltip_text = ticker_tooltip(row.get("Name", ""), raw_ticker_row.get("Beta", np.nan))
+            else:
+                tooltip_text = str(val) if col == "Name" and val else ""
+            title_attr = f" title='{html.escape(tooltip_text, quote=True)}'" if tooltip_text else ""
             sticky_style = sticky_first_column_style(bg_color) if j == 0 else ""
             html_table += (
                 f"<td{title_attr} style='padding:4px; text-align:{align}; {sticky_style}color:{text_color}; "
                 f"background-color:{bg_color}; white-space:nowrap; overflow:hidden; "
                 f"text-overflow:ellipsis; border:1px solid {theme['table_border']};'>"
-                f"{html.escape(str(val))}</td>"
+                f"{str(val) if col == '3/6/12M Rel (20)' else html.escape(str(val))}</td>"
             )
         
         html_table += "</tr>"
