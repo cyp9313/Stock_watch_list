@@ -261,11 +261,21 @@ def run_agent(
         )
 
     output = ctx.final_output_html
+    artifact_state = {
+        "data": ctx.data_file.is_file(),
+        "chart": ctx.chart_file.is_file(),
+        "final_notes": ctx.final_notes_json_file.is_file(),
+        "notes": ctx.notes_file.is_file(),
+    }
+    missing = [name for name, exists in artifact_state.items() if not exists]
+    reason = "Agent ended before minimum report artifacts existed: missing " + ", ".join(missing) + "."
+    if agent_error:
+        reason += f" Agent error: {type(agent_error).__name__}: {str(agent_error)[:500]}"
     return AgentRunResult(
         ok=False,
         output_html=output,
         run_dir=ctx.run_dir,
         final_messages=final_messages,
         summary_text=_plain_text_from_response(final_response) or (str(agent_error) if agent_error else ""),
-        warnings=[f"Agent failed before minimum report artifacts existed: {agent_error}"] if agent_error else ["Agent ended before minimum report artifacts existed."],
+        warnings=[reason],
     )

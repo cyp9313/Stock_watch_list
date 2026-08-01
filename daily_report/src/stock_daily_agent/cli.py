@@ -143,6 +143,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"中间文件目录: {result.run_dir}")
         return 0
     print("[FAILED] Agent 未生成有效 HTML")
+    if result.warnings:
+        print("Failure summary: " + " | ".join(result.warnings[:3]), file=sys.stderr)
     print(f"请检查中间文件目录: {result.run_dir}")
     return 2
 
