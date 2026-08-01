@@ -291,6 +291,10 @@ tr_s = pd.concat([
     (df['Low']  - df['Close'].shift()).abs()
 ], axis=1).max(axis=1)
 atr14 = float(tr_s.rolling(14).mean().iloc[-1])
+recent_low_20d = float(df['Low'].tail(20).min()) if len(df) >= 1 else None
+recent_high_20d = float(df['High'].tail(20).max()) if len(df) >= 1 else None
+recent_low_63d = float(df['Low'].tail(63).min()) if len(df) >= 1 else None
+recent_high_63d = float(df['High'].tail(63).max()) if len(df) >= 1 else None
 
 # ── 成交量均线 ────────────────────────────────────────────────────
 vol_ma5  = float(df['Volume'].rolling(5).mean().iloc[-1])
@@ -609,6 +613,10 @@ result = {
 
     # ATR
     "atr14": atr14,
+    "RECENT_LOW_20D": recent_low_20d,
+    "RECENT_HIGH_20D": recent_high_20d,
+    "RECENT_LOW_63D": recent_low_63d,
+    "RECENT_HIGH_63D": recent_high_63d,
     "ATR_PCT": atr_pct,
     "REALIZED_VOL_20D_PCT": realized_vol_20d_pct,
     "MAX_DRAWDOWN_63D_PCT": max_drawdown_63d_pct,

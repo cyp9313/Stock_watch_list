@@ -83,6 +83,22 @@ class RunContext:
         return self.run_dir / f"{self.safe_ticker}_final_notes.json"
 
     @property
+    def decision_context_file(self) -> Path:
+        return self.run_dir / f"{self.safe_ticker}_decision_context.json"
+
+    @property
+    def decision_file(self) -> Path:
+        return self.run_dir / f"{self.safe_ticker}_decision.json"
+
+    @property
+    def finalization_audit_file(self) -> Path:
+        return self.run_dir / f"{self.safe_ticker}_finalization_audit.json"
+
+    @property
+    def holding_context_file(self) -> Path:
+        return self.run_dir / f"{self.safe_ticker}_holding_context.json"
+
+    @property
     def candidates_file(self) -> Path:
         return self.run_dir / f"{self.safe_ticker}_research_candidates.json"
 

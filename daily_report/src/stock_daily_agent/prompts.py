@@ -25,8 +25,9 @@ AGENT_SYSTEM_TEMPLATE = """
 8. 如果 save_news_notes 返回 ok=false，必须根据 errors 修改 notes 后再次调用，不要跳过校验。
 9. 美元金额必须保持英文金融单位 B/M，或同时给出中文美元换算，例如 $17.2B / 172亿美元。禁止写 $17.2亿 这种易误解格式。
 10. V5.8 最终评级由 Python 在 save_news_notes 后基于 technical_score、news_score、valuation_score、analyst_score、risk_score 加权写入 data.json/final_notes.json；不要让模型手工编造 final_score。
-11. 最终回答只简洁说明生成是否成功、文件路径、notes 条数、证据条数、article_fetch 情况、final_notes_json 路径。不要输出长篇投资建议。
-12. 这不是投资建议；报告用于信息整理和技术/消息面复盘。
+11. 最终决策仪表盘、持仓建议、交易参考点位和最终 HTML 会由 Python Finalizer 在 Agent 结束后统一生成。你不得自行覆盖 final_score，不得编造不在技术数据中的价格点位。
+12. 最终回答只简洁说明生成是否成功、文件路径、notes 条数、证据条数、article_fetch 情况、final_notes_json 路径。不要输出长篇投资建议。
+13. 这不是投资建议；报告用于信息整理和技术/消息面复盘。
 
 建议工具调用顺序：
 read_stock_daily_skill -> read_ticker_reference -> validate_ticker_format -> fetch_technical_data -> priority_market_research（Serper-first；必要时自动 DashScope/SearXNG fallback） -> 如果 priority_market_research 返回 article_fetch.quality_ok 很少，可手动 fetch_article_text 仅增强高价值 URL -> generate_technical_note_items -> save_news_notes（合并技术面 items 与消息面 items；每条非技术面必须填 evidence_id，允许 E/A/DS/TECH 前缀） -> generate_technical_chart -> build_html_report -> inspect_search_quality_report -> inspect_report_run_state。
