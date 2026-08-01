@@ -203,6 +203,8 @@ def run_agent(
     enable_builtin_web: bool = True,
     verbose: bool = True,
     holding_context: dict[str, Any] | None = None,
+    decision_provider: str | None = None,
+    decision_model: str | None = None,
 ) -> AgentRunResult:
     set_context(ctx)
     final_response: Any = None
@@ -238,7 +240,12 @@ def run_agent(
         final_messages = [final_response]
 
     if minimum_artifacts_exist(ctx):
-        finalization = finalize_report(ctx, holding_context=holding_context)
+        finalization = finalize_report(
+            ctx,
+            holding_context=holding_context,
+            decision_provider=decision_provider,
+            decision_model=decision_model,
+        )
         warnings = list(finalization.warnings)
         if agent_error:
             warnings.append(f"Agent ended with an error after recoverable artifacts were created: {agent_error}")

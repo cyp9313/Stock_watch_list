@@ -152,6 +152,8 @@ def finalize_report(
     holding_context: dict[str, Any] | None = None,
     proposal: DecisionDashboard | None = None,
     synthesis_meta: dict[str, Any] | None = None,
+    decision_provider: str | None = None,
+    decision_model: str | None = None,
 ) -> FinalizationResult:
     """Finalize the report from local artifacts; never fetch market or news data."""
     if not minimum_artifacts_exist(ctx):
@@ -162,19 +164,33 @@ def finalize_report(
     except Exception as exc:
         return FinalizationResult(False, None, None, False, [f"cannot build decision context: {exc}"], [])
     _write_json(ctx.decision_context_file, context)
-    fallback_reason: str | None = None
     decision = proposal
+    meta = synthesis_meta
+    if decision is None and os.environ.get("DECISION_REPORT_ENABLED", "true").strip().lower() not in {"0", "false", "no"}:
+        from .decision_synthesizer import synthesize_decision
+        synthesis = synthesize_decision(context, provider=decision_provider, model=decision_model)
+        meta = {
+            "attempted": True, "ok": synthesis.ok, "provider": synthesis.provider, "model": synthesis.model,
+            "elapsed_seconds": round(synthesis.elapsed_seconds, 3), "error": synthesis.error,
+        }
+        decision = synthesis.proposal
+    fallback_reason: str | None = None
     if decision is None:
         fallback_reason = "Decision synthesis was disabled or unavailable; deterministic fallback was used."
         decision = build_fallback_decision(context, fallback_reason)
     integrity = validate_decision_integrity(decision, context)
+    if "authoritative_score_override" in integrity.errors:
+        payload = decision.model_dump()
+        payload["final_score"] = context["authoritative_rating"]["final_score"]
+        decision = DecisionDashboard.model_validate(payload)
+        integrity = validate_decision_integrity(decision, context)
     if not integrity.ok and not decision.fallback_used:
         fallback_reason = "Decision proposal failed integrity validation; deterministic fallback was used."
         decision = build_fallback_decision(context, fallback_reason)
         integrity = validate_decision_integrity(decision, context)
     decision = apply_guardrails(decision, context, integrity)
     _write_json(ctx.decision_file, decision.model_dump())
-    meta = synthesis_meta or {"attempted": False, "ok": False, "provider": "", "model": "", "elapsed_seconds": 0, "error": None}
+    meta = meta or {"attempted": False, "ok": False, "provider": "", "model": "", "elapsed_seconds": 0, "error": None}
     audit = {
         "schema_version": "1.0", "ticker": ctx.ticker, "generated_at": datetime.now(timezone.utc).isoformat(),
         "decision_enabled": os.environ.get("DECISION_REPORT_ENABLED", "true").strip().lower() not in {"0", "false", "no"},

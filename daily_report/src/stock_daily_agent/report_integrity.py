@@ -28,6 +28,15 @@ def validate_decision_integrity(decision: DecisionDashboard, context: dict[str, 
             for evidence_id in item.evidence_ids:
                 if not str(evidence_id).strip() or str(evidence_id).upper() not in allowed:
                     errors.append(f"invalid_{label}_evidence_id:{evidence_id}")
+    allowed_levels = {
+        str(value)
+        for value in (context.get("level_candidates", {}).get("display") or {}).values()
+        if value
+    }
+    for label in ("ideal_buy", "secondary_buy", "stop_loss", "take_profit"):
+        value = getattr(decision.levels, label)
+        if value is not None and value not in allowed_levels:
+            errors.append(f"unrecognized_level:{label}")
     if len(decision.action_checklist) < 2:
         errors.append("action_checklist_requires_at_least_two_items")
     if decision.proposed_action in {"buy", "add"} and not (decision.levels.stop_loss or decision.levels.invalidation_condition):

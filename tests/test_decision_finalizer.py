@@ -86,6 +86,7 @@ def test_finalizer_writes_fallback_and_audit_without_model(tmp_path: Path, monke
         return True, ""
 
     monkeypatch.setattr("stock_daily_agent.finalizer._render_html", fake_render)
+    monkeypatch.setenv("DECISION_REPORT_ENABLED", "false")
     result = finalize_report(ctx)
     assert result.ok and result.fallback_used
     decision = json.loads(ctx.decision_file.read_text(encoding="utf-8"))
