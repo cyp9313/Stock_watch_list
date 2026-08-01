@@ -13,6 +13,8 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 DecisionAction = Literal["buy", "add", "hold", "reduce", "sell", "watch", "avoid"]
+OpinionAgentName = Literal["technical", "news_fundamental", "risk"]
+OpinionSignal = Literal["buy", "hold", "sell"]
 
 
 class EvidenceBackedItem(BaseModel):
@@ -60,6 +62,18 @@ class DecisionAdjustment(BaseModel):
     reason: str = Field(min_length=1, max_length=800)
 
 
+class OpinionAgentOutput(BaseModel):
+    """A bounded advisory opinion; it can never own score, levels, or HTML."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    agent: OpinionAgentName
+    signal: OpinionSignal
+    confidence: float = Field(ge=0, le=1)
+    reason: str = Field(min_length=1, max_length=800)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=5)
+
+
 class DecisionDashboard(BaseModel):
     """Validated user-facing decision summary.
 
@@ -73,6 +87,12 @@ class DecisionDashboard(BaseModel):
     one_sentence: str = Field(min_length=1, max_length=1400)
     proposed_action: DecisionAction
     final_action: DecisionAction
+    # These two fields are injected by Python after synthesis.  They make it
+    # explicit that a score band and a user-context action are related but are
+    # not interchangeable recommendations.
+    authoritative_rating_class: Literal["buy", "hold", "avoid"] = "hold"
+    authoritative_rating_text: str | None = Field(default=None, max_length=240)
+    action_scope: Literal["no_position", "has_position"] = "no_position"
     final_score: float = Field(ge=0, le=100)
     confidence: Literal["low", "medium", "high"]
     position_advice: PositionAdvice
@@ -83,6 +103,14 @@ class DecisionDashboard(BaseModel):
     phase_decision: PhaseDecision
     score_explanation: str = Field(min_length=1, max_length=1400)
     adjustments: list[DecisionAdjustment] = Field(default_factory=list, max_length=12)
+    agent_opinions: list[OpinionAgentOutput] = Field(default_factory=list, max_length=3)
+    opinion_conflict_summary: str | None = Field(default=None, max_length=1000)
+    opinion_agents_enabled: bool = False
+    opinion_agents_completed: int = Field(default=0, ge=0, le=3)
+    opinion_agents_unavailable: list[OpinionAgentName] = Field(default_factory=list, max_length=3)
+    # Set only when Python replaces a model-written risk-boundary phrase that
+    # conflicts with the deterministic stop-loss reference.
+    risk_boundary_guardrail_applied: bool = False
     fallback_used: bool = False
     fallback_reason: str | None = Field(default=None, max_length=1200)
 

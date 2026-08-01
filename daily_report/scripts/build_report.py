@@ -475,16 +475,56 @@ def _decision_action_label(value):
     return labels.get(str(value or '').lower(), '观察')
 
 
+def _decision_rating_label(value, score, rating_text=None):
+    """Show the exact Python rating band, not only its coarse action class."""
+    text = str(rating_text or '').strip()
+    if text and any('\u4e00' <= char <= '\u9fff' for char in text):
+        # Python's rating text ends in an optional English convenience label
+        # such as " WATCH".  The dashboard itself uses Chinese labels.
+        return re.sub(r'\s+[A-Z][A-Z /-]*$', '', text).strip() or text
+    try:
+        numeric_score = float(score)
+    except (TypeError, ValueError):
+        numeric_score = None
+    if str(value or '').lower() == 'hold' and numeric_score is not None and 40 <= numeric_score < 50:
+        return '观察'
+    return _decision_action_label(value)
+
+
+def _decision_market_label(value):
+    return {'US': '美股', 'DE': '德国市场', 'HK': '香港市场', 'CN': '中国市场', 'JP': '日本市场', 'KR': '韩国市场', 'TW': '台湾市场', 'CRYPTO': '加密市场'}.get(str(value or '').upper(), str(value or '—'))
+
+
+def _decision_phase_label(value):
+    return {'premarket': '盘前', 'open': '交易时段', 'lunch_break': '午间休市', 'postmarket': '盘后', 'non_trading': '非交易时段', 'continuous': '连续交易'}.get(str(value or '').lower(), str(value or '—'))
+
+
+def _decision_timezone_label(value):
+    return {
+        'America/New_York': '美国东部时间', 'Europe/Berlin': '中欧时间', 'Asia/Hong_Kong': '香港时间',
+        'Asia/Shanghai': '中国标准时间', 'Asia/Tokyo': '日本时间', 'Asia/Seoul': '韩国时间',
+        'Asia/Taipei': '台北时间', 'UTC': '协调世界时',
+    }.get(str(value or ''), str(value or '—'))
+
+
 def _decision_html(payload):
     if not payload:
         return ''
     action = str(payload.get('final_action') or '').lower()
     action_class = action if action in {'buy', 'add', 'hold', 'reduce', 'sell', 'watch', 'avoid'} else 'watch'
+    action_scope = str(payload.get('action_scope') or 'no_position').lower()
+    action_scope_label = '当前持仓情境' if action_scope == 'has_position' else '无持仓情境'
+    rating_class = str(payload.get('authoritative_rating_class') or 'hold').lower()
     score = payload.get('final_score')
     try:
         score_text = f'{float(score):.1f}'
     except (TypeError, ValueError):
         score_text = '—'
+    rating_label = _decision_rating_label(
+        rating_class,
+        score,
+        payload.get('authoritative_rating_text'),
+    )
     def text(value): return escape_text(value or '—')
     def evidence_items(items, empty):
         rendered = []
@@ -497,22 +537,66 @@ def _decision_html(payload):
                     ids.append('<a href="#evidence-' + safe_id + '">' + escape_text(safe_id) + '</a>')
             rendered.append('<li>' + text(item.get('text')) + (' <span class="decision-evidence">[' + ', '.join(ids) + ']</span>' if ids else '') + '</li>')
         return ''.join(rendered) if rendered else '<li>' + escape_text(empty) + '</li>'
+    def opinion_items(items):
+        labels = {'technical': '技术', 'news_fundamental': '消息/基本面', 'risk': '风险'}
+        rendered = []
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            agent = str(item.get('agent') or '').lower()
+            signal = str(item.get('signal') or 'hold').lower()
+            safe_signal = signal if signal in {'buy', 'hold', 'sell'} else 'hold'
+            refs = []
+            for evidence_id in item.get('evidence_ids') or []:
+                safe_id = str(evidence_id or '').strip().upper()
+                if re.fullmatch(r'[A-Z][A-Z0-9-]{0,63}', safe_id):
+                    refs.append('<a href="#evidence-' + safe_id + '">' + escape_text(safe_id) + '</a>')
+            confidence = item.get('confidence')
+            try:
+                confidence_text = f'{float(confidence) * 100:.0f}%'
+            except (TypeError, ValueError):
+                confidence_text = '—'
+            rendered.append(
+                '<div><strong>' + escape_text(labels.get(agent, agent or '意见')) + '</strong> '
+                '<span class="decision-action ' + safe_signal + '">' + _decision_action_label(safe_signal) + '</span> '
+                '<span class="decision-meta">置信度 ' + confidence_text + '</span><p>' + text(item.get('reason'))
+                + (' <span class="decision-evidence">[' + ', '.join(refs) + ']</span>' if refs else '') + '</p></div>'
+            )
+        return ''.join(rendered)
     levels = payload.get('levels') if isinstance(payload.get('levels'), dict) else {}
     phase = payload.get('phase_decision') if isinstance(payload.get('phase_decision'), dict) else {}
     adjustments = payload.get('adjustments') if isinstance(payload.get('adjustments'), list) else []
-    adjustment_html = ''.join('<li>' + text(item.get('from_action')) + ' → ' + text(item.get('to_action')) + '：' + text(item.get('reason')) + '</li>' for item in adjustments if isinstance(item, dict))
+    adjustment_html = ''.join('<li>' + _decision_action_label(item.get('from_action')) + ' → ' + _decision_action_label(item.get('to_action')) + '：' + text(item.get('reason')) + '</li>' for item in adjustments if isinstance(item, dict))
+    opinions_html = opinion_items(payload.get('agent_opinions'))
+    opinion_enabled = bool(payload.get('opinion_agents_enabled'))
+    try:
+        opinion_completed = max(0, min(3, int(payload.get('opinion_agents_completed') or 0)))
+    except (TypeError, ValueError):
+        opinion_completed = 0
+    unavailable_labels = {'technical': '技术', 'news_fundamental': '消息/基本面', 'risk': '风险'}
+    unavailable = [unavailable_labels.get(str(item).lower(), str(item)) for item in payload.get('opinion_agents_unavailable') or []]
+    opinion_status = ('已启用：已采纳 ' + str(opinion_completed) + '/3 个专业意见' + ('；未返回：' + '、'.join(unavailable) if unavailable else '') if opinion_enabled else '未启用：本报告仅使用主决策模型与程序护栏')
     fallback = ''
     if payload.get('fallback_used'):
         fallback = '<div class="decision-fallback">决策文字使用确定性回退模板生成；技术数据、评分和证据仍来自正常流水线。</div>'
+    risk_boundary_notice = ''
+    if payload.get('risk_boundary_guardrail_applied'):
+        risk_boundary_notice = (
+            '<div class="decision-meta"><strong>风险边界：</strong>'
+            '模型中与止损参考区间冲突的价格表述，已由程序替换为保守的风险控制说明。</div>'
+        )
     return (
         '  <div class="section decision-dashboard">\n'
-        '    <div class="section-title"><span class="icon">🧭</span> 决策仪表盘 <span class="decision-action ' + action_class + '">' + _decision_action_label(action) + '</span><span class="decision-score">' + score_text + ' / 100</span></div>\n'
-        '    <div class="decision-summary">' + text(payload.get('one_sentence')) + '</div>' + fallback + '\n'
-        '    <div class="decision-grid"><div><strong>无持仓</strong><p>' + text((payload.get('position_advice') or {}).get('no_position')) + '</p></div><div><strong>已有持仓</strong><p>' + text((payload.get('position_advice') or {}).get('has_position')) + '</p></div></div>\n'
+        '    <div class="section-title"><span class="icon">🧭</span> 决策仪表盘 <span class="decision-action ' + action_class + '">' + action_scope_label + '：' + _decision_action_label(action) + '</span><span class="decision-score">程序综合评分 ' + score_text + ' / 100</span></div>\n'
+        '    <div class="decision-summary">' + text(payload.get('one_sentence')) + '</div>' + fallback + risk_boundary_notice + '\n'
+        '    <div class="decision-meta"><strong>结论层级：</strong>程序综合评级为 ' + text(rating_label) + '；本仪表盘的“' + action_scope_label + '”行动会结合持仓语境和风险护栏，因此可比综合评级更保守。</div>\n'
+        + '    <div class="decision-meta"><strong>多意见组件：</strong>' + opinion_status + '</div>\n'
+        + ('    <div class="decision-grid decision-opinions">' + opinions_html + '</div>\n    <div class="decision-meta"><strong>多意见处理：</strong>' + text(payload.get('opinion_conflict_summary')) + '</div>\n' if opinions_html else '')
+        + '    <div class="decision-grid"><div><strong>无持仓</strong><p>' + text((payload.get('position_advice') or {}).get('no_position')) + '</p></div><div><strong>已有持仓</strong><p>' + text((payload.get('position_advice') or {}).get('has_position')) + '</p></div></div>\n'
         '    <div class="decision-levels"><div>理想买入参考<br><strong>' + text(levels.get('ideal_buy')) + '</strong></div><div>第二买入参考<br><strong>' + text(levels.get('secondary_buy')) + '</strong></div><div>止损参考<br><strong>' + text(levels.get('stop_loss')) + '</strong></div><div>止盈参考<br><strong>' + text(levels.get('take_profit')) + '</strong></div></div>\n'
         '    <div class="decision-grid"><div><strong>催化因素</strong><ul>' + evidence_items(payload.get('catalysts'), '暂无可验证催化因素。') + '</ul></div><div><strong>风险警报</strong><ul>' + evidence_items(payload.get('risk_alerts'), '暂无可验证风险警报。') + '</ul></div></div>\n'
-        '    <div class="decision-meta">市场阶段：' + text(phase.get('market')) + ' · ' + text(phase.get('phase')) + ' · ' + text(phase.get('timezone')) + '<br>立即行动：' + text(phase.get('immediate_action')) + '<br>失效条件：' + text(levels.get('invalidation_condition')) + '</div>\n'
-        '    <div class="decision-meta"><strong>行动检查：</strong>' + '；'.join(text(item) for item in payload.get('action_checklist', []) if isinstance(item, str)) + '</div>\n'
+        '    <div class="decision-meta">市场阶段：' + text(_decision_market_label(phase.get('market'))) + ' · ' + text(_decision_phase_label(phase.get('phase'))) + ' · ' + text(_decision_timezone_label(phase.get('timezone'))) + '<br>立即行动：' + text(phase.get('immediate_action')) + '<br>失效条件：' + text(levels.get('invalidation_condition')) + '</div>\n'
+        '    <div class="decision-meta"><strong>行动检查：</strong>' + '；'.join(text(item).rstrip('。；; ') for item in payload.get('action_checklist', []) if isinstance(item, str)) + '。' + ('（请按“无持仓/已有持仓”建议分别适用相关仓位与止损项。）' if action_scope == 'no_position' else '') + '</div>\n'
         + ('    <div class="decision-meta"><strong>调整记录：</strong><ul>' + adjustment_html + '</ul></div>\n' if adjustment_html else '')
         + '  </div>\n\n'
     )
@@ -563,8 +647,8 @@ CSS = '''  * { box-sizing: border-box; margin: 0; padding: 0; }
   .section { background: #161b22; border: 1px solid #2d333b; border-radius: 12px; padding: 24px; margin-bottom: 20px; }
   .decision-dashboard { border-color:#335a88; background:linear-gradient(135deg,#142131,#161b22); }
   .decision-action { margin-left:auto; padding:3px 10px; border-radius:999px; font-size:12px; }.decision-action.buy,.decision-action.add { background:#123d2a;color:#6ee7a1; }.decision-action.sell,.decision-action.reduce,.decision-action.avoid { background:#4b1f27;color:#ff9aa4; }.decision-action.watch,.decision-action.hold { background:#3b3520;color:#f0cf72; }.decision-score { color:#58a6ff; font-size:18px; margin-left:8px; }
-  .decision-summary { color:#f0f6fc; font-size:16px; font-weight:600; margin-bottom:16px; }.decision-grid,.decision-levels { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin:12px 0; }.decision-levels { grid-template-columns:repeat(4,minmax(0,1fr)); }.decision-grid>div,.decision-levels>div { background:#0d1117; border:1px solid #30363d; border-radius:8px; padding:12px; font-size:13px; }.decision-grid p,.decision-grid ul { margin-top:6px; color:#c9d1d9; }.decision-grid ul { padding-left:18px; }.decision-evidence a { color:#9cc7ff; }.decision-meta { color:#aab7c4; font-size:12px; margin-top:9px; }.decision-fallback { margin:10px 0; padding:9px; border-left:3px solid #d29922; color:#e3c98c; font-size:12px; background:rgba(210,153,34,.08); }
-  @media (max-width:700px) { .decision-levels { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+  .decision-summary { color:#f0f6fc; font-size:16px; font-weight:600; margin-bottom:16px; }.decision-grid,.decision-levels { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin:12px 0; }.decision-levels { grid-template-columns:repeat(4,minmax(0,1fr)); }.decision-opinions { grid-template-columns:repeat(3,minmax(0,1fr)); }.decision-grid>div,.decision-levels>div { background:#0d1117; border:1px solid #30363d; border-radius:8px; padding:12px; font-size:13px; }.decision-grid p,.decision-grid ul { margin-top:6px; color:#c9d1d9; }.decision-grid ul { padding-left:18px; }.decision-evidence a { color:#9cc7ff; }.decision-meta { color:#aab7c4; font-size:12px; margin-top:9px; }.decision-fallback { margin:10px 0; padding:9px; border-left:3px solid #d29922; color:#e3c98c; font-size:12px; background:rgba(210,153,34,.08); }
+  @media (max-width:700px) { .decision-levels,.decision-opinions { grid-template-columns:repeat(2,minmax(0,1fr)); } }
   .section-title { font-size: 16px; font-weight: 700; color: #f0f6fc; margin-bottom: 18px; display: flex; align-items: center; gap: 8px; }
   .section-title .icon { font-size: 18px; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -781,7 +865,7 @@ html += '    <div class="news-list">\n' + news_html + '\n    </div>\n  </div>\n\
 
 # 综合研判
 html += '  <!-- 综合研判 -->\n  <div class="section">\n'
-html += '    <div class="section-title"><span class="icon">🎯</span> 综合研判 & 操作建议（v5.8 标的自适应多因子评分）</div>\n'
+html += '    <div class="section-title"><span class="icon">🎯</span> Python 综合评级（非个性化持仓操作指令）</div>\n'
 html += '    <div class="rating-hero">\n'
 html += '      <div class="rating-badge ' + rating_cls + '">' + rating_text + '</div>\n'
 html += '      <div style="font-size:28px; font-weight:800; color:#58a6ff; margin-top:8px;">' + final_score_str + '<span style="font-size:14px;color:#8b949e;"> / 100</span></div>\n'

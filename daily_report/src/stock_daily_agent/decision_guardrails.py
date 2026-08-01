@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .decision_schema import DecisionAdjustment, DecisionDashboard
+from .decision_schema import DecisionAdjustment, DecisionDashboard, OpinionAgentOutput
 from .report_integrity import IntegrityResult
 
 
@@ -96,3 +96,35 @@ def apply_guardrails(
     if not integrity.ok and result.final_action in {"buy", "add", "sell"}:
         result = _append_adjustment(result, "hold" if has_position else "watch", "决策完整性检查未通过，已采用保守动作。")
     return result
+
+
+def apply_opinion_guardrail(
+    decision: DecisionDashboard,
+    context: dict[str, Any],
+    opinions: list[OpinionAgentOutput],
+) -> DecisionDashboard:
+    """Only downgrade optimistic actions when bounded specialists flag conflict.
+
+    Opinions never change the Python score and can never upgrade, sell, or
+    otherwise create an action by themselves.  This is intentionally a small
+    final safety guardrail, not a voting system.
+    """
+    if decision.final_action not in {"buy", "add"}:
+        return decision
+    by_agent = {opinion.agent: opinion for opinion in opinions}
+    risk_sell = by_agent.get("risk")
+    signals = {opinion.signal for opinion in opinions}
+    has_position = bool((context.get("holding_context") or {}).get("has_position"))
+    if risk_sell and risk_sell.signal == "sell" and risk_sell.confidence >= 0.65:
+        return _append_adjustment(
+            decision,
+            "hold" if has_position else "watch",
+            "程序多意见安全护栏：风险意见高置信偏空，已将偏乐观动作保守降级。",
+        )
+    if len(signals) > 1 and max((opinion.confidence for opinion in opinions), default=0.0) >= 0.75:
+        return _append_adjustment(
+            decision,
+            "hold" if has_position else "watch",
+            "程序多意见安全护栏：专业意见存在明显分歧，已将偏乐观动作保守降级。",
+        )
+    return decision

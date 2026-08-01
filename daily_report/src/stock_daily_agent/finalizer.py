@@ -13,7 +13,7 @@ from typing import Any
 
 from .config import RunContext
 from .decision_context import build_decision_context
-from .decision_guardrails import apply_guardrails
+from .decision_guardrails import apply_guardrails, apply_opinion_guardrail
 from .decision_schema import DecisionDashboard, EvidenceBackedItem, PhaseDecision, PositionAdvice, TradingLevels
 from .report_integrity import IntegrityResult, validate_decision_integrity
 
@@ -73,6 +73,8 @@ def build_fallback_decision(context: dict[str, Any], reason: str) -> DecisionDas
     support_near = bool(levels.get("ideal_buy_candidate")) and any(
         float(item.get("distance_pct") or 999) <= 3 for item in levels.get("supports", []) if isinstance(item, dict)
     )
+
+
     if rating_class == "buy" and support_near:
         conclusion = "综合评分偏多且价格接近有效支撑；等待止跌或量能确认后再评估行动。"
     elif rating_class == "buy":
@@ -127,6 +129,51 @@ def build_fallback_decision(context: dict[str, Any], reason: str) -> DecisionDas
     )
 
 
+def _apply_deterministic_invalidation(decision: DecisionDashboard, context: dict[str, Any]) -> DecisionDashboard:
+    """Keep the invalidation condition aligned with the displayed stop range."""
+    display = (context.get("level_candidates") or {}).get("display") or {}
+    stop = display.get("stop_loss")
+    condition = (
+        f"若价格有效跌破止损参考区间 {stop}，应重新评估并执行既定风险控制。"
+        if stop else "若关键支撑失守或技术结构明显恶化，应重新评估并执行既定风险控制。"
+    )
+    payload = decision.model_dump()
+    payload["levels"]["invalidation_condition"] = condition
+    return DecisionDashboard.model_validate(payload)
+
+
+def _repair_risk_boundary_conflicts(
+    decision: DecisionDashboard,
+    context: dict[str, Any],
+    integrity: IntegrityResult,
+) -> tuple[DecisionDashboard, list[str]]:
+    """Repair only model-written risk text that contradicts the stop reference.
+
+    A conflict here is a presentation defect, not a reason to discard otherwise
+    valid evidence, scoring, and action analysis.  The replacement is taken from
+    the deterministic fallback so Python remains the sole owner of the price
+    boundary.  All other integrity failures still use the full fallback path.
+    """
+    prefix = "risk_boundary_conflicts_with_stop_reference:"
+    fields = [error.removeprefix(prefix) for error in integrity.errors if error.startswith(prefix)]
+    if not fields or decision.fallback_used:
+        return decision, []
+
+    safe = build_fallback_decision(context, "Risk-boundary text was normalized by Python.")
+    payload = decision.model_dump()
+    for field in fields:
+        if field == "position_advice.no_position":
+            payload["position_advice"]["no_position"] = safe.position_advice.no_position
+        elif field == "position_advice.has_position":
+            payload["position_advice"]["has_position"] = safe.position_advice.has_position
+        elif field == "action_checklist":
+            payload["action_checklist"] = list(safe.action_checklist)
+        elif field == "phase_decision.immediate_action":
+            payload["phase_decision"]["immediate_action"] = safe.phase_decision.immediate_action
+    payload["risk_boundary_guardrail_applied"] = True
+    return DecisionDashboard.model_validate(payload), fields
+
+
 def _write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -134,8 +181,10 @@ def _write_json(path: Path, payload: Any) -> None:
 def _render_html(ctx: RunContext) -> tuple[bool, str]:
     args = [
         sys.executable, str(ctx.paths.scripts_dir / "build_report.py"), str(ctx.data_file), str(ctx.chart_file),
-        str(ctx.final_output_html), "--date", ctx.report_date, "--months", str(ctx.months), "--decision-json", str(ctx.decision_file),
+        str(ctx.final_output_html), "--date", ctx.report_date, "--months", str(ctx.months),
     ]
+    if ctx.decision_file.is_file():
+        args.extend(["--decision-json", str(ctx.decision_file)])
     if ctx.notes_file.is_file():
         args.extend(["--notes", str(ctx.notes_file)])
     if ctx.final_notes_json_file.is_file():
@@ -158,6 +207,18 @@ def finalize_report(
     """Finalize the report from local artifacts; never fetch market or news data."""
     if not minimum_artifacts_exist(ctx):
         return FinalizationResult(False, None, None, False, ["minimum report artifacts are missing"], [])
+    decision_enabled = os.environ.get("DECISION_REPORT_ENABLED", "true").strip().lower() not in {"0", "false", "no"}
+    if not decision_enabled:
+        audit = {
+            "schema_version": "1.0", "ticker": ctx.ticker, "generated_at": datetime.now(timezone.utc).isoformat(),
+            "decision_enabled": False, "synthesis": {"attempted": False, "ok": False},
+            "final_score": None, "fallback_used": False,
+        }
+        _write_json(ctx.finalization_audit_file, audit)
+        ok, error = _render_html(ctx)
+        if not ok:
+            return FinalizationResult(False, None, None, False, [f"report rendering failed: {error}"], [])
+        return FinalizationResult(True, None, ctx.final_output_html, False, [], [])
     warnings: list[str] = []
     try:
         context = build_decision_context(ctx, holding_context=holding_context)
@@ -165,8 +226,9 @@ def finalize_report(
         return FinalizationResult(False, None, None, False, [f"cannot build decision context: {exc}"], [])
     _write_json(ctx.decision_context_file, context)
     decision = proposal
+    model_proposal: DecisionDashboard | None = proposal
     meta = synthesis_meta
-    if decision is None and os.environ.get("DECISION_REPORT_ENABLED", "true").strip().lower() not in {"0", "false", "no"}:
+    if decision is None:
         from .decision_synthesizer import synthesize_decision
         synthesis = synthesize_decision(context, provider=decision_provider, model=decision_model)
         meta = {
@@ -174,11 +236,20 @@ def finalize_report(
             "elapsed_seconds": round(synthesis.elapsed_seconds, 3), "error": synthesis.error,
         }
         decision = synthesis.proposal
+        model_proposal = decision
     fallback_reason: str | None = None
     if decision is None:
         fallback_reason = "Decision synthesis was disabled or unavailable; deterministic fallback was used."
         decision = build_fallback_decision(context, fallback_reason)
+    decision = _apply_deterministic_invalidation(decision, context)
     integrity = validate_decision_integrity(decision, context)
+    proposal_integrity = {
+        "errors": list(integrity.errors),
+        "warnings": list(integrity.warnings),
+    }
+    decision, risk_boundary_guardrail_fields = _repair_risk_boundary_conflicts(decision, context, integrity)
+    if risk_boundary_guardrail_fields:
+        integrity = validate_decision_integrity(decision, context)
     if "authoritative_score_override" in integrity.errors:
         payload = decision.model_dump()
         payload["final_score"] = context["authoritative_rating"]["final_score"]
@@ -189,14 +260,65 @@ def finalize_report(
         decision = build_fallback_decision(context, fallback_reason)
         integrity = validate_decision_integrity(decision, context)
     decision = apply_guardrails(decision, context, integrity)
+    opinion_meta: dict[str, Any] = {"enabled": False, "attempted": False, "completed": 0, "errors": {}}
+    opinion_payloads: list[dict[str, Any]] = []
+    opinion_conflict_summary: str | None = None
+    opinion_unavailable: list[str] = []
+    from .opinion_agents import opinion_agents_enabled
+    if opinion_agents_enabled():
+        opinion_meta["enabled"] = True
+        opinion_meta["attempted"] = True
+        try:
+            from .opinion_agents import summarize_opinion_conflict, synthesize_opinions
+
+            opinion_result = synthesize_opinions(
+                context,
+                provider=decision_provider,
+                model=decision_model,
+            )
+            decision = apply_opinion_guardrail(decision, context, opinion_result.opinions)
+            opinion_payloads = [item.model_dump() for item in opinion_result.opinions]
+            opinion_conflict_summary = summarize_opinion_conflict(opinion_result.opinions)
+            returned_agents = {item.agent for item in opinion_result.opinions}
+            opinion_unavailable = [agent for agent in ("technical", "news_fundamental", "risk") if agent not in returned_agents]
+            opinion_meta.update({
+                "provider": opinion_result.provider,
+                "model": opinion_result.model,
+                "elapsed_seconds": round(opinion_result.elapsed_seconds, 3),
+                "completed": len(opinion_result.opinions),
+                "errors": opinion_result.errors,
+            })
+        except Exception as exc:
+            # P3 is advisory only: no model/provider issue may prevent the
+            # validated decision dashboard from being rendered.
+            opinion_meta["errors"] = {"finalizer": str(exc)[:500]}
+    # The model proposes a generic action; the rating class and whether the
+    # action applies to a holder are deterministic local facts.
+    decision_payload = decision.model_dump()
+    rating_class = str(context.get("authoritative_rating", {}).get("rating_class") or "hold").lower()
+    decision_payload["authoritative_rating_class"] = rating_class if rating_class in {"buy", "hold", "avoid"} else "hold"
+    rating_text = str(context.get("authoritative_rating", {}).get("rating_text") or "").strip()
+    decision_payload["authoritative_rating_text"] = rating_text[:240] or None
+    decision_payload["action_scope"] = "has_position" if bool((context.get("holding_context") or {}).get("has_position")) else "no_position"
+    decision_payload["agent_opinions"] = opinion_payloads
+    decision_payload["opinion_conflict_summary"] = opinion_conflict_summary
+    decision_payload["opinion_agents_enabled"] = bool(opinion_meta["enabled"])
+    decision_payload["opinion_agents_completed"] = int(opinion_meta["completed"])
+    decision_payload["opinion_agents_unavailable"] = opinion_unavailable
+    decision = DecisionDashboard.model_validate(decision_payload)
     _write_json(ctx.decision_file, decision.model_dump())
     meta = meta or {"attempted": False, "ok": False, "provider": "", "model": "", "elapsed_seconds": 0, "error": None}
     audit = {
         "schema_version": "1.0", "ticker": ctx.ticker, "generated_at": datetime.now(timezone.utc).isoformat(),
-        "decision_enabled": os.environ.get("DECISION_REPORT_ENABLED", "true").strip().lower() not in {"0", "false", "no"},
-        "synthesis": meta, "integrity": {"errors": integrity.errors, "warnings": integrity.warnings},
+        "decision_enabled": decision_enabled,
+        "synthesis": meta,
+        "proposal_integrity": proposal_integrity,
+        "risk_boundary_guardrail_fields": risk_boundary_guardrail_fields,
+        "integrity": {"errors": integrity.errors, "warnings": integrity.warnings},
+        "opinion_agents": opinion_meta,
         "adjustments": [item.model_dump() for item in decision.adjustments],
-        "authoritative_score": context["authoritative_rating"]["final_score"], "proposal_score": proposal.final_score if proposal else None,
+        "authoritative_score": context["authoritative_rating"]["final_score"],
+        "proposal_score": model_proposal.final_score if model_proposal else None,
         "final_score": decision.final_score, "fallback_used": decision.fallback_used, "fallback_reason": decision.fallback_reason,
     }
     _write_json(ctx.finalization_audit_file, audit)

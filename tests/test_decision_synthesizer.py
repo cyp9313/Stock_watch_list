@@ -11,7 +11,7 @@ AGENT_SRC = REPO_ROOT / "daily_report" / "src"
 if str(AGENT_SRC) not in sys.path:
     sys.path.insert(0, str(AGENT_SRC))
 
-from stock_daily_agent.decision_synthesizer import synthesize_decision
+from stock_daily_agent.decision_synthesizer import _prompt, synthesize_decision
 
 
 def _context() -> dict:
@@ -49,3 +49,9 @@ def test_synthesis_rejects_invalid_json_without_retry(monkeypatch) -> None:
     result = synthesize_decision(_context(), provider="dashscope", model="qwen-plus")
     assert not result.ok
     assert len(calls) == 1
+
+
+def test_synthesis_prompt_forbids_model_owned_numeric_risk_boundaries() -> None:
+    prompt = _prompt(_context())
+    assert "Risk-boundary rule" in prompt
+    assert "position_advice" in prompt

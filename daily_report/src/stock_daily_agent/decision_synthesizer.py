@@ -85,12 +85,15 @@ def _prompt(context: dict[str, Any]) -> str:
     schema = json.dumps(DecisionDashboard.model_json_schema(), ensure_ascii=False, separators=(",", ":"))
     payload = json.dumps(context, ensure_ascii=False, separators=(",", ":"))
     return (
-        "You produce a controlled investment decision dashboard. Output JSON only, matching the supplied JSON schema exactly. "
-        "Do not call tools, browse, add fields, calculate a score, invent an evidence ID, invent a price, guarantee returns, "
-        "or contradict market_session. final_score must exactly copy authoritative_rating.final_score. "
-        "Use only allowed_evidence_ids. Any levels field must copy a non-null string from level_candidates.display or be null. "
-        "Give distinct no_position and has_position advice. If evidence is limited, prefer watch or hold. "
-        "The final action may later be changed by Python guardrails.\nSCHEMA:\n"
+        "Risk-boundary rule: in position_advice, action_checklist, and "
+        "phase_decision.immediate_action, do not state any specific price, stop price, "
+        "or other numeric price level. Refer generically to the displayed stop-loss "
+        "reference range instead.\n"
+        "你生成受控的股票决策仪表盘。只输出与 JSON Schema 严格匹配的 JSON。所有面向用户的叙述字段必须使用简体中文；"
+        "ticker、公司名、证据 ID、市场代码、时区和价格区间可以保留原样。不得调用工具、联网、添加字段、计算或修改评分、"
+        "编造证据 ID/价格或保证收益，也不得与 market_session 冲突。final_score 必须精确复制 authoritative_rating.final_score。"
+        "只能使用 allowed_evidence_ids；任意 levels 字段只能复制 level_candidates.display 的非空字符串或为 null。"
+        "必须分别给出无持仓与已有持仓建议；证据有限时优先 watch 或 hold。最终动作仍可能被 Python 护栏调整。\nSCHEMA:\n"
         + schema + "\nCONTEXT:\n" + payload
     )
 

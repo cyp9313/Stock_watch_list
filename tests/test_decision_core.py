@@ -70,6 +70,42 @@ def test_schema_accepts_continuous_adjustment_chain() -> None:
     assert decision.final_action == "watch"
 
 
+def test_integrity_rejects_english_only_dashboard_narrative() -> None:
+    from stock_daily_agent.report_integrity import validate_decision_integrity
+
+    decision = _dashboard()
+    context = {
+        "authoritative_rating": {"final_score": 63.4},
+        "allowed_evidence_ids": [],
+        "level_candidates": {"display": {}},
+        "market_session": {"market": "US", "timezone": "America/New_York", "phase": "postmarket"},
+    }
+    assert "decision_narrative_must_be_chinese" in validate_decision_integrity(decision, context).errors
+
+
+def test_integrity_rejects_risk_boundary_outside_displayed_stop_range() -> None:
+    from stock_daily_agent.report_integrity import validate_decision_integrity
+
+    decision = _dashboard(
+        one_sentence="等待确认。",
+        position_advice=PositionAdvice(no_position="暂不操作。", has_position="若跌破 MA200 $50，则减仓。"),
+        levels=TradingLevels(stop_loss="$90–$95", invalidation_condition="跌破止损区间则重新评估。"),
+        phase_decision=PhaseDecision(market="US", timezone="America/New_York", phase="postmarket", action_window="下一交易时段。", immediate_action="等待确认。"),
+        score_explanation="程序评分保持权威。",
+        action_checklist=["关注趋势确认。", "遵守止损。"],
+    )
+    context = {
+        "authoritative_rating": {"final_score": 63.4},
+        "allowed_evidence_ids": [],
+        "level_candidates": {"display": {"stop_loss": "$90–$95"}},
+        "market_session": {"market": "US", "timezone": "America/New_York", "phase": "postmarket"},
+    }
+    assert any(
+        error.startswith("risk_boundary_conflicts_with_stop_reference:position_advice.has_position")
+        for error in validate_decision_integrity(decision, context).errors
+    )
+
+
 @pytest.mark.parametrize(
     ("ticker", "instrument_type", "when", "market", "phase"),
     [

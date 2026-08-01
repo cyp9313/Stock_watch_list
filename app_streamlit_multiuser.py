@@ -5330,8 +5330,19 @@ def render_daily_report(user, config=None):
             if result:
                 if result.get("success"):
                     st.success(f"Report generated in {result.get('elapsed', 0):.1f}s")
+                    if result.get("diagnostic_run_dir"):
+                        st.warning(
+                            "Diagnostic run retention is enabled. This folder contains report intermediates "
+                            "(including research data) and will not be cleaned automatically. Remove it after troubleshooting."
+                        )
+                        st.code(
+                            result.get("diagnostic_audit_file") or result["diagnostic_run_dir"],
+                            language=None,
+                        )
                     if result.get("decision_dashboard"):
                         st.caption("Decision dashboard: generated · Decision fallback: " + ("yes" if result.get("fallback_used") else "no"))
+                    for warning in result.get("warnings") or []:
+                        st.warning(str(warning))
                     st.download_button(
                         "Download HTML Report",
                         data=result["html_bytes"],
@@ -5347,6 +5358,8 @@ def render_daily_report(user, config=None):
                             st.code(result["stderr"])
                 else:
                     st.error(result.get("error", "Daily report generation failed."))
+                    if result.get("diagnostic_run_dir"):
+                        st.caption("Diagnostic run directory retained: " + str(result["diagnostic_run_dir"]))
                     with st.expander("Generation log", expanded=True):
                         if result.get("stdout"):
                             st.code(result["stdout"])
@@ -5405,7 +5418,6 @@ def render_daily_report(user, config=None):
             render_weekly_report_schedules(user, runner_ok, mail_ready)
 
         render_email_job_status(user["cache_key"], report_kind="ticker")
-
 
 _backend_ok, _backend_msg = ensure_backend()
 if not _backend_ok:

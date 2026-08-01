@@ -29,6 +29,7 @@ REPORT_ROOT = Path(__file__).resolve().parent
 REPORT_RUNNER = REPORT_ROOT / "run_report.py"
 DEFAULT_TIMEOUT_SECONDS = 1800
 _TICKER_PATTERN = re.compile(r"^[A-Z0-9.^=\-]+$")
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 
 
 def runtime_available() -> bool:
@@ -47,6 +48,11 @@ def _safe_scope(scope: str) -> str:
 def _tail(text: str | None, max_chars: int = 8000) -> str:
     text = text or ""
     return text[-max_chars:] if len(text) > max_chars else text
+
+
+def _diagnostic_run_retention_enabled() -> bool:
+    """Return whether complete per-run diagnostics were explicitly requested."""
+    return os.environ.get("DECISION_REPORT_KEEP_RUN_DIR", "").strip().lower() in _TRUE_ENV_VALUES
 
 
 def _normalize_holding_context(payload: dict | None) -> dict | None:
@@ -101,7 +107,8 @@ def generate_report(
 
     Each invocation uses a unique temporary run directory. All report and
     intermediate files are removed before this function returns, including
-    failed and timed-out runs.
+    failed and timed-out runs, unless diagnostic retention is explicitly
+    enabled with ``DECISION_REPORT_KEEP_RUN_DIR``.
     """
     ticker = str(ticker or "").strip().upper()
     if not ticker:
@@ -122,10 +129,13 @@ def generate_report(
     )
     output_html = run_dir / file_name
     run_dir.mkdir(parents=True, exist_ok=False)
+    keep_run_dir = _diagnostic_run_retention_enabled()
+    audit_path = run_dir / f"{_safe_ticker(ticker)}_finalization_audit.json"
     try:
         normalized_holding = _normalize_holding_context(holding_context)
     except ValueError as exc:
-        _remove_run_dir(run_dir)
+        if not keep_run_dir:
+            _remove_run_dir(run_dir)
         return {"success": False, "error": str(exc)}
 
     cmd = [
@@ -207,6 +217,8 @@ def generate_report(
             "decision_dashboard": bool(decision_payload),
             "fallback_used": bool(decision_payload and decision_payload.get("fallback_used")),
             "warnings": [],
+            "diagnostic_run_dir": str(run_dir) if keep_run_dir else None,
+            "diagnostic_audit_file": str(audit_path) if keep_run_dir and audit_path.is_file() else None,
         }
     except subprocess.TimeoutExpired as exc:
         return {
@@ -218,4 +230,5 @@ def generate_report(
     except Exception as exc:
         return {"success": False, "error": str(exc)}
     finally:
-        _remove_run_dir(run_dir)
+        if not keep_run_dir:
+            _remove_run_dir(run_dir)

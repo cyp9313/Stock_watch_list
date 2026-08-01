@@ -23,12 +23,16 @@ def test_decision_dashboard_renders_safe_evidence_anchors() -> None:
         chart.write_text("<div>chart</div>", encoding="utf-8")
         notes.write_text("[BULL] note", encoding="utf-8")
         decision.write_text(json.dumps({
-            "one_sentence": "<script>alert(1)</script>", "final_action": "buy\" onclick=alert(2)", "final_score": 63.4,
+            "one_sentence": "<script>alert(1)</script>", "final_action": "buy\" onclick=alert(2)", "final_score": 43.2,
+            "authoritative_rating_class": "hold", "authoritative_rating_text": "观察等待 WATCH",
             "position_advice": {"no_position": "<img src=x>", "has_position": "Hold"},
             "levels": {"ideal_buy": "$98.00–$99.00", "secondary_buy": None, "stop_loss": None, "take_profit": None, "invalidation_condition": "Support fails"},
             "catalysts": [{"text": "Catalyst", "evidence_ids": ["E-001", "<bad>"]}], "risk_alerts": [],
             "action_checklist": ["Observe"], "phase_decision": {"market": "US", "timezone": "America/New_York", "phase": "postmarket", "immediate_action": "Observe"},
-            "adjustments": [], "fallback_used": True,
+            "agent_opinions": [{"agent": "technical", "signal": "buy", "confidence": 0.7, "reason": "<b>趋势</b>", "evidence_ids": ["E-001"]}],
+            "opinion_agents_enabled": True, "opinion_agents_completed": 1, "opinion_agents_unavailable": ["news_fundamental", "risk"],
+            "opinion_conflict_summary": "程序风险护栏仍为最终依据。",
+            "adjustments": [], "fallback_used": True, "risk_boundary_guardrail_applied": True,
         }), encoding="utf-8")
         completed = subprocess.run([sys.executable, str(builder), str(data), str(chart), str(output), "--notes", str(notes), "--decision-json", str(decision)], capture_output=True, text=True)
         assert completed.returncode == 0, completed.stderr
@@ -37,5 +41,13 @@ def test_decision_dashboard_renders_safe_evidence_anchors() -> None:
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
     assert "onclick=alert(2)" not in html
     assert 'href="#evidence-E-001"' in html
+    assert "多意见处理" in html
+    assert "多意见组件" in html
+    assert "程序综合评分" in html
+    assert "Python 护栏" not in html
+    assert "程序综合评级为 观察等待" in html
+    assert "未返回：消息/基本面、风险" in html
+    assert "&lt;b&gt;趋势&lt;/b&gt;" in html
     assert "evidence-&lt;bad&gt;" not in html
     assert "确定性回退模板" in html
+    assert "风险边界：" in html

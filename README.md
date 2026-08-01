@@ -49,6 +49,8 @@ Short-term Watchlist 位于 **Market Dashboard** 与 **Market Breadth** 之间�
 - 为单个 ticker 生成可下载的 HTML 股票日报，包含行情、技术指标、新闻/搜索证据、评分、风险、评级和图表。
 - 日报由基于 Qwen-Agent 的定制 Agent 执行。Agent 会通过 function calling 调用受限工具获取市场数据、搜索与证据；Python 负责最终评分、风险/评级计算、技术图、HTML、证据、图标和运行日志的确定性产出。
 - 默认在报告顶部加入**决策仪表盘**：Python 基于已有评分、技术点位、已验证 evidence 和市场阶段生成交易参考区间、无持仓/已有持仓建议、催化因素、风险警报与行动检查项。额外的模型综合最多一次、无工具调用；模型不能改写最终评分、编造价格或 evidence ID，失败时立即使用可见的确定性回退模板。
+- 仪表盘明确区分 **Python 综合评级** 与按“无持仓 / 当前持仓”情境经风险护栏调整后的**决策行动**；例如综合评级为 Hold 时，无持仓行动可以是更保守的 Watch。
+- 可选 P3 提供技术、消息/基本面、风险三类受限意见组件：它们只读取已构建的本地 Context，不联网、不调用工具、不改评分、不生成 HTML。Python 会显示分歧说明，并且只会在强烈风险/分歧时保守地下调乐观动作；功能默认关闭，开启后每份报告最多增加三次无工具模型调用。
 - 决策仪表盘会按 ticker 推断 US / DE / HK / CN / JP / KR / TW / Crypto 的本地时区和市场阶段；P0 使用 weekday-only 交易日近似。下载表单可暂时关闭该仪表盘以兼容旧版报告。
 - 支持页面生成、一次性邮件和每周计划。搜索与文章抓取使用输入验证和 SSRF 防护。
 
@@ -141,7 +143,15 @@ DECISION_REPORT_PROVIDER=inherit   # inherit / dashscope / deepseek / openai_com
 DECISION_REPORT_MODEL=             # empty = inherit the AI Stock Report model
 DECISION_REPORT_TEMPERATURE=0.1
 DECISION_REPORT_TIMEOUT_SECONDS=120
-DECISION_REPORT_KEEP_CONTEXT=false # keep only decision.json/audit by default
+DECISION_REPORT_KEEP_CONTEXT=false # runner-level setting; web generation still cleans run folders by default
+# Troubleshooting only: retain the complete run folder, including finalization_audit.json and research intermediates. Delete it manually afterwards.
+DECISION_REPORT_KEEP_RUN_DIR=false
+
+# Optional P3 bounded specialist opinions; disabled by default (up to 3 extra model calls)
+DECISION_OPINION_AGENTS_ENABLED=false
+DECISION_OPINION_AGENTS_PROVIDER=inherit
+DECISION_OPINION_AGENTS_MODEL=
+DECISION_OPINION_AGENTS_TIMEOUT_SECONDS=45
 
 # Search / article evidence
 SEARCH_PROVIDER=both             # auto / priority / searxng / serper / both
@@ -287,6 +297,8 @@ The default history request is two days. The request window scales automatically
 - Generates downloadable HTML reports for individual tickers with market data, technicals, search/news evidence, scoring, risk, rating, and charts.
 - Uses a customized Qwen-Agent workflow. The agent uses function calling for approved data/search/evidence tools; Python deterministically creates the final scoring, risk/rating, charts, HTML, evidence assets, and logs.
 - Adds an opt-in-by-default **Decision Dashboard** at the top of the report. Python derives reference ranges, market phase, position-aware advice, evidence-backed catalysts/risks, and a checklist from existing artifacts. A single optional, tool-free synthesis call may improve wording, but it cannot alter the Python final score or invent prices/evidence; failures visibly fall back to a deterministic template.
+- The dashboard separates the Python **rating band** from the guarded **decision action** for the no-position or current-position scenario. A `Hold` rating can therefore correctly produce a more conservative no-position `Watch` action.
+- Optional P3 adds bounded technical, news/fundamental, and risk opinions. They only receive the built local context: no browsing, tools, score changes, or HTML generation. Python renders any disagreement and can only conservatively downgrade an optimistic action on strong risk/conflict. It is off by default and adds at most three tool-free model calls per report when enabled.
 - Market-phase display infers US / DE / HK / CN / JP / KR / TW / Crypto local sessions. P0 uses a weekday-only calendar approximation. The download form can disable the dashboard for a legacy-layout report.
 - Supports browser generation, one-off email, and weekly schedules. Article fetching includes SSRF protections.
 
@@ -333,7 +345,8 @@ Important settings include:
 
 - `STOCK_API_BASE_URL` and `STOCK_DEV_MODE` for the frontend/API boundary.
 - `LLM_PROVIDER`, `QWEN_MODEL`, `QWEN_RESEARCH_MODEL`, provider API keys, and `QWEN_AGENT_USE_RAW_API` for AI Stock Reports.
-- `DECISION_REPORT_ENABLED`, `DECISION_REPORT_PROVIDER`, `DECISION_REPORT_MODEL`, `DECISION_REPORT_TEMPERATURE`, `DECISION_REPORT_TIMEOUT_SECONDS`, and `DECISION_REPORT_KEEP_CONTEXT` for the controlled decision dashboard.
+- `DECISION_REPORT_ENABLED`, `DECISION_REPORT_PROVIDER`, `DECISION_REPORT_MODEL`, `DECISION_REPORT_TEMPERATURE`, `DECISION_REPORT_TIMEOUT_SECONDS`, and `DECISION_REPORT_KEEP_CONTEXT` for the controlled decision dashboard. Set `DECISION_REPORT_KEEP_RUN_DIR=true` only while troubleshooting: it retains the complete per-run folder (including `*_finalization_audit.json` and research intermediates) instead of automatically deleting it.
+- `DECISION_OPINION_AGENTS_ENABLED`, `DECISION_OPINION_AGENTS_PROVIDER`, `DECISION_OPINION_AGENTS_MODEL`, and `DECISION_OPINION_AGENTS_TIMEOUT_SECONDS` for optional P3 bounded specialist opinions.
 - `SEARCH_PROVIDER`, `SERPER_API_KEY`, `SEARXNG_*`, and `ARTICLE_FETCH_*` for evidence gathering.
 - `REPORT_SMTP_*`, `REPORT_*`, and `PORTFOLIO_*` for email, queues, schedules, limits, and Portfolio AI Reports.
 
