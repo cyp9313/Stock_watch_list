@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import json
+import math
 from pathlib import Path
 import re
 import shutil
@@ -47,6 +49,28 @@ def _tail(text: str | None, max_chars: int = 8000) -> str:
     return text[-max_chars:] if len(text) > max_chars else text
 
 
+def _normalize_holding_context(payload: dict | None) -> dict | None:
+    if payload is None:
+        return None
+    allowed = {"has_position", "buy_price", "shares", "portfolio_weight", "unrealized_pnl_pct"}
+    if not isinstance(payload, dict) or set(payload) - allowed or not isinstance(payload.get("has_position", False), bool):
+        raise ValueError("Invalid holding context.")
+    normalized = {"has_position": bool(payload.get("has_position", False))}
+    for key, positive in (("buy_price", True), ("shares", True), ("portfolio_weight", False), ("unrealized_pnl_pct", False)):
+        value = payload.get(key)
+        if value is None:
+            normalized[key] = None
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Invalid holding context.") from exc
+        if not math.isfinite(number) or (positive and number <= 0) or (key == "portfolio_weight" and not 0 <= number <= 1):
+            raise ValueError("Invalid holding context.")
+        normalized[key] = number
+    return normalized
+
+
 def _remove_run_dir(run_dir: Path) -> None:
     """Remove generated artifacts and prune empty per-user run directories."""
     shutil.rmtree(run_dir, ignore_errors=True)
@@ -70,6 +94,8 @@ def generate_report(
     search_provider: str = "auto",
     no_article_fetch: bool = False,
     timeout_seconds: int | None = None,
+    holding_context: dict | None = None,
+    decision_dashboard: bool = True,
 ) -> dict:
     """Generate a v5.8 report and return its HTML in memory.
 
@@ -96,6 +122,11 @@ def generate_report(
     )
     output_html = run_dir / file_name
     run_dir.mkdir(parents=True, exist_ok=False)
+    try:
+        normalized_holding = _normalize_holding_context(holding_context)
+    except ValueError as exc:
+        _remove_run_dir(run_dir)
+        return {"success": False, "error": str(exc)}
 
     cmd = [
         sys.executable,
@@ -115,6 +146,12 @@ def generate_report(
         cmd.extend(["--search-provider", search_provider])
     if no_article_fetch:
         cmd.append("--no-article-fetch")
+    if not decision_dashboard:
+        cmd.append("--disable-decision-dashboard")
+    if normalized_holding is not None:
+        holding_path = run_dir / f"{_safe_ticker(ticker)}_holding_context.json"
+        holding_path.write_text(json.dumps(normalized_holding, ensure_ascii=False), encoding="utf-8")
+        cmd.extend(["--holding-context-json", str(holding_path)])
 
     env = os.environ.copy()
     env.setdefault("PYTHONIOENCODING", "utf-8")
@@ -151,6 +188,13 @@ def generate_report(
                 "stderr": stderr,
             }
 
+        decision_payload = None
+        decision_path = run_dir / f"{_safe_ticker(ticker)}_decision.json"
+        if decision_path.is_file():
+            try:
+                decision_payload = json.loads(decision_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                decision_payload = None
         return {
             "success": True,
             "ticker": ticker,
@@ -160,6 +204,9 @@ def generate_report(
             "elapsed": elapsed,
             "stdout": stdout,
             "stderr": stderr,
+            "decision_dashboard": bool(decision_payload),
+            "fallback_used": bool(decision_payload and decision_payload.get("fallback_used")),
+            "warnings": [],
         }
     except subprocess.TimeoutExpired as exc:
         return {

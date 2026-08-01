@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import html
 import json
+import math
 import os
 import re
 import threading
@@ -5243,7 +5244,27 @@ def render_weekly_report_schedules(user, runner_ok, mail_ready):
             st.rerun()
 
 
-def render_daily_report(user):
+def _minimal_holding_context_for_report(config, ticker):
+    """Return only the selected ticker's non-sensitive holding fields."""
+    normalized = normalize_yfinance_ticker(ticker)
+    for page in (config or {}).get("portfolio_pages", []):
+        for holding in page.get("holdings", []):
+            if normalize_yfinance_ticker(holding.get("ticker")) != normalized:
+                continue
+            payload = {"has_position": True}
+            for key in ("buy_price", "shares"):
+                try:
+                    value = float(holding.get(key))
+                except (TypeError, ValueError):
+                    value = None
+                payload[key] = value if value is not None and math.isfinite(value) and value > 0 else None
+            # Do not send portfolio totals or other holdings. Weight/P&L remain
+            # optional until a portfolio-specific report action supplies them.
+            return payload
+    return {"has_position": False}
+
+
+def render_daily_report(user, config=None):
     st.subheader("AI Agent Stock Daily Report")
     st.caption(
         "Generate a v5.8 AI Agent HTML report for one yfinance ticker. "
@@ -5272,6 +5293,7 @@ def render_daily_report(user):
                 )
             with st.form("daily_report_download_form"):
                 ticker, _, months, search_provider, no_article_fetch = render_report_form_fields("daily_report_download")
+                decision_dashboard = st.checkbox("Include decision dashboard", value=True, help="Adds a score-preserving, evidence-backed decision summary to the downloaded AI Stock Report.")
                 submitted = st.form_submit_button("Generate Download", disabled=not runner_ok)
 
             if submitted:
@@ -5293,6 +5315,8 @@ def render_daily_report(user):
                                 months=months,
                                 search_provider=search_provider,
                                 no_article_fetch=no_article_fetch,
+                                holding_context=_minimal_holding_context_for_report(config, ticker),
+                                decision_dashboard=decision_dashboard,
                             )
                             st.session_state["daily_report_result"] = result
                     finally:
@@ -5306,6 +5330,8 @@ def render_daily_report(user):
             if result:
                 if result.get("success"):
                     st.success(f"Report generated in {result.get('elapsed', 0):.1f}s")
+                    if result.get("decision_dashboard"):
+                        st.caption("Decision dashboard: generated · Decision fallback: " + ("yes" if result.get("fallback_used") else "no"))
                     st.download_button(
                         "Download HTML Report",
                         data=result["html_bytes"],
@@ -5634,7 +5660,7 @@ with main_tabs[portfolio_tab_index]:
         )
 
 with main_tabs[ai_reports_tab_index]:
-    render_daily_report(user)
+    render_daily_report(user, config)
 
 st.divider()
 render_kline(user, cache_key, display_currency=display_currency)

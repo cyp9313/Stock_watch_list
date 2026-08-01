@@ -48,6 +48,8 @@ Short-term Watchlist 位于 **Market Dashboard** 与 **Market Breadth** 之间�
 
 - 为单个 ticker 生成可下载的 HTML 股票日报，包含行情、技术指标、新闻/搜索证据、评分、风险、评级和图表。
 - 日报由基于 Qwen-Agent 的定制 Agent 执行。Agent 会通过 function calling 调用受限工具获取市场数据、搜索与证据；Python 负责最终评分、风险/评级计算、技术图、HTML、证据、图标和运行日志的确定性产出。
+- 默认在报告顶部加入**决策仪表盘**：Python 基于已有评分、技术点位、已验证 evidence 和市场阶段生成交易参考区间、无持仓/已有持仓建议、催化因素、风险警报与行动检查项。额外的模型综合最多一次、无工具调用；模型不能改写最终评分、编造价格或 evidence ID，失败时立即使用可见的确定性回退模板。
+- 决策仪表盘会按 ticker 推断 US / DE / HK / CN / JP / KR / TW / Crypto 的本地时区和市场阶段；P0 使用 weekday-only 交易日近似。下载表单可暂时关闭该仪表盘以兼容旧版报告。
 - 支持页面生成、一次性邮件和每周计划。搜索与文章抓取使用输入验证和 SSRF 防护。
 
 ### 架构
@@ -132,6 +134,14 @@ QWEN_MODEL=deepseek-v4-flash
 QWEN_RESEARCH_MODEL=deepseek-v4-flash
 DASHSCOPE_API_KEY=your_key
 QWEN_AGENT_USE_RAW_API=true
+
+# Optional controlled decision dashboard for AI Stock Reports
+DECISION_REPORT_ENABLED=true       # set false for the legacy report layout
+DECISION_REPORT_PROVIDER=inherit   # inherit / dashscope / deepseek / openai_compatible
+DECISION_REPORT_MODEL=             # empty = inherit the AI Stock Report model
+DECISION_REPORT_TEMPERATURE=0.1
+DECISION_REPORT_TIMEOUT_SECONDS=120
+DECISION_REPORT_KEEP_CONTEXT=false # keep only decision.json/audit by default
 
 # Search / article evidence
 SEARCH_PROVIDER=both             # auto / priority / searxng / serper / both
@@ -276,6 +286,8 @@ The default history request is two days. The request window scales automatically
 
 - Generates downloadable HTML reports for individual tickers with market data, technicals, search/news evidence, scoring, risk, rating, and charts.
 - Uses a customized Qwen-Agent workflow. The agent uses function calling for approved data/search/evidence tools; Python deterministically creates the final scoring, risk/rating, charts, HTML, evidence assets, and logs.
+- Adds an opt-in-by-default **Decision Dashboard** at the top of the report. Python derives reference ranges, market phase, position-aware advice, evidence-backed catalysts/risks, and a checklist from existing artifacts. A single optional, tool-free synthesis call may improve wording, but it cannot alter the Python final score or invent prices/evidence; failures visibly fall back to a deterministic template.
+- Market-phase display infers US / DE / HK / CN / JP / KR / TW / Crypto local sessions. P0 uses a weekday-only calendar approximation. The download form can disable the dashboard for a legacy-layout report.
 - Supports browser generation, one-off email, and weekly schedules. Article fetching includes SSRF protections.
 
 ### Architecture
@@ -321,6 +333,7 @@ Important settings include:
 
 - `STOCK_API_BASE_URL` and `STOCK_DEV_MODE` for the frontend/API boundary.
 - `LLM_PROVIDER`, `QWEN_MODEL`, `QWEN_RESEARCH_MODEL`, provider API keys, and `QWEN_AGENT_USE_RAW_API` for AI Stock Reports.
+- `DECISION_REPORT_ENABLED`, `DECISION_REPORT_PROVIDER`, `DECISION_REPORT_MODEL`, `DECISION_REPORT_TEMPERATURE`, `DECISION_REPORT_TIMEOUT_SECONDS`, and `DECISION_REPORT_KEEP_CONTEXT` for the controlled decision dashboard.
 - `SEARCH_PROVIDER`, `SERPER_API_KEY`, `SEARXNG_*`, and `ARTICLE_FETCH_*` for evidence gathering.
 - `REPORT_SMTP_*`, `REPORT_*`, and `PORTFOLIO_*` for email, queues, schedules, limits, and Portfolio AI Reports.
 

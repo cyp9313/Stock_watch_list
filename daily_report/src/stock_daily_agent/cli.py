@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 import sys
@@ -33,6 +34,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--article-fetch-max-urls", type=int, help="临时覆盖 ARTICLE_FETCH_MAX_URLS")
     p.add_argument("--quiet", action="store_true", help="不流式打印 agent 输出")
     p.add_argument("--keep-intermediate", action="store_true", help="保留中间文件。默认也会保留 run-dir 中文件；此参数预留给后续清理策略")
+    p.add_argument("--holding-context-json", help="当前 run-dir 内的最小化持仓上下文 JSON 文件")
+    p.add_argument("--disable-decision-dashboard", action="store_true", help="禁用决策仪表盘（调试/兼容用途）")
+    p.add_argument("--decision-model", help="本次运行覆盖决策综合模型；默认继承主模型")
+    p.add_argument("--decision-provider", choices=["inherit", "dashscope", "deepseek", "openai_compatible"], help="本次运行覆盖决策综合 provider")
     return p
 
 
@@ -79,6 +84,22 @@ def main(argv: list[str] | None = None) -> int:
     if output:
         output.parent.mkdir(parents=True, exist_ok=True)
 
+    holding_context = None
+    if args.holding_context_json:
+        holding_path = Path(args.holding_context_json).resolve()
+        try:
+            holding_path.relative_to(run_dir)
+        except ValueError as exc:
+            raise ValueError("--holding-context-json 必须位于当前 --run-dir 内") from exc
+        try:
+            holding_context = json.loads(holding_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ValueError("--holding-context-json 必须是有效的本地 JSON 对象") from exc
+        if not isinstance(holding_context, dict):
+            raise ValueError("--holding-context-json 必须包含 JSON 对象")
+    if args.disable_decision_dashboard:
+        os.environ["DECISION_REPORT_ENABLED"] = "false"
+
     ctx = RunContext(
         paths=paths,
         ticker=args.ticker.upper(),
@@ -103,6 +124,9 @@ def main(argv: list[str] | None = None) -> int:
             provider=provider,
             enable_builtin_web=not args.no_web_tools,
             verbose=not args.quiet,
+            holding_context=holding_context,
+            decision_provider=args.decision_provider,
+            decision_model=args.decision_model,
         )
     except Exception as exc:
         print(f"\n[FAILED] Agent 运行失败: {exc}", file=sys.stderr)
@@ -112,6 +136,10 @@ def main(argv: list[str] | None = None) -> int:
     if result.ok:
         print("[SUCCESS] 日报生成完成")
         print(f"HTML: {result.output_html}")
+        print(f"Decision dashboard: {'generated' if result.decision_file else 'not generated'}")
+        print(f"Decision fallback: {'yes' if result.fallback_used else 'no'}")
+        if result.warnings:
+            print("Decision warnings: " + " | ".join(result.warnings[:3]))
         print(f"中间文件目录: {result.run_dir}")
         return 0
     print("[FAILED] Agent 未生成有效 HTML")
