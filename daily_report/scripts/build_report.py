@@ -22,6 +22,7 @@ build_report.py — 通用金融日报 HTML 报告生成器
 
 import sys
 import json
+import re
 from datetime import date as Date
 from html import escape as html_escape
 from urllib.parse import urlparse
@@ -121,6 +122,7 @@ REPORT_DATE = get_market_date()
 MONTHS      = 3
 NOTES_FILE  = None
 EVIDENCE_FILE = None
+DECISION_FILE = None
 
 i = 4
 while i < len(sys.argv):
@@ -132,6 +134,8 @@ while i < len(sys.argv):
         NOTES_FILE = sys.argv[i+1]; i += 2
     elif sys.argv[i] == '--evidence' and i+1 < len(sys.argv):
         EVIDENCE_FILE = sys.argv[i+1]; i += 2
+    elif sys.argv[i] == '--decision-json' and i+1 < len(sys.argv):
+        DECISION_FILE = sys.argv[i+1]; i += 2
     else:
         i += 1
 
@@ -440,8 +444,10 @@ def build_news_html(news_items):
         else:
             source_html = source_label + ' · 未附可核验链接'
         title_html = '<div class="news-title">' + title + '</div>' if title else ''
+        raw_id = str(item.get('evidence_id') or '').strip().upper()
+        anchor = (' id="evidence-' + raw_id + '"') if re.fullmatch(r'[A-Z][A-Z0-9-]{0,63}', raw_id) else ''
         parts.append(
-            '<div class="news-card ' + item['sentiment'] + '">\n'
+            '<div class="news-card ' + item['sentiment'] + '"' + anchor + '>\n'
             '  <div class="news-tag ' + item['tag_cls'] + '">' + item['tag_label'] + '</div>\n'
             '  ' + title_html + '\n'
             '  <div class="news-summary">' + body + '</div>\n'
@@ -451,6 +457,68 @@ def build_news_html(news_items):
     return '\n'.join(parts)
 
 news_html = build_news_html(news_items)
+
+
+def _load_decision_dashboard(path):
+    if not path:
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+    except (OSError, ValueError, TypeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _decision_action_label(value):
+    labels = {'buy': '买入', 'add': '加仓', 'hold': '持有', 'reduce': '减仓', 'sell': '卖出', 'watch': '观察', 'avoid': '回避'}
+    return labels.get(str(value or '').lower(), '观察')
+
+
+def _decision_html(payload):
+    if not payload:
+        return ''
+    action = str(payload.get('final_action') or '').lower()
+    action_class = action if action in {'buy', 'add', 'hold', 'reduce', 'sell', 'watch', 'avoid'} else 'watch'
+    score = payload.get('final_score')
+    try:
+        score_text = f'{float(score):.1f}'
+    except (TypeError, ValueError):
+        score_text = '—'
+    def text(value): return escape_text(value or '—')
+    def evidence_items(items, empty):
+        rendered = []
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict): continue
+            ids = []
+            for evidence_id in item.get('evidence_ids') or []:
+                safe_id = str(evidence_id or '').strip().upper()
+                if re.fullmatch(r'[A-Z][A-Z0-9-]{0,63}', safe_id):
+                    ids.append('<a href="#evidence-' + safe_id + '">' + escape_text(safe_id) + '</a>')
+            rendered.append('<li>' + text(item.get('text')) + (' <span class="decision-evidence">[' + ', '.join(ids) + ']</span>' if ids else '') + '</li>')
+        return ''.join(rendered) if rendered else '<li>' + escape_text(empty) + '</li>'
+    levels = payload.get('levels') if isinstance(payload.get('levels'), dict) else {}
+    phase = payload.get('phase_decision') if isinstance(payload.get('phase_decision'), dict) else {}
+    adjustments = payload.get('adjustments') if isinstance(payload.get('adjustments'), list) else []
+    adjustment_html = ''.join('<li>' + text(item.get('from_action')) + ' → ' + text(item.get('to_action')) + '：' + text(item.get('reason')) + '</li>' for item in adjustments if isinstance(item, dict))
+    fallback = ''
+    if payload.get('fallback_used'):
+        fallback = '<div class="decision-fallback">决策文字使用确定性回退模板生成；技术数据、评分和证据仍来自正常流水线。</div>'
+    return (
+        '  <div class="section decision-dashboard">\n'
+        '    <div class="section-title"><span class="icon">🧭</span> 决策仪表盘 <span class="decision-action ' + action_class + '">' + _decision_action_label(action) + '</span><span class="decision-score">' + score_text + ' / 100</span></div>\n'
+        '    <div class="decision-summary">' + text(payload.get('one_sentence')) + '</div>' + fallback + '\n'
+        '    <div class="decision-grid"><div><strong>无持仓</strong><p>' + text((payload.get('position_advice') or {}).get('no_position')) + '</p></div><div><strong>已有持仓</strong><p>' + text((payload.get('position_advice') or {}).get('has_position')) + '</p></div></div>\n'
+        '    <div class="decision-levels"><div>理想买入参考<br><strong>' + text(levels.get('ideal_buy')) + '</strong></div><div>第二买入参考<br><strong>' + text(levels.get('secondary_buy')) + '</strong></div><div>止损参考<br><strong>' + text(levels.get('stop_loss')) + '</strong></div><div>止盈参考<br><strong>' + text(levels.get('take_profit')) + '</strong></div></div>\n'
+        '    <div class="decision-grid"><div><strong>催化因素</strong><ul>' + evidence_items(payload.get('catalysts'), '暂无可验证催化因素。') + '</ul></div><div><strong>风险警报</strong><ul>' + evidence_items(payload.get('risk_alerts'), '暂无可验证风险警报。') + '</ul></div></div>\n'
+        '    <div class="decision-meta">市场阶段：' + text(phase.get('market')) + ' · ' + text(phase.get('phase')) + ' · ' + text(phase.get('timezone')) + '<br>立即行动：' + text(phase.get('immediate_action')) + '<br>失效条件：' + text(levels.get('invalidation_condition')) + '</div>\n'
+        '    <div class="decision-meta"><strong>行动检查：</strong>' + '；'.join(text(item) for item in payload.get('action_checklist', []) if isinstance(item, str)) + '</div>\n'
+        + ('    <div class="decision-meta"><strong>调整记录：</strong><ul>' + adjustment_html + '</ul></div>\n' if adjustment_html else '')
+        + '  </div>\n\n'
+    )
+
+
+decision_dashboard_html = _decision_html(_load_decision_dashboard(DECISION_FILE))
 
 # 员工数格式
 emp_str = f"{EMPLOYEES//10000}万人" if EMPLOYEES >= 10000 else (f"{EMPLOYEES:,}人" if EMPLOYEES > 0 else '—')
@@ -493,6 +561,10 @@ CSS = '''  * { box-sizing: border-box; margin: 0; padding: 0; }
   .kpi-sub { font-size: 11px; color: #8b949e; margin-top: 4px; }
   .kpi-value.up { color: #3fb950; } .kpi-value.down { color: #f85149; } .kpi-value.warn { color: #d29922; }
   .section { background: #161b22; border: 1px solid #2d333b; border-radius: 12px; padding: 24px; margin-bottom: 20px; }
+  .decision-dashboard { border-color:#335a88; background:linear-gradient(135deg,#142131,#161b22); }
+  .decision-action { margin-left:auto; padding:3px 10px; border-radius:999px; font-size:12px; }.decision-action.buy,.decision-action.add { background:#123d2a;color:#6ee7a1; }.decision-action.sell,.decision-action.reduce,.decision-action.avoid { background:#4b1f27;color:#ff9aa4; }.decision-action.watch,.decision-action.hold { background:#3b3520;color:#f0cf72; }.decision-score { color:#58a6ff; font-size:18px; margin-left:8px; }
+  .decision-summary { color:#f0f6fc; font-size:16px; font-weight:600; margin-bottom:16px; }.decision-grid,.decision-levels { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin:12px 0; }.decision-levels { grid-template-columns:repeat(4,minmax(0,1fr)); }.decision-grid>div,.decision-levels>div { background:#0d1117; border:1px solid #30363d; border-radius:8px; padding:12px; font-size:13px; }.decision-grid p,.decision-grid ul { margin-top:6px; color:#c9d1d9; }.decision-grid ul { padding-left:18px; }.decision-evidence a { color:#9cc7ff; }.decision-meta { color:#aab7c4; font-size:12px; margin-top:9px; }.decision-fallback { margin:10px 0; padding:9px; border-left:3px solid #d29922; color:#e3c98c; font-size:12px; background:rgba(210,153,34,.08); }
+  @media (max-width:700px) { .decision-levels { grid-template-columns:repeat(2,minmax(0,1fr)); } }
   .section-title { font-size: 16px; font-weight: 700; color: #f0f6fc; margin-bottom: 18px; display: flex; align-items: center; gap: 8px; }
   .section-title .icon { font-size: 18px; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
@@ -578,6 +650,9 @@ html += '      <div class="badge-price" style="color:' + price_col + '">' + form
 html += '      <div class="badge-change ' + chg_cls + '">' + chg_arrow + ' ' + chg_str + ' (' + pct_str + '%)</div>\n'
 html += '      <div class="badge-date">' + REPORT_DATE + ' 生成' + (' · 数据截止 ' + DATA_END if DATA_END else '') + '</div>\n'
 html += '    </div>\n  </div>\n\n'
+
+# 决策仪表盘由 Finalizer 写入独立、已校验 JSON；不传该文件时保持旧报告布局。
+html += decision_dashboard_html
 
 # KPI：不适用的基本面/分析师字段显示为真正的 N/A，而不是数值 0。
 html += '  <!-- KPI 概览 -->\n  <div class="kpi-grid">\n'
