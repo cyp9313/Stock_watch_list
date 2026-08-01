@@ -69,10 +69,16 @@ from multiuser_store import (
     check_login_lock_status,
     config_to_api_groups,
     default_watchlist_config,
+    get_screening_run,
     get_user_config,
+    list_screening_runs,
     normalize_config,
     save_user_config,
+    save_screening_runs,
+    screening_watchlist_tickers,
+    update_screening_rerank,
 )
+from screening_llm import rerank_candidates
 from ticker_mapping import normalize_yfinance_ticker, stockanalysis_overview_url
 from ticker_search import search_yfinance_candidates
 
@@ -170,6 +176,69 @@ RIGHT_ALIGNED_COLUMNS = {
     if col not in {"Ticker", "Name", "Candles (20)", "Next Earnings", *RELATIVE_SPARKLINE_COLUMNS}
 }
 BREADTH_WATCHLIST_COLUMNS = ("Ticker", "Price", "1D%", "5D%", "1M%")
+
+WATCHLIST_COLUMN_TOOLTIPS = {
+    "Ticker": "Yahoo Finance ticker。悬浮 ticker 单元格可查看名称和 Beta。",
+    "Name": "标的名称，来自本地名称缓存或 Yahoo Finance 元数据。",
+    "Price": "最新可用价格；常规时段为最新复权收盘价，盘前/盘后价格会使用对应时段的估算更新。",
+    "Candles (20)": "最近 20 根日线蜡烛图；绿色为收涨、红色为收跌。",
+    "ADX": "14 日平均趋向指数。通常高于 25 表示趋势较强，低于 20 表示趋势较弱或震荡。",
+    "1D%": "最新价格相对上一交易日复权收盘价的涨跌幅。",
+    "5D%": "最新复权收盘价相对 5 个交易日前的累计涨跌幅。",
+    "1M%": "最新复权收盘价相对约 21 个交易日前的累计涨跌幅。",
+    "YTD%": "最新复权收盘价相对本年首个有效交易日的累计涨跌幅。",
+    "20D Rel%": "20 日个股收益率减去 ^GSPC 同期收益率，单位为百分点。",
+    "60D Rel%": "60 日个股收益率减去 ^GSPC 同期收益率，单位为百分点。",
+    "120D Rel%": "120 日个股收益率减去 ^GSPC 同期收益率，单位为百分点。",
+    "3/6/12M Rel%": "3、6、12 个月相对 ^GSPC 收益的加权组合：20% / 30% / 50%。",
+    "20D Rel (20)": "最近 20 个交易日的 20 日相对 ^GSPC 收益变化；灰色虚线为 0 轴。",
+    "60D Rel (20)": "最近 20 个交易日的 60 日相对 ^GSPC 收益变化；灰色虚线为 0 轴。",
+    "120D Rel (20)": "最近 20 个交易日的 120 日相对 ^GSPC 收益变化；灰色虚线为 0 轴。",
+    "3/6/12M Rel (20)": "最近 20 个交易日的 3/6/12 个月加权相对动量变化；灰色虚线为 0 轴。",
+    "Diff_BB_Up%": "(Price - 布林上轨) / 布林上轨 × 100；上轨为 20 日均线 + 2 倍标准差。",
+    "Diff_BB_Low%": "(Price - 布林下轨) / 布林下轨 × 100；下轨为 20 日均线 - 2 倍标准差。",
+    "RSI": "14 日相对强弱指数。常用参考：低于 30 偏超卖，高于 70 偏超买。",
+    "Volume_Ratio": "当日成交量 / 5 日成交量 EMA。",
+    "Next Earnings": "下一次已知财报日期。",
+    "Trailing PE": "最近十二个月实际盈利对应的市盈率。",
+    "Forward PE": "基于分析师未来盈利预期的市盈率。",
+    "PEG Ratio": "市盈率相对盈利增长率的比值；数据源缺失时留空。",
+    "Analysts": "分析师综合评级，来自基本面缓存。",
+    "Price Target": "分析师平均目标价，来自基本面缓存。",
+    "Market Cap": "市值，来自基本面缓存。",
+    "Buy Price": "该账户配置中记录的持仓成本价。",
+    "Shares": "该账户配置中记录的持仓数量。",
+    "Market Value": "Price × Shares，按当前显示币种换算。",
+    "P/L": "未实现盈亏：Market Value - Buy Price × Shares。",
+    "P/L 1D": "按 1D% 估算的当日持仓盈亏变动。",
+    "P/L 5D": "按 5D% 估算的 5 日持仓盈亏变动。",
+    "P/L 1M": "按 1M% 估算的 1 个月持仓盈亏变动。",
+    "P/L%": "(Price / Buy Price - 1) × 100。",
+    "Interval": "K 线周期：5 分钟或 15 分钟。",
+    "Bar Diff%": "最新 K 线 Close 相对前一根 K 线 Close 的涨跌幅。",
+    "Candles (15)": "最近 15 根对应周期 K 线蜡烛图；绿色为收涨、红色为收跌。",
+    "ADX (15)": "最近 15 根 K 线的 ADX 走势；虚线为 ADX 25 的趋势强度参考线。",
+    "MA Spread‱": "(均线 A - 均线 B) / 均线 B × 10,000，以万分之一为单位。",
+    "MA 1 / MA 2": "两条可配置均线在最近 15 根 K 线上的走势对比。",
+    "Volume Ratio": "最新成交量 / 最近 20 根 K 线平均成交量。",
+    "Volume (15)": "最近 15 根 K 线的成交量柱状图。",
+    "MACD Diff‱": "(MACD - Signal) / Close × 10,000，以万分之一为单位。",
+    "MACD / Signal": "最近 15 根 K 线的 MACD 与 Signal；灰色虚线为 0 轴。",
+    "Diff BB Upper%": "(Close - 布林上轨) / (布林上轨 - 布林下轨) × 100。0% 触及上轨，-50% 位于带宽中线。",
+    "BB / Close": "Close 与布林上下轨的最近 15 根 K 线走势；虚线为上下轨。",
+    "Diff VWAP%": "(Close - VWAP) / VWAP × 100；无当前交易量的盘外 K 线不显示。",
+    "VWAP / Close": "Close、VWAP 与 VWAP ±1σ 的最近 15 根 K 线走势；虚线为 ±1σ 轨道。",
+    "RSI (30/70)": "最近 15 根 K 线 RSI；灰色虚线分别为 30 与 70。",
+    "ATR": "可配置窗口的平均真实波幅，衡量绝对波动，不参与短线语音提醒。",
+    "ATR (15)": "最近 15 根 K 线 ATR 变化曲线。",
+}
+
+
+def watchlist_column_tooltip(column):
+    column = str(column)
+    if column.startswith("Diff_EMA"):
+        return f"(Price - {column.replace('Diff_', '').replace('%', '')}) / {column.replace('Diff_', '').replace('%', '')} × 100。"
+    return WATCHLIST_COLUMN_TOOLTIPS.get(column, column)
 
 SECTION_META = {
     "stocks_pages": {
@@ -1259,7 +1328,7 @@ def render_grouped_table(
     for col_index, col in enumerate(visible_columns):
         sticky_style = sticky_first_column_header_style(theme["table_header_bg"]) if col_index == 0 else ""
         html_table += (
-            f"<th title='{html.escape(col, quote=True)}' style='padding:4px; text-align:left; {sticky_style}"
+            f"<th title='{html.escape(watchlist_column_tooltip(col), quote=True)}' style='padding:4px; text-align:left; {sticky_style}"
             f"color:{theme['text']}; white-space:normal; overflow-wrap:anywhere; line-height:1.12; "
             f"border:1px solid {theme['table_border']};'>"
             f"{html.escape(col)}</th>"
@@ -1688,7 +1757,7 @@ def render_portfolio_table(
     for col_index, col in enumerate(visible_columns):
         sticky_style = sticky_first_column_header_style(theme["table_header_bg"]) if col_index == 0 else ""
         html_table += (
-            f"<th title='{html.escape(col, quote=True)}' style='padding:4px; text-align:left; {sticky_style}color:{theme['text']}; "
+            f"<th title='{html.escape(watchlist_column_tooltip(col), quote=True)}' style='padding:4px; text-align:left; {sticky_style}color:{theme['text']}; "
             f"white-space:normal; overflow-wrap:anywhere; line-height:1.12; "
             f"border:1px solid {theme['table_border']};'>{html.escape(col)}</th>"
         )
@@ -2519,12 +2588,14 @@ def fetch_stock_data(config_json, cache_key):
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def fetch_breadth_data():
+def fetch_breadth_data(screening_candidates=(), enable_screener=False):
     sp500_syms = stock_watch_list_back_end.get_sp500_symbols()
     nasdaq100_syms = stock_watch_list_back_end.get_nasdaq100_symbols()
     payload = {
         "sp500_symbols": json.dumps(sp500_syms),
         "nasdaq100_symbols": json.dumps(nasdaq100_syms),
+        "screening_candidates": json.dumps(list(screening_candidates)),
+        "enable_screener": "1" if enable_screener else "0",
     }
     try:
         resp = requests.post(f"{API_BASE}/api/breadth_data", data=payload, timeout=300)
@@ -2709,7 +2780,7 @@ def render_short_term_table(
     """
     for index, column in enumerate(columns):
         sticky = sticky_first_column_header_style(theme["table_header_bg"]) if index == 0 else ""
-        html_table += f"<th title='{html.escape(column, quote=True)}' style='width:{widths[index]}px; padding:4px; text-align:left; {sticky} color:{theme['text']}; border:1px solid {theme['table_border']};'>{html.escape(column)}</th>"
+        html_table += f"<th title='{html.escape(watchlist_column_tooltip(column), quote=True)}' style='width:{widths[index]}px; padding:4px; text-align:left; {sticky} color:{theme['text']}; border:1px solid {theme['table_border']};'>{html.escape(column)}</th>"
     html_table += "</tr></thead><tbody>"
 
     for group_name, tickers in groups.items():
@@ -5145,6 +5216,12 @@ def render_weekly_report_schedules(user, runner_ok, mail_ready):
             "daily_report_schedule",
             include_email=True,
         )
+        schedule_decision_dashboard = st.checkbox(
+            "Include decision dashboard",
+            value=True,
+            key="daily_report_schedule_decision_dashboard",
+            help="Adds a score-preserving, evidence-backed decision summary to each scheduled AI Stock Report.",
+        )
         day_col, time_col = st.columns([4, 1])
         with day_col:
             st.markdown("**Send on (Europe/Berlin)**")
@@ -5181,6 +5258,7 @@ def render_weekly_report_schedules(user, runner_ok, mail_ready):
                 months=schedule_months,
                 search_provider=schedule_provider,
                 no_article_fetch=schedule_no_fetch,
+                decision_dashboard=schedule_decision_dashboard,
             )
             st.success(
                 f"Weekly plan for {', '.join(WEEKDAY_NAMES[day] for day in schedule['weekdays'])} created. "
@@ -5392,6 +5470,12 @@ def render_daily_report(user, config=None):
                     "daily_report_email",
                     include_email=True,
                 )
+                email_decision_dashboard = st.checkbox(
+                    "Include decision dashboard",
+                    value=True,
+                    key="daily_report_email_decision_dashboard",
+                    help="Adds a score-preserving, evidence-backed decision summary to the emailed AI Stock Report.",
+                )
                 email_submitted = st.form_submit_button(
                     "Queue Report Email",
                     disabled=not runner_ok or not mail_ready,
@@ -5406,6 +5490,7 @@ def render_daily_report(user, config=None):
                         months=email_months,
                         search_provider=email_provider,
                         no_article_fetch=email_no_fetch,
+                        decision_dashboard=email_decision_dashboard,
                     )
                     st.success(
                         f"Job {job['id'][:8]} queued for {job['recipient_masked']}. "
@@ -5418,6 +5503,325 @@ def render_daily_report(user, config=None):
             render_weekly_report_schedules(user, runner_ok, mail_ready)
 
         render_email_job_status(user["cache_key"], report_kind="ticker")
+
+SCREENING_METRIC_COLUMNS = {
+    "trend_quality": (
+        ("20D Return%", "20D%"), ("60D Return%", "60D%"), ("120D Return%", "120D%"),
+        ("20D Relative%", "20D Rel%"), ("60D Relative%", "60D Rel%"), ("120D Relative%", "120D Rel%"),
+        ("MA50 Distance%", "MA50 Gap%"), ("MA50/MA200%", "MA50/MA200%"),
+        ("Volume Ratio", "Volume Ratio"), ("20D Avg Turnover", "20D Avg Turnover"),
+        ("PE TTM", "PE TTM"), ("Forward PE", "Forward PE"), ("PB", "PB"), ("Market Cap", "Market Cap"),
+        ("Annual Volatility", "Annual Vol"), ("60D Drawdown%", "60D DD%"),
+    ),
+    "volume_breakout": (
+        ("20D Breakout%", "20D Breakout%"), ("20D Return%", "20D%"), ("60D Return%", "60D%"),
+        ("MA20 Distance%", "MA20 Gap%"), ("Volume Ratio", "Volume Ratio"),
+        ("20D Avg Turnover", "20D Avg Turnover"), ("Annual Volatility", "Annual Vol"),
+    ),
+    "oversold_reversal": (
+        ("RSI14", "RSI14"), ("BB Lower Distance%", "BB Lower Gap%"),
+        ("MACD Diff", "MACD Diff"), ("MACD Diff Change", "MACD Diff Change"),
+        ("Volume Ratio", "Volume Ratio"), ("20D Avg Turnover", "20D Avg Turnover"),
+        ("PE TTM", "PE TTM"), ("Forward PE", "Forward PE"), ("PB", "PB"), ("Annual Volatility", "Annual Vol"),
+    ),
+}
+
+SCREENING_RULE_EXPLANATIONS = {
+    "trend_quality": (
+        "**硬过滤：**不少于 252 根日线；本地价格/20 日平均成交额达标；`Close > MA50 > MA200`，且 MA50 高于 20 日前。\n\n"
+        "**基础分（100）：**动量 30、估值 16、流动性 19、活跃度 16、稳定性 13、MACD 反转 4、规模 2；估值优先使用 PE TTM，缺失时才回退 Forward PE。\n\n"
+        "**风险扣分：**高波动、异常放量、非正 PE、高 PB、偏离 MA50 过大。"
+    ),
+    "volume_breakout": (
+        "**硬过滤：**不少于 126 根日线；本地价格/20 日平均成交额达标；收盘突破此前 20 日高点、量比不少于 1.5，且高于 MA20。\n\n"
+        "**基础分（100）：**突破动量 35、活跃度 30、流动性 24、稳定性 11。\n\n"
+        "**风险扣分：**高波动、异常放量、非正 PE、高 PB、当日涨幅过大带来的追涨风险。"
+    ),
+    "oversold_reversal": (
+        "**硬过滤：**不少于 126 根日线；本地价格/20 日平均成交额达标；`RSI14 ≤ 35` 或触及/跌破布林下轨，并且 MACD Diff 较前一日改善。\n\n"
+        "**基础分（100）：**反转 40、稳定性 20、流动性 18、估值 16、活跃度 6；估值优先使用 PE TTM，缺失时才回退 Forward PE。\n\n"
+        "**风险扣分：**高波动、异常放量、非正 PE、高 PB，以及反转尚未确认的固定风险扣分。"
+    ),
+}
+
+SCREENING_COLUMN_TOOLTIPS = {
+    "Ticker": "Yahoo Finance ticker。悬浮单元格可查看标的名称和相对本地市场基准计算的 Beta。",
+    "Source": "该标的进入候选池的来源：S&P 500、Nasdaq 100 和/或当前账户自选。",
+    "Market": "由 ticker 后缀识别的市场；决定本地价格/流动性门槛与相对强弱基准。",
+    "Price": "本次筛选下载的最新日线复权收盘价（Adj Close）。",
+    "1D%": "最新复权收盘价相对前一根有效日线的涨跌幅。",
+    "20D%": "最新复权收盘价相对 20 个交易日前的累计涨跌幅。",
+    "60D%": "最新复权收盘价相对 60 个交易日前的累计涨跌幅。",
+    "120D%": "最新复权收盘价相对 120 个交易日前的累计涨跌幅。",
+    "20D Rel%": "20 日个股收益率减去对应本地基准指数同期收益率，单位为百分点。",
+    "60D Rel%": "60 日个股收益率减去对应本地基准指数同期收益率，单位为百分点。",
+    "120D Rel%": "120 日个股收益率减去对应本地基准指数同期收益率，单位为百分点。",
+    "MA50 Gap%": "(Close / MA50 - 1) × 100；衡量价格相对 50 日均线的位置。",
+    "MA50/MA200%": "(MA50 / MA200 - 1) × 100；正值通常表示中期均线位于长期均线上方。",
+    "MA20 Gap%": "(Close / MA20 - 1) × 100；衡量价格相对 20 日均线的位置。",
+    "20D Breakout%": "(Close / 此前 20 日最高收盘价 - 1) × 100；仅在突破策略中使用。",
+    "Volume Ratio": "最新日成交量 / 最近 20 日日均成交量。",
+    "20D Avg Turnover": "最近 20 日平均的 Adj Close × Volume，按标的交易币种计；用于流动性门槛，并以科学计数法显示。",
+    "PE TTM": "最近十二个月实际盈利对应的市盈率；估值评分优先使用该值。",
+    "Forward PE": "基于分析师未来盈利预期的市盈率；仅在 PE TTM 缺失时作为估值评分回退。",
+    "PB": "市净率，来自当日基本面 SQLite 缓存；以 1.5 倍为中性，越低越偏绿、越高越偏红，8 倍以上为高值端。",
+    "Market Cap": "市值，来自当日基本面 SQLite 缓存；以科学计数法显示，数值单位遵循数据源。",
+    "Annual Vol": "最近 20 日日收益率标准差 × √252 的年化波动率估计。",
+    "60D DD%": "最近 60 日内的最大回撤：Close / 期间滚动最高价 - 1 的最小值。",
+    "RSI14": "14 日 RSI；超跌反转策略以 RSI14 ≤ 35 作为一个触发条件。",
+    "BB Lower Gap%": "(Close / 布林下轨 - 1) × 100；下轨为 MA20 - 2 × 20 日标准差。",
+    "MACD Diff": "MACD 线减去 Signal 线；MACD 使用 EMA12-EMA26，Signal 为其 EMA9。",
+    "MACD Diff Change": "当前 MACD Diff 减去前一日 MACD Diff；正值表示 Diff 正在改善。",
+    "Base": "各已展示因子分数之和，尚未扣除风险。",
+    "Risk Deduction": "由波动、异常放量、估值异常、过度追涨或反转未确认等规则产生的扣分。",
+    "Score": "最终规则分 = Base - Risk Deduction，限制在 0–100；不被 AI rerank 改写。",
+    "Factors": "该策略实际使用的各因子分数明细；权重与计算规则见表格上方说明。",
+    "Risk": "命中的风险标签；会对应 Risk Deduction 中的规则。",
+    "Reason": "满足该策略硬过滤条件的确定性入选原因。",
+    "AI Rank": "AI 只能重排既有候选；不会修改 Score 或新增 ticker。",
+    "AI reason": "AI 对重排位置的简短中文说明。",
+}
+
+
+def _format_screening_scientific(value):
+    numeric = pd.to_numeric(value, errors="coerce")
+    return "" if pd.isna(numeric) else f"{float(numeric):.2e}"
+
+
+def render_screening_rule_explanation(strategy_key):
+    explanation = SCREENING_RULE_EXPLANATIONS.get(str(strategy_key or ""))
+    if explanation:
+        st.caption("分数计算说明")
+        st.markdown(explanation)
+
+
+def _screening_display_rows(candidates, strategy_key=None):
+    metric_columns = SCREENING_METRIC_COLUMNS.get(strategy_key or "", ())
+    rows = []
+    for row in candidates or []:
+        if not isinstance(row, dict):
+            continue
+        factors = row.get("Factor Scores") if isinstance(row.get("Factor Scores"), dict) else {}
+        metrics = row.get("Metrics") if isinstance(row.get("Metrics"), dict) else {}
+        display_row = {
+            "Ticker": row.get("Ticker"), "Source": row.get("Source"), "Market": row.get("Market"), "Price": row.get("Price"),
+            "1D%": row.get("1D%"),
+            "_Name": row.get("Name"), "_Beta": row.get("Beta"),
+        }
+        for metric_key, display_name in metric_columns:
+            value = metrics.get(metric_key)
+            display_row[display_name] = _format_screening_scientific(value) if display_name in {"20D Avg Turnover", "Market Cap"} else value
+        display_row.update({
+            "Base": row.get("Base Score"), "Risk Deduction": row.get("Risk Deduction"), "Score": row.get("Score"),
+            "Factors": " | ".join(f"{name} {value}" for name, value in factors.items()),
+            "Risk": "、".join(str(item) for item in row.get("Risk Tags", []) if item),
+            "Reason": row.get("Reason"),
+        })
+        rows.append(display_row)
+    return rows
+
+
+def _screening_cell_color(column, value, row, theme):
+    """Apply the same restrained heat-map language as the watchlist tables."""
+    if column == "Ticker":
+        return beta_color(row.get("_Beta", np.nan))
+    if column == "Price":
+        return "#dcfce7"
+    numeric = pd.to_numeric(value, errors="coerce")
+    if pd.isna(numeric):
+        return theme["table_bg"]
+    if column == "RSI14":
+        return rsi_color(numeric)
+    if column == "Volume Ratio":
+        return blue_color(numeric)
+    if column == "20D Avg Turnover":
+        return blue_color(numeric, clip=100_000_000.0)
+    if column == "Market Cap":
+        return blue_color(numeric, clip=1_000_000_000_000.0)
+    if column in {"PE TTM", "Forward PE"}:
+        # Match the financial watchlist columns exactly: positive PE uses the
+        # 0-50 blue scale; non-positive PE is rendered at its high-value end.
+        return blue_color(numeric if numeric > 0 else 50.0, clip=50.0)
+    if column == "PB":
+        # PB is sector-sensitive, but 1.5 is a useful neutral reference for a
+        # broad screener.  Values toward 0 are greener; 8+ is fully red.
+        return red_green(1.5 - numeric, neg_clip=-6.5, pos_clip=1.5)
+    if column == "Risk Deduction":
+        return red_green(-numeric, neg_clip=-12.0, pos_clip=12.0)
+    if column in {"Score", "Base"}:
+        return red_green(numeric - 50.0, neg_clip=-50.0, pos_clip=50.0)
+    if column in {
+        "1D%", "20D%", "60D%", "120D%", "20D Rel%", "60D Rel%", "120D Rel%", "MA50 Gap%", "MA50/MA200%",
+        "MA20 Gap%", "20D Breakout%", "BB Lower Gap%", "MACD Diff", "MACD Diff Change", "60D DD%",
+    }:
+        return red_green(numeric, neg_clip=-25.0, pos_clip=25.0)
+    return theme["table_bg"]
+
+
+def _render_screening_table(rows, *, max_height=600):
+    """Use the app's HTML table path: Streamlit's canvas grid can render blank here."""
+    rows = rows or []
+    if not rows:
+        st.info("没有可显示的候选。")
+        return
+    columns = [column for column in rows[0] if not str(column).startswith("_")]
+    theme = get_theme(bool(st.session_state.get("dark_mode", False)))
+    table = (
+        f"<div style='width:100%;max-height:{max_height}px;overflow:auto;border:1px solid {theme['table_border']};'>"
+        f"<table style='width:max-content;min-width:0;border-collapse:collapse;font-size:12px;background:{theme['table_bg']};color:{theme['text']};'>"
+        "<thead><tr>"
+    )
+    for index, column in enumerate(columns):
+        sticky = f"position:sticky;left:0;z-index:12;min-width:{ticker_column_width([str(row.get('Ticker', '')) for row in rows])}px;" if index == 0 else ""
+        table += (
+            f"<th title='{html.escape(SCREENING_COLUMN_TOOLTIPS.get(str(column), str(column)), quote=True)}' style='position:sticky;top:0;z-index:11;{sticky}padding:6px;text-align:left;"
+            f"background:{theme['table_header_bg']};color:{theme['text']};border:1px solid {theme['table_border']};'>"
+            f"{html.escape(str(column))}</th>"
+        )
+    table += "</tr></thead><tbody>"
+    numeric_columns = {
+        "Price", "1D%", "Base", "Risk Deduction", "Score", "20D%", "60D%", "120D%", "20D Rel%", "60D Rel%", "120D Rel%",
+        "MA50 Gap%", "MA50/MA200%", "MA20 Gap%", "20D Breakout%", "Volume Ratio", "20D Avg Turnover", "RSI14",
+        "BB Lower Gap%", "MACD Diff", "MACD Diff Change", "PE TTM", "Forward PE", "PB", "Market Cap", "Annual Vol", "60D DD%", "AI Rank",
+    }
+    for row in rows:
+        table += "<tr>"
+        for index, column in enumerate(columns):
+            value = row.get(column, "")
+            if value is None or (isinstance(value, float) and pd.isna(value)):
+                value = ""
+            align = "right" if column in numeric_columns else "left"
+            bg_color = _screening_cell_color(column, value, row, theme)
+            text_color = theme["text"] if bg_color == theme["table_bg"] else readable_text_color(bg_color)
+            tooltip = ticker_tooltip(row.get("_Name", ""), row.get("_Beta", np.nan)) if column == "Ticker" else ""
+            title = f" title='{html.escape(tooltip, quote=True)}'" if tooltip else ""
+            sticky = f"position:sticky;left:0;z-index:2;min-width:{ticker_column_width([str(item.get('Ticker', '')) for item in rows])}px;" if index == 0 else ""
+            table += (
+                f"<td{title} style='padding:6px;text-align:{align};vertical-align:top;white-space:normal;overflow-wrap:anywhere;{sticky}"
+                f"background:{bg_color};color:{text_color};border:1px solid {theme['table_border']};'>{html.escape(str(value))}</td>"
+            )
+        table += "</tr>"
+    table += "</tbody></table></div>"
+    st.markdown(table, unsafe_allow_html=True)
+
+
+def _render_screening_rerank(rerank):
+    if not isinstance(rerank, dict):
+        return
+    if not rerank.get("ok"):
+        if rerank.get("error"):
+            st.warning(f"AI 复排未应用：{rerank['error']}")
+        return
+    st.caption(
+        f"AI 复排已完成：{rerank.get('provider', 'unknown')} / {rerank.get('model', 'unknown')}，"
+        f"耗时 {rerank.get('elapsed_seconds', 'N/A')} 秒。规则评分未被修改。"
+    )
+    _render_screening_table([
+        {"AI Rank": index + 1, "Ticker": item.get("ticker"), "AI reason": item.get("reason"), "Risk": item.get("risk")}
+        for index, item in enumerate(rerank.get("items") or []) if isinstance(item, dict)
+    ], max_height=320)
+
+
+def render_stock_screener(breadth, user):
+    screener = breadth.get("screener") if isinstance(breadth, dict) else None
+    if not isinstance(screener, dict):
+        st.info("刷新 Market Breadth & Screener 后将显示筛选结果。")
+        return
+    universe = screener.get("universe") if isinstance(screener.get("universe"), dict) else {}
+    st.caption(
+        f"候选池：{universe.get('eligible_equities', 0)} 个已验证个股；"
+        f"来自 S&P 500 {universe.get('sp500', 0)}、Nasdaq 100 {universe.get('nasdaq100', 0)} 和当前账户自选。"
+    )
+    excluded = universe.get("excluded") if isinstance(universe.get("excluded"), dict) else {}
+    if excluded:
+        st.caption("已排除：" + "；".join(f"{reason} {count}" for reason, count in excluded.items()))
+    st.info("筛选结果仅作研究参考，不构成投资建议。AI 复排只使用已计算的技术数据，不会联网或改变规则评分。")
+    strategies = screener.get("strategies") if isinstance(screener.get("strategies"), list) else []
+    strategy_tabs = st.tabs([str(strategy.get("label") or strategy.get("key")) for strategy in strategies])
+    run_ids = screener.get("history_run_ids") if isinstance(screener.get("history_run_ids"), dict) else {}
+    for strategy, tab in zip(strategies, strategy_tabs):
+        with tab:
+            st.caption(strategy.get("description") or "")
+            candidates = strategy.get("candidates") if isinstance(strategy.get("candidates"), list) else []
+            st.caption(f"符合规则：{strategy.get('matched_count', len(candidates))}；显示前 {min(30, len(candidates))} 名。")
+            if candidates:
+                strategy_key = str(strategy.get("key") or "strategy")
+                render_screening_rule_explanation(strategy_key)
+                _render_screening_table(_screening_display_rows(candidates[:30], strategy_key))
+                if st.button("AI rerank top 15", key=f"screening_rerank_{strategy_key}"):
+                    with st.spinner("AI 正在复排当前规则前 15 名候选..."):
+                        rerank = rerank_candidates(strategy, limit=15)
+                    strategy["ai_rerank"] = rerank
+                    run_id = run_ids.get(strategy_key)
+                    if run_id:
+                        update_screening_rerank(user["id"], run_id, rerank)
+                _render_screening_rerank(strategy.get("ai_rerank"))
+            else:
+                st.info("本次刷新没有标的符合该策略的全部硬过滤条件。")
+
+
+def render_screening_history(user):
+    runs = list_screening_runs(user["id"])
+    if not runs:
+        st.info("尚无筛选历史。点击侧边栏 Refresh Breadth & Screen 后会保存本次三个策略的完整快照。")
+        return
+    labels = {
+        run["id"]: f"{run['strategy_label']} | {_format_berlin_datetime(run['created_at'])} | {run['matched_count']} candidates"
+        for run in runs
+    }
+    selected_id = st.selectbox("选择历史快照", list(labels), format_func=lambda run_id: labels[run_id], key="screening_history_run")
+    entry = get_screening_run(user["id"], selected_id)
+    if not entry:
+        st.warning("无法读取所选筛选快照。")
+        return
+    st.caption(f"{entry['strategy_label']} · 规则版本 {entry['strategy_version']} · {_format_berlin_datetime(entry['created_at'])}")
+    universe = entry.get("universe") if isinstance(entry.get("universe"), dict) else {}
+    st.caption(f"当时已验证个股：{universe.get('eligible_equities', 'N/A')}。历史包含全部通过硬过滤的候选。")
+    result = entry.get("result") if isinstance(entry.get("result"), dict) else {}
+    render_screening_rule_explanation(entry.get("strategy_key"))
+    _render_screening_table(_screening_display_rows(result.get("candidates", []), entry.get("strategy_key")))
+    _render_screening_rerank(entry.get("rerank"))
+
+
+def render_market_breadth_panel(dark_mode=False):
+    st.subheader("Market Breadth")
+    st.caption("Calculates the percentage of S&P 500 and Nasdaq 100 constituents above their 20/50/200-day moving averages. Use Refresh Breadth & Screen in the sidebar to download and recalculate this shared market dataset.")
+    breadth = st.session_state.get("breadth_data")
+    if st.session_state.get("breadth_last_refresh"):
+        st.caption(f"Last refreshed: {st.session_state['breadth_last_refresh']}")
+    if not breadth:
+        st.info("Market breadth is not loaded yet. Click Refresh Breadth & Screen in the sidebar to load it.")
+        return
+    if not breadth.get("success"):
+        st.warning(breadth.get("error", "Failed to load market breadth data") if isinstance(breadth, dict) else "Failed to load market breadth data")
+        return
+    counts = breadth.get("breadth_universe_counts", {})
+    if counts:
+        st.caption(
+            f"Download universe: {counts.get('combined_download', 'N/A')} unique tickers "
+            f"({counts.get('sp500', 'N/A')} S&P 500, {counts.get('nasdaq100', 'N/A')} Nasdaq 100, "
+            f"{counts.get('overlap', 'N/A')} overlap)."
+        )
+    render_grouped_table(pd.DataFrame(breadth["data"]), BREADTH_GROUPS, dark_mode=dark_mode, columns=BREADTH_WATCHLIST_COLUMNS)
+    st.divider()
+    fig = build_breadth_chart(breadth, dark_mode=dark_mode)
+    ndx_fig = build_breadth_chart(breadth, dark_mode=dark_mode, chart_key="nasdaq100_breadth_chart_data", title="Market Breadth (Nasdaq 100)", index_key="NDX", index_label="^NDX Adj Close")
+    chart_col1, chart_col2 = st.columns(2)
+    with chart_col1:
+        if fig is not None:
+            st.plotly_chart(fig, width="stretch")
+    with chart_col2:
+        if ndx_fig is not None:
+            st.plotly_chart(ndx_fig, width="stretch")
+    st.divider()
+    st.caption("Treemap tile area is based on cached latest market cap; color is the latest regular 1D% move.")
+    treemap_fig = build_sp500_treemap(breadth, dark_mode=dark_mode)
+    ndx_treemap_fig = build_nasdaq100_treemap(breadth, dark_mode=dark_mode)
+    if treemap_fig is not None:
+        st.plotly_chart(treemap_fig, width="stretch")
+    if ndx_treemap_fig is not None:
+        st.plotly_chart(ndx_treemap_fig, width="stretch")
+
 
 _backend_ok, _backend_msg = ensure_backend()
 if not _backend_ok:
@@ -5450,15 +5854,22 @@ with st.sidebar:
             st.session_state.pop("kline_cache_key", None)
             st.rerun()
     with col_r2:
-        if st.button("Refresh Breadth", width="stretch", key="btn_refresh_breadth"):
+        if st.button("Refresh Breadth & Screen", width="stretch", key="btn_refresh_breadth"):
             fetch_breadth_data.clear()
-            with st.spinner("Refreshing market breadth data..."):
-                st.session_state["breadth_data"] = fetch_breadth_data()
+            screening_candidates = tuple(screening_watchlist_tickers(get_active_config(user))) if editable else ()
+            with st.spinner("Refreshing market breadth and screening data..."):
+                breadth_payload = fetch_breadth_data(screening_candidates, enable_screener=editable)
+                if editable and breadth_payload.get("success") and isinstance(breadth_payload.get("screener"), dict):
+                    history_run_ids = save_screening_runs(
+                        user["id"], breadth_payload["screener"], breadth_payload["screener"].get("universe", {}),
+                    )
+                    breadth_payload["screener"]["history_run_ids"] = history_run_ids
+                st.session_state["breadth_data"] = breadth_payload
                 st.session_state["breadth_last_refresh"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             st.rerun()
 
     if editable:
-        st.caption("Auto-refresh does not refresh Market Breadth.")
+        st.caption("Auto-refresh does not refresh Market Breadth & Screener.")
         auto_refresh_stocks = st.toggle("Auto-refresh stocks", value=False, key="auto_refresh_stocks")
         auto_refresh_kline = st.toggle("Auto-refresh K-line chart", value=False, key="auto_refresh_kline")
         auto_refresh_interval_minutes = st.selectbox(
@@ -5515,7 +5926,7 @@ inject_css(dark_mode)
 st.title("Stock Watchlist")
 st.caption(
     "Stock Watchlists organize custom stock and ETF lists; Market Dashboard tracks indices and cross-asset signals; "
-    "Market Breadth summarizes the shared S&P 500 and Nasdaq 100 universes; Portfolios & AI Reports combine personal "
+    "Market Breadth & Screener summarizes the shared S&P 500 and Nasdaq 100 universes and screens saved equities; Portfolios & AI Reports combine personal "
     "holding monitoring with AI Portfolio Report generation, download, email, and scheduling; and AI Stock Reports let "
     "signed-in users generate, download, email, and schedule in-depth ticker reports."
 )
@@ -5553,7 +5964,7 @@ else:
 main_tab_labels = [
     SECTION_META["stocks_pages"]["tab"],
     SECTION_META["broad_pages"]["tab"],
-    "Market Breadth",
+    "Market Breadth & Screener",
     SECTION_META["portfolio_pages"]["tab"],
     "AI Stock Reports",
 ]
@@ -5607,56 +6018,16 @@ if editable:
         )
 
 with main_tabs[market_breadth_tab_index]:
-    st.subheader("Market Breadth")
-    st.caption("Calculates the percentage of S&P 500 and Nasdaq 100 constituents above their 20/50/200-day moving averages. Use Refresh Breadth in the sidebar to download and recalculate this shared market dataset.")
-    breadth = st.session_state.get("breadth_data")
-    if st.session_state.get("breadth_last_refresh"):
-        st.caption(f"Last refreshed: {st.session_state['breadth_last_refresh']}")
-
-    if not breadth:
-        st.info("Market breadth is not loaded yet. Click Refresh Breadth in the sidebar to load it.")
-    elif breadth.get("success"):
-        counts = breadth.get("breadth_universe_counts", {})
-        if counts:
-            st.caption(
-                f"Download universe: {counts.get('combined_download', 'N/A')} unique tickers "
-                f"({counts.get('sp500', 'N/A')} S&P 500, {counts.get('nasdaq100', 'N/A')} Nasdaq 100, "
-                f"{counts.get('overlap', 'N/A')} overlap)."
-            )
-        render_grouped_table(
-            pd.DataFrame(breadth["data"]),
-            BREADTH_GROUPS,
-            dark_mode=dark_mode,
-            columns=BREADTH_WATCHLIST_COLUMNS,
-        )
-        st.divider()
-        fig = build_breadth_chart(breadth, dark_mode=dark_mode)
-        ndx_fig = build_breadth_chart(
-            breadth,
-            dark_mode=dark_mode,
-            chart_key="nasdaq100_breadth_chart_data",
-            title="Market Breadth (Nasdaq 100)",
-            index_key="NDX",
-            index_label="^NDX Adj Close",
-        )
-        chart_col1, chart_col2 = st.columns(2)
-        with chart_col1:
-            if fig is not None:
-                st.plotly_chart(fig, width="stretch")
-        with chart_col2:
-            if ndx_fig is not None:
-                st.plotly_chart(ndx_fig, width="stretch")
-
-        st.divider()
-        st.caption("Treemap tile area is based on cached latest market cap; color is the latest regular 1D% move.")
-        treemap_fig = build_sp500_treemap(breadth, dark_mode=dark_mode)
-        ndx_treemap_fig = build_nasdaq100_treemap(breadth, dark_mode=dark_mode)
-        if treemap_fig is not None:
-            st.plotly_chart(treemap_fig, width="stretch")
-        if ndx_treemap_fig is not None:
-            st.plotly_chart(ndx_treemap_fig, width="stretch")
+    breadth_tabs = st.tabs(["Market Breadth", "Stock Screener", "Screening History"] if editable else ["Market Breadth"])
+    with breadth_tabs[0]:
+        render_market_breadth_panel(dark_mode=dark_mode)
+    if editable:
+        with breadth_tabs[1]:
+            render_stock_screener(st.session_state.get("breadth_data"), user)
+        with breadth_tabs[2]:
+            render_screening_history(user)
     else:
-        st.warning(breadth.get("error", "Failed to load market breadth data") if isinstance(breadth, dict) else "Failed to load market breadth data")
+        st.info("Sign in to screen the union of your saved watchlists and review account-specific screening history.")
 
 with main_tabs[portfolio_tab_index]:
     if not _stock_data_ok:

@@ -271,6 +271,24 @@ def init_user_db():
             locked_until TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS screening_runs (
+            id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            strategy_key TEXT NOT NULL,
+            strategy_label TEXT NOT NULL,
+            strategy_version TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            universe_json TEXT NOT NULL,
+            result_json TEXT NOT NULL,
+            rerank_json TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_screening_runs_owner_strategy_time
+        ON screening_runs(user_id, strategy_key, created_at DESC)
+    """)
     conn.commit()
     return conn
 
@@ -612,6 +630,139 @@ def config_to_api_groups(config):
     for group_name, tickers in config.get("short_term_watchlist", {}).get("groups", {}).items():
         groups[f"ST:{group_name}"] = tickers
     return groups
+
+
+def screening_watchlist_tickers(config):
+    """Return the current account's full saved ticker union for screening.
+
+    Classification is deliberately left to the market-data backend: this layer
+    only owns account configuration and must not make yfinance requests.
+    """
+    tickers = []
+    for section in ("stocks_pages", "broad_pages"):
+        for page in config.get(section, []):
+            for values in page.get("groups", {}).values():
+                tickers.extend(values)
+    for page in config.get("portfolio_pages", []):
+        tickers.extend(holding.get("ticker") for holding in page.get("holdings", []) if isinstance(holding, dict))
+    for values in config.get("short_term_watchlist", {}).get("groups", {}).values():
+        tickers.extend(values)
+    return list(dict.fromkeys(normalize_yfinance_ticker(ticker) for ticker in tickers if normalize_yfinance_ticker(ticker)))
+
+
+def _screening_now():
+    return _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def save_screening_runs(user_id, screener, universe):
+    """Persist the full deterministic snapshots and return strategy -> run id."""
+    if not isinstance(screener, dict):
+        return {}
+    version = str(screener.get("version") or "unknown")[:80]
+    strategies = screener.get("strategies") if isinstance(screener.get("strategies"), list) else []
+    now = _screening_now()
+    stored = {}
+    conn = init_user_db()
+    try:
+        for strategy in strategies:
+            if not isinstance(strategy, dict) or not strategy.get("key"):
+                continue
+            run_id = uuid.uuid4().hex
+            key = str(strategy["key"])[:80]
+            label = str(strategy.get("label") or key)[:120]
+            conn.execute(
+                "INSERT INTO screening_runs "
+                "(id, user_id, strategy_key, strategy_label, strategy_version, created_at, universe_json, result_json, rerank_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+                (
+                    run_id, int(user_id), key, label, version, now,
+                    json.dumps(universe if isinstance(universe, dict) else {}, ensure_ascii=False, separators=(",", ":")),
+                    json.dumps(strategy, ensure_ascii=False, separators=(",", ":")),
+                ),
+            )
+            stored[key] = run_id
+
+        cutoff = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=90)).isoformat(timespec="seconds")
+        conn.execute("DELETE FROM screening_runs WHERE user_id=? AND created_at < ?", (int(user_id), cutoff))
+        for strategy_key in {str(item.get("key")) for item in strategies if isinstance(item, dict) and item.get("key")}:
+            conn.execute(
+                "DELETE FROM screening_runs WHERE id IN ("
+                "SELECT id FROM screening_runs WHERE user_id=? AND strategy_key=? "
+                "ORDER BY created_at DESC LIMIT -1 OFFSET 100)",
+                (int(user_id), strategy_key),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return stored
+
+
+def update_screening_rerank(user_id, run_id, rerank):
+    if not run_id or not isinstance(rerank, dict):
+        return False
+    conn = init_user_db()
+    try:
+        cursor = conn.execute(
+            "UPDATE screening_runs SET rerank_json=? WHERE id=? AND user_id=?",
+            (json.dumps(rerank, ensure_ascii=False, separators=(",", ":")), str(run_id), int(user_id)),
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+    finally:
+        conn.close()
+
+
+def list_screening_runs(user_id, limit=300):
+    conn = init_user_db()
+    try:
+        rows = conn.execute(
+            "SELECT id, strategy_key, strategy_label, strategy_version, created_at, result_json, rerank_json "
+            "FROM screening_runs WHERE user_id=? ORDER BY created_at DESC LIMIT ?",
+            (int(user_id), max(1, min(int(limit), 300))),
+        ).fetchall()
+    finally:
+        conn.close()
+    result = []
+    for row in rows:
+        try:
+            payload = json.loads(row[5])
+        except (TypeError, ValueError):
+            payload = {}
+        try:
+            rerank = json.loads(row[6]) if row[6] else None
+        except (TypeError, ValueError):
+            rerank = None
+        result.append({
+            "id": row[0], "strategy_key": row[1], "strategy_label": row[2],
+            "strategy_version": row[3], "created_at": row[4],
+            "matched_count": int(payload.get("matched_count") or 0) if isinstance(payload, dict) else 0,
+            "rerank_available": isinstance(rerank, dict) and bool(rerank.get("ok")),
+        })
+    return result
+
+
+def get_screening_run(user_id, run_id):
+    conn = init_user_db()
+    try:
+        row = conn.execute(
+            "SELECT strategy_key, strategy_label, strategy_version, created_at, universe_json, result_json, rerank_json "
+            "FROM screening_runs WHERE user_id=? AND id=?",
+            (int(user_id), str(run_id)),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    try:
+        universe = json.loads(row[4])
+        result = json.loads(row[5])
+        rerank = json.loads(row[6]) if row[6] else None
+    except (TypeError, ValueError):
+        return None
+    return {
+        "strategy_key": row[0], "strategy_label": row[1], "strategy_version": row[2],
+        "created_at": row[3], "universe": universe, "result": result, "rerank": rerank,
+    }
 
 
 def broad_market_tickers(config):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -32,6 +33,15 @@ class PermanentReportFailure(RuntimeError):
     """A deterministic quality failure that should not be retried unchanged."""
 
 
+def _job_decision_dashboard_enabled(job: dict) -> bool:
+    """Read the optional per-job choice while keeping legacy jobs enabled."""
+    try:
+        payload = json.loads(job.get("payload_json") or "{}")
+    except (TypeError, ValueError):
+        payload = {}
+    return payload.get("decision_dashboard") is not False if isinstance(payload, dict) else True
+
+
 def generate_job_report(job: dict) -> dict:
     report_kind = (job.get("report_kind") or "ticker").lower()
     if report_kind == "portfolio":
@@ -43,6 +53,7 @@ def generate_job_report(job: dict) -> dict:
             months=int(job["months"]),
             search_provider=job["search_provider"],
             no_article_fetch=bool(job["no_article_fetch"]),
+            decision_dashboard=_job_decision_dashboard_enabled(job),
         )
     raise ValueError(f"Unsupported report kind: {report_kind}")
 

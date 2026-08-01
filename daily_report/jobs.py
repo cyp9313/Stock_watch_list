@@ -475,6 +475,7 @@ def enqueue_email_job(
     months: int = 3,
     search_provider: str = "auto",
     no_article_fetch: bool = False,
+    decision_dashboard: bool = True,
 ) -> dict:
     ticker = str(ticker or "").strip().upper()
     if not ticker:
@@ -488,7 +489,7 @@ def enqueue_email_job(
         months=months,
         search_provider=search_provider,
         no_article_fetch=no_article_fetch,
-        payload={"ticker": ticker},
+        payload={"ticker": ticker, "decision_dashboard": bool(decision_dashboard)},
     )
 
 
@@ -879,6 +880,7 @@ def create_weekly_schedule(
     months: int = 3,
     search_provider: str = "auto",
     no_article_fetch: bool = False,
+    decision_dashboard: bool = True,
 ) -> dict:
     ticker = str(ticker or "").strip().upper()
     if not ticker:
@@ -895,7 +897,7 @@ def create_weekly_schedule(
         months=months,
         search_provider=search_provider,
         no_article_fetch=no_article_fetch,
-        payload={"ticker": ticker},
+        payload={"ticker": ticker, "decision_dashboard": bool(decision_dashboard)},
     )
 
 

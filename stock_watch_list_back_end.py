@@ -21,7 +21,8 @@ import requests_cache
 from stockanalysis_scraper import scrape_batch, should_query_forward_pe
 from short_term_watchlist import candlestick_svg
 from kline_indicators import calculate_adx_series
-from ticker_mapping import normalize_yfinance_ticker
+from ticker_mapping import is_known_us_etf, normalize_yfinance_ticker
+from market_screener import MARKET_PROFILES, market_profile_for_ticker, run_screener, screening_benchmark_tickers
 from options_open_interest import aggregate_open_interest, option_gamma_legs, select_option_expirations
 
 RELATIVE_RETURN_BENCHMARK = "^GSPC"
@@ -184,6 +185,14 @@ def _create_schema(conn):
             name            TEXT,
             checked_date    TEXT,
             updated_at      TEXT    DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS security_type_cache (
+            ticker TEXT PRIMARY KEY,
+            quote_type TEXT,
+            checked_date TEXT NOT NULL,
+            updated_at TEXT DEFAULT (datetime('now'))
         )
     """)
 
@@ -552,7 +561,7 @@ def get_market_date():
     return datetime.datetime.now(ny).strftime('%Y-%m-%d')
 
 
-def get_cached_stock_analysis(all_tickers):
+def get_cached_stock_analysis(all_tickers, *, fetch_missing=True):
     """
     带缓存的批量 StockAnalysis 查询
     1. 先查缓存，命中直接返回
@@ -603,6 +612,14 @@ def get_cached_stock_analysis(all_tickers):
             missing.append(t)
 
     if not missing:
+        conn.close()
+        return results
+
+    # Screening first consumes the same-day fundamentals already available in
+    # SQLite.  This avoids unexpectedly scraping an entire 500+ ticker universe
+    # during every Market Breadth refresh.  A bounded short-list is enriched by
+    # the caller only after technical hard filters have produced candidates.
+    if not fetch_missing:
         conn.close()
         return results
 
@@ -1631,6 +1648,164 @@ def normalize_groups_for_yfinance(groups):
 
 def is_breadth_pseudo_ticker(ticker):
     return str(ticker or "").upper() in BREADTH_PSEUDO_TICKERS_UPPER
+
+
+_SCREENING_MAX_USER_TICKERS = 2_000
+_SCREENING_SECURITY_TYPE_MAX_AGE_DAYS = 30
+_SCREENING_CRYPTO_PATTERN = re.compile(r"^[A-Z0-9]{2,15}-(?:USD|EUR|GBP|JPY|USDT|USDC)$")
+
+
+def _screening_static_exclusion(ticker):
+    """Return the reason a syntactically non-equity symbol is excluded."""
+    ticker = normalize_yfinance_ticker(ticker)
+    if not ticker:
+        return "空 ticker"
+    if is_breadth_pseudo_ticker(ticker):
+        return "市场宽度伪 ticker"
+    if ticker.startswith("^"):
+        return "指数"
+    if ticker.endswith("=F"):
+        return "期货"
+    if ticker.endswith("=X"):
+        return "货币汇率"
+    if _SCREENING_CRYPTO_PATTERN.fullmatch(ticker):
+        return "加密货币"
+    if is_known_us_etf(ticker):
+        return "已知 ETF"
+    return None
+
+
+def _cached_quote_types(tickers):
+    """Classify only user-supplied unknown tickers; cache yfinance quoteType."""
+    tickers = list(dict.fromkeys(normalize_yfinance_ticker(ticker) for ticker in tickers if ticker))
+    if not tickers:
+        return {}
+    today = datetime.date.today()
+    cutoff = (today - datetime.timedelta(days=_SCREENING_SECURITY_TYPE_MAX_AGE_DAYS)).isoformat()
+    conn = get_db_connection()
+    try:
+        placeholders = ",".join("?" * len(tickers))
+        cached_rows = conn.execute(
+            f"SELECT ticker, quote_type, checked_date FROM security_type_cache WHERE ticker IN ({placeholders})",
+            tickers,
+        ).fetchall()
+        cached = {ticker: quote_type for ticker, quote_type, checked_date in cached_rows if checked_date >= cutoff}
+        missing = [ticker for ticker in tickers if ticker not in cached]
+        fetched = {}
+        if missing:
+            def fetch_one(symbol):
+                try:
+                    info = yf.Ticker(symbol).info
+                    quote_type = str((info or {}).get("quoteType") or "").upper().strip()
+                    return symbol, quote_type or None
+                except (AttributeError, KeyError, OSError, TypeError, ValueError, requests.RequestException):
+                    return symbol, None
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(missing))) as executor:
+                for symbol, quote_type in executor.map(fetch_one, missing):
+                    fetched[symbol] = quote_type
+            conn.executemany(
+                "INSERT INTO security_type_cache (ticker, quote_type, checked_date, updated_at) VALUES (?, ?, ?, datetime('now')) "
+                "ON CONFLICT(ticker) DO UPDATE SET quote_type=excluded.quote_type, checked_date=excluded.checked_date, updated_at=datetime('now')",
+                [(symbol, quote_type, today.isoformat()) for symbol, quote_type in fetched.items()],
+            )
+            conn.commit()
+            cached.update(fetched)
+        return cached
+    finally:
+        conn.close()
+
+
+def build_screening_candidate_sources(sp500_symbols, nasdaq100_symbols, user_tickers):
+    """Build the equity-only screener universe and its displayed source labels."""
+    sp500 = set(_normalize_sp500_symbols(sp500_symbols))
+    nasdaq100 = set(_normalize_sp500_symbols(nasdaq100_symbols))
+    raw_user = list(dict.fromkeys(
+        normalize_yfinance_ticker(ticker) for ticker in (user_tickers or []) if normalize_yfinance_ticker(ticker)
+    ))[:_SCREENING_MAX_USER_TICKERS]
+    sources = {}
+    for ticker in sp500 | nasdaq100:
+        labels = []
+        if ticker in sp500:
+            labels.append("S&P 500")
+        if ticker in nasdaq100:
+            labels.append("Nasdaq 100")
+        sources[ticker] = " · ".join(labels)
+
+    excluded = {}
+    unknown = []
+    for ticker in raw_user:
+        if ticker in sources:
+            sources[ticker] = f"{sources[ticker]} · User watchlist"
+            continue
+        reason = _screening_static_exclusion(ticker)
+        if reason:
+            excluded[reason] = excluded.get(reason, 0) + 1
+            continue
+        unknown.append(ticker)
+
+    quote_types = _cached_quote_types(unknown)
+    for ticker in unknown:
+        if quote_types.get(ticker) == "EQUITY":
+            sources[ticker] = "User watchlist"
+        else:
+            reason = "无法验证为个股" if quote_types.get(ticker) is None else f"{quote_types[ticker]} 非个股"
+            excluded[reason] = excluded.get(reason, 0) + 1
+    return sources, {
+        "sp500": len(sp500), "nasdaq100": len(nasdaq100), "user_watchlist_submitted": len(raw_user),
+        "eligible_equities": len(sources), "excluded": excluded,
+    }
+
+
+def _screening_beta(data, ticker):
+    """Compute display-only beta from the already downloaded local benchmark."""
+    market = market_profile_for_ticker(ticker)
+    benchmark_ticker = MARKET_PROFILES[market]["benchmark"]
+    try:
+        stock = pd.to_numeric(data["Adj Close"][ticker], errors="coerce").dropna().tail(252)
+        benchmark = pd.to_numeric(data["Adj Close"][benchmark_ticker], errors="coerce").dropna().tail(252)
+    except (KeyError, TypeError):
+        return np.nan
+    joined = pd.concat([stock.rename("stock"), benchmark.rename("benchmark")], axis=1, sort=False).dropna()
+    if len(joined) < 3:
+        return np.nan
+    returns = joined.pct_change().dropna()
+    if len(returns) < 2:
+        return np.nan
+    benchmark_var = float(returns["benchmark"].var())
+    if not np.isfinite(benchmark_var) or benchmark_var == 0:
+        return np.nan
+    beta = float(returns["stock"].cov(returns["benchmark"]) / benchmark_var)
+    return round(beta, 2) if np.isfinite(beta) else np.nan
+
+
+def decorate_screener_candidates(screener, data, sp500_symbols):
+    """Add display metadata without issuing another price-data request."""
+    if not isinstance(screener, dict):
+        return screener
+    tickers = list(dict.fromkeys(
+        str(row.get("Ticker"))
+        for strategy in screener.get("strategies", []) if isinstance(strategy, dict)
+        for row in strategy.get("candidates", []) if isinstance(row, dict) and row.get("Ticker")
+    ))
+    if not tickers:
+        return screener
+    sp500_metadata = get_sp500_constituents_metadata(sp500_symbols)
+    names = {ticker: meta.get("name") for ticker, meta in sp500_metadata.items() if meta.get("name") and meta.get("name") != ticker}
+    unresolved = [ticker for ticker in tickers if ticker not in names]
+    # This existing cache helper only calls yfinance for symbols whose name is
+    # absent today; ordinary S&P 500 names came from the constituent cache.
+    names.update(get_cached_ticker_names(unresolved))
+    betas = {ticker: _screening_beta(data, ticker) for ticker in tickers}
+    for strategy in screener.get("strategies", []):
+        if not isinstance(strategy, dict):
+            continue
+        for row in strategy.get("candidates", []):
+            if isinstance(row, dict):
+                ticker = str(row.get("Ticker") or "")
+                row["Name"] = names.get(ticker) or ticker
+                row["Beta"] = betas.get(ticker, np.nan)
+    return screener
 
 
 def stock_analysis_marked_not_found(sa_data):
@@ -2995,12 +3170,19 @@ def get_breadth_data():
     try:
         sp500_symbols_json = request.form.get('sp500_symbols', '[]')
         nasdaq100_symbols_json = request.form.get('nasdaq100_symbols', '[]')
+        screening_candidates_json = request.form.get('screening_candidates', '[]')
+        screening_enabled = str(request.form.get('enable_screener', '')).strip().lower() in {'1', 'true', 'yes'}
+        if len(screening_candidates_json) > 128_000:
+            return jsonify({"success": False, "error": "Screening candidates payload is too large"}), 413
 
         try:
             sp500_symbols = _normalize_sp500_symbols(json.loads(sp500_symbols_json))
             nasdaq100_symbols = _normalize_sp500_symbols(json.loads(nasdaq100_symbols_json))
+            screening_candidates = json.loads(screening_candidates_json)
         except json.JSONDecodeError:
             return jsonify({"success": False, "error": "Breadth symbol list JSON is invalid"})
+        if not isinstance(screening_candidates, list) or not all(isinstance(ticker, str) for ticker in screening_candidates):
+            return jsonify({"success": False, "error": "Screening candidates must be a list of ticker strings"})
 
         if not sp500_symbols:
             sp500_symbols = get_sp500_symbols()
@@ -3011,7 +3193,17 @@ def get_breadth_data():
         if not nasdaq100_symbols:
             return jsonify({"success": False, "error": "Unable to load Nasdaq 100 symbols"})
 
-        combined_symbols = list(dict.fromkeys(sp500_symbols + nasdaq100_symbols + ["^GSPC", "^NDX"]))
+        candidate_sources = {}
+        screening_universe = None
+        if screening_enabled:
+            candidate_sources, screening_universe = build_screening_candidate_sources(
+                sp500_symbols, nasdaq100_symbols, screening_candidates,
+            )
+        screening_benchmarks = screening_benchmark_tickers(candidate_sources) if screening_enabled else []
+        combined_symbols = list(dict.fromkeys(
+            (list(candidate_sources) if screening_enabled else sp500_symbols + nasdaq100_symbols)
+            + ["^GSPC", "^NDX"] + screening_benchmarks
+        ))
         overlap_count = len(set(sp500_symbols).intersection(nasdaq100_symbols))
 
         try:
@@ -3044,6 +3236,32 @@ def get_breadth_data():
         nasdaq100_breadth_data = build_breadth_chart_payload(nasdaq100_breadth_df, combined_data, "^NDX", "NDX")
         treemap_data = build_sp500_treemap_data(combined_data, sp500_symbols)
         nasdaq100_treemap_data = build_nasdaq100_treemap_data(combined_data, nasdaq100_symbols)
+        screener = None
+        if screening_enabled:
+            # Cache-first fundamentals retain fast Market Breadth refreshes.
+            # Only the union of preliminary technical top candidates receives
+            # a bounded same-day StockAnalysis enrichment if it is missing.
+            cached_fundamentals = get_cached_stock_analysis(list(candidate_sources), fetch_missing=False)
+            preliminary_screener = run_screener(combined_data, candidate_sources, cached_fundamentals)
+            enrichment_tickers = []
+            for strategy in preliminary_screener.get("strategies", []):
+                enrichment_tickers.extend(
+                    row.get("Ticker") for row in strategy.get("candidates", [])[:25] if row.get("Ticker")
+                )
+            enrichment_tickers = list(dict.fromkeys(enrichment_tickers))[:75]
+            try:
+                enriched_fundamentals = get_cached_stock_analysis(enrichment_tickers) if enrichment_tickers else {}
+            except Exception as exc:
+                print(f"[Screener] bounded fundamental enrichment failed: {exc}")
+                enriched_fundamentals = {}
+            cached_fundamentals.update(enriched_fundamentals)
+            screener = run_screener(combined_data, candidate_sources, cached_fundamentals)
+            decorate_screener_candidates(screener, combined_data, sp500_symbols)
+            screener["fundamental_coverage"].update({
+                "enrichment_limit": 75,
+                "enriched_requested": len(enrichment_tickers),
+            })
+            screener["universe"] = screening_universe
 
         print(f"/api/breadth_data completed in {time.perf_counter() - endpoint_start:.1f}s")
         return jsonify({
@@ -3055,6 +3273,7 @@ def get_breadth_data():
             "nasdaq100_data": nasdaq100_results,
             "nasdaq100_breadth_chart_data": nasdaq100_breadth_data,
             "nasdaq100_breadth_treemap_data": nasdaq100_treemap_data,
+            **({"screener": screener} if screener is not None else {}),
             "breadth_universe_counts": {
                 "sp500": len(sp500_symbols),
                 "nasdaq100": len(nasdaq100_symbols),

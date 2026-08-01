@@ -17,7 +17,8 @@ Stock Watch List 是一个可部署的股票与跨市场监控应用，而不只
 - 可编辑的股票 Watchlist、Market Dashboard 和 Portfolio 页面；支持按组管理标的、Yahoo Finance 搜索添加标的、暗色模式和本币/EUR 显示。Ticker 列会完整显示长代码；悬停 Ticker 可查看标的名称及 Beta，悬停 Price 可查看该价格对应的交易日期，盘前/盘后估算价还会显示美国东部时间。
 - 日线市场数据：价格、最近 20 根日线 K 线蜡烛图、`1D%` / `5D%` / `1M%` / `YTD%`、RSI、成交量比、EMA 偏离、布林带、相对 `^GSPC` 的收益/动量、估值、分析师评级、目标价、市值和 Beta；相对动量列可展开为各自最近 20 根日线的内嵌趋势曲线，灰色虚线为 0 轴。
 - 顶部市场情绪卡片：CNN Fear & Greed、VIX 和 Crypto Fear & Greed。
-- Market Breadth：S&P 500 与 Nasdaq 100 的 20/50/200 日均线上方比例、历史图和 treemap。Breadth 只在手动点击 **Refresh Breadth** 时重新下载与计算。
+- **Market Breadth & Screener**：S&P 500 与 Nasdaq 100 的 20/50/200 日均线上方比例、历史图和 treemap；登录用户还可在同一次 **Refresh Breadth & Screen** 中筛选“指数成分股 + 自己全部 Watchlist/Portfolio/Short-term 标的”的并集。选股会过滤 ETF、指数、期货、汇率和加密资产，并仅允许已验证的个股进入趋势质量、放量突破和超跌反转三套规则策略。评分按市场原币种处理：A 股使用沪指、港股使用恒指等本地基准；流动性采用 20 日平均成交额，不会把美元门槛直接用于非美元标的。
+- Screener 复用 Breadth 的两年日线 SQLite 缓存：三套策略不重复下载行情；以动量、估值、流动性、活跃度、稳定性等透明因子构成基础分，再单列风险扣分。PE/PB/市值优先读取当日 SQLite 基本面缓存；为避免每次刷新全量爬取，最多只补全三套技术初筛候选的 75 个标的。结果按账户保存完整规则快照（90 天、每策略最多 100 次）。每个策略可手动对规则前 15 名执行一次无工具的 AI 复排；默认继承 `LLM_PROVIDER` / `QWEN_MODEL`，只发送已计算技术数据，不联网、不新增 ticker、不改写规则评分。
 - K 线图：周期与 SMA/EMA/ATR/ADX 可配；支持 VWAP、MACD、RSI、KDJ、布林带、成交量、60 天筹码峰、Auto Fibonacci Retracement 与 Extension；多用户版还会在手动 Plot 时显示最近可用到期日及可配置未来 1–12 个月汇总的 Call/Put Open Interest 墙，以及 Dealer-GEX 墙（Call 为正、Put 为负的仓位代理）。调整 OI 覆盖月份会重新下载 OI/IV；K 线自动刷新不会下载期权链，但会使用缓存 OI/IV 与最新股价重算 GEX 并移动价格线。
 - 多用户版的 K 线自动刷新会恢复同一浏览器、同一 ticker/周期/间隔/币种下的 zoom/pan 与 Plotly 图例隐藏/显示偏好。
 - 即使 ticker、周期与间隔未变，手动点击 **Plot** 也会强制重新拉取 K 线数据。
@@ -137,6 +138,12 @@ QWEN_RESEARCH_MODEL=deepseek-v4-flash
 DASHSCOPE_API_KEY=your_key
 QWEN_AGENT_USE_RAW_API=true
 
+# Optional manual AI rerank for Market Breadth & Screener
+SCREENING_RERANK_PROVIDER=inherit # inherit / dashscope / deepseek / openai_compatible
+SCREENING_RERANK_MODEL=            # empty = inherit QWEN_MODEL / provider default
+SCREENING_RERANK_TIMEOUT_SECONDS=45
+SCREENING_RERANK_TEMPERATURE=0.1
+
 # Optional controlled decision dashboard for AI Stock Reports
 DECISION_REPORT_ENABLED=true       # set false for the legacy report layout
 DECISION_REPORT_PROVIDER=inherit   # inherit / dashscope / deepseek / openai_compatible
@@ -228,7 +235,7 @@ sudo systemctl restart stock-watchlist-api.service stock-watchlist.service stock
 - 主 Watchlist 数据在 Streamlit 侧有短期缓存；**Refresh Stocks**、全局自动刷新或缓存到期后会更新。
 - Short-term Watchlist 的 5m/15m 数据调用 `/api/kline_data`，按 ticker、interval 和所需历史窗口在当前会话暂存。它不会每 10/20/30 秒重新下载上一交易日 `Adj Close`。
 - Short-term `1D%` 由短线最新 Close 与共享日线缓存中的上一交易日复权收盘价计算；ticker 的 Beta 着色也复用共享日线数据。
-- Market Breadth 不受自动刷新影响，只在手动刷新时重新计算。
+- Market Breadth & Screener 不受自动刷新影响，只在手动点击 **Refresh Breadth & Screen** 时重新计算并保存筛选快照。未登录用户仍可查看 Breadth，但不能使用账户自选、Screener 或 Screening History。
 
 ### 安全与使用边界
 
@@ -267,6 +274,8 @@ Stock Watch List is a deployable market-monitoring and AI-reporting application,
 - Editable grouped watchlists, market dashboards, and portfolio pages with Yahoo Finance ticker search, dark mode, and local/EUR display. Ticker cells wrap instead of truncating long symbols; hover a Ticker for its name and beta, or hover a Price cell for its trading date or the US Eastern timestamp of a pre-/after-hours estimate.
 - Daily-market metrics including price, a 20-bar daily candlestick SVG, 1D/5D/1M/YTD returns, RSI, volume ratio, EMA and Bollinger distances, relative returns/momentum versus `^GSPC`, valuation, analyst data, targets, market cap, and beta. Expanded relative-momentum columns include an embedded 20-daily-bar trend sparkline per metric, with a gray dashed zero axis.
 - CNN Fear & Greed, VIX, and Crypto Fear & Greed cards; on-demand S&P 500/Nasdaq 100 market-breadth charts and treemaps.
+- **Market Breadth & Screener** (authenticated users): one **Refresh Breadth & Screen** action refreshes Breadth and screens the union of S&P 500, Nasdaq 100, and all account watchlists, portfolio holdings, and Short-term symbols. Only verified equities are eligible; indices, ETFs, futures, FX, crypto, and pseudo tickers are excluded. Three transparent daily-bar strategies are included: Trend Quality, Volume Breakout, and Oversold Reversal. Screening is market-aware: local-currency price/liquidity gates and local benchmarks are used for China A, Hong Kong, Japan, Germany, and US symbols. Factor base scores and separate risk deductions are shown; PE/PB/market-cap use same-day SQLite cache first, with a bounded 75-symbol enrichment shortlist rather than a whole-universe scrape. Their complete account-isolated snapshots are retained for 90 days (up to 100 runs per strategy).
+- Each strategy can manually AI-rerank its rule-ranked top 15 with the inherited `LLM_PROVIDER` / `QWEN_MODEL` (or the `SCREENING_RERANK_*` overrides). The model is tool-free, sees only structured computed metrics, cannot add symbols or change rule scores, and failure safely keeps the deterministic ranking.
 - Configurable K-line charts with SMA/EMA/ATR/ADX, VWAP, MACD, RSI, KDJ, Bollinger Bands, volume, chip peak, and Auto Fibonacci retracement/extension. In the multi-user app, a manual Plot also loads Call/Put open-interest walls and Dealer-GEX walls (positive calls, negative puts as a positioning proxy) for the nearest available expiry and an aggregate over a configurable 1–12-month horizon. Changing the OI horizon reloads OI/IV; K-line auto-refresh never reloads option chains, but recomputes GEX from cached OI/IV using the latest stock price and moves the price marker.
 - In the multi-user app, K-line auto-refresh restores browser-local zoom/pan and Plotly legend visibility for the same ticker, period, interval, and currency.
 - Clicking **Plot** always refetches K-line data, even when the ticker, period, and interval are unchanged.
@@ -345,6 +354,7 @@ Important settings include:
 
 - `STOCK_API_BASE_URL` and `STOCK_DEV_MODE` for the frontend/API boundary.
 - `LLM_PROVIDER`, `QWEN_MODEL`, `QWEN_RESEARCH_MODEL`, provider API keys, and `QWEN_AGENT_USE_RAW_API` for AI Stock Reports.
+- `SCREENING_RERANK_PROVIDER`, `SCREENING_RERANK_MODEL`, `SCREENING_RERANK_TIMEOUT_SECONDS`, and `SCREENING_RERANK_TEMPERATURE` for the manual, tool-free Screener rerank. Empty provider/model settings inherit the main report LLM configuration.
 - `DECISION_REPORT_ENABLED`, `DECISION_REPORT_PROVIDER`, `DECISION_REPORT_MODEL`, `DECISION_REPORT_TEMPERATURE`, `DECISION_REPORT_TIMEOUT_SECONDS`, and `DECISION_REPORT_KEEP_CONTEXT` for the controlled decision dashboard. Set `DECISION_REPORT_KEEP_RUN_DIR=true` only while troubleshooting: it retains the complete per-run folder (including `*_finalization_audit.json` and research intermediates) instead of automatically deleting it.
 - `DECISION_OPINION_AGENTS_ENABLED`, `DECISION_OPINION_AGENTS_PROVIDER`, `DECISION_OPINION_AGENTS_MODEL`, and `DECISION_OPINION_AGENTS_TIMEOUT_SECONDS` for optional P3 bounded specialist opinions.
 - `SEARCH_PROVIDER`, `SERPER_API_KEY`, `SEARXNG_*`, and `ARTICLE_FETCH_*` for evidence gathering.
