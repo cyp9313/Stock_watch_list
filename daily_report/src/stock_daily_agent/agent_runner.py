@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 import json
@@ -12,6 +12,7 @@ from .config import RunContext, build_llm_cfg
 from .prompts import build_system_prompt, build_user_task
 from .skill_loader import load_skill
 from .tools import set_context, build_custom_tools
+from .finalizer import finalize_report, minimum_artifacts_exist
 
 
 @dataclass
@@ -21,6 +22,9 @@ class AgentRunResult:
     run_dir: Path
     final_messages: list[dict]
     summary_text: str
+    decision_file: Path | None = None
+    fallback_used: bool = False
+    warnings: list[str] = field(default_factory=list)
 
 
 def _strict_json_arguments(arguments: Any) -> str:
@@ -198,26 +202,30 @@ def run_agent(
     provider: str = "dashscope",
     enable_builtin_web: bool = True,
     verbose: bool = True,
+    holding_context: dict[str, Any] | None = None,
 ) -> AgentRunResult:
     set_context(ctx)
-    bot = build_agent(ctx, model=model, provider=provider, enable_builtin_web=enable_builtin_web)
-    user_task = build_user_task(
-        ticker=ctx.ticker,
-        months=ctx.months,
-        output_html=str(ctx.output_html) if ctx.output_html else None,
-        report_date=ctx.report_date,
-    )
-    messages: list[dict] = [{"role": "user", "content": user_task}]
-
     final_response: Any = None
     last_text = ""
-    for response in bot.run(messages=messages):
-        final_response = response
-        text = _plain_text_from_response(response)
-        if verbose and text and text != last_text:
-            delta = text[len(last_text):] if text.startswith(last_text) else text
-            print(delta, end="", flush=True)
-            last_text = text
+    agent_error: Exception | None = None
+    try:
+        bot = build_agent(ctx, model=model, provider=provider, enable_builtin_web=enable_builtin_web)
+        user_task = build_user_task(
+            ticker=ctx.ticker,
+            months=ctx.months,
+            output_html=str(ctx.output_html) if ctx.output_html else None,
+            report_date=ctx.report_date,
+        )
+        messages: list[dict] = [{"role": "user", "content": user_task}]
+        for response in bot.run(messages=messages):
+            final_response = response
+            text = _plain_text_from_response(response)
+            if verbose and text and text != last_text:
+                delta = text[len(last_text):] if text.startswith(last_text) else text
+                print(delta, end="", flush=True)
+                last_text = text
+    except Exception as exc:
+        agent_error = exc
 
     if verbose and last_text and not last_text.endswith("\n"):
         print()
@@ -229,11 +237,28 @@ def run_agent(
     else:
         final_messages = [final_response]
 
+    if minimum_artifacts_exist(ctx):
+        finalization = finalize_report(ctx, holding_context=holding_context)
+        warnings = list(finalization.warnings)
+        if agent_error:
+            warnings.append(f"Agent ended with an error after recoverable artifacts were created: {agent_error}")
+        return AgentRunResult(
+            ok=finalization.ok,
+            output_html=finalization.output_html or ctx.final_output_html,
+            run_dir=ctx.run_dir,
+            final_messages=final_messages,
+            summary_text=_plain_text_from_response(final_response),
+            decision_file=finalization.decision_file,
+            fallback_used=finalization.fallback_used,
+            warnings=warnings + finalization.errors,
+        )
+
     output = ctx.final_output_html
     return AgentRunResult(
-        ok=output.exists() and output.stat().st_size > 0,
+        ok=False,
         output_html=output,
         run_dir=ctx.run_dir,
         final_messages=final_messages,
-        summary_text=_plain_text_from_response(final_response),
+        summary_text=_plain_text_from_response(final_response) or (str(agent_error) if agent_error else ""),
+        warnings=[f"Agent failed before minimum report artifacts existed: {agent_error}"] if agent_error else ["Agent ended before minimum report artifacts existed."],
     )

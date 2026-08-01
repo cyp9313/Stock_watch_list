@@ -2779,7 +2779,8 @@ class BuildHtmlReportTool(BaseTool):
     parameters = {
         "type": "object",
         "properties": {
-            "use_notes": {"type": "boolean", "description": "是否传入已生成的 notes 文件，默认 true"}
+            "use_notes": {"type": "boolean", "description": "是否传入已生成的 notes 文件，默认 true"},
+            "decision_json": {"type": "string", "description": "可选的本地决策仪表盘 JSON 路径；最终版由 Python Finalizer 生成"},
         },
         "required": [],
     }
@@ -2801,6 +2802,14 @@ class BuildHtmlReportTool(BaseTool):
             # evidence-gated note records rather than flattening them into text.
             if ctx.final_notes_json_file.exists():
                 args.extend(["--evidence", str(ctx.final_notes_json_file)])
+        decision_json = str(p.get("decision_json") or "").strip()
+        if decision_json:
+            candidate = Path(decision_json).resolve()
+            if candidate != ctx.decision_file.resolve():
+                return json_dumps({"ok": False, "errors": ["decision_json 必须是当前 run_dir 的 decision 文件。"]})
+            if not candidate.exists():
+                return json_dumps({"ok": False, "errors": ["decision_json 不存在。"]})
+            args.extend(["--decision-json", str(candidate)])
         result = run_python_script(ctx.paths.scripts_dir / "build_report.py", args, cwd=ctx.run_dir, timeout=180)
         return json_dumps({
             "ok": True,
@@ -2834,6 +2843,9 @@ class InspectRunStateTool(BaseTool):
             "combined_reranked_evidence_file": ctx.combined_reranked_evidence_file,
             "search_quality_report_file": ctx.search_quality_report_file,
             "audit_file": ctx.audit_file,
+            "decision_context_file": ctx.decision_context_file,
+            "decision_file": ctx.decision_file,
+            "finalization_audit_file": ctx.finalization_audit_file,
             "output_html": ctx.final_output_html,
         }.items():
             files[label] = {
