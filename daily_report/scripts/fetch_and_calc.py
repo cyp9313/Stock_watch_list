@@ -24,6 +24,7 @@ import numpy as np
 # Shared market data service — provides OHLCV snapshot sharing and unified provider layer.
 from market_data_service import MarketDataService
 from report_data_normalization import normalize_dividend_yield_pct
+from daily_report.src.stock_daily_agent.decision_levels import classify_chip_profile_signal
 
 # Optional StockAnalysis.com fundamentals scraper.
 # It is used for valuation / analyst fields because yfinance info can be stale or inaccurate.
@@ -441,12 +442,13 @@ def _calc_volume_profile(frame: pd.DataFrame, window: int, bins: int = 48, value
         score += 2.0
     score = _clamp(score)
 
-    if score >= 65:
-        chip_signal = "BULL_SUPPORTIVE"
-    elif score <= 40:
-        chip_signal = "BEAR_OVERHEAD_SUPPLY"
-    else:
-        chip_signal = "MIX_BALANCE_AREA"
+    chip_signal = classify_chip_profile_signal(
+        close=close,
+        poc_price=poc_price,
+        support_volume_ratio=below,
+        overhead_supply_ratio=above,
+        score=score,
+    )
 
     return {
         "window": window,

@@ -18,7 +18,7 @@ if str(AGENT_SRC) not in sys.path:
 
 from stock_daily_agent.config import ProjectPaths, RunContext
 from stock_daily_agent.decision_context import build_decision_context, normalize_holding_context
-from stock_daily_agent.decision_levels import calculate_level_plan
+from stock_daily_agent.decision_levels import calculate_level_plan, classify_chip_profile_signal
 from stock_daily_agent.decision_schema import (
     DecisionAdjustment,
     DecisionDashboard,
@@ -140,6 +140,37 @@ def test_level_plan_filters_wrong_side_and_merges_nearby_levels() -> None:
     assert all(item.value >= 100 for item in plan.resistances)
     assert plan.ideal_buy is not None and plan.stop_loss is not None
     assert plan.stop_loss < plan.ideal_buy <= 100
+
+
+def test_chip_signal_is_not_balance_when_price_is_far_above_poc_with_lower_cost_base() -> None:
+    """Regression: SNDK-like 126d profiles must not call a distant POC a balance area."""
+    assert classify_chip_profile_signal(
+        close=1214.83,
+        poc_price=612.70,
+        support_volume_ratio=0.619,
+        overhead_supply_ratio=0.381,
+        score=64.7,
+    ) == "BULL_COST_BASE_SUPPORT"
+
+
+def test_chip_signal_keeps_balance_label_for_a_near_poc_profile() -> None:
+    assert classify_chip_profile_signal(
+        close=100.4,
+        poc_price=100.0,
+        support_volume_ratio=0.51,
+        overhead_supply_ratio=0.49,
+        score=55.0,
+    ) == "MIX_BALANCE_AREA"
+
+
+def test_chip_signal_handles_invalid_profile_values_conservatively() -> None:
+    assert classify_chip_profile_signal(
+        close=100.0,
+        poc_price="not-a-price",
+        support_volume_ratio=0.6,
+        overhead_supply_ratio=0.4,
+        score=70.0,
+    ) == "MIX_BALANCE_AREA"
 
 
 def test_holding_context_whitelists_and_context_stays_compact(tmp_path: Path) -> None:

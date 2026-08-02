@@ -1922,13 +1922,13 @@ class GenerateTechnicalNoteItemsTool(BaseTool):
                 chip_meaning = "若价格无法放量站上 POC 和价值区间上沿，技术反弹可能受限；突破 POC 后再观察是否能转为支撑。"
             elif "BULL" in signal:
                 chip_tag = "BULL"
-                chip_title = "筹码峰显示下方成本支撑较强"
-                chip_logic = "当前价位于主要成交密集区上方或价值区间上半部，下方累计成交量占比较高，说明成本沉淀可能形成支撑。"
-                chip_meaning = "若回撤不跌破 POC 或价值区间下沿，技术面更容易形成震荡上行或趋势修复。"
+                chip_title = "筹码峰显示下方历史成本带较密集"
+                chip_logic = "当前价高于 POC，且日线 OHLCV 近似分布显示下方累计成交量高于上方；这表示历史成本带主要位于现价下方，并不表示 POC 一定是短线支撑。"
+                chip_meaning = "POC 与价值区间适合作为中短期价格参考，仍应结合均线、ATR 和近期低点判断实际支撑；价格明显远离 POC 时，不应解读为处于平衡博弈区。"
             else:
                 chip_tag = "MIX"
                 chip_title = "筹码峰处于平衡博弈区"
-                chip_logic = "当前价接近主要成交密集区，说明多空成本区重叠，方向性不如均线突破或放量跌破更明确。"
+                chip_logic = "当前价位于价值区间内，且筹码分布未显示明确的下方成本支撑或上方套牢压力优势；这不必然意味着价格与 POC 完全重合。"
                 chip_meaning = "适合把 POC、价值区间上下沿作为观察位，等待价格离开平衡区后再提高方向判断置信度。"
             items.append({
                 "tag": chip_tag,

@@ -347,6 +347,12 @@ chip_overhead_str = f"{float(chip.get('overhead_supply_ratio', 0) or 0)*100:.1f}
 chip_support_str = f"{float(chip.get('support_volume_ratio', 0) or 0)*100:.1f}%" if chip_ok else '—'
 chip_score_str = f"{float(chip.get('chip_score', 50) or 50):.1f}/100" if chip_ok else '—'
 chip_signal = escape_text(chip.get('chip_signal') or 'N/A') if chip_ok else 'N/A'
+chip_signal_label = {
+    'BULL_COST_BASE_SUPPORT': '下方历史成本带较密集',
+    'BULL_SUPPORTIVE': '下方成本支撑占优',
+    'BEAR_OVERHEAD_SUPPLY': '上方历史套牢压力占优',
+    'MIX_BALANCE_AREA': '价值区内平衡',
+}.get(chip.get('chip_signal'), chip_signal) if chip_ok else 'N/A'
 tech_score = float(d.get('technical_score', 50) or 50)
 tech_subscores = d.get('technical_subscores') or {}
 final_rating = d.get('final_rating') or {}
@@ -801,12 +807,12 @@ html += '      </div>\n    </div>\n\n'
 if chip_ok:
     html += '    <div class="tech-card" style="margin-top:16px;">\n      <h4>🧩 筹码峰 / Volume Profile（126日近似）</h4>\n'
     html += '      <div class="tech-grid">\n'
-    html += '        <div class="tech-item"><span class="tech-key">POC 主筹码峰</span><span class="tech-val">' + format_price(chip_poc_str, CURRENCY) + ' (' + chip_dist_str + ')</span></div>\n'
+    html += '        <div class="tech-item"><span class="tech-key">126日 POC（近似）</span><span class="tech-val">' + format_price(chip_poc_str, CURRENCY) + ' (' + chip_dist_str + ')</span></div>\n'
     html += '        <div class="tech-item"><span class="tech-key">70%价值区间</span><span class="tech-val">' + format_price(chip_va_str, CURRENCY) + '</span></div>\n'
     html += '        <div class="tech-item"><span class="tech-key">上方筹码占比</span><span class="tech-val signal-bear">' + chip_overhead_str + '</span></div>\n'
     html += '        <div class="tech-item"><span class="tech-key">下方支撑占比</span><span class="tech-val signal-bull">' + chip_support_str + '</span></div>\n'
     html += '      </div>\n'
-    html += '      <div style="margin-top:10px; font-size:12px; color:#8b949e;">chip_score ' + chip_score_str + ' · ' + chip_signal + '。该指标基于 yfinance 日线 OHLCV 的成交量价格分布近似，不等同于券商逐笔真实筹码。</div>\n'
+    html += '      <div style="margin-top:10px; font-size:12px; color:#8b949e;">chip_score ' + chip_score_str + ' · ' + chip_signal_label + '。POC 是价格桶中心；该指标基于 yfinance 日线 OHLCV 的成交量价格分布近似，不等同于券商逐笔真实筹码。</div>\n'
     html += '    </div>\n\n'
 
 # 布林带 + 价位标尺

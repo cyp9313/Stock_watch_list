@@ -38,6 +38,43 @@ def _number(value: Any) -> float | None:
     return number if math.isfinite(number) and number > 0 else None
 
 
+def classify_chip_profile_signal(
+    *,
+    close: float,
+    poc_price: float,
+    support_volume_ratio: float,
+    overhead_supply_ratio: float,
+    score: float,
+) -> str:
+    """Classify a daily-OHLCV volume-profile proxy without miscalling a distant POC neutral.
+
+    ``score`` remains the numerical chip score used by the technical composite.
+    This label adds a geometry check: a price materially above/below the POC with
+    most estimated volume on the opposite side is a cost-base/overhead condition,
+    not a balance area merely because the numerical score sits just below a cutoff.
+    """
+    try:
+        close, poc_price, support_volume_ratio, overhead_supply_ratio, score = (
+            float(value)
+            for value in (close, poc_price, support_volume_ratio, overhead_supply_ratio, score)
+        )
+    except (TypeError, ValueError):
+        return "MIX_BALANCE_AREA"
+    if not all(math.isfinite(value) for value in (close, poc_price, support_volume_ratio, overhead_supply_ratio, score)) or close <= 0 or poc_price <= 0:
+        return "MIX_BALANCE_AREA"
+
+    poc_distance_pct = (close - poc_price) / poc_price * 100.0
+    if poc_distance_pct >= 5.0 and support_volume_ratio > overhead_supply_ratio:
+        return "BULL_COST_BASE_SUPPORT"
+    if poc_distance_pct <= -5.0 and overhead_supply_ratio > support_volume_ratio:
+        return "BEAR_OVERHEAD_SUPPLY"
+    if score >= 65:
+        return "BULL_SUPPORTIVE"
+    if score <= 40:
+        return "BEAR_OVERHEAD_SUPPLY"
+    return "MIX_BALANCE_AREA"
+
+
 def _candidate(value: Any, kind: Literal["support", "resistance"], source: str, price: float, strength: float) -> PriceLevelCandidate | None:
     number = _number(value)
     if number is None:
