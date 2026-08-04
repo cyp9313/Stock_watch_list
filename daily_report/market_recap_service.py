@@ -1189,17 +1189,21 @@ def render_market_recap_html(payload: dict[str, Any]) -> str:
         leader_rows = [[item.get("name", ""), _pct(item.get("change_pct")), item.get("kind", "行业")] for item in (snapshot.get("sectors") or {}).get("leaders", [])]
         laggard_rows = [[item.get("name", ""), _pct(item.get("change_pct")), item.get("kind", "行业")] for item in (snapshot.get("sectors") or {}).get("laggards", [])]
         breadth_headers = ["范围", "MA20 上方", "1D变化", "MA50 上方", "1D变化", "MA200 上方", "1D变化"] if snapshot.get("market") == "us" else ["指标", "数值"]
-        breadth_html = _render_table(breadth_headers, breadth_rows) if breadth_rows else "<p class='kpi-sub'>数据不可用</p>"
-        macro_html = _render_table(["指标", "最新值", "1D", "5D", "趋势"], macro_rows) if macro_rows else "<p class='kpi-sub'>数据不可用</p>"
+        unavailable_html = "<p class='kpi-sub'>数据不可用</p>"
+        breadth_html = _render_table(breadth_headers, breadth_rows) if breadth_rows else unavailable_html
+        macro_html = _render_table(["指标", "最新值", "1D", "5D", "趋势"], macro_rows) if macro_rows else unavailable_html
+        leader_html = _render_table(["名称", "涨跌幅", "类别"], leader_rows) if leader_rows else unavailable_html
+        laggard_html = _render_table(["名称", "涨跌幅", "类别"], laggard_rows) if laggard_rows else unavailable_html
+        index_html = _render_table(index_headers, index_rows) if index_rows else unavailable_html
         sector_html = (
             "<div class='risk-grid'>"
-            f"<div><h3>领涨板块 / 主题</h3>{_render_table(['名称', '涨跌幅', '类别'], leader_rows) if leader_rows else '<p class=\"kpi-sub\">数据不可用</p>'}</div>"
-            f"<div><h3>领跌板块 / 主题</h3>{_render_table(['名称', '涨跌幅', '类别'], laggard_rows) if laggard_rows else '<p class=\"kpi-sub\">数据不可用</p>'}</div>"
+            f"<div><h3>领涨板块 / 主题</h3>{leader_html}</div>"
+            f"<div><h3>领跌板块 / 主题</h3>{laggard_html}</div>"
             "</div>"
         )
         snapshot_body = (
             "<h3>主要指数</h3>"
-            f"{_render_table(index_headers, index_rows) if index_rows else '<p class=\"kpi-sub\">数据不可用</p>'}"
+            f"{index_html}"
             "<h3>市场宽度与流动性</h3>"
             f"{breadth_html}"
             f"<h3>跨资产宏观环境</h3>{macro_html}"
