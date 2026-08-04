@@ -50,9 +50,11 @@ from daily_report.jobs import (
     check_download_generation_limits,
     create_weekly_schedule,
     create_weekly_portfolio_schedule,
+    create_weekly_market_recap_schedule,
     delete_schedule,
     enqueue_portfolio_email_job,
     enqueue_email_job,
+    enqueue_market_recap_email_job,
     finish_download_generation,
     list_owner_jobs,
     list_owner_schedules,
@@ -62,6 +64,11 @@ from daily_report.jobs import (
 from daily_report.mailer import smtp_configured
 from daily_report.portfolio_service import generate_portfolio_report, portfolio_runtime_available
 from daily_report.service import generate_report, runtime_available
+from daily_report.market_recap_service import (
+    generate_market_recap,
+    market_recap_enabled,
+    market_subject_key,
+)
 from multiuser_store import (
     BREADTH_GROUPS,
     authenticate,
@@ -263,14 +270,14 @@ SECTION_META = {
     },
     "portfolio_pages": {
         "tab": "Portfolios & AI Reports",
-        "title": "Portfolio Monitor & AI Reports",
+        "title": "Portfolio Monitor, DCA Backtest & AI Reports",
         "add_label": "Portfolio page",
         "new_page": "New Portfolio",
         "help": (
             "Use these pages for personal holdings. Each row stores ticker, buy price, "
             "shares and buy currency, while market data is reused from the shared watchlist API. "
-            "Signed-in users can also generate, download, email and schedule AI Portfolio Reports "
-            "for each portfolio page."
+            "Signed-in users can also run equal-weight DCA backtests, and generate, download, email and schedule "
+            "AI Portfolio Reports for each portfolio page."
         ),
     },
 }
@@ -2241,6 +2248,185 @@ def render_portfolio_weekly_schedules(user, page, mail_ready, runner_ok):
             st.rerun()
 
 
+def _portfolio_dca_date(value, fallback, minimum, maximum):
+    """Read a saved ISO date while keeping the date picker inside cache coverage."""
+    try:
+        parsed = datetime.date.fromisoformat(str(value or ""))
+    except ValueError:
+        parsed = fallback
+    return min(max(parsed, minimum), maximum)
+
+
+def build_portfolio_dca_backtest_figure(result, dark_mode=False):
+    theme = get_theme(dark_mode)
+    colors = {"portfolio": "#2563eb", "SPY": "#16a34a", "QQQ": "#f97316"}
+    fig = go.Figure()
+    portfolio_curve = None
+    for curve in result.get("curves") or []:
+        key = curve.get("key")
+        if key == "portfolio":
+            portfolio_curve = curve
+        fig.add_trace(go.Scatter(
+            x=curve.get("dates") or [],
+            y=curve.get("return_pct") or [],
+            mode="lines",
+            name=curve.get("label") or key,
+            line={"color": colors.get(key, "#64748b"), "width": 3 if key == "portfolio" else 2, "dash": "solid" if key == "portfolio" else "dash"},
+            hovertemplate="%{x}<br>%{y:.2f}%<extra>" + html.escape(str(curve.get("label") or key)) + "</extra>",
+        ))
+    if portfolio_curve:
+        return_by_date = dict(zip(portfolio_curve.get("dates") or [], portfolio_curve.get("return_pct") or []))
+        markers = result.get("buy_markers") or []
+        marker_dates = [marker.get("date") for marker in markers if marker.get("date") in return_by_date]
+        marker_returns = [return_by_date[marker_date] for marker_date in marker_dates]
+        if marker_dates:
+            fig.add_trace(go.Scatter(
+                x=marker_dates,
+                y=marker_returns,
+                mode="markers",
+                name="Portfolio DCA contribution",
+                marker={"symbol": "triangle-up", "size": 9, "color": "#7c3aed", "line": {"color": "#ffffff", "width": 1}},
+                hovertemplate="Scheduled DCA contribution<br>%{x}<br>Portfolio return: %{y:.2f}%<extra></extra>",
+            ))
+    fig.add_hline(y=0, line_color=theme["grid"], line_dash="dot", line_width=1)
+    fig.update_layout(
+        title="Equal-weight DCA return vs benchmarks",
+        xaxis_title="Date",
+        yaxis_title="Return on cumulative contributions (%)",
+        hovermode="x unified",
+        template=theme["plot_template"],
+        paper_bgcolor=theme["page_bg"],
+        plot_bgcolor=theme["plot_bg"],
+        font={"color": theme["text"]},
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0},
+        margin={"l": 12, "r": 12, "t": 72, "b": 12},
+        height=520,
+    )
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(gridcolor=theme["grid"], zeroline=False, ticksuffix="%")
+    return fig
+
+
+def render_portfolio_dca_backtest(config, page_index, user, dark_mode=False):
+    """Render account-scoped controls for a portfolio's deterministic DCA backtest."""
+    page = config["portfolio_pages"][page_index]
+    st.divider()
+    st.markdown("### DCA Backtest")
+    st.caption(
+        "Simulates one equal-sized contribution per scheduled date across this portfolio's current holdings. "
+        "Each date reweights only currently tradable holdings, so a later IPO joins from its next eligible contribution. "
+        "Uses adjusted closes (split/dividend adjusted); fees, taxes and currency conversion are not included."
+    )
+    if not user:
+        st.info("Sign in to run a DCA backtest for an account portfolio.")
+        return config
+    tickers = portfolio_page_tickers(page)
+    if not tickers:
+        st.info("Add portfolio holdings before running a DCA backtest.")
+        return config
+
+    maximum = datetime.date.today()
+    minimum = datetime.date(1970, 1, 1)
+    settings = dict(page.get("dca_backtest_settings") or {})
+    default_end = _portfolio_dca_date(settings.get("end_date"), maximum, minimum, maximum)
+    default_start = _portfolio_dca_date(
+        settings.get("start_date"),
+        max(minimum, default_end - datetime.timedelta(days=365)), minimum, maximum,
+    )
+    if default_start >= default_end:
+        default_start = max(minimum, default_end - datetime.timedelta(days=365))
+
+    with st.form(f"portfolio_dca_backtest_form_{page.get('id')}"):
+        date_col, cadence_col, timing_col, action_col = st.columns([1.2, 1, 1, 0.85])
+        with date_col:
+            selected_range = st.date_input(
+                "Backtest date range", value=(default_start, default_end), min_value=minimum, max_value=maximum,
+                key=f"portfolio_dca_range_{page.get('id')}",
+                help="Downloads the selected daily history directly from yfinance and does not write it to SQLite. Long ranges can take longer.",
+            )
+        with cadence_col:
+            cadence_label = st.selectbox(
+                "Contribution cadence", ["Monthly", "Weekly (Friday)"],
+                index=0 if settings.get("frequency", "monthly") == "monthly" else 1,
+                key=f"portfolio_dca_frequency_{page.get('id')}",
+            )
+        frequency = "monthly" if cadence_label == "Monthly" else "weekly"
+        with timing_col:
+            timing_label = st.selectbox(
+                "Monthly buy timing", ["Month start", "Month middle (third Friday)"],
+                index=0 if settings.get("monthly_timing", "start") == "start" else 1,
+                disabled=frequency != "monthly",
+                key=f"portfolio_dca_monthly_timing_{page.get('id')}",
+                help="If the selected date is not a trading day, purchase uses the next available daily adjusted close. The third Friday usually matches the US monthly options-expiration convention.",
+            )
+        monthly_timing = "start" if timing_label == "Month start" else "middle"
+        with action_col:
+            st.write("")
+            submitted = st.form_submit_button("Run DCA Backtest", width="stretch")
+
+    result_key = f"portfolio_dca_backtest_result:{user['cache_key']}:{page.get('id')}"
+    if submitted:
+        if not isinstance(selected_range, (tuple, list)) or len(selected_range) != 2:
+            st.error("Select both a start and an end date.")
+        else:
+            start_date, end_date = selected_range
+            if start_date >= end_date:
+                st.error("The end date must be after the start date.")
+            else:
+                page["dca_backtest_settings"] = {
+                    "start_date": start_date.isoformat(),
+                    "end_date": end_date.isoformat(),
+                    "frequency": frequency,
+                    "monthly_timing": monthly_timing,
+                }
+                config["portfolio_pages"][page_index] = page
+                save_active_config(user, config)
+                with st.spinner("Downloading selected daily prices and simulating equal-weight DCA…"):
+                    result = fetch_portfolio_dca_backtest(
+                        tuple(tickers), start_date.isoformat(), end_date.isoformat(), frequency, monthly_timing, user["cache_key"],
+                    )
+                st.session_state[result_key] = result
+
+    result = st.session_state.get(result_key)
+    if not result:
+        return config
+    if not result.get("success"):
+        st.error(result.get("error", "DCA backtest failed."))
+        return config
+    if result.get("initial_contribution_fallback"):
+        st.info("No regular DCA date falls inside this short range, so one initial contribution was invested from the selected start date.")
+    unavailable = result.get("unavailable_tickers") or []
+    if unavailable:
+        st.warning("Excluded due to unavailable adjusted-close history: " + ", ".join(unavailable))
+    if result.get("skipped_contributions", 0):
+        st.info(
+            f"{result['skipped_contributions']} scheduled contribution date(s) were skipped because no portfolio holding was tradable yet."
+        )
+    benchmark_status = result.get("benchmark_status") or {}
+    unavailable_benchmarks = [ticker for ticker, status in benchmark_status.items() if status != "ok"]
+    if unavailable_benchmarks:
+        st.info("Unavailable benchmark data: " + ", ".join(unavailable_benchmarks))
+
+    portfolio_curve = next((curve for curve in result.get("curves", []) if curve.get("key") == "portfolio"), None)
+    final_return = next((value for value in reversed((portfolio_curve or {}).get("return_pct") or []) if value is not None), None)
+    benchmark_returns = {
+        curve.get("key"): next((value for value in reversed(curve.get("return_pct") or []) if value is not None), None)
+        for curve in result.get("curves", []) if curve.get("key") in {"SPY", "QQQ"}
+    }
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Portfolio DCA return", f"{final_return:+.2f}%" if final_return is not None else "—")
+    metric_cols[1].metric("SPY DCA return", f"{benchmark_returns.get('SPY'):+.2f}%" if benchmark_returns.get("SPY") is not None else "—")
+    metric_cols[2].metric("QQQ DCA return", f"{benchmark_returns.get('QQQ'):+.2f}%" if benchmark_returns.get("QQQ") is not None else "—")
+    metric_cols[3].metric("Executed contributions", str(result.get("executed_contributions", 0)))
+    st.plotly_chart(build_portfolio_dca_backtest_figure(result, dark_mode=dark_mode), width="stretch", key=f"portfolio_dca_backtest_chart_{page.get('id')}")
+    st.caption(
+        f"Range: {result.get('start_date')} to {result.get('end_date')} • "
+        f"{result.get('frequency')} DCA • {len(result.get('portfolio_tickers') or [])} possible holdings • "
+        "triangles mark scheduled portfolio contributions."
+    )
+    return config
+
+
 def render_portfolio_ai_report(config, page_index, raw_df, user):
     page = config["portfolio_pages"][page_index]
     st.divider()
@@ -2602,6 +2788,28 @@ def fetch_breadth_data(screening_candidates=(), enable_screener=False):
         return resp.json() if resp.status_code == 200 else {"success": False, "error": resp.text}
     except (requests.RequestException, ValueError) as e:
         return {"success": False, "error": str(e)}
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_portfolio_dca_backtest(tickers, start_date, end_date, frequency, monthly_timing, cache_key=""):
+    """Request an on-demand DCA simulation; Streamlit retains only a short-lived response cache."""
+    payload = {
+        "tickers": list(tickers),
+        "start_date": str(start_date),
+        "end_date": str(end_date),
+        "frequency": str(frequency),
+        "monthly_timing": str(monthly_timing),
+    }
+    if cache_key:
+        payload["cache_key"] = cache_key
+    try:
+        response = requests.post(f"{API_BASE}/api/portfolio_dca_backtest", json=payload, timeout=180)
+        return response.json() if response.status_code == 200 else {
+            "success": False,
+            "error": response.json().get("error", response.text) if response.content else f"HTTP {response.status_code}",
+        }
+    except (requests.RequestException, ValueError) as exc:
+        return {"success": False, "error": f"DCA backtest request failed: {exc}"}
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -4897,6 +5105,7 @@ def render_portfolio_section(config, raw_df, editable, user, dark_mode=False, di
             if treemap_fig is not None:
                 st.divider()
                 st.plotly_chart(treemap_fig, width="stretch", key=f"portfolio_treemap_{i}")
+            config = render_portfolio_dca_backtest(config, i, user, dark_mode=dark_mode)
             config = render_portfolio_ai_report(config, i, raw_df, user)
     return config
 
@@ -5175,7 +5384,11 @@ def render_email_job_status(owner_key, report_kind=None, subject_key=None):
         if job.get("email_sent_at") and job["status"] != "sent":
             status = "Possibly sent"
         rows.append({
-            "Kind": "Portfolio" if (job.get("report_kind") == "portfolio") else "Ticker",
+            "Kind": (
+                "Portfolio" if job.get("report_kind") == "portfolio"
+                else "Market Recap" if job.get("report_kind") == "market_recap"
+                else "Ticker"
+            ),
             "Subject": job.get("subject_name") or job["ticker"],
             "Type": "Weekly" if job.get("schedule_id") else "One-time",
             "Status": status,
@@ -5342,6 +5555,94 @@ def _minimal_holding_context_for_report(config, ticker):
     return {"has_position": False}
 
 
+def _market_recap_selection(widget_key):
+    labels = {"US Market": ["us"], "China A-share Market": ["cn"], "US + China A-share Markets": ["cn", "us"]}
+    choice = st.selectbox(
+        "Markets to recap",
+        list(labels),
+        index=2,
+        key=widget_key,
+        help="A combined report uses separate sections and identifies each market's latest available completed daily session.",
+    )
+    return labels[choice]
+
+
+def render_market_recap_download_controls(user):
+    """Show recap download controls inside the normal download workflow."""
+    st.divider()
+    with st.expander("Market Recap (US / China A-share)", expanded=False):
+        st.caption("Structured market data is calculated first, then interpreted by one tool-free model call. The model cannot change the deterministic market-regime label.")
+        if not market_recap_enabled():
+            st.warning("Market Recap is disabled because MARKET_RECAP_ENABLED=false.")
+            return
+        with st.form("market_recap_download_form"):
+            markets = _market_recap_selection("market_recap_download_markets")
+            submitted = st.form_submit_button("Generate Market Recap")
+        if submitted:
+            session_id, result = None, None
+            try:
+                check_download_generation_limits(user["cache_key"], report_kind="market_recap")
+                session_id = start_download_generation(user["cache_key"], market_subject_key(markets), report_kind="market_recap")
+                with st.spinner("Collecting market data and news evidence, then generating the market recap…"):
+                    result = generate_market_recap(markets=markets, user_scope=user["cache_key"])
+                st.session_state["market_recap_result"] = result
+            except (ActiveJobError, DailyLimitError, ValueError) as exc:
+                st.error(str(exc))
+            finally:
+                if session_id:
+                    finish_download_generation(session_id, success=bool(result and result.get("success")))
+        result = st.session_state.get("market_recap_result")
+        if not result:
+            return
+        if not result.get("success"):
+            st.error(result.get("error", "Market recap generation failed."))
+            return
+        st.success(f"Market recap generated in {result.get('elapsed', 0):.1f}s.")
+        for warning in result.get("warnings") or []:
+            st.info("The LLM interpretation was unavailable; a deterministic template was used: " + str(warning))
+        st.download_button("Download HTML Market Recap", data=result["html_bytes"], file_name=result["file_name"], mime="text/html", key=f"download_market_recap_{result['file_name']}", width="stretch")
+
+
+def render_market_recap_email_controls(user, mail_ready):
+    """Show recap email and scheduling controls inside the normal email workflow."""
+    st.divider()
+    with st.expander("Market Recap email & schedule", expanded=False):
+        if not market_recap_enabled():
+            st.warning("Market Recap is disabled because MARKET_RECAP_ENABLED=false.")
+            return
+        once_tab, schedule_tab = st.tabs(["Send Once", "Weekly Schedule"])
+        with once_tab:
+            with st.form("market_recap_email_form"):
+                markets = _market_recap_selection("market_recap_email_markets")
+                recipient_email = st.text_input("Recipient email", key="market_recap_recipient_email")
+                queued = st.form_submit_button("Queue Market Recap Email", disabled=not mail_ready)
+            if queued:
+                try:
+                    job = enqueue_market_recap_email_job(owner_key=user["cache_key"], recipient_email=recipient_email, markets=markets)
+                    st.success(f"Job {job['id'][:8]} queued for {job['recipient_masked']}.")
+                except (ValueError, ActiveJobError, DailyLimitError, QueueFullError) as exc:
+                    st.error(str(exc))
+        with schedule_tab:
+            st.caption("Runs in Europe/Berlin time. No empty report is sent when neither selected market has a newer completed trading session.")
+            with st.form("market_recap_schedule_form"):
+                markets = _market_recap_selection("market_recap_schedule_markets")
+                recipient_email = st.text_input("Recipient email", key="market_recap_schedule_recipient_email")
+                day_cols, selected_weekdays = st.columns(7), []
+                for weekday, weekday_name in enumerate(WEEKDAY_NAMES):
+                    with day_cols[weekday]:
+                        if st.checkbox(weekday_name, value=weekday < 5, key=f"market_recap_weekday_{weekday}"):
+                            selected_weekdays.append(weekday)
+                send_time = st.time_input("Send time (Europe/Berlin)", value=datetime.time(hour=22, minute=30), step=datetime.timedelta(minutes=15), key="market_recap_schedule_time")
+                scheduled = st.form_submit_button("Create Market Recap Schedule", disabled=not mail_ready)
+            if scheduled:
+                try:
+                    schedule = create_weekly_market_recap_schedule(owner_key=user["cache_key"], recipient_email=recipient_email, markets=markets, weekdays=selected_weekdays, local_time=send_time)
+                    st.success(f"Recurring schedule created. Next send: {_format_berlin_datetime(schedule['next_run_at'])}.")
+                except (ValueError, ScheduleLimitError) as exc:
+                    st.error(str(exc))
+        render_email_job_status(user["cache_key"], report_kind="market_recap")
+
+
 def render_daily_report(user, config=None):
     st.subheader("AI Agent Stock Daily Report")
     st.caption(
@@ -5443,6 +5744,7 @@ def render_daily_report(user, config=None):
                             st.code(result["stdout"])
                         if result.get("stderr"):
                             st.code(result["stderr"])
+            render_market_recap_download_controls(user)
 
     with email_tab:
         if not user:
@@ -5503,6 +5805,7 @@ def render_daily_report(user, config=None):
             render_weekly_report_schedules(user, runner_ok, mail_ready)
 
         render_email_job_status(user["cache_key"], report_kind="ticker")
+        render_market_recap_email_controls(user, mail_ready)
 
 SCREENING_METRIC_COLUMNS = {
     "trend_quality": (
@@ -5927,8 +6230,8 @@ st.title("Stock Watchlist")
 st.caption(
     "Stock Watchlists organize custom stock and ETF lists; Market Dashboard tracks indices and cross-asset signals; "
     "Market Breadth & Screener summarizes the shared S&P 500 and Nasdaq 100 universes and screens saved equities; Portfolios & AI Reports combine personal "
-    "holding monitoring with AI Portfolio Report generation, download, email, and scheduling; and AI Stock Reports let "
-    "signed-in users generate, download, email, and schedule in-depth ticker reports."
+    "holding monitoring with AI Portfolio Report generation, download, email, and scheduling; and AI Market Intelligence lets "
+    "signed-in users generate, download, email, and schedule in-depth ticker reports and A-share/US market recaps."
 )
 
 fg1, fg_vix, fg2 = st.columns(3)
@@ -5966,7 +6269,7 @@ main_tab_labels = [
     SECTION_META["broad_pages"]["tab"],
     "Market Breadth & Screener",
     SECTION_META["portfolio_pages"]["tab"],
-    "AI Stock Reports",
+    "AI Market Intelligence",
 ]
 if editable:
     # This is deliberately absent for guests, rather than rendered as a

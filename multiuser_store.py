@@ -60,6 +60,12 @@ DEFAULT_PORTFOLIO_PAGES = [
         "id": "pf_default",
         "name": "Portfolio",
         "holdings": [],
+        "dca_backtest_settings": {
+            "start_date": "",
+            "end_date": "",
+            "frequency": "monthly",
+            "monthly_timing": "start",
+        },
         "analysis_settings": {
             "base_currency": "EUR",
             "benchmark": "^GSPC",
@@ -141,6 +147,7 @@ def _normalize_portfolio_pages(pages, fallback_name):
         if not page_id:
             page_id = f"pf_{uuid.uuid4().hex[:12]}"
         settings = _normalize_portfolio_analysis_settings(page.get("analysis_settings") or {})
+        dca_backtest_settings = _normalize_portfolio_dca_backtest_settings(page.get("dca_backtest_settings") or {})
         holdings = []
         raw_holdings = page.get("holdings")
 
@@ -176,12 +183,14 @@ def _normalize_portfolio_pages(pages, fallback_name):
             "id": page_id,
             "name": name,
             "holdings": holdings,
+            "dca_backtest_settings": dca_backtest_settings,
             "analysis_settings": settings,
         })
     return normalized or [{
         "id": f"pf_{uuid.uuid4().hex[:12]}",
         "name": fallback_name,
         "holdings": [],
+        "dca_backtest_settings": _normalize_portfolio_dca_backtest_settings({}),
         "analysis_settings": _normalize_portfolio_analysis_settings({}),
     }]
 
@@ -239,6 +248,27 @@ def _normalize_portfolio_analysis_settings(settings):
         data["max_focus_holdings"] = 5
     data.pop("research_max_tickers", None)
     data["custom_instructions"] = str(data.get("custom_instructions") or "").strip()[:600]
+    return data
+
+
+def _normalize_portfolio_dca_backtest_settings(settings):
+    defaults = DEFAULT_PORTFOLIO_PAGES[0]["dca_backtest_settings"]
+    data = dict(defaults)
+    if isinstance(settings, dict):
+        data.update(settings)
+    for key in ("start_date", "end_date"):
+        value = str(data.get(key) or "").strip()
+        try:
+            _dt.date.fromisoformat(value)
+        except ValueError:
+            value = ""
+        data[key] = value
+    data["frequency"] = str(data.get("frequency") or "monthly").strip().lower()
+    if data["frequency"] not in {"weekly", "monthly"}:
+        data["frequency"] = "monthly"
+    data["monthly_timing"] = str(data.get("monthly_timing") or "start").strip().lower()
+    if data["monthly_timing"] not in {"start", "middle"}:
+        data["monthly_timing"] = "start"
     return data
 
 

@@ -5,9 +5,9 @@ Verifies that:
 2. fetch_stock_data handles connection errors gracefully (returns dict, not crash)
 3. fetch_kline_data handles connection errors gracefully (returns None, not crash)
 4. Backend failure shows warning banner, not error + st.stop()
-5. Stock data failure still creates all tabs (including AI Stock Reports)
-6. AI Stock Reports tab content does not depend on stock data
-7. Backend failure does not block AI Stock Reports tab
+5. Stock data failure still creates all tabs (including AI Market Intelligence)
+6. AI Market Intelligence tab content does not depend on stock data
+7. Backend failure does not block AI Market Intelligence tab
 8. fetch_stock_data still returns data on success (no regression)
 9. fetch_kline_data still returns data on success (no regression)
 """
@@ -179,7 +179,7 @@ class TestStockDataFailureCreatesAllTabs:
         )
 
     def test_ai_agent_reports_tab_not_gated_by_stock_data(self):
-        """The AI Stock Reports tab should not check _stock_data_ok."""
+        """The AI Market Intelligence tab should not check _stock_data_ok."""
         lines = _SOURCE.splitlines()
         # Find the account-aware AI report tab section.
         ai_tab_idx = None
@@ -187,15 +187,15 @@ class TestStockDataFailureCreatesAllTabs:
             if "main_tabs[ai_reports_tab_index]" in line:
                 ai_tab_idx = i
                 break
-        assert ai_tab_idx is not None, "Could not find the AI Stock Reports tab"
+        assert ai_tab_idx is not None, "Could not find the AI Market Intelligence tab"
         # Check the next few lines -- should NOT contain _stock_data_ok check
         section = "\n".join(lines[ai_tab_idx:ai_tab_idx + 5])
         assert "_stock_data_ok" not in section, (
-            "AI Stock Reports tab must not be gated by _stock_data_ok -- "
+            "AI Market Intelligence tab must not be gated by _stock_data_ok -- "
             "it should render unconditionally"
         )
         assert "render_daily_report" in section, (
-            "AI Stock Reports tab should call render_daily_report(user)"
+            "AI Market Intelligence tab should call render_daily_report(user)"
         )
 
     def test_short_term_tab_is_added_only_for_authenticated_users(self):
@@ -208,7 +208,7 @@ class TestStockDataFailureCreatesAllTabs:
         assert "market_breadth_tab_index = 3 if editable else 2" in _SOURCE
         assert "portfolio_tab_index = 4 if editable else 3" in _SOURCE
         assert "ai_reports_tab_index = 5 if editable else 4" in _SOURCE
-        assert "\"AI Stock Reports\"" in _SOURCE, "AI Stock Reports tab label missing"
+        assert "\"AI Market Intelligence\"" in _SOURCE, "AI Market Intelligence tab label missing"
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +383,7 @@ class TestFetchKlineDataBehavior:
 
 
 # ---------------------------------------------------------------------------
-# Integration: verify AI Stock Reports does not depend on backend or stock data
+# Integration: verify AI Market Intelligence does not depend on backend or stock data
 # ---------------------------------------------------------------------------
 
 class TestAIReportIndependence:

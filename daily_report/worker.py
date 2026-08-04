@@ -25,6 +25,7 @@ from .jobs import (
     store_generated_report,
 )
 from .mailer import compute_job_message_id, send_report_email
+from .market_recap_service import generate_market_recap_for_job, mark_market_recap_delivered
 from .portfolio_service import generate_portfolio_report_for_job
 from .service import generate_report, _get_market_date
 
@@ -46,6 +47,8 @@ def generate_job_report(job: dict) -> dict:
     report_kind = (job.get("report_kind") or "ticker").lower()
     if report_kind == "portfolio":
         return generate_portfolio_report_for_job(job)
+    if report_kind == "market_recap":
+        return generate_market_recap_for_job(job)
     if report_kind == "ticker":
         return generate_report(
             job["subject_key"] or job["ticker"],
@@ -81,6 +84,10 @@ def process_one_job() -> bool:
                 if result.get("quality_gate_failed"):
                     raise PermanentReportFailure(result.get("error") or "Portfolio report quality gate failed.")
                 raise RuntimeError(detail or "Daily report generation failed.")
+            if result.get("skip_delivery"):
+                mark_job_sent(job_id)
+                print(f"[ReportWorker] Job {job_id[:8]} skipped: no newly completed market session", flush=True)
+                return True
             html_bytes = result["html_bytes"]
             file_name = result["file_name"]
             job["report_date"] = result["report_date"]
@@ -120,6 +127,12 @@ def process_one_job() -> bool:
             )
             mark_email_sent(job_id, message_id)
             mark_job_sent(job_id)
+            if report_kind == "market_recap":
+                try:
+                    payload = result.get("payload") if 'result' in locals() else None
+                    mark_market_recap_delivered(job.get("schedule_id"), (payload or {}).get("snapshots", []))
+                except Exception as exc:
+                    print(f"[ReportWorker] Job {job_id[:8]} delivered but recap schedule marker failed: {type(exc).__name__}", flush=True)
             print(f"[ReportWorker] Job {job_id[:8]} sent successfully", flush=True)
     except Exception as exc:
         next_status = mark_job_failure(

@@ -24,6 +24,7 @@ from kline_indicators import calculate_adx_series
 from ticker_mapping import is_known_us_etf, normalize_yfinance_ticker
 from market_screener import MARKET_PROFILES, market_profile_for_ticker, run_screener, screening_benchmark_tickers
 from options_open_interest import aggregate_open_interest, option_gamma_legs, select_option_expirations
+from portfolio_backtest import BENCHMARK_TICKERS, run_equal_weight_dca_backtest
 
 RELATIVE_RETURN_BENCHMARK = "^GSPC"
 DEFAULT_BETA_BENCHMARK = "^GSPC"
@@ -3162,6 +3163,83 @@ def get_stock_data():
     finally:
         CURRENT_DB_PATH.reset(cache_token)
 
+@app.route('/api/portfolio_dca_backtest', methods=['POST'])
+def portfolio_dca_backtest():
+    """Run an on-demand DCA simulation without writing its history to SQLite."""
+    try:
+        body = request.get_json(silent=True)
+        if not isinstance(body, dict):
+            return jsonify({"success": False, "error": "DCA backtest body must be a JSON object."}), 400
+        raw_tickers = body.get("tickers")
+        if not isinstance(raw_tickers, list) or not raw_tickers:
+            return jsonify({"success": False, "error": "Select at least one portfolio ticker."}), 400
+        if len(raw_tickers) > 60:
+            return jsonify({"success": False, "error": "A DCA backtest supports at most 60 unique tickers."}), 400
+        tickers = list(dict.fromkeys(
+            normalize_yfinance_ticker(ticker)
+            for ticker in raw_tickers
+            if isinstance(ticker, str) and normalize_yfinance_ticker(ticker)
+        ))
+        if not tickers:
+            return jsonify({"success": False, "error": "No valid portfolio tickers were supplied."}), 400
+        try:
+            start_date = datetime.date.fromisoformat(str(body.get("start_date") or ""))
+            end_date = datetime.date.fromisoformat(str(body.get("end_date") or ""))
+        except ValueError:
+            return jsonify({"success": False, "error": "Use ISO dates for the DCA backtest range."}), 400
+        today = datetime.date.today()
+        if start_date < datetime.date(1970, 1, 1) or end_date > today or start_date >= end_date:
+            return jsonify({
+                "success": False,
+                "error": f"Choose a range from 1970-01-01 through {today.isoformat()} with an end date after the start date.",
+            }), 400
+        frequency = str(body.get("frequency") or "monthly")
+        monthly_timing = str(body.get("monthly_timing") or "start")
+
+        requested = list(dict.fromkeys(tickers + list(BENCHMARK_TICKERS)))
+        # A DCA backtest may need more history than the normal application
+        # cache retains.  Deliberately download its requested range directly:
+        # this avoids both truncating long simulations and bloating price_cache.
+        price_data = yf.download(
+            tickers=requested,
+            # Keep a small pre-window history only in this in-memory download.
+            # The backtest needs it to distinguish a weekend/holiday start from
+            # a ticker that genuinely had not listed by the start date.
+            start=(start_date - datetime.timedelta(days=14)).isoformat(),
+            end=(end_date + datetime.timedelta(days=1)).isoformat(),
+            interval="1d",
+            auto_adjust=False,
+            group_by="column",
+            threads=True,
+            progress=False,
+            timeout=45,
+        )
+        if price_data is None or price_data.empty:
+            return jsonify({"success": False, "error": "No daily price data was returned for the selected range."}), 502
+        if isinstance(price_data.columns, pd.MultiIndex):
+            if "Adj Close" not in set(price_data.columns.get_level_values(0)):
+                return jsonify({"success": False, "error": "Adjusted-close data is unavailable for this backtest."}), 502
+            adj_close = price_data["Adj Close"].copy()
+        else:
+            adj_close = price_data.copy()
+            if "Adj Close" in adj_close.columns and len(requested) == 1:
+                adj_close = adj_close[["Adj Close"]].rename(columns={"Adj Close": requested[0]})
+
+        result = run_equal_weight_dca_backtest(
+            adj_close,
+            tickers,
+            start_date,
+            end_date,
+            frequency=frequency,
+            monthly_timing=monthly_timing,
+        )
+        result["data_source"] = "on-demand yfinance download (not stored in SQLite)"
+        return jsonify(result)
+    except ValueError as exc:
+        return jsonify({"success": False, "error": str(exc)}), 400
+    except Exception as exc:
+        print(f"[DCA Backtest] failed: {exc}")
+        return jsonify({"success": False, "error": "DCA backtest could not be calculated from market data."}), 502
 @app.route('/api/breadth_data', methods=['POST'])
 def get_breadth_data():
     """获取市场宽度数据"""

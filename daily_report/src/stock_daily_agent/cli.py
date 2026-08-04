@@ -27,9 +27,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--searxng-language", help="临时覆盖 SEARXNG_LANGUAGE；建议 auto/en-US/zh-CN，默认 auto")
     p.add_argument("--searxng-time-range", choices=["day", "month", "year", ""], help="临时覆盖 SEARXNG_TIME_RANGE，默认 month")
     p.add_argument("--searxng-engines", help="临时覆盖 SEARXNG_ENGINES，例如 google 或 google,google news；为空则使用实例默认引擎")
-    p.add_argument("--search-provider", choices=["auto", "priority", "searxng", "serper", "both"], help="V5.8 搜索来源：priority/serper/searxng/both/auto；默认 auto，即生产模式 Serper-first")
+    p.add_argument("--search-provider", choices=["auto", "priority", "searxng", "serper", "anspire", "serpapi", "both"], help="搜索来源：priority/serper/anspire/serpapi/searxng/both/auto；priority 使用完整质量驱动链")
     p.add_argument("--serper-api-key", help="临时覆盖 SERPER_API_KEY，用于测试 Serper 搜索质量")
     p.add_argument("--serper-types", help="临时覆盖 SERPER_TYPES，例如 search 或 search,news")
+    p.add_argument("--anspire-api-key", help="临时覆盖 ANSPIRE_API_KEY；不会写入日志或中间文件")
+    p.add_argument("--serpapi-api-key", help="临时覆盖 SERPAPI_API_KEY；不会写入日志或中间文件")
+    p.add_argument("--search-provider-priority", help="临时覆盖 SEARCH_PROVIDER_PRIORITY，例如 serper,anspire,serpapi,dashscope,searxng")
     p.add_argument("--no-article-fetch", action="store_true", help="禁用 v5.8 正文抓取增强层，仅使用搜索 title/snippet")
     p.add_argument("--article-fetch-max-urls", type=int, help="临时覆盖 ARTICLE_FETCH_MAX_URLS")
     p.add_argument("--quiet", action="store_true", help="不流式打印 agent 输出")
@@ -71,6 +74,12 @@ def main(argv: list[str] | None = None) -> int:
         os.environ["SERPER_API_KEY"] = args.serper_api_key
     if args.serper_types:
         os.environ["SERPER_TYPES"] = args.serper_types
+    if args.anspire_api_key:
+        os.environ["ANSPIRE_API_KEY"] = args.anspire_api_key
+    if args.serpapi_api_key:
+        os.environ["SERPAPI_API_KEY"] = args.serpapi_api_key
+    if args.search_provider_priority:
+        os.environ["SEARCH_PROVIDER_PRIORITY"] = args.search_provider_priority
     if args.no_article_fetch:
         os.environ["ARTICLE_FETCH_ENABLED"] = "false"
     if args.article_fetch_max_urls is not None:

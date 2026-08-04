@@ -123,6 +123,22 @@ class RunContext:
         return self.run_dir / f"{self.safe_ticker}_serper_reranked_evidence.json"
 
     @property
+    def anspire_raw_results_file(self) -> Path:
+        return self.run_dir / f"{self.safe_ticker}_anspire_raw_search_results.json"
+
+    @property
+    def anspire_reranked_evidence_file(self) -> Path:
+        return self.run_dir / f"{self.safe_ticker}_anspire_reranked_evidence.json"
+
+    @property
+    def serpapi_raw_results_file(self) -> Path:
+        return self.run_dir / f"{self.safe_ticker}_serpapi_raw_search_results.json"
+
+    @property
+    def serpapi_reranked_evidence_file(self) -> Path:
+        return self.run_dir / f"{self.safe_ticker}_serpapi_reranked_evidence.json"
+
+    @property
     def combined_reranked_evidence_file(self) -> Path:
         return self.run_dir / f"{self.safe_ticker}_combined_reranked_evidence.json"
 

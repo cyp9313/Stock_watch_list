@@ -87,6 +87,12 @@ def send_report_email(
             f"Your AI portfolio analysis report for {subject_name} is attached.\n\n"
             "This report is for research purposes only and is not investment advice."
         )
+    elif report_kind == "market_recap":
+        message["Subject"] = f"{subject_name} Market Recap - {report_date}"
+        body = (
+            f"Your market recap for {subject_name} is attached.\n\n"
+            "This report is for research purposes only and is not investment advice."
+        )
     else:
         message["Subject"] = f"{subject_name} AI Stock Daily Report - {report_date}"
         body = (

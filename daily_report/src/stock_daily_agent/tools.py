@@ -26,6 +26,16 @@ except ImportError:  # Allows static checks before qwen-agent is installed.
 from .config import RunContext
 from .notes import parse_notes_payload, validate_notes, render_notes_text, notes_to_jsonable
 from .utils import parse_tool_params, json_dumps, run_python_script, ToolError, ensure_within_dir, strip_markdown_code_fence
+from .search_provider_clients import (
+    anspire_available,
+    canonicalize_url,
+    dedupe_search_items,
+    parse_provider_priority, provider_priority_warnings,
+    prepare_search_candidates,
+    run_anspire_raw_search,
+    run_serpapi_raw_search,
+    serpapi_available,
+)
 
 _CONTEXT: RunContext | None = None
 
@@ -467,10 +477,40 @@ def _run_serper_raw_search(ctx: RunContext, ticker: str, languages: list[str], m
     return all_items, calls, errors
 
 
-def _prepare_evidence_from_raw(ctx: RunContext, ticker: str, raw_items: list[dict[str, Any]], max_total: int, context_top_n: int, provider: str, fetch_articles: bool = True) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    items = _dedupe_evidence(raw_items, max_items=max(max_total * 2, max_total + 8))
+def _provider_queries(ticker: str, data: dict[str, Any], languages: list[str]) -> dict[str, list[tuple[str, str]]]:
+    return {str(language): _build_market_queries(ticker, data, str(language)) for language in languages}
+
+
+def _run_anspire_provider(ctx: RunContext, ticker: str, languages: list[str], max_per_query: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    return run_anspire_raw_search(
+        ticker=ticker,
+        languages=languages,
+        queries=_provider_queries(ticker, _load_current_data(ctx), languages),
+        report_date=ctx.report_date,
+        max_per_query=min(max_per_query, int(os.environ.get("ANSPIRE_MAX_RESULTS_PER_QUERY", "10"))),
+    )
+
+
+def _run_serpapi_provider(ctx: RunContext, ticker: str, languages: list[str], max_per_query: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    return run_serpapi_raw_search(
+        ticker=ticker,
+        languages=languages,
+        queries=_provider_queries(ticker, _load_current_data(ctx), languages),
+        report_date=ctx.report_date,
+        max_per_query=min(max_per_query, int(os.environ.get("SERPAPI_MAX_RESULTS_PER_QUERY", "10"))),
+    )
+
+
+def _prepare_evidence_from_raw(ctx: RunContext, ticker: str, raw_items: list[dict[str, Any]], max_total: int, context_top_n: int, provider: str, fetch_articles: bool = True, article_cache: dict[str, dict[str, Any]] | None = None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    items, _rejected = prepare_search_candidates(
+        raw_items,
+        ticker=ticker,
+        data=_load_current_data(ctx),
+        report_date=ctx.report_date,
+        max_items=max(max_total * 2, max_total + 8),
+    )
     items = _rerank_evidence(items)
-    max_unknown = int(os.environ.get("EVIDENCE_MAX_UNKNOWN_DATE", "6"))
+    max_unknown = int(os.environ.get("SEARCH_UNKNOWN_DATE_LIMIT", os.environ.get("EVIDENCE_MAX_UNKNOWN_DATE", "4")))
     items = _limit_unknown_dates(items, max_unknown=max_unknown)[:max_total]
     article_records: list[dict[str, Any]] = []
     article_fetch_enabled = fetch_articles and os.environ.get("ARTICLE_FETCH_ENABLED", "true").strip().lower() not in {"0", "false", "no"}
@@ -478,26 +518,15 @@ def _prepare_evidence_from_raw(ctx: RunContext, ticker: str, raw_items: list[dic
         max_urls = int(os.environ.get("ARTICLE_FETCH_MAX_URLS", "10"))
         article_max_chars = int(os.environ.get("ARTICLE_FETCH_MAX_CHARS", "3500"))
         article_timeout = float(os.environ.get("ARTICLE_FETCH_TIMEOUT", "12"))
-        items, article_records = _enrich_evidence_with_articles(items, max_urls=max_urls, max_chars=article_max_chars, timeout=article_timeout)
+        items, article_records = _enrich_evidence_with_articles(items, max_urls=max_urls, max_chars=article_max_chars, timeout=article_timeout, article_cache=article_cache)
         items = _rerank_evidence(items)
     prefix = "SP" if provider == "serper" else "SX" if provider == "searxng" else "E"
     items = _assign_evidence_ids(items[:min(context_top_n, max_total)], prefix=prefix)
     return items, article_records
 
 def _dedupe_evidence(items: list[dict[str, Any]], max_items: int) -> list[dict[str, Any]]:
-    seen: set[str] = set()
-    out: list[dict[str, Any]] = []
-    for item in items:
-        url = str(item.get("url") or "").strip()
-        title = str(item.get("title") or "").strip().lower()
-        key = url or title
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        out.append(item)
-        if len(out) >= max_items:
-            break
-    return out
+    """Compatibility wrapper with canonical cross-provider URL/title dedupe."""
+    return dedupe_search_items(items, max_items=max_items)
 
 
 def _source_domain(url: str) -> str:
@@ -641,7 +670,8 @@ def _required_focus_coverage(ticker: str, data: dict[str, Any]) -> list[str]:
     An explicit SERPER_REQUIRED_FOCUS_COVERAGE value still overrides these defaults.
     Set it to ``auto`` to use this instrument-aware mapping.
     """
-    override = os.environ.get("SERPER_REQUIRED_FOCUS_COVERAGE", "auto").strip()
+    override = os.environ.get("SEARCH_REQUIRED_FOCUS_COVERAGE") or os.environ.get("SERPER_REQUIRED_FOCUS_COVERAGE", "auto")
+    override = override.strip()
     if override and override.lower() not in {"auto", "default"}:
         return [x.strip() for x in override.split(",") if x.strip()]
 
@@ -662,25 +692,63 @@ def _required_focus_coverage(ticker: str, data: dict[str, Any]) -> list[str]:
     }.get(instrument_type, ["major_events", "macro", "risks"])
 
 
-def _evaluate_evidence_sufficiency(items: list[dict[str, Any]], required_focus: list[str] | None = None) -> dict[str, Any]:
+def evaluate_search_quality(
+    items: list[dict[str, Any]],
+    *,
+    ticker: str = "",
+    data: dict[str, Any] | None = None,
+    required_focus: list[str] | None = None,
+    supplemental_records: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Provider-neutral cumulative evidence gate used by production fallback."""
     required_focus = required_focus or ["major_events", "macro", "risks"]
-    min_total = int(os.environ.get("SERPER_MIN_FINAL_EVIDENCE", "10"))
-    min_ab = int(os.environ.get("SERPER_MIN_GRADE_AB", "6"))
-    grades = [str(i.get("evidence_grade") or _evidence_grade(i)) for i in items]
+    data = data or {}
+    min_total = int(os.environ.get("SEARCH_MIN_FINAL_EVIDENCE", os.environ.get("SERPER_MIN_FINAL_EVIDENCE", "10")))
+    min_ab = int(os.environ.get("SEARCH_MIN_GRADE_AB", os.environ.get("SERPER_MIN_GRADE_AB", "6")))
+    min_known_dates = int(os.environ.get("SEARCH_MIN_KNOWN_DATE_EVIDENCE", "6"))
+    min_direct = int(os.environ.get("SEARCH_MIN_DIRECT_RELEVANCE_EQUITY", "3"))
+    records = [*items, *(supplemental_records or [])]
+    grades = [str(i.get("evidence_grade") or _evidence_grade(i)) for i in records]
     ab = sum(1 for g in grades if g in {"A", "B", "TECH"})
-    focus_set = {str(i.get("focus") or "") for i in items}
+    focus_set = {str(i.get("focus") or "") for i in records}
     missing_focus = [f for f in required_focus if f not in focus_set]
-    ok = len(items) >= min_total and ab >= min_ab and not missing_focus
+    known_dates = sum(
+        1 for item in records
+        if str(item.get("date_status") or "") == "known"
+        or (not item.get("date_status") and str(item.get("source_date") or "").lower() not in {"", "unknown", "none", "null"})
+    )
+    direct_count = sum(1 for item in records if str(item.get("target_relevance_category") or "") == "direct_company_news")
+    instrument_type = str(data.get("INSTRUMENT_TYPE") or "").upper()
+    direct_required = instrument_type in {"", "EQUITY"}
+    failures: list[str] = []
+    if len(records) < min_total:
+        failures.append("too_few_evidence")
+    if ab < min_ab:
+        failures.append("too_few_grade_ab")
+    if known_dates < min_known_dates:
+        failures.append("too_few_known_dates")
+    if direct_required and direct_count < min_direct:
+        failures.append("too_few_direct_company_news")
+    failures.extend(f"missing_focus:{focus}" for focus in missing_focus)
+    ok = not failures
     return {
         "ok": ok,
-        "count": len(items),
+        "count": len(records),
         "grade_ab_count": ab,
+        "known_date_count": known_dates,
+        "direct_relevance_count": direct_count,
         "required_focus": required_focus,
         "focus_coverage": sorted(x for x in focus_set if x),
         "missing_focus": missing_focus,
-        "thresholds": {"min_total": min_total, "min_grade_ab": min_ab},
-        "reason": "sufficient" if ok else f"insufficient: count={len(items)} min={min_total}, A/B={ab} min_ab={min_ab}, missing_focus={missing_focus}",
+        "thresholds": {"min_total": min_total, "min_grade_ab": min_ab, "min_known_dates": min_known_dates, "min_direct_relevance_equity": min_direct if direct_required else 0},
+        "failure_reasons": failures,
+        "reason": "sufficient" if ok else "insufficient:" + ",".join(failures),
     }
+
+
+def _evaluate_evidence_sufficiency(items: list[dict[str, Any]], required_focus: list[str] | None = None) -> dict[str, Any]:
+    """Backward-compatible wrapper for callers/tests using the old name."""
+    return evaluate_search_quality(items, required_focus=required_focus)
 
 
 def _source_quality_score(item: dict[str, Any]) -> int:
@@ -753,6 +821,10 @@ def _evidence_origin(item: dict[str, Any]) -> str:
         return "dashscope_source"
     if provider == "serper" or eid.startswith("SP"):
         return "serper"
+    if provider == "anspire":
+        return "anspire"
+    if provider == "serpapi":
+        return "serpapi"
     if provider == "searxng" or eid.startswith("SX"):
         return "searxng"
     return provider or method or "unknown"
@@ -1580,11 +1652,174 @@ class CombinedMarketResearchTool(BaseTool):
         })
 
 
+def _write_provider_artifacts(ctx: RunContext, provider: str, ticker: str, raw: list[dict[str, Any]], calls: list[dict[str, Any]], errors: list[str], preview: list[dict[str, Any]]) -> dict[str, str]:
+    mapping = {
+        "serper": (ctx.serper_raw_results_file, ctx.serper_reranked_evidence_file),
+        "anspire": (ctx.anspire_raw_results_file, ctx.anspire_reranked_evidence_file),
+        "serpapi": (ctx.serpapi_raw_results_file, ctx.serpapi_reranked_evidence_file),
+        "searxng": (ctx.raw_results_file, ctx.reranked_evidence_file),
+    }
+    raw_file, reranked_file = mapping[provider]
+    raw_file.write_text(json_dumps({"ticker": ticker, "method": f"{provider}_market_research_raw", "raw_count": len(raw), "items": raw, "calls": calls, "errors": errors}), encoding="utf-8")
+    reranked_file.write_text(json_dumps({"ticker": ticker, "method": f"{provider}_market_research_reranked_preview", "count": len(preview), "items": preview}), encoding="utf-8")
+    return {"raw_file": str(raw_file), "reranked_file": str(reranked_file)}
+
+
+def _dedupe_article_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for record in records:
+        key = canonicalize_url(str(record.get("url") or record.get("final_url") or "")) or str(record.get("url") or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(record)
+    return out
+
+
+def _run_priority_provider_chain(ctx: RunContext, p: dict[str, Any]) -> str:
+    ticker = str(p.get("ticker") or ctx.ticker).strip().upper()
+    languages = p.get("languages") or infer_search_languages(ticker)
+    if isinstance(languages, str):
+        languages = [part.strip() for part in languages.split(",") if part.strip()]
+    languages = list(languages)
+    max_per_query = int(p.get("max_results_per_query") or os.environ.get("SEARCH_MAX_RESULTS_PER_QUERY") or os.environ.get("SERPER_MAX_RESULTS_PER_QUERY") or 8)
+    max_total = int(p.get("max_total_results") or os.environ.get("PRIORITY_MAX_TOTAL_RESULTS") or os.environ.get("COMBINED_MAX_TOTAL_RESULTS") or 60)
+    context_top_n = int(os.environ.get("EVIDENCE_CONTEXT_TOP_N", "18"))
+    fetch_articles = os.environ.get("ARTICLE_FETCH_ENABLED", "true").strip().lower() not in {"0", "false", "no"}
+    priority = parse_provider_priority(os.environ.get("SEARCH_PROVIDER_PRIORITY"))
+    priority_warnings = provider_priority_warnings(os.environ.get("SEARCH_PROVIDER_PRIORITY"))
+    # Keep the old --search-provider values useful for one-provider and A/B
+    # diagnostics, while production continues to use the configurable chain.
+    provider_mode = os.environ.get("SEARCH_PROVIDER", "priority").strip().lower()
+    if provider_mode in {"serper", "anspire", "serpapi", "searxng"}:
+        priority = [provider_mode]
+    elif provider_mode == "both":
+        priority = ["serper", "searxng"]
+    force_dashscope = bool(p.get("force_dashscope", False)) or os.environ.get("FORCE_DASHSCOPE_AFTER_SERPER", "false").strip().lower() in {"1", "true", "yes"}
+    force_searxng = bool(p.get("force_searxng", False)) or os.environ.get("FORCE_SEARXNG_FALLBACK", "false").strip().lower() in {"1", "true", "yes"}
+    force_anspire = bool(p.get("force_anspire", False))
+    force_serpapi = bool(p.get("force_serpapi", False))
+    forced = {"dashscope": force_dashscope, "searxng": force_searxng, "anspire": force_anspire, "serpapi": force_serpapi}
+    current_data = _load_current_data(ctx)
+    required_focus = _required_focus_coverage(ticker, current_data)
+    all_raw: list[dict[str, Any]] = []
+    items: list[dict[str, Any]] = []
+    article_cache: dict[str, dict[str, Any]] = {}
+    article_records: list[dict[str, Any]] = []
+    calls: list[dict[str, Any]] = []
+    errors: list[str] = list(priority_warnings)
+    stages: list[dict[str, Any]] = []
+    selected_stop_provider: str | None = None
+    final_quality = evaluate_search_quality([], ticker=ticker, data=current_data, required_focus=required_focus)
+    runners = {"serper": _run_serper_raw_search, "anspire": _run_anspire_provider, "serpapi": _run_serpapi_provider, "searxng": _run_searxng_raw_search}
+    availability = {"serper": bool(_serper_api_key()), "anspire": anspire_available(), "serpapi": serpapi_available(), "searxng": bool(_searxng_base_url()), "dashscope": bool(os.environ.get("DASHSCOPE_API_KEY"))}
+
+    for provider in priority:
+        if selected_stop_provider and not forced.get(provider, False):
+            stages.append({"provider": provider, "available": availability[provider], "attempted": False, "skip_reason": "quality_satisfied"})
+            continue
+        if not availability[provider]:
+            reason = "provider_missing_key" if provider in {"serper", "anspire", "serpapi", "dashscope"} else "provider_unavailable"
+            stages.append({"provider": provider, "available": False, "attempted": False, "skip_reason": reason, "errors": [f"{reason}:{provider}"]})
+            errors.append(f"{reason}:{provider}")
+            continue
+        started = time.monotonic()
+        if provider == "dashscope":
+            try:
+                result = json.loads(DashScopeMarketResearchTool().call({"ticker": ticker, "languages": languages, "min_items": int(os.environ.get("DASHSCOPE_TARGET_COUNT", "8"))}))
+            except Exception as exc:
+                result = {"ok": False, "errors": [f"dashscope_error:{type(exc).__name__}"]}
+            dashscope_sources = _load_json_file(ctx.dashscope_sources_file).get("items", [])
+            raw: list[dict[str, Any]] = []
+            for source in dashscope_sources if isinstance(dashscope_sources, list) else []:
+                if not isinstance(source, dict):
+                    continue
+                converted = dict(source)
+                converted.pop("evidence_id", None)  # Unified final evidence IDs are E001…
+                converted.update({"provider": "dashscope", "engine": "dashscope_source", "focus": "", "raw_item": source})
+                raw.append(converted)
+            provider_calls = [{"provider": "dashscope", "count": len(raw), "sources_file": str(ctx.dashscope_sources_file)}]
+            provider_errors = [str(error) for error in result.get("errors", [])]
+            artifact_files = {"raw_file": str(ctx.dashscope_sources_file), "reranked_file": str(ctx.dashscope_sources_file)}
+        else:
+            raw, provider_calls, provider_errors = runners[provider](ctx, ticker, languages, max_per_query)
+            preview, _ = prepare_search_candidates(raw, ticker=ticker, data=current_data, report_date=ctx.report_date, max_items=max_total)
+            artifact_files = _write_provider_artifacts(ctx, provider, ticker, raw, provider_calls, provider_errors, _rerank_evidence(preview)[:context_top_n])
+        # Record admission/rejection diagnostics before adding this provider to
+        # the cumulative set.  This makes stale/irrelevant/junk results visible
+        # without placing rejected content in final evidence.
+        previous_candidates, _ = prepare_search_candidates(
+            all_raw, ticker=ticker, data=current_data, report_date=ctx.report_date, max_items=max_total * 4,
+        )
+        admitted_raw, rejected_raw = prepare_search_candidates(
+            raw, ticker=ticker, data=current_data, report_date=ctx.report_date, max_items=max_total * 4,
+        )
+        all_raw.extend(raw)
+        cumulative_candidates, _ = prepare_search_candidates(
+            all_raw, ticker=ticker, data=current_data, report_date=ctx.report_date, max_items=max_total * 4,
+        )
+        prior_keys = {str(item.get("canonical_url") or item.get("normalized_title") or "") for item in previous_candidates}
+        new_unique_count = sum(
+            1 for item in cumulative_candidates
+            if str(item.get("canonical_url") or item.get("normalized_title") or "") not in prior_keys
+        )
+        rejection_counts: dict[str, int] = {}
+        for rejected in rejected_raw:
+            for reason in rejected.get("rejection_reasons") or ["rejected"]:
+                rejection_counts[str(reason)] = rejection_counts.get(str(reason), 0) + 1
+        calls.extend({**call, "provider": provider} for call in provider_calls)
+        errors.extend(provider_errors)
+        items, new_articles = _prepare_evidence_from_raw(
+            ctx, ticker, all_raw, max_total=max_total, context_top_n=context_top_n,
+            provider="priority_combined", fetch_articles=fetch_articles, article_cache=article_cache,
+        )
+        article_records.extend(new_articles)
+        final_quality = evaluate_search_quality(items, ticker=ticker, data=current_data, required_focus=required_focus)
+        stage = {
+            "provider": provider, "available": True, "attempted": True, "raw_count": len(raw),
+            "admitted_count": len(admitted_raw), "rejected_count": len(rejected_raw),
+            "rejection_counts": rejection_counts, "new_unique_count": new_unique_count,
+            "cumulative_count": len(items), "article_fetch_new_count": len(new_articles),
+            "quality": final_quality, "fallback_required": not final_quality["ok"],
+            "fallback_reasons": final_quality["failure_reasons"], "latency_ms": round((time.monotonic() - started) * 1000),
+            "errors": provider_errors, **artifact_files,
+        }
+        stages.append(stage)
+        if final_quality["ok"]:
+            selected_stop_provider = provider
+
+    items = _assign_evidence_ids(items, prefix="E")
+    article_records = _dedupe_article_records(article_records)
+    ctx.combined_reranked_evidence_file.write_text(json_dumps({"ticker": ticker, "method": "priority_market_research_reranked", "count": len(items), "items": items}), encoding="utf-8")
+    if items:
+        ctx.evidence_file.write_text(json_dumps({
+            "ticker": ticker, "method": "priority_market_research", "market_type": infer_market_type(ticker), "languages": languages,
+            "provider_priority": priority, "items": items,
+            "article_fetch": {"enabled": fetch_articles, "attempted": len(article_records), "ok": sum(1 for item in article_records if item.get("ok")), "quality_ok": sum(1 for item in article_records if item.get("article_text_quality_ok"))},
+            "calls": calls, "errors": errors,
+        }), encoding="utf-8")
+    if article_records:
+        ctx.articles_file.write_text(json_dumps({"ticker": ticker, "method": "fetch_article_text", "items": _assign_evidence_ids(article_records, prefix="A")}), encoding="utf-8")
+    provider_counts: dict[str, int] = {}
+    for item in items:
+        for provider in item.get("provider_sources") or [item.get("provider") or "unknown"]:
+            provider_counts[str(provider)] = provider_counts.get(str(provider), 0) + 1
+    report = {
+        "ticker": ticker, "mode": "priority_production", "provider_priority": priority,
+        "selected_stop_provider": selected_stop_provider, "final_quality": final_quality, "stages": stages,
+        "metrics": {"raw": _quality_metrics(all_raw, "raw"), "final_evidence": _quality_metrics(items, "final_evidence"), "articles": _quality_metrics(article_records, "articles"), "final_evidence_provider_counts": provider_counts},
+        "files": {"serper_raw": str(ctx.serper_raw_results_file), "anspire_raw": str(ctx.anspire_raw_results_file), "serpapi_raw": str(ctx.serpapi_raw_results_file), "dashscope_sources": str(ctx.dashscope_sources_file), "searxng_raw": str(ctx.raw_results_file), "combined_reranked": str(ctx.combined_reranked_evidence_file), "evidence": str(ctx.evidence_file), "articles": str(ctx.articles_file)},
+    }
+    ctx.search_quality_report_file.write_text(json_dumps(report), encoding="utf-8")
+    return json_dumps({"ok": bool(items), "method": "priority_market_research", "provider_priority": priority, "selected_stop_provider": selected_stop_provider, "count": len(items), "raw_count": len(all_raw), "evidence_file": str(ctx.evidence_file) if items else None, "search_quality_report_file": str(ctx.search_quality_report_file), "article_fetch": {"enabled": fetch_articles, "attempted": len(article_records), "ok": sum(1 for item in article_records if item.get("ok"))}, "provider_counts_in_final_evidence": provider_counts, "items": items, "errors": errors[:12]})
+
+
 class PriorityMarketResearchTool(BaseTool):
     name = "priority_market_research"
     description = (
-        "V5.4 生产版检索入口：优先使用 Serper 结构化搜索；只有 Serper evidence 不足时才调用 DashScope enable_search+enable_source；"
-        "若仍不足，再退化到 SearXNG。主 Agent 自身 web_search 应保持关闭。"
+        "生产检索入口：按配置依次调用 Serper、Anspire Open、SerpAPI Google News、DashScope source 与 SearXNG；"
+        "每一层都与已有证据累计评估，只在质量不足时继续。主 Agent 自身 web_search 保持关闭。"
     )
     parameters = {
         "type": "object",
@@ -1595,6 +1830,8 @@ class PriorityMarketResearchTool(BaseTool):
             "max_total_results": {"type": "integer", "description": "默认 60"},
             "force_dashscope": {"type": "boolean", "description": "即使 Serper 足够也调用 DashScope 补充；默认 false"},
             "force_searxng": {"type": "boolean", "description": "即使 Serper/DashScope 足够也调用 SearXNG；默认 false"},
+            "force_anspire": {"type": "boolean", "description": "调试用：即使前序证据足够也调用 Anspire"},
+            "force_serpapi": {"type": "boolean", "description": "调试用：即使前序证据足够也调用 SerpAPI"},
         },
         "required": ["ticker"],
     }
@@ -1752,6 +1989,12 @@ class PriorityMarketResearchTool(BaseTool):
             "items": items,
             "errors": errors[:12],
         })
+
+    # V6.0 quality-driven chain.  The older body above is intentionally left
+    # intact as a narrow compatibility reference for the independent A/B
+    # tools; this is the active production entry point.
+    def call(self, params: str | dict, **kwargs) -> str:
+        return _run_priority_provider_chain(get_context(), parse_tool_params(params))
 
 
 class SearchQualityReportTool(BaseTool):
@@ -2840,6 +3083,10 @@ class InspectRunStateTool(BaseTool):
             "searxng_reranked_evidence_file": ctx.reranked_evidence_file,
             "serper_raw_results_file": ctx.serper_raw_results_file,
             "serper_reranked_evidence_file": ctx.serper_reranked_evidence_file,
+            "anspire_raw_results_file": ctx.anspire_raw_results_file,
+            "anspire_reranked_evidence_file": ctx.anspire_reranked_evidence_file,
+            "serpapi_raw_results_file": ctx.serpapi_raw_results_file,
+            "serpapi_reranked_evidence_file": ctx.serpapi_reranked_evidence_file,
             "combined_reranked_evidence_file": ctx.combined_reranked_evidence_file,
             "search_quality_report_file": ctx.search_quality_report_file,
             "audit_file": ctx.audit_file,

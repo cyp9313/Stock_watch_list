@@ -19,6 +19,8 @@ requests-cache==1.3.3
 streamlit==1.58.0
 tksheet==7.5.12
 yfinance==0.2.65
+efinance>=0.5.5
+akshare>=1.12.0
 lxml==6.0.0
 qwen-agent==0.0.34
 dashscope==1.26.3

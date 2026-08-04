@@ -359,21 +359,35 @@ def _fetch_article_text(url: str, timeout: float = 12, max_chars: int = 5000) ->
 # Batch enrichment
 # ---------------------------------------------------------------------------
 
-def _enrich_evidence_with_articles(items: list[dict[str, Any]], max_urls: int, max_chars: int, timeout: float) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _enrich_evidence_with_articles(
+    items: list[dict[str, Any]],
+    max_urls: int,
+    max_chars: int,
+    timeout: float,
+    article_cache: dict[str, dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     if max_urls <= 0:
         return items, []
 
     # Lazy imports to avoid circular dependency.
     from .tools import _source_domain, _source_quality_score
+    from .search_provider_clients import canonicalize_url
 
     enriched: list[dict[str, Any]] = []
     article_records: list[dict[str, Any]] = []
     candidates = sorted(items, key=lambda x: int(x.get("source_quality_score") or _source_quality_score(x)), reverse=True)
     urls_done = 0
     url_to_article: dict[str, dict[str, Any]] = {}
+    article_cache = article_cache if article_cache is not None else {}
     for item in candidates:
         url = str(item.get("url") or "").strip()
-        if not url or urls_done >= max_urls:
+        if not url:
+            continue
+        cache_key = str(item.get("canonical_url") or canonicalize_url(url) or url)
+        if cache_key in article_cache:
+            url_to_article[url] = article_cache[cache_key]
+            continue
+        if urls_done >= max_urls:
             break
         domain = _source_domain(url)
         # Skip sources that are commonly hostile to scraping or too low value unless they scored high.
@@ -384,6 +398,7 @@ def _enrich_evidence_with_articles(items: list[dict[str, Any]], max_urls: int, m
         except Exception as exc:
             article = {"url": url, "ok": False, "error": str(exc), "source_domain": domain}
         url_to_article[url] = article
+        article_cache[cache_key] = article
         article_records.append(article)
         urls_done += 1
 

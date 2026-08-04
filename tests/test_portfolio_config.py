@@ -16,6 +16,9 @@ def test_normalize_config_adds_empty_portfolio_pages_for_legacy_configs():
     assert page["id"].startswith("pf_")
     assert page["analysis_settings"]["base_currency"] == "EUR"
     assert page["analysis_settings"]["benchmark"] == "^GSPC"
+    assert page["dca_backtest_settings"] == {
+        "start_date": "", "end_date": "", "frequency": "monthly", "monthly_timing": "start",
+    }
     assert config["kline_indicator_settings"] == default_indicator_settings()
     assert config["short_term_watchlist"] == default_short_term_watchlist()
 
@@ -41,6 +44,26 @@ def test_normalize_config_preserves_portfolio_id_and_settings():
     assert page["analysis_settings"]["benchmark"] == "SXR8.DE"
     assert page["analysis_settings"]["risk_profile"] == "growth"
     assert page["analysis_settings"]["max_focus_holdings"] == 3
+
+
+def test_normalize_config_keeps_valid_portfolio_dca_backtest_settings():
+    config = normalize_config({
+        "portfolio_pages": [{
+            "name": "DCA",
+            "dca_backtest_settings": {
+                "start_date": "2025-01-02",
+                "end_date": "2026-01-02",
+                "frequency": "weekly",
+                "monthly_timing": "middle",
+            },
+            "holdings": [],
+        }],
+    })
+
+    assert config["portfolio_pages"][0]["dca_backtest_settings"] == {
+        "start_date": "2025-01-02", "end_date": "2026-01-02",
+        "frequency": "weekly", "monthly_timing": "middle",
+    }
 
 
 def test_normalize_config_keeps_valid_saved_kline_indicator_settings():

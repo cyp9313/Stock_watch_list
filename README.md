@@ -8,7 +8,7 @@
 
 ### 项目简介
 
-Stock Watch List 是一个可部署的股票与跨市场监控应用，而不只是单页 AI 演示。项目提供 Tkinter 桌面端、单用户 Streamlit 和带账号隔离的多用户 Streamlit；后者通过 Flask 数据 API、SQLite 缓存和独立报告 Worker 支持 AI 股票日报、AI 组合报告与邮件计划任务。
+Stock Watch List 是一个可部署的股票与跨市场监控应用，而不只是单页 AI 演示。项目提供 Tkinter 桌面端、单用户 Streamlit 和带账号隔离的多用户 Streamlit；后者通过 Flask 数据 API、SQLite 缓存和独立报告 Worker 支持 AI 股票日报、A 股/美股大盘复盘、AI 组合报告与邮件计划任务。
 
 ### 主要功能
 
@@ -42,18 +42,21 @@ Short-term Watchlist 位于 **Market Dashboard** 与 **Market Breadth** 之间�
 
 - 每个用户可创建多个 Portfolio 页面，保存组、ticker、买入价、股数和买入币种。
 - 显示持仓市值、绝对/百分比盈亏、期间盈亏、汇率换算、组合汇总、Beta 和持仓 treemap。
+- **DCA Backtest** 对当前 Portfolio 的 ticker 做等权定投仿真，并将组合累计定投收益与 `SPY`、`QQQ` 的同频定投收益用 Plotly 曲线对比；作为 ETF 的复权价格会纳入分红再投资。可选择任意可获取的历史起止日期、每月月初/第三个周五或每周周五；回测会直接从 yfinance 下载所选区间的日线，不写入 SQLite，网页只短暂缓存相同参数的结果。若短窗口内没有正常定投日，会在选定起始日执行一次初始投入。每个定投日只在已有有效历史且能交易的标的间重新等权；未上市标的不会占用现金，并从上市后的下一次定投加入。休市会顺延到下一可用交易日，图中的三角标记为每次计划定投日（不同交易所标的的实际成交可略有错开）。使用复权收盘价，未计入费用、税费和汇兑。
 - **AI Portfolio Report** 是确定性工作流：Python 先计算组合权重、集中度、Beta、波动率、回撤、风险贡献和技术快照，再以受控的一次模型/搜索调用生成 HTML 报告。它不是由 Agent 自主决定工具调用的流程。
 - 支持浏览器下载、一次性邮件和每周邮件计划。报告 Worker 在后台运行，页面关闭后任务仍可继续。
 
-#### AI Stock Reports（多用户登录后）
+#### AI Market Intelligence（多用户登录后）
 
 - 为单个 ticker 生成可下载的 HTML 股票日报，包含行情、技术指标、新闻/搜索证据、评分、风险、评级和图表。
 - 日报由基于 Qwen-Agent 的定制 Agent 执行。Agent 会通过 function calling 调用受限工具获取市场数据、搜索与证据；Python 负责最终评分、风险/评级计算、技术图、HTML、证据、图标和运行日志的确定性产出。
+- 日报新闻默认使用质量驱动的 Provider fallback：`Serper → Anspire Open → SerpAPI Google News → DashScope source → SearXNG`。每一层只在本地日期、相关性、准入、去重、正文质量和证据等级过滤后的累计证据仍不足时才会执行；运行目录中的 `*_search_quality_report.json` 会记录每层的调用、拒绝原因、贡献和停止原因。Anspire/SerpAPI 均为可选 Key，未配置会安全跳过。
 - 默认在报告顶部加入**决策仪表盘**：Python 基于已有评分、技术点位、已验证 evidence 和市场阶段生成交易参考区间、无持仓/已有持仓建议、催化因素、风险警报与行动检查项。额外的模型综合最多一次、无工具调用；模型不能改写最终评分、编造价格或 evidence ID，失败时立即使用可见的确定性回退模板。
 - 仪表盘明确区分 **Python 综合评级** 与按“无持仓 / 当前持仓”情境经风险护栏调整后的**决策行动**；例如综合评级为 Hold 时，无持仓行动可以是更保守的 Watch。
 - 可选 P3 提供技术、消息/基本面、风险三类受限意见组件：它们只读取已构建的本地 Context，不联网、不调用工具、不改评分、不生成 HTML。Python 会显示分歧说明，并且只会在强烈风险/分歧时保守地下调乐观动作；功能默认关闭，开启后每份报告最多增加三次无工具模型调用。
 - 决策仪表盘会按 ticker 推断 US / DE / HK / CN / JP / KR / TW / Crypto 的本地时区和市场阶段；P0 使用 weekday-only 交易日近似。下载表单可暂时关闭该仪表盘以兼容旧版报告。
 - 支持页面生成、一次性邮件和每周计划。搜索与文章抓取使用输入验证和 SSRF 防护。
+- **Market Recap** 不会进入个股 Agent 或改变个股评分。可选美股、A 股或合并复盘，支持 HTML 下载、一次性邮件和 Europe/Berlin 周期邮件。美股复用 yfinance 与共享两年日线缓存，汇总指数当日 OHLC/振幅、S&P 500/Nasdaq 100 市场宽度及其日变化、行业轮动，以及 `^TNX`、`BZ=F`、`DX-Y.NYB` 的跨资产背景；A 股通过 efinance 优先、akshare 兜底获取指数、涨跌家数、涨跌停、成交额、行业与概念排行。市场新闻按收盘走势、板块主线、政策/宏观分组检索并去重，优先使用可信来源；最高排名的少量文章会经既有 SSRF 防护提取器补充受控摘要。模型只对这些受控证据作一次无工具解读；无法调用时使用确定性模板，数据源失败会明确显示数据边界。
 
 ### 架构
 
@@ -154,6 +157,20 @@ DECISION_REPORT_KEEP_CONTEXT=false # runner-level setting; web generation still 
 # Troubleshooting only: retain the complete run folder, including finalization_audit.json and research intermediates. Delete it manually afterwards.
 DECISION_REPORT_KEEP_RUN_DIR=false
 
+# Optional Market Recap (A-share / US market review)
+MARKET_RECAP_ENABLED=true
+MARKET_RECAP_LLM_PROVIDER=inherit  # inherits LLM_PROVIDER / QWEN_MODEL
+MARKET_RECAP_LLM_MODEL=
+MARKET_RECAP_LLM_TIMEOUT_SECONDS=60
+MARKET_RECAP_LLM_TEMPERATURE=0.2
+MARKET_RECAP_NEWS_MAX_ITEMS=6      # Serper-backed sources when configured
+MARKET_RECAP_NEWS_MAX_AGE_DAYS=3   # reject undated/stale or low-relevance stories
+MARKET_RECAP_NEWS_FETCH_MAX_URLS=3 # SSRF-safe article enrichment for top sources
+MARKET_RECAP_NEWS_FETCH_TIMEOUT_SECONDS=8
+MARKET_RECAP_NEWS_FETCH_MAX_CHARS=1800
+MARKET_RECAP_A_SHARE_PROVIDER=auto # efinance first, akshare fallback
+MARKET_RECAP_CACHE_TTL_SECONDS=900
+
 # Optional P3 bounded specialist opinions; disabled by default (up to 3 extra model calls)
 DECISION_OPINION_AGENTS_ENABLED=false
 DECISION_OPINION_AGENTS_PROVIDER=inherit
@@ -161,8 +178,13 @@ DECISION_OPINION_AGENTS_MODEL=
 DECISION_OPINION_AGENTS_TIMEOUT_SECONDS=45
 
 # Search / article evidence
-SEARCH_PROVIDER=both             # auto / priority / searxng / serper / both
-SERPER_API_KEY=your_key
+SEARCH_PROVIDER=priority         # priority / serper / anspire / serpapi / searxng / both / auto
+# Production fallback chain: each later provider runs only when the filtered,
+# cumulative evidence is still insufficient.
+SEARCH_PROVIDER_PRIORITY=serper,anspire,serpapi,dashscope,searxng
+SERPER_API_KEY=your_key          # Serper is not SerpAPI
+ANSPIRE_API_KEY=                 # optional Anspire Open fallback
+SERPAPI_API_KEY=                 # optional SerpAPI Google News fallback
 ARTICLE_FETCH_ENABLED=true
 
 # SMTP (needed for email reports)
@@ -298,18 +320,21 @@ The default history request is two days. The request window scales automatically
 #### Portfolios and AI Portfolio Reports
 
 - Multiple per-account portfolio pages with holdings, cost basis, shares, currencies, current value, P/L, period P/L, FX conversion, beta, and treemaps.
+- **DCA Backtest** simulates equal-weight recurring contributions across the current portfolio tickers and compares the resulting cumulative-contribution return with `SPY` and `QQQ` DCA curves in Plotly. Their adjusted ETF closes include reinvested distributions. Choose any available historical start/end date, monthly purchases on the first or third Friday, or weekly Friday purchases. The selected daily range is downloaded directly from yfinance and is not written to SQLite; only the same-parameter browser response is cached briefly. If a short range contains no regular DCA date, one initial contribution is made on the selected start date. Each contribution is dynamically reweighted across holdings that already have usable history and can trade, so a later IPO does not consume cash and joins on its next eligible contribution. Holidays roll to the next available trading close; triangle markers show each scheduled portfolio contribution (individual local-market fills can be slightly staggered). Adjusted closes are used; fees, taxes, and FX conversion are excluded.
 - The AI Portfolio Report is a deterministic workflow: Python computes weights, concentration, beta, volatility, drawdown, risk contribution, and technical snapshots before a controlled model/search call produces a self-contained HTML report.
 - Download, one-off email, and weekly schedules are supported. Queued work continues in the worker after the browser closes.
 
-#### AI Stock Reports
+#### AI Market Intelligence
 
 - Generates downloadable HTML reports for individual tickers with market data, technicals, search/news evidence, scoring, risk, rating, and charts.
 - Uses a customized Qwen-Agent workflow. The agent uses function calling for approved data/search/evidence tools; Python deterministically creates the final scoring, risk/rating, charts, HTML, evidence assets, and logs.
+- News evidence uses a quality-driven fallback chain by default: `Serper → Anspire Open → SerpAPI Google News → DashScope source → SearXNG`. A later provider runs only when the locally freshness-filtered, relevance-filtered, admitted, deduplicated and graded cumulative evidence remains insufficient. Each run's `*_search_quality_report.json` records provider attempts, rejected-result reasons, contribution and stop/fallback reasons. Anspire and SerpAPI are optional and are skipped safely when their keys are absent.
 - Adds an opt-in-by-default **Decision Dashboard** at the top of the report. Python derives reference ranges, market phase, position-aware advice, evidence-backed catalysts/risks, and a checklist from existing artifacts. A single optional, tool-free synthesis call may improve wording, but it cannot alter the Python final score or invent prices/evidence; failures visibly fall back to a deterministic template.
 - The dashboard separates the Python **rating band** from the guarded **decision action** for the no-position or current-position scenario. A `Hold` rating can therefore correctly produce a more conservative no-position `Watch` action.
 - Optional P3 adds bounded technical, news/fundamental, and risk opinions. They only receive the built local context: no browsing, tools, score changes, or HTML generation. Python renders any disagreement and can only conservatively downgrade an optimistic action on strong risk/conflict. It is off by default and adds at most three tool-free model calls per report when enabled.
 - Market-phase display infers US / DE / HK / CN / JP / KR / TW / Crypto local sessions. P0 uses a weekday-only calendar approximation. The download form can disable the dashboard for a legacy-layout report.
 - Supports browser generation, one-off email, and weekly schedules. Article fetching includes SSRF protections.
+- **Market Recap** is a separate authenticated subpage, not part of the individual-stock Agent or score. It can generate/download and email US, A-share, or combined recaps. US data reuses yfinance and the shared two-year SQLite price cache for indexes, breadth, sector rotation, `^TNX`, `BZ=F`, and `DX-Y.NYB`; A-share aggregate data uses efinance first and AkShare as a fallback. One tool-free LLM call may interpret the computed snapshot, while a deterministic template is used on failure. Berlin-time schedules avoid empty repeats when neither market has a newer completed session.
 
 ### Architecture
 
@@ -357,7 +382,8 @@ Important settings include:
 - `SCREENING_RERANK_PROVIDER`, `SCREENING_RERANK_MODEL`, `SCREENING_RERANK_TIMEOUT_SECONDS`, and `SCREENING_RERANK_TEMPERATURE` for the manual, tool-free Screener rerank. Empty provider/model settings inherit the main report LLM configuration.
 - `DECISION_REPORT_ENABLED`, `DECISION_REPORT_PROVIDER`, `DECISION_REPORT_MODEL`, `DECISION_REPORT_TEMPERATURE`, `DECISION_REPORT_TIMEOUT_SECONDS`, and `DECISION_REPORT_KEEP_CONTEXT` for the controlled decision dashboard. Set `DECISION_REPORT_KEEP_RUN_DIR=true` only while troubleshooting: it retains the complete per-run folder (including `*_finalization_audit.json` and research intermediates) instead of automatically deleting it.
 - `DECISION_OPINION_AGENTS_ENABLED`, `DECISION_OPINION_AGENTS_PROVIDER`, `DECISION_OPINION_AGENTS_MODEL`, and `DECISION_OPINION_AGENTS_TIMEOUT_SECONDS` for optional P3 bounded specialist opinions.
-- `SEARCH_PROVIDER`, `SERPER_API_KEY`, `SEARXNG_*`, and `ARTICLE_FETCH_*` for evidence gathering.
+- `MARKET_RECAP_*` controls the Market Recap capability in AI Market Intelligence. It uses one tool-free LLM interpretation of deterministic public-market data, shares the existing US daily-price cache, and stores only short-lived global aggregate snapshots—not account-specific recap history or full news articles. The snapshot includes cached US index session ranges and breadth changes, plus available A-share industry and concept rankings. Serper news is queried separately for each selected market, diversified across close/sector/policy themes, filtered by a usable publication date, recency, market relevance, and URL safety, then optionally enriched through the existing SSRF-protected article extractor before it reaches the report or LLM. Scheduled delivery runs in Europe/Berlin time and skips sending when neither selected market has a newer completed trading date.
+- `SEARCH_PROVIDER=priority`, `SEARCH_PROVIDER_PRIORITY`, `SERPER_API_KEY`, `ANSPIRE_*`, `SERPAPI_*`, `SEARXNG_*`, and `ARTICLE_FETCH_*` for evidence gathering. `SERPER_API_KEY` and `SERPAPI_API_KEY` belong to different providers.
 - `REPORT_SMTP_*`, `REPORT_*`, and `PORTFOLIO_*` for email, queues, schedules, limits, and Portfolio AI Reports.
 
 See [`.env.example`](.env.example) for the complete template. Use model names and API keys available to your own provider account.

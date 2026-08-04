@@ -114,6 +114,8 @@ def _plain_text_from_response(response: Any) -> str:
 def _search_status(enable_builtin_web: bool) -> tuple[str, bool]:
     searxng_url = os.environ.get("SEARXNG_URL", "").strip()
     serper_available = bool(os.environ.get("SERPER_API_KEY"))
+    anspire_available = bool(os.environ.get("ANSPIRE_API_KEY"))
+    serpapi_available = bool(os.environ.get("SERPAPI_API_KEY"))
     dashscope_available = bool(os.environ.get("DASHSCOPE_API_KEY"))
     # V5.8: do not enable Qwen-Agent built-in web_search by default even if
     # SERPER_API_KEY exists. Serper should be used via serper_market_research /
@@ -122,11 +124,12 @@ def _search_status(enable_builtin_web: bool) -> tuple[str, bool]:
     builtin_web_available = bool(enable_builtin_web and allow_builtin and serper_available)
 
     parts: list[str] = []
-    search_provider = os.environ.get("SEARCH_PROVIDER", "both").strip()
+    search_provider = os.environ.get("SEARCH_PROVIDER", "priority").strip()
+    priority = os.environ.get("SEARCH_PROVIDER_PRIORITY", "serper,anspire,serpapi,dashscope,searxng").strip()
     if searxng_url:
         lang = os.environ.get("SEARXNG_LANGUAGE", "auto")
         parts.append(
-            f"SearXNG 已配置（SEARXNG_URL={searxng_url}）；SEARCH_PROVIDER={search_provider}。V5.8 默认使用 priority_market_research：Serper 优先、DashScope source fallback、SearXNG 最后兜底；SEARXNG_LANGUAGE={lang}。"
+            f"SearXNG 已配置（SEARXNG_URL={searxng_url}）；SEARCH_PROVIDER={search_provider}，优先链={priority}；质量不足时依次补充，SearXNG 为最后兜底；SEARXNG_LANGUAGE={lang}。"
         )
     else:
         parts.append("SearXNG 未配置（缺少 SEARXNG_URL）。")
@@ -135,6 +138,9 @@ def _search_status(enable_builtin_web: bool) -> tuple[str, bool]:
         parts.append("SERPER_API_KEY 已配置；请通过 priority_market_research 或 serper_market_research 使用 Serper，而不是内置 web_search，以保留 evidence_id 审计链。")
     else:
         parts.append("SERPER_API_KEY 未配置；Serper provider 不可用。")
+
+    parts.append("Anspire Open 已配置。" if anspire_available else "ANSPIRE_API_KEY 未配置；Anspire provider 会被跳过。")
+    parts.append("SerpAPI Google News 已配置。" if serpapi_available else "SERPAPI_API_KEY 未配置；SerpAPI provider 会被跳过。")
 
     if builtin_web_available:
         parts.append("ENABLE_BUILTIN_SERPER_WEB_TOOLS=true，因此 Qwen-Agent 内置 web_search/web_extractor 也会加载；仅用于调试，不建议正式报告使用。")

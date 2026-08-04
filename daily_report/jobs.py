@@ -381,7 +381,7 @@ def enqueue_report_job(
     if not owner_key:
         raise ValueError("A signed-in account is required for email delivery.")
     report_kind = str(report_kind or "ticker").strip().lower()
-    if report_kind not in {"ticker", "portfolio"}:
+    if report_kind not in {"ticker", "portfolio", "market_recap"}:
         raise ValueError("Unsupported report kind.")
     subject_key = str(subject_key or "").strip()
     subject_name = str(subject_name or subject_key).strip() or subject_key
@@ -389,7 +389,7 @@ def enqueue_report_job(
         raise ValueError("Report subject is required.")
     ticker = subject_key.upper() if report_kind == "ticker" else subject_name
     recipient_email = validate_email(recipient_email)
-    limit_env = "PORTFOLIO_EMAIL_DAILY_LIMIT_PER_USER" if report_kind == "portfolio" else "REPORT_DAILY_LIMIT_PER_USER"
+    limit_env = "PORTFOLIO_EMAIL_DAILY_LIMIT_PER_USER" if report_kind == "portfolio" else ("MARKET_RECAP_EMAIL_DAILY_LIMIT_PER_USER" if report_kind == "market_recap" else "REPORT_DAILY_LIMIT_PER_USER")
     daily_limit = max(1, int(os.environ.get(limit_env, os.environ.get("REPORT_DAILY_LIMIT_PER_USER", "3"))))
     max_attempts = max(1, int(os.environ.get("REPORT_EMAIL_MAX_ATTEMPTS", "3")))
     now = _now()
@@ -521,6 +521,28 @@ def enqueue_portfolio_email_job(
             "search_provider": search_provider or "auto",
             "settings": settings or {},
         },
+    )
+
+
+def enqueue_market_recap_email_job(
+    *,
+    owner_key: str,
+    recipient_email: str,
+    markets: object = None,
+) -> dict:
+    """Queue one public-market recap while retaining normal account limits."""
+    from .market_recap_service import market_subject_key, market_subject_name, normalize_markets
+    selected = normalize_markets(markets)
+    return enqueue_report_job(
+        owner_key=owner_key,
+        report_kind="market_recap",
+        subject_key=market_subject_key(selected),
+        subject_name=market_subject_name(selected),
+        recipient_email=recipient_email,
+        months=3,
+        search_provider="auto",
+        no_article_fetch=True,
+        payload={"markets": selected},
     )
 
 
@@ -787,7 +809,7 @@ def create_report_schedule(
     if not owner_key:
         raise ValueError("A signed-in account is required for weekly reports.")
     report_kind = str(report_kind or "ticker").strip().lower()
-    if report_kind not in {"ticker", "portfolio"}:
+    if report_kind not in {"ticker", "portfolio", "market_recap"}:
         raise ValueError("Unsupported report kind.")
     subject_key = str(subject_key or "").strip()
     subject_name = str(subject_name or subject_key).strip() or subject_key
@@ -803,7 +825,7 @@ def create_report_schedule(
     weekday = selected_weekdays[0]
     weekdays_json = json.dumps(selected_weekdays, separators=(",", ":"))
     local_time = _normalize_local_time(local_time)
-    schedule_limit_env = "PORTFOLIO_MAX_SCHEDULES_PER_USER" if report_kind == "portfolio" else "REPORT_MAX_SCHEDULES_PER_USER"
+    schedule_limit_env = "PORTFOLIO_MAX_SCHEDULES_PER_USER" if report_kind == "portfolio" else ("MARKET_RECAP_MAX_SCHEDULES_PER_USER" if report_kind == "market_recap" else "REPORT_MAX_SCHEDULES_PER_USER")
     max_schedules = min(7, max(1, int(os.environ.get(schedule_limit_env, os.environ.get("REPORT_MAX_SCHEDULES_PER_USER", "7")))))
     now = _now()
     next_run = next_scheduled_run_at(selected_weekdays, local_time, after_utc=now)
@@ -931,6 +953,31 @@ def create_weekly_portfolio_schedule(
             "search_provider": search_provider or "auto",
             "settings": settings or {},
         },
+    )
+
+
+def create_weekly_market_recap_schedule(
+    *,
+    owner_key: str,
+    recipient_email: str,
+    local_time: str | dt.time,
+    weekdays: object | None = None,
+    markets: object = None,
+) -> dict:
+    from .market_recap_service import market_subject_key, market_subject_name, normalize_markets
+    selected = normalize_markets(markets)
+    return create_report_schedule(
+        owner_key=owner_key,
+        report_kind="market_recap",
+        subject_key=market_subject_key(selected),
+        subject_name=market_subject_name(selected),
+        recipient_email=recipient_email,
+        local_time=local_time,
+        weekdays=weekdays,
+        months=3,
+        search_provider="auto",
+        no_article_fetch=True,
+        payload={"markets": selected},
     )
 
 
