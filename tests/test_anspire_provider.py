@@ -62,4 +62,3 @@ def test_anspire_uses_china_region_and_redacts_key_from_errors(monkeypatch) -> N
 
     assert not items
     assert errors and "do-not-leak" not in " ".join(errors)
-

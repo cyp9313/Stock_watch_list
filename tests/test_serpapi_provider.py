@@ -58,4 +58,3 @@ def test_serpapi_prefers_iso_date_and_does_not_expose_key(monkeypatch) -> None:
         report_date="2026-08-01", max_per_query=5, http_get=broken,
     )
     assert "secret-serpapi-key" not in " ".join(errors)
-
