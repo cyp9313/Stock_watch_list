@@ -39,8 +39,11 @@ APP_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CACHE_DB = APP_ROOT / "daily_report_jobs.db"
 _MARKETS = {"us", "cn"}
 _US_INDEXES = {
-    "^GSPC": "标普 500",
-    "^NDX": "纳斯达克 100",
+    # Futures provide a more consistently updated Yahoo volume series than the
+    # cash-index tickers. Breadth remains calculated from the corresponding
+    # S&P 500 / Nasdaq 100 constituent universes below.
+    "ES=F": "标普 500 E-mini 期货",
+    "NQ=F": "纳斯达克 100 E-mini 期货",
     "^DJI": "道琼斯工业指数",
     "^RUT": "罗素 2000",
     "^VIX": "VIX 波动率指数",

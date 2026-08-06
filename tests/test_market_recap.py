@@ -292,15 +292,22 @@ def test_market_recap_job_helpers_use_generic_queue(monkeypatch, tmp_path):
     assert schedule["report_kind"] == "market_recap"
 
 
+def test_us_recap_uses_futures_for_sp500_and_nasdaq100_volume():
+    assert recap._US_INDEXES["ES=F"] == "标普 500 E-mini 期货"
+    assert recap._US_INDEXES["NQ=F"] == "纳斯达克 100 E-mini 期货"
+    assert "^GSPC" not in recap._US_INDEXES
+    assert "^NDX" not in recap._US_INDEXES
+
+
 def test_cached_index_session_fields_include_ohlc_and_range():
     data = pd.DataFrame({
-        ("Close", "^GSPC"): [100.0, 104.0],
-        ("Open", "^GSPC"): [99.0, 101.0],
-        ("High", "^GSPC"): [101.0, 106.0],
-        ("Low", "^GSPC"): [98.0, 100.0],
-        ("Volume", "^GSPC"): [10.0, 30.0],
+        ("Close", "ES=F"): [100.0, 104.0],
+        ("Open", "ES=F"): [99.0, 101.0],
+        ("High", "ES=F"): [101.0, 106.0],
+        ("Low", "ES=F"): [98.0, 100.0],
+        ("Volume", "ES=F"): [10.0, 30.0],
     })
-    row = recap._add_index_session_fields([{"ticker": "^GSPC", "name": "S&P 500"}], data)[0]
+    row = recap._add_index_session_fields([{"ticker": "ES=F", "name": "S&P 500 E-mini futures"}], data)[0]
     assert row["open"] == 101.0
     assert row["high"] == 106.0
     assert row["low"] == 100.0

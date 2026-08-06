@@ -56,7 +56,7 @@ Short-term Watchlist 位于 **Market Dashboard** 与 **Market Breadth** 之间�
 - 可选 P3 提供技术、消息/基本面、风险三类受限意见组件：它们只读取已构建的本地 Context，不联网、不调用工具、不改评分、不生成 HTML。Python 会显示分歧说明，并且只会在强烈风险/分歧时保守地下调乐观动作；功能默认关闭，开启后每份报告最多增加三次无工具模型调用。
 - 决策仪表盘会按 ticker 推断 US / DE / HK / CN / JP / KR / TW / Crypto 的本地时区和市场阶段；P0 使用 weekday-only 交易日近似。下载表单可暂时关闭该仪表盘以兼容旧版报告。
 - 支持页面生成、一次性邮件和每周计划。搜索与文章抓取使用输入验证和 SSRF 防护。
-- **Market Recap** 不会进入个股 Agent 或改变个股评分。可选美股、A 股或合并复盘，支持 HTML 下载、一次性邮件和 Europe/Berlin 周期邮件。美股复用 yfinance 与共享两年日线缓存，汇总指数当日 OHLC/振幅、S&P 500/Nasdaq 100 市场宽度及其日变化、行业轮动，以及 `^TNX`、`BZ=F`、`DX-Y.NYB` 的跨资产背景；A 股通过 efinance 优先、akshare 兜底获取指数、涨跌家数、涨跌停、成交额、行业与概念排行。市场新闻按收盘走势、板块主线、政策/宏观分组检索并去重，优先使用可信来源；最高排名的少量文章会经既有 SSRF 防护提取器补充受控摘要。模型只对这些受控证据作一次无工具解读；无法调用时使用确定性模板，数据源失败会明确显示数据边界。
+- **Market Recap** 不会进入个股 Agent 或改变个股评分。可选美股、A 股或合并复盘，支持 HTML 下载、一次性邮件和 Europe/Berlin 周期邮件。美股复用 yfinance 与共享两年日线缓存，使用 `ES=F`（S&P 500 E-mini）和 `NQ=F`（Nasdaq-100 E-mini）作为带成交量的核心市场代理，汇总其当日 OHLC/振幅、S&P 500/Nasdaq 100 成分股市场宽度及其日变化、行业轮动，以及 `^TNX`、`BZ=F`、`DX-Y.NYB` 的跨资产背景；A 股通过 efinance 优先、akshare 兜底获取指数、涨跌家数、涨跌停、成交额、行业与概念排行。市场新闻按收盘走势、板块主线、政策/宏观分组检索并去重，优先使用可信来源；最高排名的少量文章会经既有 SSRF 防护提取器补充受控摘要。模型只对这些受控证据作一次无工具解读；无法调用时使用确定性模板，数据源失败会明确显示数据边界。
 
 ### 架构
 
@@ -334,7 +334,7 @@ The default history request is two days. The request window scales automatically
 - Optional P3 adds bounded technical, news/fundamental, and risk opinions. They only receive the built local context: no browsing, tools, score changes, or HTML generation. Python renders any disagreement and can only conservatively downgrade an optimistic action on strong risk/conflict. It is off by default and adds at most three tool-free model calls per report when enabled.
 - Market-phase display infers US / DE / HK / CN / JP / KR / TW / Crypto local sessions. P0 uses a weekday-only calendar approximation. The download form can disable the dashboard for a legacy-layout report.
 - Supports browser generation, one-off email, and weekly schedules. Article fetching includes SSRF protections.
-- **Market Recap** is a separate authenticated subpage, not part of the individual-stock Agent or score. It can generate/download and email US, A-share, or combined recaps. US data reuses yfinance and the shared two-year SQLite price cache for indexes, breadth, sector rotation, `^TNX`, `BZ=F`, and `DX-Y.NYB`; A-share aggregate data uses efinance first and AkShare as a fallback. One tool-free LLM call may interpret the computed snapshot, while a deterministic template is used on failure. Berlin-time schedules avoid empty repeats when neither market has a newer completed session.
+- **Market Recap** is a separate authenticated subpage, not part of the individual-stock Agent or score. It can generate/download and email US, A-share, or combined recaps. US data reuses yfinance and the shared two-year SQLite price cache, using `ES=F` (S&P 500 E-mini) and `NQ=F` (Nasdaq-100 E-mini) as volume-bearing market proxies, alongside their OHLC/range, S&P 500/Nasdaq 100 constituent breadth, sector rotation, `^TNX`, `BZ=F`, and `DX-Y.NYB`; A-share aggregate data uses efinance first and AkShare as a fallback. One tool-free LLM call may interpret the computed snapshot, while a deterministic template is used on failure. Berlin-time schedules avoid empty repeats when neither market has a newer completed session.
 
 ### Architecture
 
