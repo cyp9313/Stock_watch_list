@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pandas as pd
@@ -200,6 +201,46 @@ def test_market_news_search_queries_each_market_separately(monkeypatch):
     assert {item["market"] for item in results} == {"us", "cn"}
     assert all("crypto" not in item["title"].casefold() for item in results)
     assert all(item["published_date"] >= "2026-08-03" for item in results)
+
+
+def test_released_payrolls_searches_actual_result_and_rejects_preview():
+    generated_at = datetime(2026, 8, 7, 13, 0, tzinfo=timezone.utc)  # 09:00 New York
+    events = recap._released_us_macro_events("2026-08-07", generated_at)
+    assert events == {"nonfarm_payrolls"}
+    queries = recap._market_news_queries("us", as_of_date="2026-08-07", generated_at=generated_at)
+    assert queries[0][1] == "macro_release"
+    assert "actual results" in queries[0][0]
+
+    preview = recap._score_market_news_item(
+        {
+            "title": "Wall Street waits as payrolls loom",
+            "snippet": "US stock market investors expect the jobs report.",
+            "link": "https://www.reuters.com/markets/us/payroll-preview",
+            "date": "2026-08-07",
+        },
+        market="us",
+        as_of_date="2026-08-07",
+        query=queries[0][0],
+        category="policy_macro",
+        released_macro_events=events,
+    )
+    assert preview is None
+
+    actual = recap._score_market_news_item(
+        {
+            "title": "US payrolls fall as July employment report is released",
+            "snippet": "The US jobs report showed nonfarm payrolls and unemployment results.",
+            "link": "https://www.reuters.com/markets/us/payrolls-results",
+            "date": "2026-08-07",
+        },
+        market="us",
+        as_of_date="2026-08-07",
+        query=queries[0][0],
+        category="macro_release",
+        released_macro_events=events,
+    )
+    assert actual is not None
+    assert actual["event_status"] == "released"
 
 
 def test_html_escapes_untrusted_news_and_keeps_safe_link_shell():

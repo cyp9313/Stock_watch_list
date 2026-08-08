@@ -36,6 +36,7 @@ read_stock_daily_skill -> read_ticker_reference -> validate_ticker_format -> fet
 - 至少覆盖：最新财报/业绩、分析师评级/目标价、行业动态、宏观环境、重大事件、多空风险、市场情绪/资金流向。
 - 美股优先英文来源：公司 IR/SEC、Reuters/AP/CNBC/Bloomberg/Yahoo Finance/MarketWatch/Nasdaq/Morningstar 等。
 - 港股同时搜索英文与中文来源；A股优先中文公告/财报/券商研报/交易所信息。
+- 对处于财报季的个股，优先使用 `earnings_current` 的当季业绩证据；如果没有可核验的当季结果，必须明确写“当季业绩尚未核验”，不得把上一季财报表述为最新财报，也不得据此虚构当季结论。
 - 每条 notes 都要有具体事实或数据、逻辑推演、投资含义；必须写 evidence_id/source/source_date。
 - 每条非技术面 notes 只能引用本地 evidence.json/articles.json/dashscope_sources.json 中真实存在的 evidence_id；Serper/SearXNG 结果必须先进入 evidence.json，DashScope candidate 只可启发搜索，不能引用没有 DS-xxx source object 的内容。
 - 正文抓取只是 evidence enrichment：只有 article_text_quality_ok=true 的 A-xxx 才能作为全文证据；HTTP 200 但正文过短/consent/login/captcha 的 article 不能支撑硬财务结论。

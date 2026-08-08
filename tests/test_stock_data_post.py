@@ -273,6 +273,17 @@ def test_post_response_structure(client, valid_payload):
         assert "Price" in row
 
 
+def test_post_response_is_strict_json_when_indicators_are_unavailable(client, valid_payload):
+    """Missing benchmark history must become JSON null, never a bare NaN token."""
+    with _common_mocks():
+        resp = client.post('/api/stock_data', json=valid_payload)
+
+    raw = resp.get_data(as_text=True)
+    assert "NaN" not in raw
+    assert "Infinity" not in raw
+    assert json.loads(raw, parse_constant=lambda token: (_ for _ in ()).throw(ValueError(token)))["success"] is True
+
+
 # ──────────────────────────────────────────────────────────────
 # 8. 内部客户端确实使用 POST
 # ──────────────────────────────────────────────────────────────

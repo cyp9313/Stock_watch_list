@@ -665,7 +665,7 @@ _MARKET_NEWS_QUERIES = {
 }
 _MARKET_NEWS_KEYWORDS = {
     "cn": ("a股", "a-share", "中国股市", "中国股票", "上证", "深证", "创业板", "科创", "沪深", "中证", "股市", "证券", "板块", "涨停", "人民币"),
-    "us": ("u.s. stock", "us stock", "wall street", "s&p", "nasdaq", "dow", "vix", "treasury", "federal reserve", "fed", "nyse", "american stock"),
+    "us": ("u.s. stock", "us stock", "wall street", "s&p", "nasdaq", "dow", "vix", "treasury", "federal reserve", "fed", "nyse", "american stock", "payroll", "jobs report", "employment situation", "unemployment"),
 }
 _NEWS_REJECT_TERMS = (
     "bitcoin", "crypto", "cryptocurrency", "meme coin", "memecoin", "binance", "wallet", "nft",
@@ -707,7 +707,59 @@ def _parse_market_news_date(value: Any, as_of_date: str) -> str | None:
     return pd.Timestamp(parsed).date().isoformat()
 
 
-def _score_market_news_item(item: dict[str, Any], *, market: str, as_of_date: str, query: str, category: str = "market") -> dict[str, Any] | None:
+def _released_us_macro_events(as_of_date: str, generated_at: datetime | None = None) -> set[str]:
+    """Return US calendar events that were already released for this session.
+
+    The first-Friday Employment Situation release is particularly prone to
+    stale search previews.  Once 08:30 New York time has passed, its result
+    must be searched and interpreted as a released fact, never as an upcoming
+    catalyst.
+    """
+    try:
+        session_date = datetime.fromisoformat(as_of_date).date()
+    except ValueError:
+        return set()
+    first_day = session_date.replace(day=1)
+    first_friday = first_day + timedelta(days=(4 - first_day.weekday()) % 7)
+    if session_date != first_friday:
+        return set()
+    current = generated_at or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    new_york = current.astimezone(ZoneInfo("America/New_York"))
+    release_time = datetime.combine(session_date, datetime.min.time(), tzinfo=ZoneInfo("America/New_York")).replace(hour=8, minute=30)
+    return {"nonfarm_payrolls"} if new_york >= release_time else set()
+
+
+def _market_news_queries(market: str, *, as_of_date: str, generated_at: datetime | None = None) -> tuple[tuple[str, str], ...]:
+    queries = list(_MARKET_NEWS_QUERIES[market])
+    if market == "us" and "nonfarm_payrolls" in _released_us_macro_events(as_of_date, generated_at):
+        release_day = datetime.fromisoformat(as_of_date).date()
+        reported_month = release_day.replace(day=1) - timedelta(days=1)
+        queries.insert(0, (
+            f"US {reported_month.strftime('%B %Y')} nonfarm payrolls actual results unemployment rate released",
+            "macro_release",
+        ))
+    return tuple(queries)
+
+
+def _is_released_macro_preview(text: str, events: set[str]) -> bool:
+    if "nonfarm_payrolls" not in events:
+        return False
+    mentions_payrolls = any(term in text for term in ("payroll", "jobs report", "employment situation", "nonfarm"))
+    preview_terms = ("loom", "expected", "preview", "ahead of", "await", "due", "upcoming", "will be released", "to be released")
+    return mentions_payrolls and any(term in text for term in preview_terms)
+
+
+def _score_market_news_item(
+    item: dict[str, Any],
+    *,
+    market: str,
+    as_of_date: str,
+    query: str,
+    category: str = "market",
+    released_macro_events: set[str] | None = None,
+) -> dict[str, Any] | None:
     """Reject stale/generic search results before they can reach the recap LLM."""
     url = str(item.get("link") or item.get("url") or "").strip()
     parsed = urlparse(url)
@@ -717,6 +769,9 @@ def _score_market_news_item(item: dict[str, Any], *, market: str, as_of_date: st
         return None
     combined = f"{title} {snippet}".casefold()
     if any(term in combined for term in _NEWS_REJECT_TERMS):
+        return None
+    released_macro_events = released_macro_events or set()
+    if market == "us" and _is_released_macro_preview(combined, released_macro_events):
         return None
     published_date = _parse_market_news_date(item.get("date") or item.get("publishedDate") or item.get("published_date"), as_of_date)
     if published_date is None:
@@ -745,6 +800,7 @@ def _score_market_news_item(item: dict[str, Any], *, market: str, as_of_date: st
         "market": market,
         "query": query,
         "category": category,
+        "event_status": "released" if category == "macro_release" else "not_applicable",
         "published_date": published_date,
         "source_quality": "tier_1" if trusted else "tier_3",
         "score": score,
@@ -776,7 +832,7 @@ def _select_diverse_market_news(candidates: list[dict[str, Any]], limit: int) ->
     selected: list[dict[str, Any]] = []
     seen_domains: set[str] = set()
     ranked = sorted(candidates, key=lambda item: (-int(item["score"]), item["published_date"], item["title"]))
-    for category in ("market_close", "sector_rotation", "policy_macro"):
+    for category in ("macro_release", "market_close", "sector_rotation", "policy_macro"):
         for candidate in ranked:
             if candidate.get("category") != category or candidate.get("source") in seen_domains or _is_near_duplicate_market_news(candidate, selected):
                 continue
@@ -837,7 +893,12 @@ def _enrich_market_news_with_articles(items: list[dict[str, Any]]) -> list[dict[
     return enriched
 
 
-def _search_market_news(markets: list[str], snapshots: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+def _search_market_news(
+    markets: list[str],
+    snapshots: list[dict[str, Any]] | None = None,
+    *,
+    generated_at: datetime | None = None,
+) -> list[dict[str, Any]]:
     """Collect market-specific, recent news; never mix A-share and US recall pools."""
     limit = max(0, min(12, int(os.environ.get("MARKET_RECAP_NEWS_MAX_ITEMS", "6") or 6)))
     key = os.environ.get("SERPER_API_KEY", "").strip()
@@ -850,7 +911,8 @@ def _search_market_news(markets: list[str], snapshots: list[dict[str, Any]] | No
         if market not in _MARKET_NEWS_QUERIES:
             continue
         as_of_date = as_of_by_market.get(market, _get_market_date())
-        for query, category in _MARKET_NEWS_QUERIES[market]:
+        released_macro_events = _released_us_macro_events(as_of_date, generated_at) if market == "us" else set()
+        for query, category in _market_news_queries(market, as_of_date=as_of_date, generated_at=generated_at):
             try:
                 response = requests.post(
                     "https://google.serper.dev/news",
@@ -863,7 +925,14 @@ def _search_market_news(markets: list[str], snapshots: list[dict[str, Any]] | No
             except (requests.RequestException, ValueError, AttributeError):
                 continue
             for item in raw if isinstance(raw, list) else []:
-                candidate = _score_market_news_item(item, market=market, as_of_date=as_of_date, query=query, category=category)
+                candidate = _score_market_news_item(
+                    item,
+                    market=market,
+                    as_of_date=as_of_date,
+                    query=query,
+                    category=category,
+                    released_macro_events=released_macro_events,
+                )
                 if candidate and (candidate["url"] not in accepted or candidate["score"] > accepted[candidate["url"]]["score"]):
                     accepted[candidate["url"]] = candidate
     ranked: list[dict[str, Any]] = []
@@ -892,6 +961,7 @@ def _call_llm(snapshot: list[dict[str, Any]], news: list[dict[str, Any]]) -> tup
         "不可编造数值、新闻、因果或交易承诺，不得改变 deterministic_regime。"
         "news 中每条证据均包含 market、category、published_date、source、title、snippet，以及可选 evidence_excerpt；"
         "news_catalysts 只能引用这些证据，并将不同新闻分别归入市场走势、行业主题或宏观政策。"
+        "category=macro_release 表示该日程事件已经发布：只能按实际结果表述，绝不能称其为“即将公布”或“等待公布”。"
         "只有标题、摘要或证据摘录明确支持时才可描述可能关联。若 news 为空，必须明确写‘未取得高相关、近期的市场新闻来源’，"
         "不能以常识或旧闻补全。数据表会单独显示数值，因此不要逐项复述表格；应解释结构、确认条件、分歧和失效条件。"
         "输出唯一 JSON 对象，结构必须为 {\"markets\": {\"cn\": {...}, \"us\": {...}}}；仅输出 CONTEXT 中存在的市场。"
@@ -1253,7 +1323,8 @@ def generate_market_recap(*, markets: str | Iterable[str] | None = None, user_sc
     snapshots = [_us_snapshot() if item == "us" else _cn_snapshot() for item in selected]
     for snapshot in snapshots:
         snapshot["deterministic_regime"] = _regime(snapshot)
-    news = _search_market_news(selected, snapshots)
+    generated_at = datetime.now(timezone.utc)
+    news = _search_market_news(selected, snapshots, generated_at=generated_at)
     deterministic_sections = {
         str(snapshot.get("market")): _fallback_sections(
             [snapshot], [item for item in news if str(item.get("market") or "") == str(snapshot.get("market") or "")]
@@ -1275,7 +1346,7 @@ def generate_market_recap(*, markets: str | Iterable[str] | None = None, user_sc
         }
     as_of = "_".join(snapshot.get("as_of_date", "unknown") for snapshot in snapshots)
     title = market_subject_name(selected)
-    payload = {"title": title, "generated_at": datetime.now(ZoneInfo("Europe/Berlin")).strftime("%Y-%m-%d %H:%M %Z"), "snapshots": snapshots, "news": news, "sections": sections, "llm": llm}
+    payload = {"title": title, "generated_at": generated_at.astimezone(ZoneInfo("Europe/Berlin")).strftime("%Y-%m-%d %H:%M %Z"), "snapshots": snapshots, "news": news, "sections": sections, "llm": llm}
     safe_date = re.sub(r"[^0-9_-]+", "_", as_of)
     return {"success": True, "report_kind": "market_recap", "markets": selected, "report_date": max((snapshot.get("as_of_date", "") for snapshot in snapshots), default=_get_market_date()), "file_name": f"market_recap_{safe_date}.html", "html_bytes": render_market_recap_html(payload).encode("utf-8"), "elapsed": time.perf_counter() - started, "payload": payload, "warnings": [llm["error"]] if llm.get("error") else []}
 

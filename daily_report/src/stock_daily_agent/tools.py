@@ -414,7 +414,7 @@ def _run_searxng_raw_search(ctx: RunContext, ticker: str, languages: list[str], 
     errors: list[str] = []
     search_url = _searxng_search_url(base)
     for language in languages:
-        for query, focus in _build_market_queries(ticker, data, str(language)):
+        for query, focus in _build_market_queries(ticker, data, str(language), report_date=ctx.report_date):
             params_dict: dict[str, Any] = {"q": query, "format": "json", "language": language}
             if time_range:
                 params_dict["time_range"] = time_range
@@ -456,7 +456,7 @@ def _run_serper_raw_search(ctx: RunContext, ticker: str, languages: list[str], m
     errors: list[str] = []
     for language in languages:
         gl, hl = _serper_gl_hl(str(language))
-        for query, focus in _build_market_queries(ticker, data, str(language)):
+        for query, focus in _build_market_queries(ticker, data, str(language), report_date=ctx.report_date):
             for search_type in serper_types:
                 endpoint = _serper_endpoint(search_type)
                 payload = {"q": query, "gl": gl, "hl": hl, "num": max_per_query}
@@ -477,15 +477,24 @@ def _run_serper_raw_search(ctx: RunContext, ticker: str, languages: list[str], m
     return all_items, calls, errors
 
 
-def _provider_queries(ticker: str, data: dict[str, Any], languages: list[str]) -> dict[str, list[tuple[str, str]]]:
-    return {str(language): _build_market_queries(ticker, data, str(language)) for language in languages}
+def _provider_queries(
+    ticker: str,
+    data: dict[str, Any],
+    languages: list[str],
+    *,
+    report_date: str | None = None,
+) -> dict[str, list[tuple[str, str]]]:
+    return {
+        str(language): _build_market_queries(ticker, data, str(language), report_date=report_date)
+        for language in languages
+    }
 
 
 def _run_anspire_provider(ctx: RunContext, ticker: str, languages: list[str], max_per_query: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
     return run_anspire_raw_search(
         ticker=ticker,
         languages=languages,
-        queries=_provider_queries(ticker, _load_current_data(ctx), languages),
+        queries=_provider_queries(ticker, _load_current_data(ctx), languages, report_date=ctx.report_date),
         report_date=ctx.report_date,
         max_per_query=min(max_per_query, int(os.environ.get("ANSPIRE_MAX_RESULTS_PER_QUERY", "10"))),
     )
@@ -495,7 +504,7 @@ def _run_serpapi_provider(ctx: RunContext, ticker: str, languages: list[str], ma
     return run_serpapi_raw_search(
         ticker=ticker,
         languages=languages,
-        queries=_provider_queries(ticker, _load_current_data(ctx), languages),
+        queries=_provider_queries(ticker, _load_current_data(ctx), languages, report_date=ctx.report_date),
         report_date=ctx.report_date,
         max_per_query=min(max_per_query, int(os.environ.get("SERPAPI_MAX_RESULTS_PER_QUERY", "10"))),
     )
@@ -711,6 +720,10 @@ def evaluate_search_quality(
     grades = [str(i.get("evidence_grade") or _evidence_grade(i)) for i in records]
     ab = sum(1 for g in grades if g in {"A", "B", "TECH"})
     focus_set = {str(i.get("focus") or "") for i in records}
+    # A verified current-season earnings result is a stricter form of earnings
+    # coverage, so it satisfies the ordinary earnings evidence requirement.
+    if "earnings_current" in focus_set:
+        focus_set.add("earnings")
     missing_focus = [f for f in required_focus if f not in focus_set]
     known_dates = sum(
         1 for item in records
@@ -867,6 +880,7 @@ def _rerank_evidence(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(
         items,
         key=lambda x: (
+            int(str(x.get("focus") or "") == "earnings_current"),
             int(x.get("source_quality_score") or 0),
             0 if str(x.get("source_date") or "unknown").lower() == "unknown" else 1,
             len(str(x.get("facts") or "")),
@@ -1019,7 +1033,28 @@ from .article_fetcher import (
 )
 
 
-def _build_market_queries(ticker: str, data: dict[str, Any], language: str) -> list[tuple[str, str]]:
+def _current_reporting_quarter(report_date: str | None) -> tuple[int, int]:
+    """Return the calendar quarter currently being reported around ``report_date``.
+
+    This is a search-priority hint, not an assertion about a company's fiscal
+    calendar.  It catches the common case where a report generated during a
+    US earnings season otherwise retrieves the prior quarter's articles.
+    """
+    try:
+        as_of = Date.fromisoformat(str(report_date or "")[:10])
+    except ValueError:
+        as_of = Date.today()
+    quarter = (as_of.month - 1) // 3
+    return (4, as_of.year - 1) if quarter == 0 else (quarter, as_of.year)
+
+
+def _build_market_queries(
+    ticker: str,
+    data: dict[str, Any],
+    language: str,
+    *,
+    report_date: str | None = None,
+) -> list[tuple[str, str]]:
     ticker_u = ticker.upper()
     name = str(data.get("LONG_NAME") or data.get("SHORT_NAME") or ticker_u).strip()
     instrument_type = str(data.get('INSTRUMENT_TYPE') or '').upper()
@@ -1078,7 +1113,22 @@ def _build_market_queries(ticker: str, data: dict[str, Any], language: str) -> l
             (f"{name} {ticker_u} macro rates inflation Fed risks", "macro_risks"),
         ]
 
-    return [
+    current_quarter, current_year = _current_reporting_quarter(report_date)
+    current_earnings = [
+        (
+            f"{name} {ticker_u} Q{current_quarter} {current_year} earnings results actual EPS revenue guidance",
+            "earnings_current",
+        ),
+    ]
+    website = str(data.get("WEBSITE") or data.get("WEBSITE_URL") or "").strip()
+    website_host = urlparse(website).netloc.lower().removeprefix("www.")
+    if website_host:
+        current_earnings.append((
+            f"site:{website_host} {name} {ticker_u} Q{current_quarter} {current_year} earnings results",
+            "earnings_current",
+        ))
+
+    return current_earnings + [
         (f"{name} {ticker_u} latest earnings revenue EPS guidance", "earnings"),
         (f"{name} {ticker_u} analyst rating target price upgrade downgrade", "analyst_ratings"),
         (f"{name} {ticker_u} stock latest news last 30 days", "major_events"),
@@ -1293,7 +1343,7 @@ class SearXNGMarketResearchTool(BaseTool):
         calls: list[dict[str, Any]] = []
         search_url = _searxng_search_url(base)
         for language in languages:
-            for query, focus in _build_market_queries(ticker, data, str(language)):
+            for query, focus in _build_market_queries(ticker, data, str(language), report_date=ctx.report_date):
                 params_dict: dict[str, Any] = {"q": query, "format": "json", "language": language}
                 if time_range:
                     params_dict["time_range"] = time_range

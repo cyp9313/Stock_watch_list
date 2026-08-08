@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, g
 import json
+import math
 import sqlite3
 import yfinance as yf
 import pandas as pd
@@ -81,6 +82,26 @@ NON_EXTENDED_HOURS_TICKERS = BREADTH_PSEUDO_TICKERS
 SP500_MARKET_CAP_WORKERS = 12
 MARKET_BREADTH_MIN_DAILY_COVERAGE = 0.80
 MAX_STOCK_DATA_BODY_SIZE = 2 * 1024 * 1024  # 2 MB — stock_data POST body 上限
+
+
+def _json_finite(value):
+    """Convert NumPy/Pandas non-finite scalars to JSON-compatible ``null``.
+
+    Flask's default JSON encoder can emit bare ``NaN`` tokens.  They are not
+    valid JSON for browsers and strict clients, so sanitize API values at the
+    boundary instead of asking every table calculation to special-case NaN.
+    """
+    if isinstance(value, dict):
+        return {str(key): _json_finite(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_finite(item) for item in value]
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        value = float(value)
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    return value
 
 
 def _safe_cache_key(cache_key):
@@ -3156,7 +3177,7 @@ def get_stock_data():
 
         save_betas(beta_updates)
 
-        return jsonify({"success": True, "data": results})
+        return jsonify({"success": True, "data": _json_finite(results)})
         
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})

@@ -20,7 +20,7 @@ KNOWN_SEARCH_PROVIDERS = {"serper", "anspire", "serpapi", "dashscope", "searxng"
 DEFAULT_SEARCH_PROVIDER_PRIORITY = ["serper", "anspire", "serpapi", "dashscope", "searxng"]
 
 FOCUS_FRESHNESS_DAYS = {
-    "earnings": 180, "analyst_ratings": 90, "major_events": 30,
+    "earnings": 180, "earnings_current": 35, "analyst_ratings": 90, "major_events": 30,
     "industry": 45, "industry_macro": 45, "macro": 30, "macro_risks": 30,
     "risks": 60, "risks_sentiment": 30, "sentiment_flows": 30,
     "fund_flows": 30, "holdings_outlook": 90, "earnings_outlook": 90,
