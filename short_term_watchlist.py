@@ -570,7 +570,19 @@ def volume_svg(volume_values: list[float]) -> str:
 def _ny_timestamps(dates: list[Any]) -> pd.Series:
     parsed = pd.to_datetime(pd.Series(dates), errors="coerce")
     if getattr(parsed.dt, "tz", None) is None:
-        return parsed.dt.tz_localize("America/New_York")
+        # /api/kline_data intentionally returns legacy timezone-naive strings.
+        # At the autumn DST change, 01:00 occurs twice in New York.  Infer the
+        # two offsets from ordered intraday bars when both occurrences are
+        # present; a partial/legacy response cannot be inferred, so choose the
+        # post-fallback (standard-time) occurrence instead of crashing the UI.
+        try:
+            return parsed.dt.tz_localize(
+                "America/New_York", ambiguous="infer", nonexistent="shift_forward",
+            )
+        except ValueError:
+            return parsed.dt.tz_localize(
+                "America/New_York", ambiguous=False, nonexistent="shift_forward",
+            )
     return parsed.dt.tz_convert("America/New_York")
 
 

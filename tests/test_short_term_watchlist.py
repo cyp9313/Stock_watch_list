@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from short_term_watchlist import (
+    _ny_timestamps,
     calculate_short_term_row,
     consume_macd_alert_events,
     default_short_term_watchlist,
@@ -165,6 +166,30 @@ def test_row_calculates_requested_metrics_and_inline_svg():
     assert "#059669" in row["ADX (15)"]
     assert "M 3.0,17.4 L 77.0,17.4" in row["ADX (15)"]
     assert "M 3.0,15.0 L 77.0,15.0" in row["ADX (15)"]
+
+
+def test_new_york_timestamps_handle_fall_dst_duplicate_hour():
+    """Repeated 01:00 bars on DST fallback must not break short-term refresh."""
+    timestamps = _ny_timestamps([
+        "2026-11-01 00:55",
+        "2026-11-01 01:00",
+        "2026-11-01 01:05",
+        "2026-11-01 01:00",
+        "2026-11-01 01:05",
+        "2026-11-01 02:00",
+    ])
+
+    assert str(timestamps.dt.tz) == "America/New_York"
+    assert timestamps.iloc[1].utcoffset().total_seconds() == -4 * 60 * 60
+    assert timestamps.iloc[3].utcoffset().total_seconds() == -5 * 60 * 60
+
+
+def test_new_york_timestamps_falls_back_safely_for_partial_dst_hour():
+    """A truncated API response can include only one ambiguous bar."""
+    timestamps = _ny_timestamps(["2026-11-01 01:00", "2026-11-01 01:05"])
+
+    assert timestamps.notna().all()
+    assert all(item.utcoffset().total_seconds() == -5 * 60 * 60 for item in timestamps)
 
 
 def test_vwap_is_blank_for_zero_volume_or_after_hours_latest_bar():
