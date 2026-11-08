@@ -140,10 +140,16 @@ STOCK_DEV_MODE=1                 # 仅本地开发；生产环境应为 0
 
 # LLM for AI Stock Reports
 LLM_PROVIDER=dashscope           # auto / dashscope / deepseek / openai_compatible
-QWEN_MODEL=deepseek-v4-flash
-QWEN_RESEARCH_MODEL=deepseek-v4-flash
+QWEN_MODEL=deepseek-v4.1-flash-1017
+QWEN_RESEARCH_MODEL=deepseek-v4.1-flash-1017
 DASHSCOPE_API_KEY=your_key
 QWEN_AGENT_USE_RAW_API=true
+# deepseek-v4.1-flash-1017 is automatically routed to Model Studio Chat
+# Completions; DashScope web research uses Responses API web_search. Set these
+# when your Model Studio key belongs to a specific workspace/region:
+# DASHSCOPE_WORKSPACE_ID=your_workspace_id
+# DASHSCOPE_REGION=cn-beijing
+# DASHSCOPE_COMPATIBLE_MODEL_SERVER=  # optional full endpoint override
 
 # Optional manual AI rerank for Market Breadth & Screener
 SCREENING_RERANK_PROVIDER=inherit # inherit / dashscope / deepseek / openai_compatible

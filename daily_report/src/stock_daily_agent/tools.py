@@ -23,7 +23,7 @@ except ImportError:  # Allows static checks before qwen-agent is installed.
         description = ""
         parameters: dict = {}
 
-from .config import RunContext
+from .config import RunContext, dashscope_compatible_model_server, uses_dashscope_responses_api
 from .notes import parse_notes_payload, validate_notes, render_notes_text, notes_to_jsonable
 from .utils import parse_tool_params, json_dumps, run_python_script, ToolError, ensure_within_dir, strip_markdown_code_fence
 from .search_provider_clients import (
@@ -180,6 +180,88 @@ def _dashscope_content_and_sources(response: Any) -> tuple[str, list[dict[str, A
         "code": _obj_get(response, "code", ""),
         "message": _obj_get(response, "message", ""),
     }
+
+
+def _as_source_dict(source: Any) -> dict[str, Any] | None:
+    """Normalize a Responses API web-search source to the legacy source shape."""
+    if isinstance(source, str):
+        url = source.strip()
+        return {"url": url} if url else None
+    url = str(_obj_get(source, "url", "") or _obj_get(source, "link", "")).strip()
+    if not url:
+        return None
+    return {
+        "url": url,
+        "title": _obj_get(source, "title", "") or _obj_get(source, "name", ""),
+        "snippet": _obj_get(source, "snippet", "") or _obj_get(source, "content", "") or _obj_get(source, "summary", ""),
+        "date": _obj_get(source, "date", "") or _obj_get(source, "published_date", "") or _obj_get(source, "publish_time", ""),
+        "raw_source": source,
+    }
+
+
+def _responses_text_from_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    parts: list[str] = []
+    for block in content or []:
+        if isinstance(block, str):
+            parts.append(block)
+            continue
+        if str(_obj_get(block, "type", "")) not in {"output_text", "text"}:
+            continue
+        text = _obj_get(block, "text", "")
+        if isinstance(text, dict):
+            text = text.get("value") or text.get("text") or ""
+        parts.append(str(text or ""))
+    return "".join(parts)
+
+
+def _dashscope_responses_content_and_sources(response: Any) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
+    """Extract text and source URLs from Model Studio's Responses API output."""
+    raw_sources: list[dict[str, Any]] = []
+    message_parts: list[str] = []
+    for item in _obj_get(response, "output", []) or []:
+        item_type = str(_obj_get(item, "type", "") or "")
+        if item_type == "web_search_call":
+            action = _obj_get(item, "action", {}) or {}
+            for source in _obj_get(action, "sources", []) or []:
+                normalized = _as_source_dict(source)
+                if normalized:
+                    raw_sources.append(normalized)
+        elif item_type == "message":
+            message_parts.append(_responses_text_from_content(_obj_get(item, "content", [])))
+
+    content = str(_obj_get(response, "output_text", "") or "").strip() or "".join(message_parts).strip()
+    unique_sources: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    for source in raw_sources:
+        normalized_url = _normalize_url_for_match(str(source.get("url") or ""))
+        if not normalized_url or normalized_url in seen_urls:
+            continue
+        seen_urls.add(normalized_url)
+        unique_sources.append(source)
+
+    usage = _obj_get(response, "usage", {}) or {}
+    return content, unique_sources, {
+        "response_id": _obj_get(response, "id", ""),
+        "usage": usage if isinstance(usage, dict) else {},
+        "protocol": "responses_api",
+    }
+
+
+def _call_dashscope_responses_search(*, api_key: str, model: str, system: str, user: str) -> Any:
+    """Call Model Studio's Responses API with its native web-search tool."""
+    from openai import OpenAI
+
+    client = OpenAI(api_key=api_key, base_url=dashscope_compatible_model_server())
+    return client.responses.create(
+        model=model,
+        input=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        tools=[{"type": "web_search"}],
+    )
 
 
 def _dashscope_source_record(src: dict[str, Any], idx: int, model: str) -> dict[str, Any]:
@@ -924,7 +1006,7 @@ def _load_json_file(path: Path) -> dict[str, Any]:
 
 
 def _normalize_url_for_match(url: str) -> str:
-    return str(url or "").strip().rstrip("/")
+    return canonicalize_url(url) or str(url or "").strip().rstrip("/")
 
 
 def _collect_verifiable_records(ctx: RunContext) -> dict[str, dict[str, Any]]:
@@ -2242,7 +2324,7 @@ class DashScopeMarketResearchTool(BaseTool):
     name = "dashscope_market_research"
     description = (
         "使用 DashScope/Qwen 模型自带联网搜索能力，为指定 ticker 收集市场消息面线索。"
-        "V5.1 使用 DashScope 协议 enable_source=true 保存真实搜索来源到 dashscope_sources.json。"
+        "DeepSeek V4.1 Flash 自动使用 Model Studio Responses API 的 web_search，并保存真实搜索来源到 dashscope_sources.json。"
         "模型生成的 items 仍是 candidate；只有 DS-xxx source_id 对应的来源对象可作为 final notes 证据。"
     )
     parameters = {
@@ -2321,28 +2403,39 @@ class DashScopeMarketResearchTool(BaseTool):
 }}
 """.strip()
         try:
-            import dashscope
-            dashscope.base_http_api_url = os.environ.get("DASHSCOPE_API_BASE", "https://dashscope.aliyuncs.com/api/v1")
-            strategy = os.environ.get("DASHSCOPE_SEARCH_STRATEGY", "max")
-            search_options: dict[str, Any] = {
-                "search_strategy": strategy,
-                "enable_source": True,
-                "enable_citation": True,
-                "citation_format": "[ref_<number>]",
-            }
-            freshness = os.environ.get("DASHSCOPE_SEARCH_FRESHNESS", "30").strip()
-            if freshness and strategy == "turbo":
-                search_options["freshness"] = int(freshness)
+            if uses_dashscope_responses_api(model):
+                response = _call_dashscope_responses_search(
+                    api_key=api_key,
+                    model=model,
+                    system=system,
+                    user=user,
+                )
+                raw, raw_sources, meta = _dashscope_responses_content_and_sources(response)
+                strategy = "responses_web_search"
+            else:
+                import dashscope
 
-            response = dashscope.Generation.call(
-                api_key=api_key,
-                model=model,
-                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                enable_search=True,
-                search_options=search_options,
-                result_format="message",
-            )
-            raw, raw_sources, meta = _dashscope_content_and_sources(response)
+                dashscope.base_http_api_url = os.environ.get("DASHSCOPE_API_BASE", "https://dashscope.aliyuncs.com/api/v1")
+                strategy = os.environ.get("DASHSCOPE_SEARCH_STRATEGY", "max")
+                search_options: dict[str, Any] = {
+                    "search_strategy": strategy,
+                    "enable_source": True,
+                    "enable_citation": True,
+                    "citation_format": "[ref_<number>]",
+                }
+                freshness = os.environ.get("DASHSCOPE_SEARCH_FRESHNESS", "30").strip()
+                if freshness and strategy == "turbo":
+                    search_options["freshness"] = int(freshness)
+
+                response = dashscope.Generation.call(
+                    api_key=api_key,
+                    model=model,
+                    messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                    enable_search=True,
+                    search_options=search_options,
+                    result_format="message",
+                )
+                raw, raw_sources, meta = _dashscope_content_and_sources(response)
             source_records = [_dashscope_source_record(src, i, model=model) for i, src in enumerate(raw_sources, start=1)]
             if source_records:
                 ctx.dashscope_sources_file.write_text(json_dumps({

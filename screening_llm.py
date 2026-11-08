@@ -30,7 +30,7 @@ def _resolve_model(provider: str) -> str:
     if explicit:
         return explicit
     if provider == "deepseek":
-        return (os.environ.get("LLM_MODEL") or os.environ.get("DEEPSEEK_MODEL") or "deepseek-v4-flash").strip()
+        return (os.environ.get("LLM_MODEL") or os.environ.get("DEEPSEEK_MODEL") or "deepseek-v4-flash-0731").strip()
     return (os.environ.get("LLM_MODEL") or os.environ.get("QWEN_MODEL") or "qwen-plus").strip()
 
 

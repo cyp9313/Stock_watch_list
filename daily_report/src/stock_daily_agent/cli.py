@@ -17,7 +17,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("ticker", help="yfinance ticker，例如 ORCL, BTC-USD, QQQ, 0700.HK, ^NDX")
     p.add_argument("-m", "--months", type=int, default=3, help="K线图月份数，默认 3")
     p.add_argument("-o", "--output", help="输出 HTML 文件路径。默认写到 runs/<ticker>_<date>/")
-    p.add_argument("--model", default=None, help="主 Agent 模型名；默认读取 LLM_MODEL/QWEN_MODEL。provider=deepseek 时默认 deepseek-v4-flash，否则 qwen-plus")
+    p.add_argument("--model", default=None, help="主 Agent 模型名；默认读取 LLM_MODEL/QWEN_MODEL。provider=deepseek 时默认 deepseek-v4-flash-0731，否则 qwen-plus")
     p.add_argument("--provider", choices=["auto", "dashscope", "deepseek", "openai_compatible"], default=None, help="主 Agent 模型提供商；默认读取 LLM_PROVIDER/auto，若有有效 DEEPSEEK_API_KEY 则优先 deepseek，否则 dashscope")
     p.add_argument("--run-dir", help="中间文件目录，默认 runs/<ticker>_<date>")
     p.add_argument("--date", default=get_market_date(), help="报告日期，默认美东市场日期")
@@ -56,7 +56,7 @@ def main(argv: list[str] | None = None) -> int:
     if provider == "auto":
         provider = "deepseek" if deepseek_key_ok else "dashscope"
     if provider == "deepseek":
-        model_name = args.model or os.environ.get("LLM_MODEL") or os.environ.get("DEEPSEEK_MODEL") or "deepseek-v4-flash"
+        model_name = args.model or os.environ.get("LLM_MODEL") or os.environ.get("DEEPSEEK_MODEL") or "deepseek-v4-flash-0731"
     else:
         model_name = args.model or os.environ.get("LLM_MODEL") or os.environ.get("QWEN_MODEL", "qwen-plus")
 

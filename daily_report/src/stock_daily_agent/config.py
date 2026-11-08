@@ -168,9 +168,53 @@ def load_dotenv(project_root: Path) -> None:
     load_project_env(project_root / ".env")
 
 
+def uses_dashscope_responses_api(model: str) -> bool:
+    """Whether a Model Studio model must use the current Responses/Chat API."""
+    return model.strip().lower().startswith("deepseek-v4.1-flash")
+
+
+def dashscope_compatible_model_server() -> str:
+    """Return the Model Studio OpenAI-compatible endpoint without exposing keys."""
+    base_url = (
+        os.environ.get("DASHSCOPE_COMPATIBLE_MODEL_SERVER")
+        or os.environ.get("QWEN_MODEL_SERVER")
+        or os.environ.get("OPENAI_MODEL_SERVER")
+    )
+    if base_url:
+        return base_url.rstrip("/")
+
+    workspace = os.environ.get("DASHSCOPE_WORKSPACE_ID", "").strip()
+    region = os.environ.get("DASHSCOPE_REGION", "cn-beijing").strip()
+    if workspace:
+        return f"https://{workspace}.{region}.maas.aliyuncs.com/compatible-mode/v1"
+    return "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+
 def build_llm_cfg(model: str, provider: str = "dashscope") -> dict:
     """Build a Qwen-Agent llm_cfg for DashScope, DeepSeek, or OpenAI-compatible endpoints."""
     if provider == "dashscope":
+        # ``deepseek-v4.1-flash-1017`` is served by Model Studio through the
+        # current Chat Completions API.  qwen-agent 0.0.34's qwen_dashscope
+        # adapter still uses the legacy Generation.call text endpoint, which
+        # Model Studio rejects for this model with ``url error``.  Keep the
+        # public ``dashscope`` provider setting ergonomic, but transparently
+        # route this one model through Qwen-Agent's OpenAI-compatible adapter.
+        #
+        # A workspace/region endpoint is preferred for new Model Studio keys;
+        # the legacy compatible-mode endpoint remains a useful fallback for
+        # existing default-workspace keys.  No API key is duplicated: the
+        # existing DASHSCOPE_API_KEY remains the credential source.
+        if uses_dashscope_responses_api(model):
+            return {
+                "model": model,
+                "model_type": "oai",
+                "model_server": dashscope_compatible_model_server(),
+                "api_key": os.environ.get("DASHSCOPE_API_KEY") or "EMPTY",
+                "generate_cfg": {
+                    "top_p": 0.8,
+                    "temperature": 0.2,
+                },
+            }
         raw_api_override = os.environ.get("QWEN_AGENT_USE_RAW_API")
         if raw_api_override is None:
             model_lower = model.strip().lower()
@@ -216,7 +260,7 @@ def build_llm_cfg(model: str, provider: str = "dashscope") -> dict:
 
     if provider == "openai_compatible":
         model_server = os.environ.get("QWEN_MODEL_SERVER") or os.environ.get("OPENAI_MODEL_SERVER") or "http://localhost:8000/v1"
-        api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("QWEN_API_KEY") or "EMPTY"
+        api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("QWEN_API_KEY") or os.environ.get("DASHSCOPE_API_KEY") or "EMPTY"
         return {
             "model": model,
             "model_type": "oai",
