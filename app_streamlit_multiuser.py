@@ -103,6 +103,7 @@ from trading212_monitor import (
     send_telegram_test,
     test_trading212_connection,
 )
+from trading212_mapping_view import build_mapping_table_html
 
 
 _PAGE_ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "survival_hunter_icon.png")
@@ -5234,17 +5235,17 @@ def render_trading212_monitor_settings(user):
         if not mapping_rows:
             st.info("No positions have been checked yet. Use Refresh mappings now after saving Trading 212 credentials.")
         else:
-            mapping_frame = pd.DataFrame(mapping_rows).rename(columns={
-                "position_key": "Trading 212 key", "ticker": "Trading 212 ticker", "display_name": "Name",
-                "yfinance_ticker": "yfinance ticker", "mapping_status": "Status",
-                "mapping_source": "Source", "last_history_date": "Latest daily bar", "last_error": "Last error",
-            })
-            visible_mapping_columns = [
-                column for column in (
-                    "Trading 212 ticker", "Name", "yfinance ticker", "Status", "Source", "Latest daily bar", "Last error",
-                ) if column in mapping_frame.columns
-            ]
-            st.dataframe(mapping_frame[visible_mapping_columns], hide_index=True, use_container_width=True)
+            theme = get_theme(bool(st.session_state.get("dark_mode", False)))
+            st.markdown(
+                build_mapping_table_html(
+                    mapping_rows,
+                    border_color=theme["table_border"],
+                    header_background=theme["table_header_bg"],
+                    table_background=theme["table_bg"],
+                    text_color=theme["text"],
+                ),
+                unsafe_allow_html=True,
+            )
             mapping_by_key = {row["position_key"]: row for row in mapping_rows}
             selected_key = st.selectbox(
                 "Holding to map", list(mapping_by_key),
