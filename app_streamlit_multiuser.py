@@ -90,10 +90,12 @@ from ticker_mapping import normalize_yfinance_ticker, stockanalysis_overview_url
 from ticker_search import search_yfinance_candidates
 from trading212_monitor import (
     MonitorConfigurationError,
+    Trading212APIError,
     THRESHOLDS_BY_WINDOW,
     WINDOWS_MINUTES,
     get_monitor_status,
     list_position_mappings,
+    refresh_position_mappings,
     remove_telegram_credentials,
     remove_trading212_credentials,
     save_monitor_settings,
@@ -5206,12 +5208,31 @@ def render_trading212_monitor_settings(user):
 
     with st.expander("Trading 212 → yfinance ticker mappings", expanded=False):
         st.caption(
-            "Mappings appear after the worker has observed your positions. Automatic mappings use the Trading 212 market suffix and are cached. "
-            "If a mapping is unavailable or wrong, save a manual yfinance ticker here; it is used on the next worker cycle."
+            "Refresh mappings works at any time, including the frozen weekend period. It reads your broker's current positions and updates only mapping/history metadata: "
+            "it does not save price snapshots, evaluate alerts, or send Telegram messages. Automatic mappings use the Trading 212 market suffix and are cached."
         )
+        mapping_flash_key = f"trading212_mapping_refresh_message_{user['id']}"
+        mapping_flash = st.session_state.pop(mapping_flash_key, None)
+        if mapping_flash:
+            (st.warning if mapping_flash["unavailable"] else st.success)(mapping_flash["message"])
+        if st.button("Refresh mappings now", key=f"trading212_refresh_mappings_{user['id']}"):
+            try:
+                refreshed = refresh_position_mappings(user["id"])
+                st.session_state[mapping_flash_key] = {
+                    "unavailable": bool(refreshed["unavailable"]),
+                    "message": (
+                        f"Checked {refreshed['positions']} position(s); {refreshed['mapped']} mapped. "
+                        f"{len(refreshed['unavailable'])} needs a manual mapping or has no usable daily history."
+                        if refreshed["unavailable"]
+                        else f"Checked {refreshed['positions']} position(s); {refreshed['mapped']} mapped successfully."
+                    ),
+                }
+                st.rerun()
+            except (MonitorConfigurationError, Trading212APIError, ValueError, RuntimeError) as exc:
+                st.error(str(exc))
         mapping_rows = list_position_mappings(user["id"])
         if not mapping_rows:
-            st.info("No observed positions yet. Enable the monitor and wait for its next successful minute cycle.")
+            st.info("No positions have been checked yet. Use Refresh mappings now after saving Trading 212 credentials.")
         else:
             mapping_frame = pd.DataFrame(mapping_rows).rename(columns={
                 "position_key": "Trading 212 key", "ticker": "Trading 212 ticker", "display_name": "Name",

@@ -317,3 +317,22 @@ def test_user_can_review_and_override_a_mapping_after_a_position_is_observed(tmp
     assert mappings[0]["yfinance_ticker"] == "AAPL"
     monitor.save_yfinance_mapping_override(7, "AAPL_US_EQ", "AAPL", path=path)
     assert monitor.list_position_mappings(7, path=path)[0]["mapping_source"] == "manual"
+
+
+def test_mapping_refresh_works_outside_monitor_window_without_snapshots(tmp_path, monkeypatch):
+    path = tmp_path / "monitor.db"
+    _configure(monkeypatch, path, enabled=False)
+    # Saturday noon Berlin is outside the 5x24 alert/snapshot window.
+    saturday = dt.datetime(2026, 11, 7, 11, 0, tzinfo=dt.timezone.utc)
+    refreshed = monitor.refresh_position_mappings(
+        7, path=path, now=saturday,
+        request_get=lambda *_args, **_kwargs: _Response(_position(100.0)),
+        history_fetcher=_completed_daily_history,
+    )
+    assert refreshed == {"positions": 1, "mapped": 1, "unavailable": {}}
+    assert monitor.list_position_mappings(7, path=path)[0]["yfinance_ticker"] == "AAPL"
+    conn = monitor._connect(path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM position_snapshots WHERE user_id=7").fetchone()[0] == 0
+    finally:
+        conn.close()

@@ -255,6 +255,19 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS user_observed_positions (
+            user_id INTEGER NOT NULL,
+            position_key TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            display_name TEXT,
+            currency TEXT,
+            last_observed_at TEXT NOT NULL,
+            PRIMARY KEY(user_id, position_key)
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS technical_signal_state (
             user_id INTEGER NOT NULL,
             position_key TEXT NOT NULL,
@@ -394,18 +407,24 @@ def list_position_mappings(user_id: int, *, path: Path | None = None) -> list[di
     try:
         rows = conn.execute(
             """
-            WITH latest AS (
-                SELECT position_key, MAX(captured_at) AS captured_at
-                FROM position_snapshots WHERE user_id=? GROUP BY position_key
+            WITH positions AS (
+                SELECT position_key, ticker, display_name, currency
+                FROM user_observed_positions WHERE user_id=?
+                UNION
+                SELECT s.position_key, s.ticker, s.display_name, s.currency
+                FROM position_snapshots s
+                WHERE s.user_id=?
+                  AND s.captured_at=(
+                      SELECT MAX(other.captured_at) FROM position_snapshots other
+                      WHERE other.user_id=s.user_id AND other.position_key=s.position_key
+                  )
             )
-            SELECT s.position_key, s.ticker, s.display_name, s.currency,
+            SELECT p.position_key, p.ticker, p.display_name, p.currency,
                    m.yfinance_ticker, m.mapping_status, m.mapping_source,
                    m.last_history_date, m.last_error
-            FROM latest l
-            JOIN position_snapshots s
-              ON s.position_key=l.position_key AND s.captured_at=l.captured_at AND s.user_id=?
-            LEFT JOIN instrument_mappings m ON m.position_key=s.position_key
-            ORDER BY s.ticker COLLATE NOCASE
+            FROM positions p
+            LEFT JOIN instrument_mappings m ON m.position_key=p.position_key
+            ORDER BY p.ticker COLLATE NOCASE
             """,
             (int(user_id), int(user_id)),
         ).fetchall()
@@ -430,11 +449,19 @@ def save_yfinance_mapping_override(
         snapshot = conn.execute(
             """
             SELECT position_key, ticker, display_name, currency
-            FROM position_snapshots WHERE user_id=? AND position_key=?
-            ORDER BY captured_at DESC LIMIT 1
+            FROM user_observed_positions WHERE user_id=? AND position_key=?
             """,
             (int(user_id), str(position_key)),
         ).fetchone()
+        if snapshot is None:
+            snapshot = conn.execute(
+                """
+                SELECT position_key, ticker, display_name, currency
+                FROM position_snapshots WHERE user_id=? AND position_key=?
+                ORDER BY captured_at DESC LIMIT 1
+                """,
+                (int(user_id), str(position_key)),
+            ).fetchone()
         if snapshot is None:
             raise ValueError("This holding has not been observed for your account yet.")
         existing = conn.execute(
@@ -622,6 +649,25 @@ def _position_from_api(raw: dict[str, Any]) -> dict[str, Any] | None:
         "quantity": quantity,
         "current_value": current_value,
     }
+
+
+def _record_observed_position(
+    conn: sqlite3.Connection, user_id: int, position: dict[str, Any], now: dt.datetime,
+) -> None:
+    """Keep a non-price position identity for UI mapping controls."""
+    conn.execute(
+        """
+        INSERT INTO user_observed_positions(user_id, position_key, ticker, display_name, currency, last_observed_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, position_key) DO UPDATE SET
+            ticker=excluded.ticker, display_name=excluded.display_name,
+            currency=excluded.currency, last_observed_at=excluded.last_observed_at
+        """,
+        (
+            int(user_id), position["position_key"], position["ticker"],
+            position.get("display_name") or "", position.get("currency") or "", _iso(now),
+        ),
+    )
 
 
 def _t212_yfinance_candidates(position: dict[str, Any]) -> list[str]:
@@ -941,6 +987,51 @@ def _ensure_daily_history(
         last_error=last_error,
     )
     return None, [], last_error
+
+
+def refresh_position_mappings(
+    user_id: int,
+    *,
+    path: Path | None = None,
+    now: dt.datetime | None = None,
+    request_get: Callable[..., Any] = requests.get,
+    history_fetcher: Callable[[str, dt.date], list[tuple[Any, ...]]] = _download_yfinance_daily_history,
+) -> dict[str, Any]:
+    """Manually validate ticker mappings without requiring an active monitor window.
+
+    This is deliberately read-only with respect to broker positions: it writes
+    mapping/cache metadata only. It does not add price snapshots, evaluate
+    alerts, send Telegram messages, or alter the 5x24 worker schedule.
+    """
+    current_time = (now or _now()).astimezone(UTC).replace(microsecond=0)
+    conn = _connect(path)
+    try:
+        row = conn.execute("SELECT * FROM monitor_accounts WHERE user_id=?", (int(user_id),)).fetchone()
+        if row is None:
+            raise MonitorConfigurationError("Save Trading 212 API credentials first.")
+        secrets = _account_secrets(row)
+        if not secrets["api_key"] or not secrets["api_secret"]:
+            raise MonitorConfigurationError("Both Trading 212 API Key and API Secret are required.")
+        positions = [
+            position for item in fetch_positions(
+                secrets["api_key"], secrets["api_secret"], row["environment"], request_get=request_get,
+            )
+            if (position := _position_from_api(item)) is not None
+        ]
+        mapped = 0
+        unavailable: dict[str, str] = {}
+        for position in positions:
+            _record_observed_position(conn, int(user_id), position, current_time)
+            ticker, closes, error = _ensure_daily_history(
+                conn, position, current_time, history_fetcher=history_fetcher,
+            )
+            if ticker and closes:
+                mapped += 1
+            elif error:
+                unavailable[position["ticker"]] = error
+        return {"positions": len(positions), "mapped": mapped, "unavailable": unavailable}
+    finally:
+        conn.close()
 
 
 def _ema_series(values: list[float], period: int) -> list[float]:
@@ -1368,6 +1459,8 @@ def run_account_monitor(
             secrets["api_key"], secrets["api_secret"], row["environment"], request_get=request_get
         )]
         positions = [item for item in positions if item is not None]
+        for position in positions:
+            _record_observed_position(conn, int(user_id), position, current_time)
         policy = normalize_alert_policy(json.loads(row["alert_policy_json"] or "{}"))
         technical_enabled = any(
             bool(policy["technical"].get(key))
