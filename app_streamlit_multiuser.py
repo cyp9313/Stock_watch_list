@@ -88,6 +88,17 @@ from multiuser_store import (
 from screening_llm import rerank_candidates
 from ticker_mapping import normalize_yfinance_ticker, stockanalysis_overview_url
 from ticker_search import search_yfinance_candidates
+from trading212_monitor import (
+    MonitorConfigurationError,
+    THRESHOLDS_BY_WINDOW,
+    WINDOWS_MINUTES,
+    get_monitor_status,
+    remove_telegram_credentials,
+    remove_trading212_credentials,
+    save_monitor_settings,
+    send_telegram_test,
+    test_trading212_connection,
+)
 
 
 _PAGE_ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "survival_hunter_icon.png")
@@ -592,6 +603,23 @@ def inject_css(dark_mode=False):
             box-shadow: inset 0 0 0 1px rgba(255,255,255,0.42), 0 0 9px rgba(22,163,74,0.35) !important;
         }}
         div[class*="st-key-short_term_alert_"] label[data-baseweb="checkbox"] > div:first-child > div {{
+            background: #ffffff !important;
+            background-color: #ffffff !important;
+            box-shadow: 0 1px 4px rgba(15, 23, 42, 0.45) !important;
+        }}
+        div[class*="st-key-trading212_monitor_enabled_"] label[data-baseweb="checkbox"] > div:first-child {{
+            background: #0ea5e9 !important;
+            background-color: #0ea5e9 !important;
+            border-color: #0369a1 !important;
+            box-shadow: inset 0 0 0 1px rgba(255,255,255,0.40), 0 0 8px rgba(14,165,233,0.35) !important;
+        }}
+        div[class*="st-key-trading212_monitor_enabled_"]:has(input:checked) label[data-baseweb="checkbox"] > div:first-child {{
+            background: #ef4444 !important;
+            background-color: #ef4444 !important;
+            border-color: #fecaca !important;
+            box-shadow: inset 0 0 0 1px rgba(255,255,255,0.45), 0 0 12px rgba(239,68,68,0.45) !important;
+        }}
+        div[class*="st-key-trading212_monitor_enabled_"] label[data-baseweb="checkbox"] > div:first-child > div {{
             background: #ffffff !important;
             background-color: #ffffff !important;
             box-shadow: 0 1px 4px rgba(15, 23, 42, 0.45) !important;
@@ -5031,9 +5059,140 @@ def render_section(section_title, section_key, config, raw_df, editable, user, d
     return config
 
 
+def _trading212_window_label(minutes):
+    if minutes == 240:
+        return "4h"
+    if minutes == 1440:
+        return "24h"
+    return f"{minutes}m"
+
+
+def render_trading212_monitor_settings(user):
+    """Render account-scoped, secret-safe Trading 212 monitor controls."""
+    if not user:
+        return
+    st.divider()
+    st.markdown("### Trading 212 Position Monitor")
+    st.caption(
+        "A dedicated read-only worker checks configured positions once per minute on Berlin weekdays, "
+        "keeps the latest 48 active-monitor hours of snapshots (weekends frozen), and sends Telegram alerts when a selected move threshold is crossed."
+    )
+    try:
+        status = get_monitor_status(user["id"])
+    except MonitorConfigurationError as exc:
+        st.warning(str(exc))
+        st.caption("Add a valid TRADING212_CREDENTIAL_ENCRYPTION_KEY to the server .env before saving broker or Telegram credentials.")
+        return
+    policy = status["alert_policy"]
+    state_text = "Enabled" if status["enabled"] else "Disabled"
+    st.caption(
+        f"Status: {state_text} · Trading 212 credentials: {'configured' if status['has_trading212_credentials'] else 'not configured'} "
+        f"· Telegram: {'configured' if status['has_telegram'] else 'not configured'} · retained snapshots: {status['snapshot_count']}"
+    )
+    if status.get("last_success_at"):
+        st.caption(f"Last successful position fetch (UTC): {status['last_success_at']}")
+    if status.get("last_error"):
+        st.warning(f"Latest monitor status: {status['last_error']}")
+
+    with st.expander("Connection and alert settings", expanded=not status["configured"]):
+        with st.form(f"trading212_monitor_settings_{user['id']}"):
+            environment = st.selectbox(
+                "Trading 212 environment", ["live", "demo"],
+                index=0 if status["environment"] == "live" else 1,
+                help="Use demo first to validate the integration. The monitor only calls the read-only positions endpoint and never places orders.",
+            )
+            enabled = st.toggle(
+                "Enable Trading 212 monitoring and Telegram alerts", value=bool(status["enabled"]),
+                key=f"trading212_monitor_enabled_{user['id']}",
+                help="Blue means disabled; red means enabled after saving. A dedicated worker polls once per minute on Berlin weekdays. Credentials stay encrypted in the monitor database.",
+            )
+            st.caption("Blue = disabled · Red = enabled. Click Save Trading 212 monitor settings to apply this change.")
+            credentials_left, credentials_right = st.columns(2)
+            with credentials_left:
+                api_key = st.text_input(
+                    "Trading 212 API Key", type="password",
+                    placeholder="Leave empty to keep the existing key" if status["has_trading212_credentials"] else "Required",
+                )
+                api_secret = st.text_input(
+                    "Trading 212 API Secret", type="password",
+                    placeholder="Leave empty to keep the existing secret" if status["has_trading212_credentials"] else "Required",
+                )
+            with credentials_right:
+                telegram_bot_token = st.text_input(
+                    "Telegram Bot Token", type="password",
+                    placeholder="Leave empty to keep the existing token" if status["has_telegram"] else "Required",
+                )
+                telegram_chat_id = st.text_input(
+                    "Telegram Chat ID", type="password",
+                    placeholder="Leave empty to keep the existing Chat ID" if status["has_telegram"] else "Required",
+                )
+            st.markdown("##### Alert windows and tiers")
+            st.caption("A threshold alerts once on first crossing. It rearms after the move falls below 80% of that threshold.")
+            updated_policy = {"windows": {}, "thresholds": {}}
+            for group_index, minute_group in enumerate(((1, 5, 15), (30, 60), (240, 1440))):
+                cols = st.columns(len(minute_group))
+                for col, minutes in zip(cols, minute_group):
+                    policy_key = str(minutes)
+                    with col:
+                        updated_policy["windows"][policy_key] = st.checkbox(
+                            f"Monitor {_trading212_window_label(minutes)}",
+                            value=bool(policy["windows"].get(policy_key)),
+                            key=f"trading212_window_{user['id']}_{minutes}",
+                        )
+                        updated_policy["thresholds"][policy_key] = st.multiselect(
+                            f"{_trading212_window_label(minutes)} alert tiers (%)",
+                            list(THRESHOLDS_BY_WINDOW[minutes]),
+                            default=policy["thresholds"].get(policy_key, list(THRESHOLDS_BY_WINDOW[minutes])),
+                            key=f"trading212_thresholds_{user['id']}_{minutes}",
+                        )
+            submitted = st.form_submit_button("Save Trading 212 monitor settings")
+        if submitted:
+            try:
+                save_monitor_settings(
+                    user["id"], environment=environment, enabled=enabled,
+                    api_key=api_key if api_key else None,
+                    api_secret=api_secret if api_secret else None,
+                    telegram_bot_token=telegram_bot_token if telegram_bot_token else None,
+                    telegram_chat_id=telegram_chat_id if telegram_chat_id else None,
+                    alert_policy=updated_policy,
+                )
+                st.success("Trading 212 monitor settings saved. The worker will apply them on its next minute cycle.")
+                st.rerun()
+            except (ValueError, MonitorConfigurationError) as exc:
+                st.error(str(exc))
+
+    test_col, telegram_col, remove_col = st.columns(3)
+    with test_col:
+        if st.button("Test Trading 212 connection", key=f"trading212_test_connection_{user['id']}"):
+            try:
+                count = test_trading212_connection(user["id"])
+                st.success(f"Trading 212 connection succeeded. Open positions returned: {count}.")
+            except (MonitorConfigurationError, ValueError, RuntimeError) as exc:
+                st.error(str(exc))
+    with telegram_col:
+        if st.button("Send Telegram test message", key=f"trading212_test_telegram_{user['id']}"):
+            try:
+                send_telegram_test(user["id"])
+                st.success("Telegram test message sent.")
+            except (MonitorConfigurationError, ValueError, RuntimeError) as exc:
+                st.error(str(exc))
+    with remove_col:
+        with st.popover("Remove saved credentials"):
+            st.caption("Removing either credential set disables monitoring immediately. Secrets cannot be recovered from this page.")
+            if st.button("Remove Trading 212 credentials", key=f"trading212_delete_api_{user['id']}"):
+                remove_trading212_credentials(user["id"])
+                st.success("Trading 212 credentials removed and monitoring disabled.")
+                st.rerun()
+            if st.button("Remove Telegram settings", key=f"trading212_delete_telegram_{user['id']}"):
+                remove_telegram_credentials(user["id"])
+                st.success("Telegram settings removed and monitoring disabled.")
+                st.rerun()
+
+
 def render_portfolio_section(config, raw_df, editable, user, dark_mode=False, display_currency="Local"):
     st.subheader(SECTION_META["portfolio_pages"]["title"])
     st.caption(SECTION_META["portfolio_pages"]["help"])
+    render_trading212_monitor_settings(user)
     render_table_legend(dark_mode=dark_mode)
     pages = config["portfolio_pages"]
     tabs = st.tabs([page["name"] for page in pages])

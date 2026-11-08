@@ -45,6 +45,7 @@ Short-term Watchlist 位于 **Market Dashboard** 与 **Market Breadth** 之间�
 - **DCA Backtest** 对当前 Portfolio 的 ticker 做等权定投仿真，并将组合累计定投收益与 `SPY`、`QQQ` 的同频定投收益用 Plotly 曲线对比；作为 ETF 的复权价格会纳入分红再投资。可选择任意可获取的历史起止日期、每月月初/第三个周五或每周周五；回测会直接从 yfinance 下载所选区间的日线，不写入 SQLite，网页只短暂缓存相同参数的结果。若短窗口内没有正常定投日，会在选定起始日执行一次初始投入。每个定投日只在已有有效历史且能交易的标的间重新等权；未上市标的不会占用现金，并从上市后的下一次定投加入。休市会顺延到下一可用交易日，图中的三角标记为每次计划定投日（不同交易所标的的实际成交可略有错开）。使用复权收盘价，未计入费用、税费和汇兑。
 - **AI Portfolio Report** 是确定性工作流：Python 先计算组合权重、集中度、Beta、波动率、回撤、风险贡献和技术快照，再以受控的一次模型/搜索调用生成 HTML 报告。它不是由 Agent 自主决定工具调用的流程。
 - 支持浏览器下载、一次性邮件和每周邮件计划。报告 Worker 在后台运行，页面关闭后任务仍可继续。
+- **Trading 212 Position Monitor**（可选）允许登录用户保存各自的只读 Trading 212 API Key/API Secret 与 Telegram Bot 配置。独立 Worker 在 Europe/Berlin 的工作日每分钟读取持仓当前价，按 1m/5m/15m（1/2/5/10%）、30m/60m（2/5/10%）、4h/24h（5/10%）的分级阈值发送 Telegram 消息；每级只在首次跨越时触发，回到阈值的 80% 内后重新布防。分钟快照以 UTC 存储在独立 SQLite 数据库，并保留最近 48 个有效监控小时；周末冻结保留期，因此周一会接续周五最后的状态。周末不请求 Trading 212；节假日或无新报价不会产生告警。凭证经 `TRADING212_CREDENTIAL_ENCRYPTION_KEY` 加密后落库，页面永不回显原文。
 
 #### AI Market Intelligence（多用户登录后）
 
@@ -76,6 +77,7 @@ Multi-user Streamlit (authenticated users)
                          |
                          v
               Report Worker -> SMTP / LLM / Search
+              Trading 212 Monitor Worker -> Trading 212 / Telegram
 ```
 
 关键文件：
@@ -90,6 +92,8 @@ short_term_watchlist.py            短线指标、VWAP 与内嵌 SVG sparkline
 kline_indicators.py                可配置 K 线指标
 kline_fibonacci.py                 Auto Fibonacci 计算与覆盖层
 daily_report/                      股票日报、组合报告、任务队列、邮件与 Worker
+trading212_monitor.py              账户隔离的加密凭证、分钟快照、告警状态与 Trading 212/Telegram 客户端
+trading212_monitor_worker.py       独立的单写入持仓监控 Worker
 portfolio_analysis/                组合快照、风险指标与建议验证
 deploy/                            Worker 部署辅助文件
 tests/                             pytest 测试
@@ -222,6 +226,9 @@ python app_tkinter.py
 
 # Terminal 3: required for queued email jobs and weekly schedules
 python -m daily_report.worker
+
+# Terminal 4: optional, required for Trading 212 Telegram monitoring
+python -m trading212_monitor_worker
 ```
 
 健康检查：
@@ -240,6 +247,7 @@ Invoke-RestMethod http://127.0.0.1:5000/api/health
 
 - 生产环境使用独立 Flask 服务，设置 `STOCK_DEV_MODE=0`，并让 Streamlit 通过 `STOCK_API_BASE_URL` 访问它。
 - 将 Streamlit、Flask API 和 `daily_report.worker` 作为独立 systemd 服务运行；Worker 不应以 root 运行。
+- 启用 Trading 212 监控前，生成并安全保存 `TRADING212_CREDENTIAL_ENCRYPTION_KEY`；安装 `deploy/stock-watchlist-trading212-monitor.service`，该服务同样以 `stockwatch` 非 root 用户运行。Trading 212 API Key 应限制为只读权限，并在 Trading 212 中限制为服务器公网 IP。
 - 先备份服务器 `.env`，再通过安全通道覆盖；权限建议为 `600`。
 - 更新代码后安装 requirements、执行编译检查，再重启服务。服务名取决于你的部署；示例系统可使用 `stock-watchlist-api.service`、`stock-watchlist.service` 和 `stock-watchlist-report-worker.service`。
 
@@ -248,7 +256,19 @@ cd /opt/Stock_watch_list
 git pull --ff-only origin main
 ./venv/bin/python -m pip install -r requirements.txt
 ./venv/bin/python -m py_compile app_streamlit_multiuser.py stock_watch_list_back_end.py
-sudo systemctl restart stock-watchlist-api.service stock-watchlist.service stock-watchlist-report-worker.service
+sudo systemctl restart stock-watchlist-api.service stock-watchlist.service stock-watchlist-report-worker.service stock-watchlist-trading212-monitor.service
+```
+
+首次启用 Trading 212 监控时，在服务器 `.env` 设置一把稳定的加密主密钥，然后安装并启动独立服务：
+
+```bash
+cd /opt/Stock_watch_list
+./venv/bin/python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# 将上一行输出粘贴为 .env 中的 TRADING212_CREDENTIAL_ENCRYPTION_KEY=...，不要更换或提交此值。
+sudo cp deploy/stock-watchlist-trading212-monitor.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now stock-watchlist-trading212-monitor.service
+sudo systemctl status stock-watchlist-trading212-monitor.service --no-pager
 ```
 
 ### 数据、缓存与刷新
@@ -323,6 +343,7 @@ The default history request is two days. The request window scales automatically
 - **DCA Backtest** simulates equal-weight recurring contributions across the current portfolio tickers and compares the resulting cumulative-contribution return with `SPY` and `QQQ` DCA curves in Plotly. Their adjusted ETF closes include reinvested distributions. Choose any available historical start/end date, monthly purchases on the first or third Friday, or weekly Friday purchases. The selected daily range is downloaded directly from yfinance and is not written to SQLite; only the same-parameter browser response is cached briefly. If a short range contains no regular DCA date, one initial contribution is made on the selected start date. Each contribution is dynamically reweighted across holdings that already have usable history and can trade, so a later IPO does not consume cash and joins on its next eligible contribution. Holidays roll to the next available trading close; triangle markers show each scheduled portfolio contribution (individual local-market fills can be slightly staggered). Adjusted closes are used; fees, taxes, and FX conversion are excluded.
 - The AI Portfolio Report is a deterministic workflow: Python computes weights, concentration, beta, volatility, drawdown, risk contribution, and technical snapshots before a controlled model/search call produces a self-contained HTML report.
 - Download, one-off email, and weekly schedules are supported. Queued work continues in the worker after the browser closes.
+- **Trading 212 Position Monitor** (optional) lets each signed-in user save a read-only Trading 212 API Key/API Secret and Telegram Bot connection. A dedicated worker polls positions once per minute on Europe/Berlin weekdays and sends tiered Telegram alerts for 1m/5m/15m (1/2/5/10%), 30m/60m (2/5/10%), and 4h/24h (5/10%) price moves. A tier fires only on its first crossing and rearms after the move returns inside 80% of that threshold. UTC snapshots live in a dedicated SQLite database and retain the most recent 48 active-monitor hours; weekend retention is frozen so Monday resumes from Friday's final state. Weekends are paused; holidays or unchanged broker prices generate no alerts. Credentials are encrypted at rest with `TRADING212_CREDENTIAL_ENCRYPTION_KEY` and are never rendered back to the browser.
 
 #### AI Market Intelligence
 
@@ -354,6 +375,7 @@ Authenticated multi-user Streamlit
                           |
                           v
                 Report Worker -> SMTP / LLM / Search
+                Trading 212 Monitor Worker -> Trading 212 / Telegram
 ```
 
 ### Installation
@@ -385,6 +407,7 @@ Important settings include:
 - `MARKET_RECAP_*` controls the Market Recap capability in AI Market Intelligence. It uses one tool-free LLM interpretation of deterministic public-market data, shares the existing US daily-price cache, and stores only short-lived global aggregate snapshots—not account-specific recap history or full news articles. The snapshot includes cached US index session ranges and breadth changes, plus available A-share industry and concept rankings. Serper news is queried separately for each selected market, diversified across close/sector/policy themes, filtered by a usable publication date, recency, market relevance, and URL safety; after the first-Friday payrolls release, an actual-results query is added and preview articles are rejected. The selected sources are optionally enriched through the existing SSRF-protected article extractor before they reach the report or LLM. Scheduled delivery runs in Europe/Berlin time and skips sending when neither selected market has a newer completed trading date.
 - `SEARCH_PROVIDER=priority`, `SEARCH_PROVIDER_PRIORITY`, `SERPER_API_KEY`, `ANSPIRE_*`, `SERPAPI_*`, `SEARXNG_*`, and `ARTICLE_FETCH_*` for evidence gathering. `SERPER_API_KEY` and `SERPAPI_API_KEY` belong to different providers.
 - `REPORT_SMTP_*`, `REPORT_*`, and `PORTFOLIO_*` for email, queues, schedules, limits, and Portfolio AI Reports.
+- `TRADING212_CREDENTIAL_ENCRYPTION_KEY`, `TRADING212_MONITOR_*`, and `TELEGRAM_REQUEST_TIMEOUT_SECONDS` for the optional per-account Trading 212 monitor. The encryption key is mandatory before the UI accepts any broker or Telegram secret; preserve it securely because rotating it makes saved secrets undecryptable.
 
 See [`.env.example`](.env.example) for the complete template. Use model names and API keys available to your own provider account.
 
@@ -404,6 +427,9 @@ python app_tkinter.py
 
 # Terminal 3: required for queued email reports and schedules
 python -m daily_report.worker
+
+# Terminal 4: optional, required for Trading 212 Telegram monitoring
+python -m trading212_monitor_worker
 ```
 
 Check the API with `curl -fsS http://127.0.0.1:5000/api/health`.
@@ -411,6 +437,7 @@ Check the API with `curl -fsS http://127.0.0.1:5000/api/health`.
 ### Deployment, caching, and security
 
 - Run Flask, Streamlit, and the report worker as separate services in production. Set `STOCK_DEV_MODE=0`; do not run an internet-facing worker as root.
+- Before enabling Trading 212 monitoring, create and securely retain `TRADING212_CREDENTIAL_ENCRYPTION_KEY`, then install `deploy/stock-watchlist-trading212-monitor.service`. It runs as the same non-root `stockwatch` account. Grant the Trading 212 key read-only permissions and restrict it to the server's public IP in Trading 212.
 - Daily adjusted close and volume data are retained in SQLite `price_cache`. The Streamlit client also keeps a short-lived shared market-data cache.
 - Short-term refresh re-downloads only 5m/15m K-lines. Its 1D% prior-close basis and ticker beta come from the shared daily data, not from each 10/20/30-second refresh.
 - The article fetcher validates URLs and redirects, rejecting loopback, private, link-local, multicast, reserved, and cloud-metadata destinations.
@@ -423,7 +450,19 @@ cd /opt/Stock_watch_list
 git pull --ff-only origin main
 ./venv/bin/python -m pip install -r requirements.txt
 ./venv/bin/python -m py_compile app_streamlit_multiuser.py stock_watch_list_back_end.py
-sudo systemctl restart stock-watchlist-api.service stock-watchlist.service stock-watchlist-report-worker.service
+sudo systemctl restart stock-watchlist-api.service stock-watchlist.service stock-watchlist-report-worker.service stock-watchlist-trading212-monitor.service
+```
+
+To enable Trading 212 monitoring for the first time, create one stable encryption key in the server `.env`, then install its separate worker:
+
+```bash
+cd /opt/Stock_watch_list
+./venv/bin/python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# Put the output in .env as TRADING212_CREDENTIAL_ENCRYPTION_KEY=... . Do not rotate or commit it.
+sudo cp deploy/stock-watchlist-trading212-monitor.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now stock-watchlist-trading212-monitor.service
+sudo systemctl status stock-watchlist-trading212-monitor.service --no-pager
 ```
 
 ### Tests

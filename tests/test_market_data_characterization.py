@@ -367,7 +367,8 @@ class TestMarketDataService:
     def test_no_flask_dependency(self):
         """MarketDataService module should not import Flask."""
         import market_data_service
-        source = open(market_data_service.__file__).read()
+        # Source files are UTF-8 regardless of the Windows console code page.
+        source = open(market_data_service.__file__, encoding="utf-8").read()
         # Check for actual import statements, not mentions in docstrings
         import_lines = [
             line.strip() for line in source.splitlines()
