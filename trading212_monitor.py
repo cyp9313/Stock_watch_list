@@ -12,12 +12,15 @@ import datetime as dt
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 import requests
 from cryptography.fernet import Fernet, InvalidToken
+
+from ticker_mapping import normalize_yfinance_ticker
 
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -36,6 +39,22 @@ THRESHOLDS_BY_WINDOW = {
     1440: (5.0, 10.0),
 }
 REARM_RATIO = 0.80
+EMA_PERIODS = (20, 50, 100, 200, 250)
+MACD_FAST_PERIOD = 12
+MACD_SLOW_PERIOD = 26
+MACD_SIGNAL_PERIOD = 9
+RSI_PERIOD = 14
+RSI_ALERT_LEVELS = (30.0, 70.0)
+
+# Trading 212 position tickers commonly use ``SYMBOL_MARKET_EQ``.  This map
+# deliberately covers the exchange tags that have an unambiguous yfinance
+# suffix.  Other symbols remain safely unmapped instead of guessing a listing.
+T212_MARKET_TO_YF_SUFFIX = {
+    "US": "", "L": ".L", "LSE": ".L", "DE": ".DE", "F": ".F",
+    "PA": ".PA", "AS": ".AS", "BR": ".BR", "MI": ".MI", "SW": ".SW",
+    "ST": ".ST", "CO": ".CO", "HE": ".HE", "OL": ".OL", "MC": ".MC",
+    "LS": ".LS", "HK": ".HK", "KS": ".KS", "KQ": ".KQ",
+}
 
 
 class MonitorConfigurationError(ValueError):
@@ -150,6 +169,54 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS instrument_mappings (
+            position_key TEXT PRIMARY KEY,
+            trading212_ticker TEXT NOT NULL,
+            display_name TEXT,
+            isin TEXT,
+            exchange_code TEXT,
+            currency TEXT,
+            yfinance_ticker TEXT,
+            mapping_status TEXT NOT NULL DEFAULT 'pending',
+            mapping_source TEXT,
+            last_history_check_date TEXT,
+            last_history_date TEXT,
+            last_error TEXT,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS daily_price_history (
+            yfinance_ticker TEXT NOT NULL,
+            trading_date TEXT NOT NULL,
+            close_price REAL NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(yfinance_ticker, trading_date)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS technical_signal_state (
+            user_id INTEGER NOT NULL,
+            position_key TEXT NOT NULL,
+            signal_key TEXT NOT NULL,
+            last_value REAL NOT NULL,
+            last_side TEXT,
+            last_observed_at TEXT NOT NULL,
+            last_triggered_at TEXT,
+            PRIMARY KEY(user_id, position_key, signal_key)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_daily_price_history_ticker_date "
+        "ON daily_price_history(yfinance_ticker, trading_date DESC)"
+    )
 
 
 def _fernet() -> Fernet:
@@ -183,6 +250,11 @@ def default_alert_policy() -> dict[str, Any]:
         "thresholds": {
             str(minutes): list(values) for minutes, values in THRESHOLDS_BY_WINDOW.items()
         },
+        "technical": {
+            "ema_crosses": True,
+            "macd_crosses": True,
+            "rsi_levels": True,
+        },
     }
 
 
@@ -191,6 +263,7 @@ def normalize_alert_policy(raw: Any) -> dict[str, Any]:
     raw = raw if isinstance(raw, dict) else {}
     raw_windows = raw.get("windows") if isinstance(raw.get("windows"), dict) else {}
     raw_thresholds = raw.get("thresholds") if isinstance(raw.get("thresholds"), dict) else {}
+    raw_technical = raw.get("technical") if isinstance(raw.get("technical"), dict) else {}
     windows: dict[str, bool] = {}
     thresholds: dict[str, list[float]] = {}
     for minutes in WINDOWS_MINUTES:
@@ -209,7 +282,11 @@ def normalize_alert_policy(raw: Any) -> dict[str, Any]:
             if numeric in permitted and numeric not in cleaned:
                 cleaned.append(numeric)
         thresholds[key] = sorted(cleaned)
-    return {"windows": windows, "thresholds": thresholds}
+    technical = {
+        key: bool(raw_technical.get(key, defaults["technical"][key]))
+        for key in defaults["technical"]
+    }
+    return {"windows": windows, "thresholds": thresholds, "technical": technical}
 
 
 def _safe_error(exc: Exception | str) -> str:
@@ -407,10 +484,238 @@ def _position_from_api(raw: dict[str, Any]) -> dict[str, Any] | None:
         "ticker": ticker,
         "display_name": str(instrument.get("name") or ticker)[:200],
         "currency": str(instrument.get("currency") or impact.get("currency") or "").upper()[:12],
+        "isin": str(instrument.get("isin") or raw.get("isin") or "").upper()[:32],
+        "exchange_code": str(instrument.get("exchange") or raw.get("exchange") or "").upper()[:32],
         "current_price": price,
         "quantity": quantity,
         "current_value": current_value,
     }
+
+
+def _t212_yfinance_candidates(position: dict[str, Any]) -> list[str]:
+    """Generate conservative, ordered yfinance candidates for a T212 position."""
+    raw = str(position.get("ticker") or "").strip().upper()
+    if not raw:
+        return []
+    candidates: list[str] = []
+    match = re.fullmatch(r"(.+)_([A-Z0-9]+)_(?:EQ|ETF)", raw)
+    if match:
+        symbol, market = match.groups()
+        suffix = T212_MARKET_TO_YF_SUFFIX.get(market)
+        if suffix is not None:
+            candidates.append(f"{symbol}{suffix}")
+            # A suffix-less fallback is only safe for the US listing. For an
+            # unknown venue it could silently select a different company.
+            if market == "US":
+                candidates.append(symbol)
+    candidates.append(raw)
+    exchange = str(position.get("exchange_code") or "").upper()
+    symbol = match.group(1) if match else raw
+    suffix = T212_MARKET_TO_YF_SUFFIX.get(exchange)
+    if suffix is not None:
+        candidates.insert(0, f"{symbol}{suffix}")
+
+    normalized: list[str] = []
+    for candidate in candidates:
+        ticker = normalize_yfinance_ticker(candidate)
+        if ticker and ticker not in normalized:
+            normalized.append(ticker)
+    return normalized
+
+
+def _download_yfinance_daily_history(yfinance_ticker: str, end_date: dt.date) -> list[tuple[str, float]]:
+    """Download up to two years of completed daily closes, excluding ``end_date``."""
+    try:
+        import yfinance as yf
+    except ImportError as exc:  # pragma: no cover - dependency is production-required
+        raise Trading212APIError("yfinance is not installed for technical monitoring.") from exc
+    try:
+        frame = yf.Ticker(yfinance_ticker).history(
+            period="2y",
+            end=end_date.isoformat(),
+            auto_adjust=False,
+            actions=False,
+        )
+    except Exception as exc:
+        raise Trading212APIError(f"yfinance daily history failed for {yfinance_ticker}: {type(exc).__name__}") from exc
+    if frame is None or frame.empty or "Close" not in frame:
+        return []
+    rows: list[tuple[str, float]] = []
+    for index, value in frame["Close"].items():
+        try:
+            close = float(value)
+            trade_date = index.date().isoformat()
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if close > 0 and trade_date < end_date.isoformat():
+            rows.append((trade_date, close))
+    return rows
+
+
+def _upsert_mapping(conn: sqlite3.Connection, position: dict[str, Any], **updates: Any) -> None:
+    existing = conn.execute(
+        "SELECT * FROM instrument_mappings WHERE position_key=?", (position["position_key"],)
+    ).fetchone()
+    data = dict(existing) if existing else {}
+    data.update(updates)
+    now = _iso(_now())
+    conn.execute(
+        """
+        INSERT INTO instrument_mappings(
+            position_key, trading212_ticker, display_name, isin, exchange_code, currency,
+            yfinance_ticker, mapping_status, mapping_source, last_history_check_date,
+            last_history_date, last_error, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(position_key) DO UPDATE SET
+            trading212_ticker=excluded.trading212_ticker, display_name=excluded.display_name,
+            isin=excluded.isin, exchange_code=excluded.exchange_code, currency=excluded.currency,
+            yfinance_ticker=excluded.yfinance_ticker, mapping_status=excluded.mapping_status,
+            mapping_source=excluded.mapping_source, last_history_check_date=excluded.last_history_check_date,
+            last_history_date=excluded.last_history_date, last_error=excluded.last_error,
+            updated_at=excluded.updated_at
+        """,
+        (
+            position["position_key"], position["ticker"], position.get("display_name") or "",
+            position.get("isin") or "", position.get("exchange_code") or "", position.get("currency") or "",
+            data.get("yfinance_ticker"), data.get("mapping_status", "pending"), data.get("mapping_source"),
+            data.get("last_history_check_date"), data.get("last_history_date"), data.get("last_error"), now,
+        ),
+    )
+
+
+def _cached_daily_closes(conn: sqlite3.Connection, yfinance_ticker: str) -> list[float]:
+    rows = conn.execute(
+        "SELECT close_price FROM daily_price_history WHERE yfinance_ticker=? ORDER BY trading_date ASC",
+        (yfinance_ticker,),
+    ).fetchall()
+    return [float(row[0]) for row in rows if float(row[0]) > 0]
+
+
+def _history_refresh_key(now: dt.datetime) -> tuple[str, dt.date]:
+    """Choose a safe daily-history cutoff without accepting an open US session.
+
+    The broker worker runs in Berlin time while a position can be listed in a
+    different market. Before 06:00 Berlin we deliberately exclude the prior
+    calendar day: that prevents a still-open US session from being mistaken for
+    a completed yfinance daily bar. A newly seen holding may be fetched at
+    that safe cutoff immediately; the normal daily refresh will then happen
+    after 06:00 Berlin.
+    """
+    local = now.astimezone(BERLIN_TZ)
+    today = local.date()
+    if local.hour < 6:
+        return (f"{today.isoformat()}:preclose", today - dt.timedelta(days=1))
+    return (today.isoformat(), today)
+
+
+def _ensure_daily_history(
+    conn: sqlite3.Connection,
+    position: dict[str, Any],
+    now: dt.datetime,
+    *,
+    history_fetcher: Callable[[str, dt.date], list[tuple[str, float]]] = _download_yfinance_daily_history,
+) -> tuple[str | None, list[float], str | None]:
+    """Return completed daily closes, updating a ticker at most once per Berlin day."""
+    mapping = conn.execute(
+        "SELECT * FROM instrument_mappings WHERE position_key=?", (position["position_key"],)
+    ).fetchone()
+    mapping_data = dict(mapping) if mapping else {}
+    yfinance_ticker = str(mapping_data.get("yfinance_ticker") or "").strip()
+    refresh_key, end_date = _history_refresh_key(now)
+    checked_today = str(mapping_data.get("last_history_check_date") or "") == refresh_key
+    if checked_today:
+        if yfinance_ticker:
+            closes = _cached_daily_closes(conn, yfinance_ticker)
+            return yfinance_ticker, closes, None if closes else "daily_history_empty"
+        return None, [], str(mapping_data.get("last_error") or "no_yfinance_candidate")
+    # Existing mappings wait for the normal post-close refresh.  A new holding
+    # (which has no mapped ticker yet) is the documented exception: it may
+    # fetch immediately from the last safe completed-bar cutoff.
+    if yfinance_ticker and now.astimezone(BERLIN_TZ).hour < 6:
+        closes = _cached_daily_closes(conn, yfinance_ticker)
+        if closes:
+            return yfinance_ticker, closes, None
+
+    candidates = [yfinance_ticker] if yfinance_ticker else _t212_yfinance_candidates(position)
+    candidates = [candidate for candidate in candidates if candidate]
+    last_error = "no_yfinance_candidate" if not candidates else "daily_history_unavailable"
+    for candidate in candidates:
+        try:
+            rows = history_fetcher(candidate, end_date)
+        except Exception as exc:
+            last_error = _safe_error(exc)
+            continue
+        if not rows:
+            last_error = "daily_history_empty"
+            continue
+        conn.execute("DELETE FROM daily_price_history WHERE yfinance_ticker=?", (candidate,))
+        conn.executemany(
+            "INSERT INTO daily_price_history(yfinance_ticker, trading_date, close_price, updated_at) VALUES (?, ?, ?, ?)",
+            [(candidate, trade_date, close, _iso(now)) for trade_date, close in rows],
+        )
+        _upsert_mapping(
+            conn, position, yfinance_ticker=candidate, mapping_status="mapped",
+            mapping_source="cached" if yfinance_ticker else "trading212_ticker_candidate",
+            last_history_check_date=refresh_key, last_history_date=rows[-1][0], last_error=None,
+        )
+        return candidate, [close for _, close in rows], None
+
+    _upsert_mapping(
+        conn, position, yfinance_ticker=yfinance_ticker or None, mapping_status="unmapped",
+        mapping_source=None, last_history_check_date=refresh_key, last_history_date=mapping_data.get("last_history_date"),
+        last_error=last_error,
+    )
+    return None, [], last_error
+
+
+def _ema_series(values: list[float], period: int) -> list[float]:
+    if not values:
+        return []
+    alpha = 2.0 / (period + 1.0)
+    result = [float(values[0])]
+    for value in values[1:]:
+        result.append(alpha * float(value) + (1.0 - alpha) * result[-1])
+    return result
+
+
+def _rsi_series(values: list[float], period: int = RSI_PERIOD) -> list[float | None]:
+    output: list[float | None] = [None] * len(values)
+    if len(values) <= period:
+        return output
+    gains = [max(0.0, values[i] - values[i - 1]) for i in range(1, len(values))]
+    losses = [max(0.0, values[i - 1] - values[i]) for i in range(1, len(values))]
+    average_gain = sum(gains[:period]) / period
+    average_loss = sum(losses[:period]) / period
+    def rsi() -> float:
+        if average_loss == 0:
+            return 100.0
+        rs = average_gain / average_loss
+        return 100.0 - 100.0 / (1.0 + rs)
+    output[period] = rsi()
+    for index in range(period, len(gains)):
+        average_gain = (average_gain * (period - 1) + gains[index]) / period
+        average_loss = (average_loss * (period - 1) + losses[index]) / period
+        output[index + 1] = rsi()
+    return output
+
+
+def _technical_values(daily_closes: list[float], live_price: float) -> dict[str, float]:
+    """Calculate daily indicators with T212's latest price as today's temporary close."""
+    values = [*daily_closes, float(live_price)]
+    result: dict[str, float] = {}
+    for period in EMA_PERIODS:
+        if len(daily_closes) >= period:
+            result[f"ema_{period}"] = _ema_series(values, period)[-1]
+    if len(daily_closes) >= MACD_SLOW_PERIOD + MACD_SIGNAL_PERIOD:
+        fast = _ema_series(values, MACD_FAST_PERIOD)
+        slow = _ema_series(values, MACD_SLOW_PERIOD)
+        macd = [a - b for a, b in zip(fast, slow)]
+        signal = _ema_series(macd, MACD_SIGNAL_PERIOD)
+        result["macd_diff"] = macd[-1] - signal[-1]
+    rsi = _rsi_series(values)
+    if rsi[-1] is not None:
+        result["rsi_14"] = float(rsi[-1])
+    return result
 
 
 def _monitor_clock(value: dt.datetime) -> int:
@@ -503,9 +808,128 @@ def _evaluate_alerts(
     return events
 
 
+def _technical_state_event(
+    conn: sqlite3.Connection,
+    *,
+    user_id: int,
+    position: dict[str, Any],
+    signal_key: str,
+    current_value: float,
+    current_side: str | None,
+    now: dt.datetime,
+    event_kind: str,
+    direction: str,
+    detail: str,
+) -> dict[str, Any] | None:
+    """Persist a technical observation and emit only on a genuine state cross."""
+    state = conn.execute(
+        "SELECT last_value, last_side, last_triggered_at FROM technical_signal_state WHERE user_id=? AND position_key=? AND signal_key=?",
+        (int(user_id), position["position_key"], signal_key),
+    ).fetchone()
+    previous_side = str(state["last_side"] or "") if state is not None else ""
+    crossed = bool(state is not None and previous_side and previous_side != str(current_side or ""))
+    conn.execute(
+        """
+        INSERT INTO technical_signal_state(
+            user_id, position_key, signal_key, last_value, last_side, last_observed_at, last_triggered_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, position_key, signal_key) DO UPDATE SET
+            last_value=excluded.last_value, last_side=excluded.last_side,
+            last_observed_at=excluded.last_observed_at, last_triggered_at=excluded.last_triggered_at
+        """,
+        (
+            int(user_id), position["position_key"], signal_key, float(current_value), current_side,
+            _iso(now), _iso(now) if crossed else (state["last_triggered_at"] if state is not None else None),
+        ),
+    )
+    if not crossed:
+        return None
+    return {
+        **position,
+        "event_type": "technical",
+        "technical_kind": event_kind,
+        "signal_key": signal_key,
+        "direction": direction,
+        "technical_value": float(current_value),
+        "previous_value": float(state["last_value"]),
+        "detail": detail,
+    }
+
+
+def _evaluate_technical_alerts(
+    conn: sqlite3.Connection,
+    user_id: int,
+    position: dict[str, Any],
+    daily_closes: list[float],
+    now: dt.datetime,
+    policy: dict[str, Any],
+) -> list[dict[str, Any]]:
+    technical = policy.get("technical", {})
+    if not any(bool(technical.get(key)) for key in ("ema_crosses", "macd_crosses", "rsi_levels")):
+        return []
+    values = _technical_values(daily_closes, float(position["current_price"]))
+    events: list[dict[str, Any]] = []
+    if technical.get("ema_crosses"):
+        for period in EMA_PERIODS:
+            ema = values.get(f"ema_{period}")
+            if ema is None:
+                continue
+            distance = float(position["current_price"]) - ema
+            side = "above" if distance > 0 else "below"
+            direction = "up" if side == "above" else "down"
+            event = _technical_state_event(
+                conn, user_id=user_id, position=position, signal_key=f"ema_{period}",
+                current_value=distance, current_side=side, now=now, event_kind="ema_cross",
+                direction=direction,
+                detail=f"Price {position['current_price']:.4g} crossed {'above' if direction == 'up' else 'below'} EMA{period} {ema:.4g}",
+            )
+            if event:
+                event["reference_value"] = ema
+                events.append(event)
+    if technical.get("macd_crosses") and "macd_diff" in values:
+        macd_diff = values["macd_diff"]
+        side = "positive" if macd_diff > 0 else "negative"
+        direction = "golden" if side == "positive" else "death"
+        event = _technical_state_event(
+            conn, user_id=user_id, position=position, signal_key="macd_diff", current_value=macd_diff,
+            current_side=side, now=now, event_kind="macd_cross", direction=direction,
+            detail=f"Daily MACD {'golden cross' if direction == 'golden' else 'death cross'} (Diff {macd_diff:+.4g})",
+        )
+        if event:
+            events.append(event)
+    if technical.get("rsi_levels") and "rsi_14" in values:
+        rsi = values["rsi_14"]
+        for level in RSI_ALERT_LEVELS:
+            side = "above" if rsi >= level else "below"
+            direction = "up" if side == "above" else "down"
+            event = _technical_state_event(
+                conn, user_id=user_id, position=position, signal_key=f"rsi_{int(level)}", current_value=rsi,
+                current_side=side, now=now, event_kind="rsi_level_cross", direction=direction,
+                detail=f"Daily RSI(14) {rsi:.1f} crossed {'above' if direction == 'up' else 'below'} {int(level)}",
+            )
+            if event:
+                event["reference_value"] = level
+                events.append(event)
+    return events
+
+
 def _telegram_message(events: list[dict[str, Any]], now: dt.datetime) -> str:
     lines = [f"Trading 212 position alert · {now.astimezone(BERLIN_TZ):%Y-%m-%d %H:%M %Z}"]
     for event in events:
+        if event.get("event_type") == "technical":
+            if event["technical_kind"] == "ema_cross":
+                arrow = "▲" if event["direction"] == "up" else "▼"
+                lines.append(
+                    f"{arrow} {event['ticker']} · {event['detail']} · live {event['current_price']:.4g} "
+                    f"{event.get('currency') or ''}"
+                )
+            elif event["technical_kind"] == "macd_cross":
+                icon = "🟢" if event["direction"] == "golden" else "🔴"
+                lines.append(f"{icon} {event['ticker']} · {event['detail']} · live {event['current_price']:.4g} {event.get('currency') or ''}")
+            else:
+                arrow = "▲" if event["direction"] == "up" else "▼"
+                lines.append(f"{arrow} {event['ticker']} · {event['detail']} · live {event['current_price']:.4g} {event.get('currency') or ''}")
+            continue
         window = "4h" if event["window_minutes"] == 240 else "24h" if event["window_minutes"] == 1440 else f"{event['window_minutes']}m"
         arrow = "▲" if event["direction"] == "up" else "▼"
         resumed = " · resumed after pause" if event.get("resumed_after_pause") else ""
@@ -578,6 +1002,7 @@ def prune_expired_snapshots(*, path: Path | None = None, now: dt.datetime | None
 def run_account_monitor(
     user_id: int, *, path: Path | None = None, now: dt.datetime | None = None,
     request_get: Callable[..., Any] = requests.get, request_post: Callable[..., Any] = requests.post,
+    history_fetcher: Callable[[str, dt.date], list[tuple[str, float]]] = _download_yfinance_daily_history,
 ) -> dict[str, Any]:
     """Fetch, retain and evaluate one enabled account. Never leaks credentials."""
     current_time = (now or _now()).astimezone(UTC).replace(microsecond=0)
@@ -598,6 +1023,24 @@ def run_account_monitor(
         )]
         positions = [item for item in positions if item is not None]
         policy = normalize_alert_policy(json.loads(row["alert_policy_json"] or "{}"))
+        technical_enabled = any(
+            bool(policy["technical"].get(key))
+            for key in ("ema_crosses", "macd_crosses", "rsi_levels")
+        )
+        # yfinance is intentionally called outside the alert transaction. It
+        # is a once-daily completed-bar cache refresh, not a minute-by-minute
+        # dependency; movement alerts keep working if a symbol cannot map.
+        histories: dict[str, list[float]] = {}
+        technical_unavailable: dict[str, str] = {}
+        if technical_enabled:
+            for position in positions:
+                _yf_ticker, closes, error = _ensure_daily_history(
+                    conn, position, current_time, history_fetcher=history_fetcher,
+                )
+                if closes:
+                    histories[position["position_key"]] = closes
+                elif error:
+                    technical_unavailable[position["ticker"]] = error
         conn.execute("BEGIN IMMEDIATE")
         try:
             events: list[dict[str, Any]] = []
@@ -616,6 +1059,13 @@ def run_account_monitor(
                     ),
                 )
                 events.extend(_evaluate_alerts(conn, int(user_id), position, current_time, policy))
+                daily_closes = histories.get(position["position_key"])
+                if daily_closes:
+                    events.extend(
+                        _evaluate_technical_alerts(
+                            conn, int(user_id), position, daily_closes, current_time, policy,
+                        )
+                    )
             cutoff_clock = _monitor_clock(current_time) - 48 * 3_600
             conn.execute(
                 "DELETE FROM position_snapshots WHERE user_id=? AND monitor_clock IS NOT NULL AND monitor_clock < ?",
@@ -635,7 +1085,10 @@ def run_account_monitor(
         except Exception:
             conn.execute("ROLLBACK")
             raise
-        return {"status": "ok", "positions": len(positions), "events": events}
+        return {
+            "status": "ok", "positions": len(positions), "events": events,
+            "technical_unavailable": technical_unavailable,
+        }
     except (MonitorConfigurationError, Trading212APIError) as exc:
         try:
             _write_account_status(conn, int(user_id), success=False, error=str(exc))

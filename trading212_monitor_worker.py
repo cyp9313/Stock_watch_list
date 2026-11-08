@@ -32,8 +32,13 @@ def main() -> None:
             active = len(results)
             failures = sum(result.get("status") == "error" for result in results)
             sent = sum(len(result.get("events") or []) for result in results)
+            technical_unavailable = sum(len(result.get("technical_unavailable") or {}) for result in results)
             if active:
-                print(f"[Trading212Monitor] accounts={active}, alerts={sent}, failures={failures}", flush=True)
+                print(
+                    f"[Trading212Monitor] accounts={active}, alerts={sent}, "
+                    f"technical_unavailable={technical_unavailable}, failures={failures}",
+                    flush=True,
+                )
             time.sleep(poll_seconds)
     except KeyboardInterrupt:
         print("[Trading212Monitor] stopped", flush=True)

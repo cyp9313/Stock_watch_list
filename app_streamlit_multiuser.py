@@ -5077,6 +5077,10 @@ def render_trading212_monitor_settings(user):
         "A dedicated read-only worker checks configured positions once per minute on Berlin weekdays, "
         "keeps the latest 48 active-monitor hours of snapshots (weekends frozen), and sends Telegram alerts when a selected move threshold is crossed."
     )
+    st.caption(
+        "Technical alerts use up to two years of completed yfinance daily closes plus the latest Trading 212 price as a temporary current-day close. "
+        "Daily history is refreshed at most once per day; yfinance intraday bars are never used."
+    )
     try:
         status = get_monitor_status(user["id"])
     except MonitorConfigurationError as exc:
@@ -5128,7 +5132,7 @@ def render_trading212_monitor_settings(user):
                 )
             st.markdown("##### Alert windows and tiers")
             st.caption("A threshold alerts once on first crossing. It rearms after the move falls below 80% of that threshold.")
-            updated_policy = {"windows": {}, "thresholds": {}}
+            updated_policy = {"windows": {}, "thresholds": {}, "technical": {}}
             for group_index, minute_group in enumerate(((1, 5, 15), (30, 60), (240, 1440))):
                 cols = st.columns(len(minute_group))
                 for col, minutes in zip(cols, minute_group):
@@ -5145,6 +5149,30 @@ def render_trading212_monitor_settings(user):
                             default=policy["thresholds"].get(policy_key, list(THRESHOLDS_BY_WINDOW[minutes])),
                             key=f"trading212_thresholds_{user['id']}_{minutes}",
                         )
+            st.markdown("##### Daily technical alerts")
+            st.caption(
+                "Signals are evaluated every minute with the live Trading 212 price. RSI alerts only trigger when RSI(14) crosses up or down through 30 or 70. "
+                "The first successful observation establishes a baseline and does not alert."
+            )
+            technical_cols = st.columns(3)
+            with technical_cols[0]:
+                updated_policy["technical"]["ema_crosses"] = st.checkbox(
+                    "Alert on EMA 20/50/100/200/250 crosses",
+                    value=bool(policy["technical"].get("ema_crosses")),
+                    key=f"trading212_technical_ema_{user['id']}",
+                )
+            with technical_cols[1]:
+                updated_policy["technical"]["macd_crosses"] = st.checkbox(
+                    "Alert on daily MACD golden/death crosses",
+                    value=bool(policy["technical"].get("macd_crosses")),
+                    key=f"trading212_technical_macd_{user['id']}",
+                )
+            with technical_cols[2]:
+                updated_policy["technical"]["rsi_levels"] = st.checkbox(
+                    "Alert on RSI(14) crossings of 30 / 70",
+                    value=bool(policy["technical"].get("rsi_levels")),
+                    key=f"trading212_technical_rsi_{user['id']}",
+                )
             submitted = st.form_submit_button("Save Trading 212 monitor settings")
         if submitted:
             try:
