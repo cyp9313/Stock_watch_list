@@ -98,9 +98,15 @@ if [[ -f "$ENV_FILE" ]]; then
   echo "    Secured .env file"
 fi
 
-# Ensure application code is at least readable by the worker user
-# (world-readable is typical for installed application files)
-chmod -R a+rX "$APP_DIR" 2>/dev/null || true
+# Do not recursively relax permissions under APP_DIR here.  In particular,
+# that would undo the 0600 .env and 0700 data/runs protections above.  A
+# normal deployed checkout is already readable by the dedicated worker; make
+# an actionable failure explicit if that is not the case.
+if ! runuser -u "$WORKER_USER" -- test -r "$APP_DIR/trading212_monitor_worker.py"; then
+  echo "ERROR: $APP_DIR/trading212_monitor_worker.py is not readable by $WORKER_USER." >&2
+  echo "       Grant read/execute access to the application code only; do not relax .env, data/, or daily_report/runs/." >&2
+  exit 1
+fi
 
 echo ""
 echo "==> Setup complete."

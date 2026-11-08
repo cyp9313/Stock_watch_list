@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 SERVICE = Path(__file__).resolve().parent.parent / "deploy" / "stock-watchlist-trading212-monitor.service"
+SETUP_SCRIPT = Path(__file__).resolve().parent.parent / "deploy" / "setup-worker-user.sh"
 
 
 def test_monitor_service_is_hardened_and_non_root():
@@ -26,3 +27,12 @@ def test_monitor_enabled_toggle_has_a_stable_key_and_visible_state_styles():
     assert 'key=f"trading212_monitor_enabled_{user[\'id\']}"' in source
     assert 'st-key-trading212_monitor_enabled_' in source
     assert 'Blue = disabled · Red = enabled.' in source
+
+
+def test_worker_setup_does_not_relax_secret_or_data_permissions():
+    text = SETUP_SCRIPT.read_text(encoding="utf-8")
+    assert 'chmod -R a+rX "$APP_DIR"' not in text
+    assert 'chmod 700 "$DATA_DIR"' in text
+    assert 'chmod 700 "$RUNS_DIR"' in text
+    assert 'chmod 600 "$ENV_FILE"' in text
+    assert 'runuser -u "$WORKER_USER" -- test -r "$APP_DIR/trading212_monitor_worker.py"' in text
