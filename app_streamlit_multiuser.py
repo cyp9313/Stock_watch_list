@@ -93,9 +93,11 @@ from trading212_monitor import (
     THRESHOLDS_BY_WINDOW,
     WINDOWS_MINUTES,
     get_monitor_status,
+    list_position_mappings,
     remove_telegram_credentials,
     remove_trading212_credentials,
     save_monitor_settings,
+    save_yfinance_mapping_override,
     send_telegram_test,
     test_trading212_connection,
 )
@@ -5074,7 +5076,7 @@ def render_trading212_monitor_settings(user):
     st.divider()
     st.markdown("### Trading 212 Position Monitor")
     st.caption(
-        "A dedicated read-only worker checks configured positions once per minute on Berlin weekdays, "
+        "A dedicated read-only worker checks configured positions once per minute from Monday 02:00 through Saturday 02:00 Berlin time, "
         "keeps the latest 48 active-monitor hours of snapshots (weekends frozen), and sends Telegram alerts when a selected move threshold is crossed."
     )
     st.caption(
@@ -5108,7 +5110,7 @@ def render_trading212_monitor_settings(user):
             enabled = st.toggle(
                 "Enable Trading 212 monitoring and Telegram alerts", value=bool(status["enabled"]),
                 key=f"trading212_monitor_enabled_{user['id']}",
-                help="Blue means disabled; red means enabled after saving. A dedicated worker polls once per minute on Berlin weekdays. Credentials stay encrypted in the monitor database.",
+                help="Blue means disabled; red means enabled after saving. A dedicated worker polls once per minute from Monday 02:00 through Saturday 02:00 Berlin time. Credentials stay encrypted in the monitor database.",
             )
             st.caption("Blue = disabled · Red = enabled. Click Save Trading 212 monitor settings to apply this change.")
             credentials_left, credentials_right = st.columns(2)
@@ -5154,25 +5156,38 @@ def render_trading212_monitor_settings(user):
                 "Signals are evaluated every minute with the live Trading 212 price. RSI alerts only trigger when RSI(14) crosses up or down through 30 or 70. "
                 "The first successful observation establishes a baseline and does not alert."
             )
-            technical_cols = st.columns(3)
+            technical_cols = st.columns(2)
             with technical_cols[0]:
                 updated_policy["technical"]["ema_crosses"] = st.checkbox(
                     "Alert on EMA 20/50/100/200/250 crosses",
                     value=bool(policy["technical"].get("ema_crosses")),
                     key=f"trading212_technical_ema_{user['id']}",
                 )
-            with technical_cols[1]:
                 updated_policy["technical"]["macd_crosses"] = st.checkbox(
                     "Alert on daily MACD golden/death crosses",
                     value=bool(policy["technical"].get("macd_crosses")),
                     key=f"trading212_technical_macd_{user['id']}",
                 )
-            with technical_cols[2]:
+            with technical_cols[1]:
                 updated_policy["technical"]["rsi_levels"] = st.checkbox(
                     "Alert on RSI(14) crossings of 30 / 70",
                     value=bool(policy["technical"].get("rsi_levels")),
                     key=f"trading212_technical_rsi_{user['id']}",
                 )
+                updated_policy["technical"]["volume_surge"] = st.checkbox(
+                    "Alert on regular-session volume surge (every 5 minutes)",
+                    value=bool(policy["technical"].get("volume_surge")),
+                    key=f"trading212_technical_volume_{user['id']}",
+                )
+            updated_policy["volume"] = {
+                "relative_ratio_threshold": st.number_input(
+                    "Intraday relative-volume threshold (× expected volume)",
+                    min_value=1.1, max_value=10.0, step=0.1,
+                    value=float(policy["volume"].get("relative_ratio_threshold", 2.0)),
+                    key=f"trading212_volume_ratio_{user['id']}",
+                    help="Alert once per exchange day when cumulative regular-session volume ÷ (20-day average daily volume × elapsed-session fraction) reaches this value. Default 2.0×; the first 30 minutes are ignored.",
+                )
+            }
             submitted = st.form_submit_button("Save Trading 212 monitor settings")
         if submitted:
             try:
@@ -5188,6 +5203,48 @@ def render_trading212_monitor_settings(user):
                 st.rerun()
             except (ValueError, MonitorConfigurationError) as exc:
                 st.error(str(exc))
+
+    with st.expander("Trading 212 → yfinance ticker mappings", expanded=False):
+        st.caption(
+            "Mappings appear after the worker has observed your positions. Automatic mappings use the Trading 212 market suffix and are cached. "
+            "If a mapping is unavailable or wrong, save a manual yfinance ticker here; it is used on the next worker cycle."
+        )
+        mapping_rows = list_position_mappings(user["id"])
+        if not mapping_rows:
+            st.info("No observed positions yet. Enable the monitor and wait for its next successful minute cycle.")
+        else:
+            mapping_frame = pd.DataFrame(mapping_rows).rename(columns={
+                "position_key": "Trading 212 key", "ticker": "Trading 212 ticker", "display_name": "Name",
+                "yfinance_ticker": "yfinance ticker", "mapping_status": "Status",
+                "mapping_source": "Source", "last_history_date": "Latest daily bar", "last_error": "Last error",
+            })
+            visible_mapping_columns = [
+                column for column in (
+                    "Trading 212 ticker", "Name", "yfinance ticker", "Status", "Source", "Latest daily bar", "Last error",
+                ) if column in mapping_frame.columns
+            ]
+            st.dataframe(mapping_frame[visible_mapping_columns], hide_index=True, use_container_width=True)
+            mapping_by_key = {row["position_key"]: row for row in mapping_rows}
+            selected_key = st.selectbox(
+                "Holding to map", list(mapping_by_key),
+                format_func=lambda key: f"{mapping_by_key[key]['ticker']} · {mapping_by_key[key]['display_name']}",
+                key=f"trading212_mapping_target_{user['id']}",
+            )
+            selected_mapping = mapping_by_key[selected_key]
+            with st.form(f"trading212_mapping_override_{user['id']}_{selected_key}"):
+                manual_ticker = st.text_input(
+                    "Manual yfinance ticker",
+                    value=selected_mapping.get("yfinance_ticker") or "",
+                    help="Examples: AAPL, VUSA.L, 0700.HK. This does not expose or change your broker credentials.",
+                )
+                mapping_submitted = st.form_submit_button("Save manual yfinance mapping")
+            if mapping_submitted:
+                try:
+                    save_yfinance_mapping_override(user["id"], selected_key, manual_ticker)
+                    st.success("Manual mapping saved. Daily history will refresh on the worker's next cycle.")
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
 
     test_col, telegram_col, remove_col = st.columns(3)
     with test_col:

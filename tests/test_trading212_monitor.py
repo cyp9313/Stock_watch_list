@@ -37,7 +37,7 @@ def _configure(monkeypatch, path: Path, *, enabled=True, policy=None):
         alert_policy=policy or {
             "windows": {"1": True}, "thresholds": {"1": [1.0]},
             # Existing price-alert tests must not make a live yfinance call.
-            "technical": {"ema_crosses": False, "macd_crosses": False, "rsi_levels": False},
+            "technical": {"ema_crosses": False, "macd_crosses": False, "rsi_levels": False, "volume_surge": False},
         }, path=path,
     )
 
@@ -45,7 +45,7 @@ def _configure(monkeypatch, path: Path, *, enabled=True, policy=None):
 def _completed_daily_history(_ticker, _end_date):
     """Two years is sufficient; 300 synthetic completed bars exercise EMA250."""
     start = dt.date(2025, 1, 1)
-    return [((start + dt.timedelta(days=index)).isoformat(), 100.0) for index in range(300)]
+    return [((start + dt.timedelta(days=index)).isoformat(), 100.0, 1_000.0) for index in range(300)]
 
 
 def test_credentials_are_encrypted_and_status_is_masked(tmp_path, monkeypatch):
@@ -144,8 +144,8 @@ def test_weekend_freeze_keeps_friday_state_as_monday_baseline(tmp_path, monkeypa
     _configure(monkeypatch, path)
     sent = []
     prices = iter((100.0, 101.5))
-    friday_final = dt.datetime(2026, 11, 6, 22, 59, tzinfo=dt.timezone.utc)  # 23:59 Berlin
-    monday_resume = dt.datetime(2026, 11, 8, 23, 0, tzinfo=dt.timezone.utc)  # Monday 00:00 Berlin
+    friday_final = dt.datetime(2026, 11, 7, 0, 59, 30, tzinfo=dt.timezone.utc)  # Saturday 01:59:30 Berlin
+    monday_resume = dt.datetime(2026, 11, 9, 1, 0, tzinfo=dt.timezone.utc)  # Monday 02:00 Berlin
 
     def fake_get(*_args, **_kwargs):
         return _Response(_position(next(prices)))
@@ -252,3 +252,68 @@ def test_unmapped_technical_history_does_not_block_price_monitoring(tmp_path, mo
     )
     assert result["status"] == "ok"
     assert result["technical_unavailable"] == {"AAPL_US_EQ": "daily_history_empty"}
+
+
+def test_trading212_5x24_window_uses_berlin_two_am_boundaries():
+    assert monitor.is_monitoring_window(dt.datetime(2026, 11, 9, 0, 59, tzinfo=dt.timezone.utc)) is False
+    assert monitor.is_monitoring_window(dt.datetime(2026, 11, 9, 1, 0, tzinfo=dt.timezone.utc)) is True
+    assert monitor.is_monitoring_window(dt.datetime(2026, 11, 7, 0, 59, tzinfo=dt.timezone.utc)) is True
+    assert monitor.is_monitoring_window(dt.datetime(2026, 11, 7, 1, 0, tzinfo=dt.timezone.utc)) is False
+
+
+def test_volume_surge_is_cached_for_five_minutes_and_only_alerts_once(tmp_path, monkeypatch):
+    path = tmp_path / "monitor.db"
+    policy = {
+        "windows": {str(minutes): False for minutes in monitor.WINDOWS_MINUTES},
+        "thresholds": {},
+        "technical": {"ema_crosses": False, "macd_crosses": False, "rsi_levels": False, "volume_surge": True},
+        "volume": {"relative_ratio_threshold": 2.0},
+    }
+    _configure(monkeypatch, path, policy=policy)
+    volume_calls = []
+    sent = []
+
+    def fake_get(*_args, **_kwargs):
+        return _Response(_position(100.0))
+
+    def fake_volume(ticker):
+        volume_calls.append(ticker)
+        return 200.0
+
+    def fake_post(*_args, **kwargs):
+        sent.append(kwargs["json"]["text"])
+        return _Response({"ok": True})
+
+    # 10:00 New York: 30 minutes into the US regular session.  With a 1,000
+    # 20-day average, expected cumulative volume is about 77; 200 is a surge.
+    base = dt.datetime(2026, 11, 2, 15, 0, tzinfo=dt.timezone.utc)
+    first = monitor.run_account_monitor(
+        7, path=path, now=base, request_get=fake_get, request_post=fake_post,
+        history_fetcher=_completed_daily_history, volume_fetcher=fake_volume,
+    )
+    assert [event["technical_kind"] for event in first["events"]] == ["volume_surge"]
+    second = monitor.run_account_monitor(
+        7, path=path, now=base + dt.timedelta(minutes=2), request_get=fake_get, request_post=fake_post,
+        history_fetcher=_completed_daily_history, volume_fetcher=fake_volume,
+    )
+    assert second["events"] == []
+    assert volume_calls == ["AAPL"]
+    assert "Regular-session volume" in sent[0]
+
+
+def test_user_can_review_and_override_a_mapping_after_a_position_is_observed(tmp_path, monkeypatch):
+    path = tmp_path / "monitor.db"
+    _configure(monkeypatch, path, policy={
+        "windows": {str(minutes): False for minutes in monitor.WINDOWS_MINUTES},
+        "thresholds": {},
+        "technical": {"ema_crosses": True, "macd_crosses": False, "rsi_levels": False, "volume_surge": False},
+    })
+    monitor.run_account_monitor(
+        7, path=path, now=dt.datetime(2026, 11, 2, 12, tzinfo=dt.timezone.utc),
+        request_get=lambda *_args, **_kwargs: _Response(_position(100.0)),
+        history_fetcher=_completed_daily_history,
+    )
+    mappings = monitor.list_position_mappings(7, path=path)
+    assert mappings[0]["yfinance_ticker"] == "AAPL"
+    monitor.save_yfinance_mapping_override(7, "AAPL_US_EQ", "AAPL", path=path)
+    assert monitor.list_position_mappings(7, path=path)[0]["mapping_source"] == "manual"

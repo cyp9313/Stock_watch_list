@@ -45,6 +45,9 @@ MACD_SLOW_PERIOD = 26
 MACD_SIGNAL_PERIOD = 9
 RSI_PERIOD = 14
 RSI_ALERT_LEVELS = (30.0, 70.0)
+VOLUME_AVERAGE_DAYS = 20
+VOLUME_CHECK_SECONDS = 5 * 60
+VOLUME_SURGE_DEFAULT_RATIO = 2.0
 
 # Trading 212 position tickers commonly use ``SYMBOL_MARKET_EQ``.  This map
 # deliberately covers the exchange tags that have an unambiguous yfinance
@@ -54,6 +57,26 @@ T212_MARKET_TO_YF_SUFFIX = {
     "PA": ".PA", "AS": ".AS", "BR": ".BR", "MI": ".MI", "SW": ".SW",
     "ST": ".ST", "CO": ".CO", "HE": ".HE", "OL": ".OL", "MC": ".MC",
     "LS": ".LS", "HK": ".HK", "KS": ".KS", "KQ": ".KQ",
+}
+
+# Volume is only meaningful while the primary exchange is in its regular
+# session. yfinance's daily volume is not a reliable measure of Trading 212's
+# overnight/extended-hours activity, so those sessions retain price monitoring
+# but deliberately skip volume-surge alerts.
+T212_REGULAR_SESSIONS = {
+    "US": (ZoneInfo("America/New_York"), ((9 * 60 + 30, 16 * 60),)),
+    "L": (ZoneInfo("Europe/London"), ((8 * 60, 16 * 60 + 30),)),
+    "LSE": (ZoneInfo("Europe/London"), ((8 * 60, 16 * 60 + 30),)),
+    "DE": (BERLIN_TZ, ((9 * 60, 17 * 60 + 30),)),
+    "F": (BERLIN_TZ, ((9 * 60, 17 * 60 + 30),)),
+    "PA": (ZoneInfo("Europe/Paris"), ((9 * 60, 17 * 60 + 30),)),
+    "AS": (ZoneInfo("Europe/Amsterdam"), ((9 * 60, 17 * 60 + 30),)),
+    "BR": (ZoneInfo("Europe/Brussels"), ((9 * 60, 17 * 60 + 30),)),
+    "MI": (ZoneInfo("Europe/Rome"), ((9 * 60, 17 * 60 + 30),)),
+    "MC": (ZoneInfo("Europe/Madrid"), ((9 * 60, 17 * 60 + 30),)),
+    "HK": (ZoneInfo("Asia/Hong_Kong"), ((9 * 60 + 30, 12 * 60), (13 * 60, 16 * 60))),
+    "KS": (ZoneInfo("Asia/Seoul"), ((9 * 60, 15 * 60 + 30),)),
+    "KQ": (ZoneInfo("Asia/Seoul"), ((9 * 60, 15 * 60 + 30),)),
 }
 
 
@@ -182,20 +205,51 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             mapping_status TEXT NOT NULL DEFAULT 'pending',
             mapping_source TEXT,
             last_history_check_date TEXT,
+            last_volume_history_check_date TEXT,
             last_history_date TEXT,
             last_error TEXT,
             updated_at TEXT NOT NULL
         )
         """
     )
+    mapping_columns = {row[1] for row in conn.execute("PRAGMA table_info(instrument_mappings)").fetchall()}
+    if "last_volume_history_check_date" not in mapping_columns:
+        conn.execute("ALTER TABLE instrument_mappings ADD COLUMN last_volume_history_check_date TEXT")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS daily_price_history (
             yfinance_ticker TEXT NOT NULL,
             trading_date TEXT NOT NULL,
             close_price REAL NOT NULL,
+            volume REAL,
             updated_at TEXT NOT NULL,
             PRIMARY KEY(yfinance_ticker, trading_date)
+        )
+        """
+    )
+    daily_price_columns = {row[1] for row in conn.execute("PRAGMA table_info(daily_price_history)").fetchall()}
+    if "volume" not in daily_price_columns:
+        conn.execute("ALTER TABLE daily_price_history ADD COLUMN volume REAL")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS intraday_volume_checks (
+            yfinance_ticker TEXT PRIMARY KEY,
+            checked_at TEXT NOT NULL,
+            trading_date TEXT,
+            volume REAL,
+            last_error TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS volume_alert_state (
+            user_id INTEGER NOT NULL,
+            position_key TEXT NOT NULL,
+            trading_date TEXT NOT NULL,
+            ratio REAL NOT NULL,
+            triggered_at TEXT NOT NULL,
+            PRIMARY KEY(user_id, position_key, trading_date)
         )
         """
     )
@@ -254,7 +308,9 @@ def default_alert_policy() -> dict[str, Any]:
             "ema_crosses": True,
             "macd_crosses": True,
             "rsi_levels": True,
+            "volume_surge": True,
         },
+        "volume": {"relative_ratio_threshold": VOLUME_SURGE_DEFAULT_RATIO},
     }
 
 
@@ -264,6 +320,7 @@ def normalize_alert_policy(raw: Any) -> dict[str, Any]:
     raw_windows = raw.get("windows") if isinstance(raw.get("windows"), dict) else {}
     raw_thresholds = raw.get("thresholds") if isinstance(raw.get("thresholds"), dict) else {}
     raw_technical = raw.get("technical") if isinstance(raw.get("technical"), dict) else {}
+    raw_volume = raw.get("volume") if isinstance(raw.get("volume"), dict) else {}
     windows: dict[str, bool] = {}
     thresholds: dict[str, list[float]] = {}
     for minutes in WINDOWS_MINUTES:
@@ -286,7 +343,15 @@ def normalize_alert_policy(raw: Any) -> dict[str, Any]:
         key: bool(raw_technical.get(key, defaults["technical"][key]))
         for key in defaults["technical"]
     }
-    return {"windows": windows, "thresholds": thresholds, "technical": technical}
+    try:
+        volume_ratio = float(raw_volume.get("relative_ratio_threshold", defaults["volume"]["relative_ratio_threshold"]))
+    except (TypeError, ValueError):
+        volume_ratio = defaults["volume"]["relative_ratio_threshold"]
+    volume_ratio = min(10.0, max(1.1, volume_ratio))
+    return {
+        "windows": windows, "thresholds": thresholds, "technical": technical,
+        "volume": {"relative_ratio_threshold": volume_ratio},
+    }
 
 
 def _safe_error(exc: Exception | str) -> str:
@@ -321,6 +386,73 @@ def get_monitor_status(user_id: int, *, path: Path | None = None) -> dict[str, A
         "last_success_at": row["last_success_at"],
         "last_error": row["last_error"],
     }
+
+
+def list_position_mappings(user_id: int, *, path: Path | None = None) -> list[dict[str, Any]]:
+    """Return only the caller's observed holdings and their safe mapping metadata."""
+    conn = _connect(path)
+    try:
+        rows = conn.execute(
+            """
+            WITH latest AS (
+                SELECT position_key, MAX(captured_at) AS captured_at
+                FROM position_snapshots WHERE user_id=? GROUP BY position_key
+            )
+            SELECT s.position_key, s.ticker, s.display_name, s.currency,
+                   m.yfinance_ticker, m.mapping_status, m.mapping_source,
+                   m.last_history_date, m.last_error
+            FROM latest l
+            JOIN position_snapshots s
+              ON s.position_key=l.position_key AND s.captured_at=l.captured_at AND s.user_id=?
+            LEFT JOIN instrument_mappings m ON m.position_key=s.position_key
+            ORDER BY s.ticker COLLATE NOCASE
+            """,
+            (int(user_id), int(user_id)),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(row) for row in rows]
+
+
+def save_yfinance_mapping_override(
+    user_id: int,
+    position_key: str,
+    yfinance_ticker: str,
+    *,
+    path: Path | None = None,
+) -> None:
+    """Save a user-approved mapping only for a holding observed in that account."""
+    normalized = normalize_yfinance_ticker(yfinance_ticker)
+    if not normalized or not re.fullmatch(r"[A-Z0-9.\-]+", normalized):
+        raise ValueError("Enter a valid yfinance ticker, for example AAPL, VUSA.L, or 0700.HK.")
+    conn = _connect(path)
+    try:
+        snapshot = conn.execute(
+            """
+            SELECT position_key, ticker, display_name, currency
+            FROM position_snapshots WHERE user_id=? AND position_key=?
+            ORDER BY captured_at DESC LIMIT 1
+            """,
+            (int(user_id), str(position_key)),
+        ).fetchone()
+        if snapshot is None:
+            raise ValueError("This holding has not been observed for your account yet.")
+        existing = conn.execute(
+            "SELECT isin, exchange_code FROM instrument_mappings WHERE position_key=?", (str(position_key),)
+        ).fetchone()
+        position = {
+            "position_key": snapshot["position_key"], "ticker": snapshot["ticker"],
+            "display_name": snapshot["display_name"], "currency": snapshot["currency"],
+            "isin": existing["isin"] if existing else "",
+            "exchange_code": existing["exchange_code"] if existing else "",
+        }
+        _upsert_mapping(
+            conn, position, yfinance_ticker=normalized, mapping_status="manual",
+            mapping_source="manual", last_history_check_date=None,
+            last_volume_history_check_date=None, last_history_date=None, last_error=None,
+        )
+    finally:
+        conn.close()
 
 
 def save_monitor_settings(
@@ -523,7 +655,7 @@ def _t212_yfinance_candidates(position: dict[str, Any]) -> list[str]:
     return normalized
 
 
-def _download_yfinance_daily_history(yfinance_ticker: str, end_date: dt.date) -> list[tuple[str, float]]:
+def _download_yfinance_daily_history(yfinance_ticker: str, end_date: dt.date) -> list[tuple[str, float, float | None]]:
     """Download up to two years of completed daily closes, excluding ``end_date``."""
     try:
         import yfinance as yf
@@ -540,7 +672,7 @@ def _download_yfinance_daily_history(yfinance_ticker: str, end_date: dt.date) ->
         raise Trading212APIError(f"yfinance daily history failed for {yfinance_ticker}: {type(exc).__name__}") from exc
     if frame is None or frame.empty or "Close" not in frame:
         return []
-    rows: list[tuple[str, float]] = []
+    rows: list[tuple[str, float, float | None]] = []
     for index, value in frame["Close"].items():
         try:
             close = float(value)
@@ -548,7 +680,11 @@ def _download_yfinance_daily_history(yfinance_ticker: str, end_date: dt.date) ->
         except (TypeError, ValueError, AttributeError):
             continue
         if close > 0 and trade_date < end_date.isoformat():
-            rows.append((trade_date, close))
+            try:
+                volume = float(frame.at[index, "Volume"])
+            except (KeyError, TypeError, ValueError):
+                volume = None
+            rows.append((trade_date, close, volume if volume is not None and volume >= 0 else None))
     return rows
 
 
@@ -564,13 +700,14 @@ def _upsert_mapping(conn: sqlite3.Connection, position: dict[str, Any], **update
         INSERT INTO instrument_mappings(
             position_key, trading212_ticker, display_name, isin, exchange_code, currency,
             yfinance_ticker, mapping_status, mapping_source, last_history_check_date,
-            last_history_date, last_error, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            last_volume_history_check_date, last_history_date, last_error, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(position_key) DO UPDATE SET
             trading212_ticker=excluded.trading212_ticker, display_name=excluded.display_name,
             isin=excluded.isin, exchange_code=excluded.exchange_code, currency=excluded.currency,
             yfinance_ticker=excluded.yfinance_ticker, mapping_status=excluded.mapping_status,
             mapping_source=excluded.mapping_source, last_history_check_date=excluded.last_history_check_date,
+            last_volume_history_check_date=excluded.last_volume_history_check_date,
             last_history_date=excluded.last_history_date, last_error=excluded.last_error,
             updated_at=excluded.updated_at
         """,
@@ -578,7 +715,8 @@ def _upsert_mapping(conn: sqlite3.Connection, position: dict[str, Any], **update
             position["position_key"], position["ticker"], position.get("display_name") or "",
             position.get("isin") or "", position.get("exchange_code") or "", position.get("currency") or "",
             data.get("yfinance_ticker"), data.get("mapping_status", "pending"), data.get("mapping_source"),
-            data.get("last_history_check_date"), data.get("last_history_date"), data.get("last_error"), now,
+            data.get("last_history_check_date"), data.get("last_volume_history_check_date"),
+            data.get("last_history_date"), data.get("last_error"), now,
         ),
     )
 
@@ -589,6 +727,116 @@ def _cached_daily_closes(conn: sqlite3.Connection, yfinance_ticker: str) -> list
         (yfinance_ticker,),
     ).fetchall()
     return [float(row[0]) for row in rows if float(row[0]) > 0]
+
+
+def _cached_average_daily_volume(conn: sqlite3.Connection, yfinance_ticker: str) -> float | None:
+    rows = conn.execute(
+        """
+        SELECT volume FROM daily_price_history
+        WHERE yfinance_ticker=? AND volume IS NOT NULL AND volume > 0
+        ORDER BY trading_date DESC LIMIT ?
+        """,
+        (yfinance_ticker, VOLUME_AVERAGE_DAYS),
+    ).fetchall()
+    values = [float(row[0]) for row in rows if row[0] is not None and float(row[0]) > 0]
+    return sum(values) / len(values) if len(values) >= VOLUME_AVERAGE_DAYS else None
+
+
+def _position_market(position: dict[str, Any]) -> str | None:
+    raw = str(position.get("ticker") or "").strip().upper()
+    match = re.fullmatch(r".+_([A-Z0-9]+)_(?:EQ|ETF)", raw)
+    market = match.group(1) if match else str(position.get("exchange_code") or "").strip().upper()
+    return market if market in T212_REGULAR_SESSIONS else None
+
+
+def _regular_session_progress(position: dict[str, Any], now: dt.datetime) -> tuple[str, float] | None:
+    """Return local trade date and completed regular-session fraction, if open."""
+    market = _position_market(position)
+    if not market:
+        return None
+    timezone, sessions = T212_REGULAR_SESSIONS[market]
+    local = now.astimezone(timezone)
+    if local.weekday() >= 5:
+        return None
+    current_minute = local.hour * 60 + local.minute + local.second / 60
+    total_minutes = sum(end - start for start, end in sessions)
+    elapsed = 0.0
+    is_open = False
+    for start, end in sessions:
+        if start <= current_minute < end:
+            elapsed += current_minute - start
+            is_open = True
+            break
+        if current_minute >= end:
+            elapsed += end - start
+    # The first 30 minutes are intentionally ignored: cumulative volume is too
+    # noisy there and can create misleading opening-auction alerts.
+    if not is_open or elapsed < 30 or total_minutes <= 0:
+        return None
+    return local.date().isoformat(), min(1.0, elapsed / total_minutes)
+
+
+def _download_yfinance_current_volume(yfinance_ticker: str) -> float | None:
+    """Read yfinance's current daily cumulative volume, never intraday bars."""
+    try:
+        import yfinance as yf
+    except ImportError as exc:  # pragma: no cover - dependency is production-required
+        raise Trading212APIError("yfinance is not installed for volume monitoring.") from exc
+    try:
+        frame = yf.Ticker(yfinance_ticker).history(
+            period="1d", interval="1d", auto_adjust=False, actions=False,
+        )
+    except Exception as exc:
+        raise Trading212APIError(f"yfinance current volume failed for {yfinance_ticker}: {type(exc).__name__}") from exc
+    if frame is None or frame.empty or "Volume" not in frame:
+        return None
+    try:
+        volume = float(frame["Volume"].iloc[-1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    return volume if volume >= 0 else None
+
+
+def _current_intraday_volume(
+    conn: sqlite3.Connection,
+    position: dict[str, Any],
+    yfinance_ticker: str,
+    now: dt.datetime,
+    *,
+    volume_fetcher: Callable[[str], float | None] = _download_yfinance_current_volume,
+) -> tuple[float | None, float | None, str | None, str | None]:
+    """Return current volume, session fraction and an optional safe error."""
+    session = _regular_session_progress(position, now)
+    if session is None:
+        return None, None, None, None
+    trade_date, fraction = session
+    cached = conn.execute(
+        "SELECT checked_at, trading_date, volume, last_error FROM intraday_volume_checks WHERE yfinance_ticker=?",
+        (yfinance_ticker,),
+    ).fetchone()
+    checked_at = _parse_iso(cached["checked_at"]) if cached else None
+    recent = checked_at is not None and (now - checked_at).total_seconds() < VOLUME_CHECK_SECONDS
+    if cached and recent and cached["trading_date"] == trade_date:
+        return (
+            float(cached["volume"]) if cached["volume"] is not None else None,
+            fraction, trade_date, cached["last_error"],
+        )
+    try:
+        volume = volume_fetcher(yfinance_ticker)
+        error = None if volume is not None else "intraday_volume_unavailable"
+    except Exception as exc:
+        volume, error = None, _safe_error(exc)
+    conn.execute(
+        """
+        INSERT INTO intraday_volume_checks(yfinance_ticker, checked_at, trading_date, volume, last_error)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(yfinance_ticker) DO UPDATE SET
+            checked_at=excluded.checked_at, trading_date=excluded.trading_date,
+            volume=excluded.volume, last_error=excluded.last_error
+        """,
+        (yfinance_ticker, _iso(now), trade_date, volume, error),
+    )
+    return volume, fraction, trade_date, error
 
 
 def _history_refresh_key(now: dt.datetime) -> tuple[str, dt.date]:
@@ -613,7 +861,7 @@ def _ensure_daily_history(
     position: dict[str, Any],
     now: dt.datetime,
     *,
-    history_fetcher: Callable[[str, dt.date], list[tuple[str, float]]] = _download_yfinance_daily_history,
+    history_fetcher: Callable[[str, dt.date], list[tuple[Any, ...]]] = _download_yfinance_daily_history,
 ) -> tuple[str | None, list[float], str | None]:
     """Return completed daily closes, updating a ticker at most once per Berlin day."""
     mapping = conn.execute(
@@ -623,11 +871,18 @@ def _ensure_daily_history(
     yfinance_ticker = str(mapping_data.get("yfinance_ticker") or "").strip()
     refresh_key, end_date = _history_refresh_key(now)
     checked_today = str(mapping_data.get("last_history_check_date") or "") == refresh_key
+    volume_checked_today = str(mapping_data.get("last_volume_history_check_date") or "") == refresh_key
     if checked_today:
         if yfinance_ticker:
             closes = _cached_daily_closes(conn, yfinance_ticker)
-            return yfinance_ticker, closes, None if closes else "daily_history_empty"
-        return None, [], str(mapping_data.get("last_error") or "no_yfinance_candidate")
+            # Older monitor databases contain close-only history. Bootstrap
+            # volume columns once without turning every minute into a retry.
+            if closes and (_cached_average_daily_volume(conn, yfinance_ticker) is not None or volume_checked_today):
+                return yfinance_ticker, closes, None
+            if not closes:
+                return yfinance_ticker, closes, "daily_history_empty"
+        if not yfinance_ticker:
+            return None, [], str(mapping_data.get("last_error") or "no_yfinance_candidate")
     # Existing mappings wait for the normal post-close refresh.  A new holding
     # (which has no mapped ticker yet) is the documented exception: it may
     # fetch immediately from the last safe completed-bar cutoff.
@@ -649,20 +904,40 @@ def _ensure_daily_history(
             last_error = "daily_history_empty"
             continue
         conn.execute("DELETE FROM daily_price_history WHERE yfinance_ticker=?", (candidate,))
+        normalized_rows: list[tuple[str, float, float | None]] = []
+        for item in rows:
+            try:
+                trade_date, close = str(item[0]), float(item[1])
+                volume = float(item[2]) if len(item) > 2 and item[2] is not None else None
+            except (IndexError, TypeError, ValueError):
+                continue
+            if close > 0:
+                normalized_rows.append((trade_date, close, volume if volume is None or volume >= 0 else None))
+        if not normalized_rows:
+            last_error = "daily_history_empty"
+            continue
         conn.executemany(
-            "INSERT INTO daily_price_history(yfinance_ticker, trading_date, close_price, updated_at) VALUES (?, ?, ?, ?)",
-            [(candidate, trade_date, close, _iso(now)) for trade_date, close in rows],
+            "INSERT INTO daily_price_history(yfinance_ticker, trading_date, close_price, volume, updated_at) VALUES (?, ?, ?, ?, ?)",
+            [(candidate, trade_date, close, volume, _iso(now)) for trade_date, close, volume in normalized_rows],
         )
         _upsert_mapping(
-            conn, position, yfinance_ticker=candidate, mapping_status="mapped",
-            mapping_source="cached" if yfinance_ticker else "trading212_ticker_candidate",
-            last_history_check_date=refresh_key, last_history_date=rows[-1][0], last_error=None,
+            conn, position, yfinance_ticker=candidate,
+            mapping_status="manual" if mapping_data.get("mapping_source") == "manual" else "mapped",
+            mapping_source="manual" if mapping_data.get("mapping_source") == "manual" else (
+                "cached" if yfinance_ticker else "trading212_ticker_candidate"
+            ),
+            last_history_check_date=refresh_key, last_volume_history_check_date=refresh_key,
+            last_history_date=normalized_rows[-1][0], last_error=None,
         )
-        return candidate, [close for _, close in rows], None
+        return candidate, [close for _, close, _ in normalized_rows], None
 
+    manual = mapping_data.get("mapping_source") == "manual"
     _upsert_mapping(
-        conn, position, yfinance_ticker=yfinance_ticker or None, mapping_status="unmapped",
-        mapping_source=None, last_history_check_date=refresh_key, last_history_date=mapping_data.get("last_history_date"),
+        conn, position, yfinance_ticker=yfinance_ticker or None,
+        mapping_status="manual_error" if manual else "unmapped",
+        mapping_source="manual" if manual else None,
+        last_history_check_date=refresh_key, last_volume_history_check_date=refresh_key,
+        last_history_date=mapping_data.get("last_history_date"),
         last_error=last_error,
     )
     return None, [], last_error
@@ -719,21 +994,27 @@ def _technical_values(daily_closes: list[float], live_price: float) -> dict[str,
 
 
 def _monitor_clock(value: dt.datetime) -> int:
-    """Return a monotonically increasing Berlin weekday-only clock in seconds.
+    """Return a monotonic 5x24 Berlin clock: Mon 02:00 to Sat 02:00.
 
-    Saturday and Sunday are frozen.  The Friday close therefore remains the
-    immediately preceding monitoring state when the worker resumes on Monday.
-    DST changes happen on Sunday in this timezone and consequently do not
-    distort an active weekday interval.
+    The inactive interval is frozen. The Friday/Saturday final state is thus
+    retained until monitoring resumes at Monday 02:00, while daylight-saving
+    changes fall inside the frozen weekend interval.
     """
     local = value.astimezone(BERLIN_TZ)
     epoch_monday = dt.date(1970, 1, 5)
     monday = local.date() - dt.timedelta(days=local.weekday())
     full_weeks = (monday - epoch_monday).days // 7
-    weekday_seconds = min(local.weekday(), 5) * 86_400
-    if local.weekday() < 5:
-        weekday_seconds += local.hour * 3_600 + local.minute * 60 + local.second
-    return full_weeks * 5 * 86_400 + weekday_seconds
+    elapsed = (
+        local.weekday() * 86_400 + local.hour * 3_600 + local.minute * 60 + local.second - 2 * 3_600
+    )
+    active_week_seconds = 5 * 86_400
+    if elapsed < 0:
+        # Monday 00:00-01:59 remains part of the previous frozen weekend.
+        full_weeks -= 1
+        elapsed = active_week_seconds
+    elif elapsed > active_week_seconds:
+        elapsed = active_week_seconds
+    return full_weeks * active_week_seconds + elapsed
 
 
 def _clock_tolerance_seconds(minutes: int) -> int:
@@ -913,6 +1194,61 @@ def _evaluate_technical_alerts(
     return events
 
 
+def _evaluate_volume_surge(
+    conn: sqlite3.Connection,
+    user_id: int,
+    position: dict[str, Any],
+    *,
+    yfinance_ticker: str,
+    current_volume: float | None,
+    session_fraction: float | None,
+    trade_date: str | None,
+    policy: dict[str, Any],
+    now: dt.datetime,
+) -> dict[str, Any] | None:
+    """Alert once per exchange day when cumulative volume is unusually high.
+
+    A ratio of 2.0 means today's cumulative volume is at least twice the
+    expected cumulative volume at this point in the regular session, where the
+    expectation is a 20-completed-day average multiplied by elapsed-session
+    fraction. It avoids comparing 10:00 volume with an entire normal day.
+    """
+    if current_volume is None or session_fraction is None or not trade_date:
+        return None
+    average_volume = _cached_average_daily_volume(conn, yfinance_ticker)
+    if average_volume is None or average_volume <= 0:
+        return None
+    expected_volume = average_volume * session_fraction
+    if expected_volume <= 0:
+        return None
+    ratio = current_volume / expected_volume
+    threshold = float(policy["volume"]["relative_ratio_threshold"])
+    if ratio < threshold:
+        return None
+    existing = conn.execute(
+        "SELECT 1 FROM volume_alert_state WHERE user_id=? AND position_key=? AND trading_date=?",
+        (int(user_id), position["position_key"], trade_date),
+    ).fetchone()
+    if existing is not None:
+        return None
+    conn.execute(
+        "INSERT INTO volume_alert_state(user_id, position_key, trading_date, ratio, triggered_at) VALUES (?, ?, ?, ?, ?)",
+        (int(user_id), position["position_key"], trade_date, ratio, _iso(now)),
+    )
+    return {
+        **position,
+        "event_type": "technical",
+        "technical_kind": "volume_surge",
+        "direction": "up",
+        "technical_value": ratio,
+        "reference_value": threshold,
+        "detail": (
+            f"Regular-session volume {current_volume:,.0f} is {ratio:.2f}x expected "
+            f"({session_fraction:.0%} of session; 20D avg {average_volume:,.0f})"
+        ),
+    }
+
+
 def _telegram_message(events: list[dict[str, Any]], now: dt.datetime) -> str:
     lines = [f"Trading 212 position alert · {now.astimezone(BERLIN_TZ):%Y-%m-%d %H:%M %Z}"]
     for event in events:
@@ -926,6 +1262,8 @@ def _telegram_message(events: list[dict[str, Any]], now: dt.datetime) -> str:
             elif event["technical_kind"] == "macd_cross":
                 icon = "🟢" if event["direction"] == "golden" else "🔴"
                 lines.append(f"{icon} {event['ticker']} · {event['detail']} · live {event['current_price']:.4g} {event.get('currency') or ''}")
+            elif event["technical_kind"] == "volume_surge":
+                lines.append(f"📊 {event['ticker']} · {event['detail']} · live {event['current_price']:.4g} {event.get('currency') or ''}")
             else:
                 arrow = "▲" if event["direction"] == "up" else "▼"
                 lines.append(f"{arrow} {event['ticker']} · {event['detail']} · live {event['current_price']:.4g} {event.get('currency') or ''}")
@@ -970,8 +1308,15 @@ def send_telegram_test(user_id: int, *, path: Path | None = None, request_post: 
 
 
 def is_monitoring_window(now: dt.datetime | None = None) -> bool:
-    """Run Monday-Friday in Berlin time; exchange holidays simply produce no price changes."""
-    return (now or _now()).astimezone(BERLIN_TZ).weekday() < 5
+    """Run Trading 212's 5x24 window: Monday 02:00 through Saturday 02:00 Berlin."""
+    local = (now or _now()).astimezone(BERLIN_TZ)
+    weekday = local.weekday()
+    seconds = local.hour * 3_600 + local.minute * 60 + local.second
+    if weekday == 0:
+        return seconds >= 2 * 3_600
+    if 1 <= weekday <= 4:
+        return True
+    return weekday == 5 and seconds < 2 * 3_600
 
 
 def _write_account_status(conn: sqlite3.Connection, user_id: int, *, success: bool, error: str | None = None) -> None:
@@ -1002,7 +1347,8 @@ def prune_expired_snapshots(*, path: Path | None = None, now: dt.datetime | None
 def run_account_monitor(
     user_id: int, *, path: Path | None = None, now: dt.datetime | None = None,
     request_get: Callable[..., Any] = requests.get, request_post: Callable[..., Any] = requests.post,
-    history_fetcher: Callable[[str, dt.date], list[tuple[str, float]]] = _download_yfinance_daily_history,
+    history_fetcher: Callable[[str, dt.date], list[tuple[Any, ...]]] = _download_yfinance_daily_history,
+    volume_fetcher: Callable[[str], float | None] = _download_yfinance_current_volume,
 ) -> dict[str, Any]:
     """Fetch, retain and evaluate one enabled account. Never leaks credentials."""
     current_time = (now or _now()).astimezone(UTC).replace(microsecond=0)
@@ -1025,22 +1371,37 @@ def run_account_monitor(
         policy = normalize_alert_policy(json.loads(row["alert_policy_json"] or "{}"))
         technical_enabled = any(
             bool(policy["technical"].get(key))
-            for key in ("ema_crosses", "macd_crosses", "rsi_levels")
+            for key in ("ema_crosses", "macd_crosses", "rsi_levels", "volume_surge")
         )
         # yfinance is intentionally called outside the alert transaction. It
         # is a once-daily completed-bar cache refresh, not a minute-by-minute
         # dependency; movement alerts keep working if a symbol cannot map.
         histories: dict[str, list[float]] = {}
+        yfinance_tickers: dict[str, str] = {}
+        intraday_volumes: dict[str, tuple[float | None, float | None, str | None]] = {}
         technical_unavailable: dict[str, str] = {}
         if technical_enabled:
             for position in positions:
-                _yf_ticker, closes, error = _ensure_daily_history(
+                yf_ticker, closes, error = _ensure_daily_history(
                     conn, position, current_time, history_fetcher=history_fetcher,
                 )
                 if closes:
                     histories[position["position_key"]] = closes
-                elif error:
+                if yf_ticker:
+                    yfinance_tickers[position["position_key"]] = yf_ticker
+                if error:
                     technical_unavailable[position["ticker"]] = error
+            if policy["technical"].get("volume_surge"):
+                for position in positions:
+                    yf_ticker = yfinance_tickers.get(position["position_key"])
+                    if not yf_ticker:
+                        continue
+                    volume, fraction, trade_date, error = _current_intraday_volume(
+                        conn, position, yf_ticker, current_time, volume_fetcher=volume_fetcher,
+                    )
+                    intraday_volumes[position["position_key"]] = (volume, fraction, trade_date)
+                    if error:
+                        technical_unavailable.setdefault(position["ticker"], error)
         conn.execute("BEGIN IMMEDIATE")
         try:
             events: list[dict[str, Any]] = []
@@ -1066,6 +1427,19 @@ def run_account_monitor(
                             conn, int(user_id), position, daily_closes, current_time, policy,
                         )
                     )
+                if policy["technical"].get("volume_surge"):
+                    volume, fraction, trade_date = intraday_volumes.get(
+                        position["position_key"], (None, None, None),
+                    )
+                    yf_ticker = yfinance_tickers.get(position["position_key"])
+                    if yf_ticker:
+                        volume_event = _evaluate_volume_surge(
+                            conn, int(user_id), position, yfinance_ticker=yf_ticker,
+                            current_volume=volume, session_fraction=fraction,
+                            trade_date=trade_date, policy=policy, now=current_time,
+                        )
+                        if volume_event:
+                            events.append(volume_event)
             cutoff_clock = _monitor_clock(current_time) - 48 * 3_600
             conn.execute(
                 "DELETE FROM position_snapshots WHERE user_id=? AND monitor_clock IS NOT NULL AND monitor_clock < ?",
