@@ -19,6 +19,8 @@ import time
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
+from .config import dashscope_native_api_server
+
 
 class PortfolioAnalystUnavailable(RuntimeError):
     """The single model call could not be made."""
@@ -829,6 +831,10 @@ def _default_call(*, api_key: str, model: str, messages: list[dict[str, str]], s
         import dashscope
     except ImportError as exc:  # pragma: no cover - runtime dependency
         raise PortfolioAnalystUnavailable("dashscope package is not installed") from exc
+    # Frankfurt uses a workspace-native Model Studio host rather than the
+    # Beijing DashScope shared endpoint.  This remains compatible with the
+    # legacy SDK path used by configurable Portfolio AI models.
+    dashscope.base_http_api_url = dashscope_native_api_server()
     return dashscope.Generation.call(
         api_key=api_key,
         model=model,

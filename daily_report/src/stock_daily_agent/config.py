@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 import os
+import re
 
 try:
     from zoneinfo import ZoneInfo
@@ -173,6 +174,60 @@ def uses_dashscope_responses_api(model: str) -> bool:
     return model.strip().lower().startswith("deepseek-v4.1-flash")
 
 
+_DASHSCOPE_REGION_ALIASES = {
+    "beijing": "cn-beijing",
+    "china-beijing": "cn-beijing",
+    "frankfurt": "eu-central-1",
+    "germany-frankfurt": "eu-central-1",
+    "de-frankfurt": "eu-central-1",
+}
+
+
+def dashscope_region_id() -> str:
+    """Return the Model Studio region ID, accepting a few human-friendly aliases."""
+    raw = os.environ.get("DASHSCOPE_REGION", "cn-beijing").strip().lower()
+    region = _DASHSCOPE_REGION_ALIASES.get(raw, raw)
+    if not re.fullmatch(r"[a-z0-9-]+", region):
+        raise ValueError("DASHSCOPE_REGION must be a Model Studio region ID, for example eu-central-1.")
+    return region
+
+
+def _dashscope_workspace_id() -> str:
+    workspace = os.environ.get("DASHSCOPE_WORKSPACE_ID", "").strip()
+    if workspace and not re.fullmatch(r"[A-Za-z0-9-]+", workspace):
+        raise ValueError("DASHSCOPE_WORKSPACE_ID contains unsupported characters.")
+    return workspace
+
+
+def _dashscope_workspace_host() -> str:
+    workspace = _dashscope_workspace_id()
+    region = dashscope_region_id()
+    if workspace:
+        return f"https://{workspace}.{region}.maas.aliyuncs.com"
+    # Frankfurt has no regional DashScope shared endpoint.  Failing early
+    # avoids accidentally sending a Frankfurt API key to the Beijing domain.
+    if region == "eu-central-1":
+        raise ValueError(
+            "DASHSCOPE_WORKSPACE_ID is required for the Germany (Frankfurt) Model Studio region."
+        )
+    return ""
+
+
+def dashscope_workspace_endpoint_configured() -> bool:
+    """Whether DashScope calls should use OpenAI-compatible workspace routing."""
+    # Validate this early for Frankfurt even when a legacy model is selected.
+    # Without this, qwen_dashscope would silently target the Beijing shared
+    # endpoint with an incompatible regional key.
+    if dashscope_region_id() == "eu-central-1":
+        _dashscope_workspace_host()
+    return bool(
+        os.environ.get("DASHSCOPE_COMPATIBLE_MODEL_SERVER", "").strip()
+        or os.environ.get("QWEN_MODEL_SERVER", "").strip()
+        or os.environ.get("OPENAI_MODEL_SERVER", "").strip()
+        or _dashscope_workspace_id()
+    )
+
+
 def dashscope_compatible_model_server() -> str:
     """Return the Model Studio OpenAI-compatible endpoint without exposing keys."""
     base_url = (
@@ -183,11 +238,27 @@ def dashscope_compatible_model_server() -> str:
     if base_url:
         return base_url.rstrip("/")
 
-    workspace = os.environ.get("DASHSCOPE_WORKSPACE_ID", "").strip()
-    region = os.environ.get("DASHSCOPE_REGION", "cn-beijing").strip()
-    if workspace:
-        return f"https://{workspace}.{region}.maas.aliyuncs.com/compatible-mode/v1"
+    workspace_host = _dashscope_workspace_host()
+    if workspace_host:
+        return f"{workspace_host}/compatible-mode/v1"
     return "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+
+def dashscope_native_api_server() -> str:
+    """Return the workspace-native DashScope API URL for legacy SDK callers."""
+    explicit = os.environ.get("DASHSCOPE_API_BASE", "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    compatible_override = os.environ.get("DASHSCOPE_COMPATIBLE_MODEL_SERVER", "").strip().rstrip("/")
+    if compatible_override.endswith("/compatible-mode/v1"):
+        # Let deployments that copied the complete OpenAI-compatible API Host
+        # migrate every in-project caller without separately reconstructing
+        # the native SDK URL.
+        return compatible_override.removesuffix("/compatible-mode/v1") + "/api/v1"
+    workspace_host = _dashscope_workspace_host()
+    if workspace_host:
+        return f"{workspace_host}/api/v1"
+    return "https://dashscope.aliyuncs.com/api/v1"
 
 
 def build_llm_cfg(model: str, provider: str = "dashscope") -> dict:
@@ -204,7 +275,11 @@ def build_llm_cfg(model: str, provider: str = "dashscope") -> dict:
         # the legacy compatible-mode endpoint remains a useful fallback for
         # existing default-workspace keys.  No API key is duplicated: the
         # existing DASHSCOPE_API_KEY remains the credential source.
-        if uses_dashscope_responses_api(model):
+        # All Frankfurt requests must use its workspace-specific endpoint.
+        # Route any model through Qwen-Agent's OpenAI-compatible adapter when
+        # a workspace/explicit compatible endpoint is configured; otherwise
+        # qwen_dashscope would keep using the China shared DashScope host.
+        if uses_dashscope_responses_api(model) or dashscope_workspace_endpoint_configured():
             return {
                 "model": model,
                 "model_type": "oai",

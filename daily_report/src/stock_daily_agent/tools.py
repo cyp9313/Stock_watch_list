@@ -23,7 +23,12 @@ except ImportError:  # Allows static checks before qwen-agent is installed.
         description = ""
         parameters: dict = {}
 
-from .config import RunContext, dashscope_compatible_model_server, uses_dashscope_responses_api
+from .config import (
+    RunContext,
+    dashscope_compatible_model_server,
+    dashscope_native_api_server,
+    uses_dashscope_responses_api,
+)
 from .notes import parse_notes_payload, validate_notes, render_notes_text, notes_to_jsonable
 from .utils import parse_tool_params, json_dumps, run_python_script, ToolError, ensure_within_dir, strip_markdown_code_fence
 from .search_provider_clients import (
@@ -2415,7 +2420,7 @@ class DashScopeMarketResearchTool(BaseTool):
             else:
                 import dashscope
 
-                dashscope.base_http_api_url = os.environ.get("DASHSCOPE_API_BASE", "https://dashscope.aliyuncs.com/api/v1")
+                dashscope.base_http_api_url = dashscope_native_api_server()
                 strategy = os.environ.get("DASHSCOPE_SEARCH_STRATEGY", "max")
                 search_options: dict[str, Any] = {
                     "search_strategy": strategy,

@@ -25,6 +25,7 @@ import requests
 import trading212_monitor as monitor
 from daily_report.src.stock_daily_agent.config import (
     dashscope_compatible_model_server,
+    dashscope_native_api_server,
     uses_dashscope_responses_api,
 )
 
@@ -516,6 +517,7 @@ def _call_ai_summary(snapshot: dict[str, Any], *, include_news: bool = True) -> 
             content, sources = _response_text_and_sources(response)
         else:
             import dashscope
+            dashscope.base_http_api_url = dashscope_native_api_server()
             response = dashscope.Generation.call(
                 api_key=api_key, model=model,
                 messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],

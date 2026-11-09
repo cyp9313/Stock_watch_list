@@ -154,6 +154,11 @@ QWEN_AGENT_USE_RAW_API=true
 # DASHSCOPE_WORKSPACE_ID=your_workspace_id
 # DASHSCOPE_REGION=cn-beijing
 # DASHSCOPE_COMPATIBLE_MODEL_SERVER=  # optional full endpoint override
+# For Germany (Frankfurt): use a new Frankfurt key and its Workspace API Host.
+# DASHSCOPE_WORKSPACE_ID=llm-xxxxxxxx
+# DASHSCOPE_REGION=eu-central-1
+# The app derives https://llm-xxxxxxxx.eu-central-1.maas.aliyuncs.com/
+# compatible-mode/v1 and /api/v1 automatically; do not reuse a Beijing key.
 
 # Optional manual AI rerank for Market Breadth & Screener
 SCREENING_RERANK_PROVIDER=inherit # inherit / dashscope / deepseek / openai_compatible
@@ -417,6 +422,7 @@ Important settings include:
 
 - `STOCK_API_BASE_URL` and `STOCK_DEV_MODE` for the frontend/API boundary.
 - `LLM_PROVIDER`, `QWEN_MODEL`, `QWEN_RESEARCH_MODEL`, provider API keys, and `QWEN_AGENT_USE_RAW_API` for AI Stock Reports.
+- `DASHSCOPE_WORKSPACE_ID` and `DASHSCOPE_REGION` select a Model Studio workspace-specific endpoint for every DashScope path (main report, web research, Portfolio AI, Screener rerank, and Trading 212 daily brief). Germany (Frankfurt) uses `eu-central-1`, requires a workspace ID, and requires a Frankfurt API key; the application derives its OpenAI-compatible and native SDK endpoints automatically. `DASHSCOPE_COMPATIBLE_MODEL_SERVER` and `DASHSCOPE_API_BASE` are optional explicit endpoint overrides.
 - `SCREENING_RERANK_PROVIDER`, `SCREENING_RERANK_MODEL`, `SCREENING_RERANK_TIMEOUT_SECONDS`, and `SCREENING_RERANK_TEMPERATURE` for the manual, tool-free Screener rerank. Empty provider/model settings inherit the main report LLM configuration.
 - `DECISION_REPORT_ENABLED`, `DECISION_REPORT_PROVIDER`, `DECISION_REPORT_MODEL`, `DECISION_REPORT_TEMPERATURE`, `DECISION_REPORT_TIMEOUT_SECONDS`, and `DECISION_REPORT_KEEP_CONTEXT` for the controlled decision dashboard. Set `DECISION_REPORT_KEEP_RUN_DIR=true` only while troubleshooting: it retains the complete per-run folder (including `*_finalization_audit.json` and research intermediates) instead of automatically deleting it.
 - `DECISION_OPINION_AGENTS_ENABLED`, `DECISION_OPINION_AGENTS_PROVIDER`, `DECISION_OPINION_AGENTS_MODEL`, and `DECISION_OPINION_AGENTS_TIMEOUT_SECONDS` for optional P3 bounded specialist opinions.
