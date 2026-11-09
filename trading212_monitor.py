@@ -49,6 +49,7 @@ RSI_ALERT_LEVELS = (30.0, 70.0)
 VOLUME_AVERAGE_DAYS = 20
 VOLUME_CHECK_SECONDS = 5 * 60
 VOLUME_SURGE_DEFAULT_RATIO = 2.0
+ACCOUNT_BASELINE_RETENTION_DAYS = 90
 
 # Trading 212 position tickers commonly use ``SYMBOL_MARKET_EQ``.  This map
 # deliberately covers the exchange tags that have an unambiguous yfinance
@@ -177,6 +178,25 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_position_snapshots_monitor_clock
         ON position_snapshots(user_id, position_key, monitor_clock DESC)
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS account_daily_baselines (
+            user_id INTEGER NOT NULL,
+            trading_date TEXT NOT NULL,
+            captured_at TEXT NOT NULL,
+            currency TEXT,
+            total_value REAL,
+            cash_value REAL,
+            PRIMARY KEY(user_id, trading_date)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_account_daily_baselines_user_date
+        ON account_daily_baselines(user_id, trading_date DESC)
         """
     )
     conn.execute(
@@ -605,6 +625,116 @@ def fetch_positions(
     if not isinstance(payload, list):
         raise Trading212APIError("Trading 212 positions response had an unexpected format.")
     return [item for item in payload if isinstance(item, dict)]
+
+
+def _account_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and abs(number) != float("inf") else None
+
+
+def _account_summary_values(payload: dict[str, Any]) -> tuple[str, float | None, float | None]:
+    """Extract only the totals needed for a once-daily monitoring baseline."""
+    cash = payload.get("cash") if isinstance(payload.get("cash"), dict) else {}
+    cash_value = None
+    for key in ("availableToTrade", "free", "available", "total"):
+        cash_value = _account_number(cash.get(key))
+        if cash_value is not None:
+            break
+    if cash_value is None:
+        cash_value = _account_number(payload.get("cash"))
+    return (
+        str(payload.get("currency") or cash.get("currency") or "").upper()[:12],
+        _account_number(payload.get("totalValue") or payload.get("total") or payload.get("accountValue")),
+        cash_value,
+    )
+
+
+def _fetch_account_summary_baseline(
+    api_key: str, api_secret: str, environment: str, *, request_get: Callable[..., Any],
+) -> tuple[str, float | None, float | None]:
+    """Read the broker account summary without affecting position monitoring on failure."""
+    timeout = max(3, int(os.environ.get("TRADING212_REQUEST_TIMEOUT_SECONDS", "20")))
+    try:
+        response = request_get(
+            f"{_base_url(environment)}/equity/account/summary",
+            auth=(api_key, api_secret), timeout=timeout, headers={"Accept": "application/json"},
+        )
+    except requests.RequestException as exc:
+        raise Trading212APIError(f"Trading 212 account summary failed: {type(exc).__name__}") from exc
+    if response.status_code == 401:
+        raise Trading212APIError("Trading 212 rejected the configured read-only credentials.")
+    if response.status_code == 429:
+        raise Trading212APIError("Trading 212 account-summary rate limit reached.")
+    if response.status_code >= 400:
+        raise Trading212APIError(f"Trading 212 account summary failed (HTTP {response.status_code}).")
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise Trading212APIError("Trading 212 account summary returned an invalid response.") from exc
+    if not isinstance(payload, dict):
+        raise Trading212APIError("Trading 212 account summary had an unexpected format.")
+    return _account_summary_values(payload)
+
+
+def _record_daily_account_baseline(
+    conn: sqlite3.Connection,
+    user_id: int,
+    *,
+    api_key: str,
+    api_secret: str,
+    environment: str,
+    now: dt.datetime,
+    request_get: Callable[..., Any],
+) -> None:
+    """Store only the first available total/cash snapshot for each Berlin day.
+
+    This costs at most one extra read-only Trading 212 request per active day
+    and is deliberately best-effort: a key without account-summary scope must
+    never stop normal price/technical alert monitoring.
+    """
+    local = now.astimezone(BERLIN_TZ)
+    trading_date = local.date().isoformat()
+    existing = conn.execute(
+        "SELECT 1 FROM account_daily_baselines WHERE user_id=? AND trading_date=?",
+        (int(user_id), trading_date),
+    ).fetchone()
+    if existing is not None:
+        return
+    try:
+        currency, total_value, cash_value = _fetch_account_summary_baseline(
+            api_key, api_secret, environment, request_get=request_get,
+        )
+    except Trading212APIError:
+        return
+    if total_value is None:
+        return
+    conn.execute(
+        """INSERT OR IGNORE INTO account_daily_baselines(
+            user_id, trading_date, captured_at, currency, total_value, cash_value
+        ) VALUES (?, ?, ?, ?, ?, ?)""",
+        (int(user_id), trading_date, _iso(now), currency, total_value, cash_value),
+    )
+    cutoff = (local.date() - dt.timedelta(days=ACCOUNT_BASELINE_RETENTION_DAYS)).isoformat()
+    conn.execute(
+        "DELETE FROM account_daily_baselines WHERE user_id=? AND trading_date < ?",
+        (int(user_id), cutoff),
+    )
+
+
+def _daily_account_brief_enabled(conn: sqlite3.Connection, user_id: int) -> bool:
+    """Avoid an extra broker request for accounts that do not use daily briefs."""
+    try:
+        row = conn.execute(
+            "SELECT enabled FROM daily_summary_settings WHERE user_id=?", (int(user_id),)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        # The optional daily-summary schema is created only after its feature
+        # is opened/configured for the first time.
+        return False
+    return bool(row and row["enabled"])
 
 
 def test_trading212_connection(user_id: int, *, path: Path | None = None, request_get: Callable[..., Any] = requests.get) -> int:
@@ -1549,6 +1679,11 @@ def run_account_monitor(
             secrets["api_key"], secrets["api_secret"], row["environment"], request_get=request_get
         )]
         positions = [item for item in positions if item is not None]
+        if _daily_account_brief_enabled(conn, int(user_id)):
+            _record_daily_account_baseline(
+                conn, int(user_id), api_key=secrets["api_key"], api_secret=secrets["api_secret"],
+                environment=row["environment"], now=current_time, request_get=request_get,
+            )
         for position in positions:
             _record_observed_position(conn, int(user_id), position, current_time)
         policy = normalize_alert_policy(json.loads(row["alert_policy_json"] or "{}"))

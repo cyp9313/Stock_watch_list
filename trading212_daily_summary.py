@@ -282,15 +282,312 @@ def _daily_signals(conn: sqlite3.Connection, user_id: int, day_start: dt.datetim
     return found
 
 
+def _parse_event_time(value: Any) -> dt.datetime | None:
+    try:
+        text = str(value or "").strip().replace("Z", "+00:00")
+        parsed = dt.datetime.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=monitor.UTC)
+    return parsed.astimezone(monitor.UTC)
+
+
+def _fetch_daily_executed_orders(
+    conn: sqlite3.Connection,
+    user_id: int,
+    *,
+    api_key: str,
+    api_secret: str,
+    environment: str,
+    day_start: dt.datetime,
+    now: dt.datetime,
+    request_get: Callable[..., Any],
+) -> dict[str, Any]:
+    """Fetch same-day executed BUY/SELL orders from Trading 212 history.
+
+    Order history is the authoritative source for additions/reductions.  The
+    position-snapshot comparison remains only a clearly-labelled fallback for
+    API keys without historical-data permission or a temporary API failure.
+    """
+    timeout = max(3, int(os.environ.get("TRADING212_REQUEST_TIMEOUT_SECONDS", "20")))
+    base_url = f"{monitor._base_url(environment)}/equity/history/orders"
+    params: dict[str, Any] | None = {
+        "limit": 50,
+        "timeFrom": _iso(day_start).replace("+00:00", "Z"),
+    }
+    events: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    # A normal daily account uses one page.  Bound pagination for safety and
+    # remain inside the published history endpoint rate limit.
+    for _page in range(3):
+        try:
+            response = request_get(
+                base_url, auth=(api_key, api_secret), timeout=timeout,
+                headers={"Accept": "application/json"}, params=params,
+            )
+        except requests.RequestException as exc:
+            return {"available": False, "events": [], "error": f"order history request failed: {type(exc).__name__}"}
+        if response.status_code in {401, 403}:
+            return {"available": False, "events": [], "error": "order-history permission is unavailable"}
+        if response.status_code == 429:
+            return {"available": False, "events": [], "error": "order-history rate limit reached"}
+        if response.status_code >= 400:
+            return {"available": False, "events": [], "error": f"order history failed (HTTP {response.status_code})"}
+        try:
+            payload = response.json()
+        except ValueError:
+            return {"available": False, "events": [], "error": "order history returned invalid data"}
+        if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+            return {"available": False, "events": [], "error": "order history had an unexpected format"}
+        for item in payload["items"]:
+            if not isinstance(item, dict):
+                continue
+            order = item.get("order") if isinstance(item.get("order"), dict) else item
+            fill = item.get("fill") if isinstance(item.get("fill"), dict) else {}
+            fill_type = str(fill.get("type") or "TRADE").upper()
+            if fill_type != "TRADE":
+                continue
+            side = str(order.get("side") or "").upper()
+            if side not in {"BUY", "SELL"}:
+                continue
+            quantity = _number(fill.get("quantity"))
+            if quantity is None:
+                quantity = _number(order.get("filledQuantity"))
+            if quantity is None:
+                quantity = _number(order.get("quantity"))
+            quantity = abs(float(quantity or 0.0))
+            if quantity <= 0:
+                continue
+            executed_at = _parse_event_time(
+                fill.get("filledAt") or order.get("dateExecuted") or order.get("filledAt") or order.get("createdAt")
+            )
+            if executed_at is None or not (day_start <= executed_at <= now):
+                continue
+            raw_ticker = str(order.get("ticker") or (order.get("instrument") or {}).get("ticker") or "").strip()
+            if not raw_ticker:
+                continue
+            event_id = str(fill.get("id") or order.get("id") or f"{raw_ticker}:{side}:{executed_at.isoformat()}:{quantity}")
+            if event_id in seen:
+                continue
+            seen.add(event_id)
+            events.append({
+                "kind": "bought" if side == "BUY" else "sold",
+                "ticker": monitor.mapped_yfinance_ticker(conn, raw_ticker, fallback=raw_ticker),
+                "broker_ticker": raw_ticker,
+                "quantity": quantity,
+                "quantity_delta": quantity if side == "BUY" else -quantity,
+                "execution_price": _number(fill.get("price") or order.get("fillPrice")),
+                "executed_at": _iso(executed_at),
+                "source": "orders_history",
+            })
+        # ``timeFrom`` should normally make one page sufficient.  When the
+        # server still paginates, use only a documented same-endpoint path.
+        next_path = str(payload.get("nextPagePath") or "")
+        if not next_path.startswith("/api/v0/equity/history/orders"):
+            break
+        split = urlsplit(monitor._base_url(environment))
+        base_url = f"{split.scheme}://{split.netloc}{next_path}"
+        params = None
+    return {"available": True, "events": events, "error": None}
+
+
+def _day_start_position_baselines(
+    conn: sqlite3.Connection, user_id: int, day_start: dt.datetime,
+) -> dict[str, sqlite3.Row]:
+    """Return one quantity baseline per position for the Berlin report day.
+
+    Prefer the final snapshot from before midnight Berlin time.  For an
+    account first observed during the day, fall back to its first same-day
+    snapshot so a later add, reduction, or close can still be reported.
+    """
+    cutoff = _iso(day_start)
+    rows = conn.execute(
+        """
+        SELECT snapshot.*
+        FROM position_snapshots AS snapshot
+        INNER JOIN (
+            SELECT position_key, MAX(captured_at) AS captured_at
+            FROM position_snapshots
+            WHERE user_id=? AND captured_at < ?
+            GROUP BY position_key
+        ) AS selected
+          ON selected.position_key=snapshot.position_key
+         AND selected.captured_at=snapshot.captured_at
+        WHERE snapshot.user_id=?
+        """,
+        (int(user_id), cutoff, int(user_id)),
+    ).fetchall()
+    result = {str(row["position_key"]): row for row in rows}
+    same_day_rows = conn.execute(
+        """
+        SELECT snapshot.*
+        FROM position_snapshots AS snapshot
+        INNER JOIN (
+            SELECT position_key, MIN(captured_at) AS captured_at
+            FROM position_snapshots
+            WHERE user_id=? AND captured_at >= ?
+            GROUP BY position_key
+        ) AS selected
+          ON selected.position_key=snapshot.position_key
+         AND selected.captured_at=snapshot.captured_at
+        WHERE snapshot.user_id=?
+        """,
+        (int(user_id), cutoff, int(user_id)),
+    ).fetchall()
+    for row in same_day_rows:
+        result.setdefault(str(row["position_key"]), row)
+    return result
+
+
+def _quantity_tolerance(quantity: float) -> float:
+    """Ignore insignificant floating-point representation noise."""
+    return max(1e-8, abs(float(quantity)) * 1e-8)
+
+
+def _position_quantity_changes(
+    conn: sqlite3.Connection,
+    user_id: int,
+    positions: list[dict[str, Any]],
+    baselines: dict[str, sqlite3.Row],
+    *,
+    has_pre_day_snapshots: bool,
+) -> list[dict[str, Any]]:
+    """Identify adds, reductions, new positions, and full closes by quantity.
+
+    Price and P&L changes never influence this classification: only Trading
+    212's reported quantity is compared with the day-start snapshot.
+    """
+    events: list[dict[str, Any]] = []
+    current_keys = {str(position["position_key"]) for position in positions}
+    for position in positions:
+        key = str(position["position_key"])
+        baseline = baselines.get(key)
+        current_quantity = _number(position.get("quantity"))
+        if baseline is None:
+            # Avoid calling every existing holding "new" on the first ever
+            # daily brief, when no prior account snapshot exists.
+            if has_pre_day_snapshots and current_quantity is not None and current_quantity > _quantity_tolerance(current_quantity):
+                events.append({
+                    "kind": "opened", "ticker": monitor.mapped_yfinance_ticker(conn, key, fallback=position["ticker"]),
+                    "name": position.get("display_name") or position["ticker"], "position_key": key,
+                    "baseline_quantity": 0.0, "quantity": current_quantity,
+                    "quantity_delta": current_quantity, "quantity_change_pct": None,
+                    "baseline_at": None,
+                })
+            continue
+        baseline_quantity = _number(baseline["quantity"])
+        if baseline_quantity is None or current_quantity is None:
+            continue
+        delta = current_quantity - baseline_quantity
+        if abs(delta) <= _quantity_tolerance(baseline_quantity):
+            continue
+        kind = "increased" if delta > 0 else "reduced"
+        events.append({
+            "kind": kind, "ticker": monitor.mapped_yfinance_ticker(conn, key, fallback=position["ticker"]),
+            "name": position.get("display_name") or position["ticker"], "position_key": key,
+            "baseline_quantity": baseline_quantity, "quantity": current_quantity,
+            "quantity_delta": delta,
+            "quantity_change_pct": (delta / baseline_quantity * 100) if baseline_quantity > 0 else None,
+            "baseline_at": baseline["captured_at"],
+        })
+
+    for key, baseline in baselines.items():
+        if key in current_keys:
+            continue
+        baseline_quantity = _number(baseline["quantity"])
+        if baseline_quantity is None or baseline_quantity <= _quantity_tolerance(baseline_quantity):
+            continue
+        events.append({
+            "kind": "closed", "ticker": monitor.mapped_yfinance_ticker(conn, key, fallback=baseline["ticker"]),
+            "name": baseline["display_name"] or baseline["ticker"], "position_key": key,
+            "baseline_quantity": baseline_quantity, "quantity": 0.0,
+            "quantity_delta": -baseline_quantity, "quantity_change_pct": -100.0,
+            "baseline_at": baseline["captured_at"],
+        })
+
+    order = {"opened": 0, "increased": 1, "reduced": 2, "closed": 3}
+    return sorted(events, key=lambda item: (order.get(str(item.get("kind")), 9), -abs(float(item.get("quantity_delta") or 0))))
+
+
+def _daily_account_change(
+    conn: sqlite3.Connection,
+    user_id: int,
+    local_date: dt.date,
+    account: dict[str, Any],
+    day_start_baselines: dict[str, sqlite3.Row],
+    current_position_value: float | None,
+) -> dict[str, Any]:
+    """Calculate a true account delta when the monitor captured a daily baseline.
+
+    The fallback deliberately reports only tracked-position market value.  It
+    must not be labelled as whole-account performance because cash deposits,
+    withdrawals, or unavailable account-summary permissions can make that
+    inference false.
+    """
+    row = conn.execute(
+        """SELECT captured_at, currency, total_value, cash_value
+           FROM account_daily_baselines WHERE user_id=? AND trading_date=?""",
+        (int(user_id), local_date.isoformat()),
+    ).fetchone()
+    current_total = _number(account.get("total_value"))
+    if row is not None:
+        baseline_total = _number(row["total_value"])
+        baseline_currency = str(row["currency"] or "")
+        current_currency = str(account.get("currency") or "")
+        if (
+            baseline_total is not None and current_total is not None
+            and (not baseline_currency or not current_currency or baseline_currency == current_currency)
+        ):
+            delta = current_total - baseline_total
+            return {
+                "daily_change_source": "account_summary",
+                "daily_baseline_value": baseline_total,
+                "daily_baseline_cash": _number(row["cash_value"]),
+                "daily_baseline_at": row["captured_at"],
+                "daily_change": delta,
+                "daily_change_pct": (delta / baseline_total * 100) if baseline_total > 0 else None,
+            }
+
+    baseline_position_values = [
+        _number(item["current_value"]) for item in day_start_baselines.values()
+    ]
+    baseline_position_total = sum(value for value in baseline_position_values if value is not None)
+    if baseline_position_total > 0 and current_position_value is not None:
+        delta = current_position_value - baseline_position_total
+        return {
+            "daily_change_source": "tracked_positions",
+            "daily_baseline_value": baseline_position_total,
+            "daily_baseline_cash": None,
+            "daily_baseline_at": None,
+            "daily_change": delta,
+            "daily_change_pct": delta / baseline_position_total * 100,
+        }
+    return {
+        "daily_change_source": "unavailable",
+        "daily_baseline_value": None,
+        "daily_baseline_cash": None,
+        "daily_baseline_at": None,
+        "daily_change": None,
+        "daily_change_pct": None,
+    }
+
+
 def build_daily_account_snapshot(
     conn: sqlite3.Connection, user_id: int, positions: list[dict[str, Any]], account_raw: dict[str, Any], now: dt.datetime,
+    *, order_activity: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     local = now.astimezone(monitor.BERLIN_TZ)
     day_start = dt.datetime.combine(local.date(), dt.time.min, tzinfo=monitor.BERLIN_TZ).astimezone(monitor.UTC)
     signals = _daily_signals(conn, user_id, day_start)
+    day_start_baselines = _day_start_position_baselines(conn, user_id, day_start)
+    has_pre_day_snapshots = conn.execute(
+        "SELECT 1 FROM position_snapshots WHERE user_id=? AND captured_at < ? LIMIT 1",
+        (int(user_id), _iso(day_start)),
+    ).fetchone() is not None
     holdings = []
     for position in positions:
-        baseline = _baseline_for_position(conn, user_id, position["position_key"], day_start)
+        baseline = day_start_baselines.get(str(position["position_key"]))
         current_price = float(position["current_price"])
         current_value = _number(position.get("current_value"))
         baseline_price = _number(baseline["current_price"]) if baseline is not None else None
@@ -330,14 +627,30 @@ def build_daily_account_snapshot(
         if len(focus) >= MAX_FOCUS_HOLDINGS:
             break
     account = _account_fields(account_raw)
+    account.update(_daily_account_change(
+        conn, user_id, local.date(), account, day_start_baselines, total_positions,
+    ))
+    snapshot_position_changes = _position_quantity_changes(
+        conn, user_id, positions, day_start_baselines, has_pre_day_snapshots=has_pre_day_snapshots,
+    )
+    uses_order_history = order_activity is not None
+    position_changes = order_activity if uses_order_history else snapshot_position_changes
+    limitations = [
+        "Daily change is calculated from the most recent stored position snapshot before this Berlin report day; it is an estimate when cash flows or intraday position changes occurred.",
+        "AI commentary may only interpret the supplied account data and returned web-search sources; it does not place orders.",
+    ]
+    if not uses_order_history:
+        limitations.insert(
+            1,
+            "Position adds and reductions compare Trading 212 quantities with the final snapshot before this Berlin report day, or the first same-day snapshot when no earlier baseline exists.",
+        )
     return {
         "as_of": local.isoformat(), "summary_date": local.date().isoformat(), "timezone": "Europe/Berlin",
         "account": {**account, "tracked_position_value": total_positions, "position_count": len(holdings)},
         "holdings": holdings, "largest_holdings": largest[:5], "largest_movers": movers[:5], "focus_holdings": focus,
-        "data_limitations": [
-            "Daily change is calculated from the most recent stored position snapshot before this Berlin report day; it is an estimate when cash flows or intraday position changes occurred.",
-            "AI commentary may only interpret the supplied account data and returned web-search sources; it does not place orders.",
-        ],
+        "position_changes": position_changes,
+        "position_changes_source": "orders_history" if uses_order_history else "snapshots",
+        "data_limitations": limitations,
     }
 
 
@@ -422,7 +735,10 @@ def _response_text_and_sources(response: Any) -> tuple[str, list[dict[str, Any]]
 
 def _compact_ai_context(snapshot: dict[str, Any]) -> dict[str, Any]:
     account = dict(snapshot.get("account") or {})
-    keep_account = {key: account.get(key) for key in ("currency", "total_value", "cash", "unrealized_profit_loss", "tracked_position_value", "position_count")}
+    keep_account = {key: account.get(key) for key in (
+        "currency", "total_value", "cash", "unrealized_profit_loss", "tracked_position_value", "position_count",
+        "daily_change_source", "daily_baseline_value", "daily_change", "daily_change_pct",
+    )}
     holdings = []
     for item in snapshot.get("focus_holdings") or []:
         holdings.append({key: item.get(key) for key in (
@@ -431,6 +747,9 @@ def _compact_ai_context(snapshot: dict[str, Any]) -> dict[str, Any]:
     return {
         "as_of": snapshot.get("as_of"), "account": keep_account, "focus_holdings": holdings,
         "largest_movers": [{key: item.get(key) for key in ("ticker", "change_pct", "weight_pct")} for item in snapshot.get("largest_movers") or []],
+        "position_changes": [{key: item.get(key) for key in (
+            "kind", "ticker", "baseline_quantity", "quantity", "quantity_delta", "quantity_change_pct",
+        )} for item in snapshot.get("position_changes") or []][:12],
     }
 
 
@@ -547,6 +866,13 @@ def _format_pct(value: Any) -> str:
     return "N/A" if number is None else f"{number:+.2f}%"
 
 
+def _format_quantity(value: Any) -> str:
+    number = _number(value)
+    if number is None:
+        return "N/A"
+    return f"{number:,.6f}".rstrip("0").rstrip(".")
+
+
 def _telegram_escape(value: Any) -> str:
     return html.escape(str(value or ""), quote=False)
 
@@ -562,12 +888,55 @@ def render_daily_summary_telegram(snapshot: dict[str, Any], ai: dict[str, Any]) 
         f"📊 Positions: <b>{int(account.get('position_count') or 0)}</b> · "
         f"Tracked value: <code>{_format_money(account.get('tracked_position_value'), currency)}</code>",
     ]
+    daily_source = str(account.get("daily_change_source") or "unavailable")
+    daily_change = account.get("daily_change")
+    if daily_source == "account_summary" and _number(daily_change) is not None:
+        icon = "🟢" if float(daily_change) >= 0 else "🔴"
+        lines.append(
+            f"{icon} <b>Daily account change</b>: <code>{_format_money(daily_change, currency)}</code> "
+            f"({_format_pct(account.get('daily_change_pct'))})"
+        )
+    elif daily_source == "tracked_positions" and _number(daily_change) is not None:
+        icon = "🟢" if float(daily_change) >= 0 else "🔴"
+        lines.append(
+            f"{icon} <b>Daily tracked-position change</b>: <code>{_format_money(daily_change, currency)}</code> "
+            f"({_format_pct(account.get('daily_change_pct'))}) <i>(account-opening balance unavailable)</i>"
+        )
+    else:
+        lines.append("⚪ <b>Daily account change</b>: unavailable until a valid opening account snapshot is collected.")
     if ai.get("ok") and ai.get("headline"):
         lines.extend(["", f"🤖 <b>AI view</b>\n{_telegram_escape(ai['headline'])}"])
         if ai.get("summary"):
             lines.extend(f"• {_telegram_escape(item)}" for item in ai["summary"])
     else:
         lines.extend(["", "⚪ <b>AI/news view unavailable</b>\nDeterministic account and position data is shown below."])
+    position_changes = snapshot.get("position_changes") or []
+    if position_changes:
+        order_history = snapshot.get("position_changes_source") == "orders_history"
+        lines.append("\n🧾 <b>Today’s executed trades</b>" if order_history else "\n🧾 <b>Today’s position changes</b>")
+        labels = {
+            "opened": ("🆕", "New position"),
+            "increased": ("➕", "Added"),
+            "reduced": ("➖", "Reduced"),
+            "closed": ("✅", "Closed"),
+            "bought": ("🟢", "Bought"),
+            "sold": ("🔴", "Sold"),
+        }
+        for item in position_changes[:12]:
+            icon, label = labels.get(str(item.get("kind")), ("•", "Changed"))
+            ticker = _telegram_escape(item.get("ticker"))
+            if str(item.get("kind")) in {"bought", "sold"}:
+                price = _number(item.get("execution_price"))
+                price_text = f" @ {price:,.4g}" if price is not None else ""
+                lines.append(f"{icon} <b>{ticker}</b> — {label}: {_format_quantity(item.get('quantity'))} shares{price_text}")
+                continue
+            before = _format_quantity(item.get("baseline_quantity"))
+            after = _format_quantity(item.get("quantity"))
+            delta = _format_quantity(abs(_number(item.get("quantity_delta")) or 0.0))
+            suffix = _format_pct(item.get("quantity_change_pct"))
+            lines.append(f"{icon} <b>{ticker}</b> — {label}: {before} → {after} ({'+' if float(item.get('quantity_delta') or 0) >= 0 else '-'}{delta}; {suffix})")
+        if len(position_changes) > 12:
+            lines.append(f"• … and {len(position_changes) - 12} more position changes")
     movers = snapshot.get("largest_movers") or []
     if movers:
         lines.append("\n📈 <b>Largest moves</b>")
@@ -649,7 +1018,21 @@ def generate_and_send_daily_summary(
             # Some otherwise-valid read-only keys may not include account-
             # summary permission. Positions still support a useful daily brief.
             account_raw = {"_summary_error": _safe_error(exc)}
-        snapshot = build_daily_account_snapshot(conn, int(user_id), positions, account_raw, current)
+        local_day_start = dt.datetime.combine(
+            current.astimezone(monitor.BERLIN_TZ).date(), dt.time.min, tzinfo=monitor.BERLIN_TZ,
+        ).astimezone(monitor.UTC)
+        order_activity = _fetch_daily_executed_orders(
+            conn, int(user_id), api_key=secrets["api_key"], api_secret=secrets["api_secret"],
+            environment=account["environment"], day_start=local_day_start, now=current, request_get=request_get,
+        )
+        snapshot = build_daily_account_snapshot(
+            conn, int(user_id), positions, account_raw, current,
+            order_activity=order_activity["events"] if order_activity["available"] else None,
+        )
+        if not order_activity["available"]:
+            snapshot["data_limitations"].append(
+                f"Trading 212 order history was unavailable; position changes use snapshot comparison ({order_activity['error']})."
+            )
         if account_raw.get("_summary_error"):
             snapshot["data_limitations"].append(
                 "Trading 212 account-summary data was unavailable; account value/cash may be omitted."

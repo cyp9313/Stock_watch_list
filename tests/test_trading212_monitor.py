@@ -9,6 +9,7 @@ from pathlib import Path
 from cryptography.fernet import Fernet
 
 import trading212_monitor as monitor
+import trading212_daily_summary as daily_summary
 
 
 class _Response:
@@ -105,6 +106,35 @@ def test_alert_crossing_rearms_and_uses_rolling_snapshot_retention(tmp_path, mon
         assert conn.execute("SELECT COUNT(*) FROM position_snapshots WHERE position_key='OLD_US_EQ'").fetchone()[0] == 0
     finally:
         conn.close()
+
+
+def test_monitor_records_one_account_value_baseline_per_berlin_day(tmp_path, monkeypatch):
+    path = tmp_path / "monitor.db"
+    _configure(monkeypatch, path)
+    daily_summary.save_daily_summary_settings(
+        7, enabled=True, hour=22, minute=15, include_ai=False, include_news=False, path=path,
+    )
+    calls = {"summary": 0}
+
+    def fake_get(url, **_kwargs):
+        if url.endswith("/equity/account/summary"):
+            calls["summary"] += 1
+            return _Response({"currency": "EUR", "totalValue": 1_000.0, "cash": {"availableToTrade": 100.0}})
+        return _Response(_position(100.0))
+
+    now = dt.datetime(2026, 11, 2, 12, 0, tzinfo=dt.timezone.utc)
+    monitor.run_account_monitor(7, path=path, now=now, request_get=fake_get, request_post=lambda *_a, **_k: _Response({}))
+    monitor.run_account_monitor(7, path=path, now=now + dt.timedelta(minutes=1), request_get=fake_get, request_post=lambda *_a, **_k: _Response({}))
+    assert calls["summary"] == 1
+    conn = monitor._connect(path)
+    try:
+        row = conn.execute(
+            "SELECT currency, total_value, cash_value FROM account_daily_baselines WHERE user_id=? AND trading_date=?",
+            (7, "2026-11-02"),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert tuple(row) == ("EUR", 1_000.0, 100.0)
 
 
 def test_telegram_alert_html_highlights_trigger_and_escapes_ticker():
