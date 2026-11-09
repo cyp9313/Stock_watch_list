@@ -768,6 +768,44 @@ def _upsert_mapping(conn: sqlite3.Connection, position: dict[str, Any], **update
     )
 
 
+def mapped_yfinance_ticker(
+    conn: sqlite3.Connection,
+    position_key: str,
+    *,
+    fallback: str = "",
+) -> str:
+    """Return the verified display/search ticker without replacing broker identity.
+
+    Trading 212 instrument names and symbols can lag a corporate rename.
+    Snapshots and monitor state retain the broker's raw identifier, whereas
+    user-facing messages may use a yfinance mapping only after it was verified
+    from daily history or confirmed manually by the account owner.
+    """
+    row = conn.execute(
+        "SELECT yfinance_ticker, mapping_status FROM instrument_mappings WHERE position_key=?",
+        (str(position_key),),
+    ).fetchone()
+    if row is not None and str(row["mapping_status"] or "") in {"mapped", "manual"}:
+        ticker = normalize_yfinance_ticker(str(row["yfinance_ticker"] or ""))
+        if ticker:
+            return ticker
+    return str(fallback or "").strip()
+
+
+def _position_with_report_ticker(
+    conn: sqlite3.Connection,
+    position: dict[str, Any],
+    *,
+    yfinance_ticker: str | None = None,
+) -> dict[str, Any]:
+    """Attach a presentation ticker while leaving the raw broker ticker intact."""
+    return {
+        **position,
+        "report_ticker": normalize_yfinance_ticker(yfinance_ticker or "")
+        or mapped_yfinance_ticker(conn, position["position_key"], fallback=position["ticker"]),
+    }
+
+
 def _cached_daily_closes(conn: sqlite3.Connection, yfinance_ticker: str) -> list[float]:
     rows = conn.execute(
         "SELECT close_price FROM daily_price_history WHERE yfinance_ticker=? ORDER BY trading_date ASC",
@@ -1254,10 +1292,11 @@ def _evaluate_technical_alerts(
                 conn, user_id=user_id, position=position, signal_key=f"ema_{period}",
                 current_value=distance, current_side=side, now=now, event_kind="ema_cross",
                 direction=direction,
-                detail=f"Price {position['current_price']:.4g} crossed {'above' if direction == 'up' else 'below'} EMA{period} {ema:.4g}",
+                detail=f"Price {position['current_price']:.4g} crossed {'above' if direction == 'up' else 'below'} EMA {period} {ema:.4g}",
             )
             if event:
                 event["reference_value"] = ema
+                event["ema_period"] = period
                 events.append(event)
     if technical.get("macd_crosses") and "macd_diff" in values:
         macd_diff = values["macd_diff"]
@@ -1357,7 +1396,12 @@ def _telegram_technical_heading(event: dict[str, Any]) -> tuple[str, str]:
     kind = str(event.get("technical_kind") or "")
     direction = str(event.get("direction") or "")
     if kind == "ema_cross":
-        return ("🟢" if direction == "up" else "🔴", f"PRICE CROSSED {'ABOVE' if direction == 'up' else 'BELOW'} EMA")
+        try:
+            period = int(event.get("ema_period"))
+        except (TypeError, ValueError):
+            period = 0
+        suffix = f" EMA {period}" if period > 0 else " EMA"
+        return ("🟢" if direction == "up" else "🔴", f"PRICE CROSSED {'ABOVE' if direction == 'up' else 'BELOW'}{suffix}")
     if kind == "macd_cross":
         return ("🟢" if direction == "golden" else "🔴", f"MACD {'GOLDEN' if direction == 'golden' else 'DEATH'} CROSS")
     if kind == "rsi_level_cross":
@@ -1372,7 +1416,7 @@ def _telegram_message(events: list[dict[str, Any]], now: dt.datetime) -> str:
     timestamp = now.astimezone(BERLIN_TZ).strftime("%Y-%m-%d %H:%M %Z")
     lines = [f"🚨 <b>TRADING 212 POSITION ALERT</b>\n🕒 <code>{timestamp}</code>"]
     for event in events:
-        ticker = _telegram_text(event.get("ticker"))
+        ticker = _telegram_text(event.get("report_ticker") or event.get("ticker"))
         detail = _telegram_text(event.get("detail"))
         live_price = _telegram_price(event)
         if event.get("event_type") == "technical":
@@ -1558,12 +1602,17 @@ def run_account_monitor(
                         position["quantity"], position["current_value"], _monitor_clock(current_time),
                     ),
                 )
-                events.extend(_evaluate_alerts(conn, int(user_id), position, current_time, policy))
+                reporting_position = _position_with_report_ticker(
+                    conn,
+                    position,
+                    yfinance_ticker=yfinance_tickers.get(position["position_key"]),
+                )
+                events.extend(_evaluate_alerts(conn, int(user_id), reporting_position, current_time, policy))
                 daily_closes = histories.get(position["position_key"])
                 if daily_closes:
                     events.extend(
                         _evaluate_technical_alerts(
-                            conn, int(user_id), position, daily_closes, current_time, policy,
+                            conn, int(user_id), reporting_position, daily_closes, current_time, policy,
                         )
                     )
                 if policy["technical"].get("volume_surge"):
@@ -1573,7 +1622,7 @@ def run_account_monitor(
                     yf_ticker = yfinance_tickers.get(position["position_key"])
                     if yf_ticker:
                         volume_event = _evaluate_volume_surge(
-                            conn, int(user_id), position, yfinance_ticker=yf_ticker,
+                            conn, int(user_id), reporting_position, yfinance_ticker=yf_ticker,
                             current_volume=volume, session_fraction=fraction,
                             trade_date=trade_date, policy=policy, now=current_time,
                         )

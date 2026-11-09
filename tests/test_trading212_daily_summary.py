@@ -34,9 +34,26 @@ def _configure(monkeypatch, path):
     )
 
 
+def _save_verified_mapping(path, *, broker_ticker="AAPL_US_EQ", yfinance_ticker="AAPL"):
+    position = monitor._position_from_api(_position()[0])
+    assert position is not None
+    position["ticker"] = broker_ticker
+    position["position_key"] = broker_ticker
+    conn = monitor._connect(path)
+    try:
+        monitor._upsert_mapping(
+            conn, position, yfinance_ticker=yfinance_ticker, mapping_status="mapped",
+            mapping_source="test", last_history_check_date="2026-11-02",
+            last_volume_history_check_date="2026-11-02", last_history_date="2026-10-30", last_error=None,
+        )
+    finally:
+        conn.close()
+
+
 def test_daily_summary_sends_one_safe_ai_brief_and_persists_history(tmp_path, monkeypatch):
     path = tmp_path / "monitor.db"
     _configure(monkeypatch, path)
+    _save_verified_mapping(path)
     sent = []
 
     def fake_get(url, **_kwargs):
@@ -50,10 +67,11 @@ def test_daily_summary_sends_one_safe_ai_brief_and_persists_history(tmp_path, mo
         return _Response({})
 
     def fake_ai(snapshot):
-        assert snapshot["focus_holdings"][0]["ticker"] == "AAPL_US_EQ"
+        assert snapshot["focus_holdings"][0]["ticker"] == "AAPL"
+        assert snapshot["focus_holdings"][0]["broker_ticker"] == "AAPL_US_EQ"
         return {
             "ok": True, "headline": "组合波动上升，重点关注苹果仓位。", "summary": ["持仓集中度需要关注。"],
-            "news": [{"ticker": "AAPL_US_EQ", "headline": "Apple update", "url": "https://example.com/news"}],
+            "news": [{"ticker": "AAPL", "headline": "Apple update", "url": "https://example.com/news"}],
             "risks": ["单一持仓波动风险。"], "next_focus": ["观察技术信号。"],
         }
 
@@ -64,7 +82,8 @@ def test_daily_summary_sends_one_safe_ai_brief_and_persists_history(tmp_path, mo
     assert result["status"] == "sent"
     assert sent[0]["parse_mode"] == "HTML"
     assert "<b>TRADING 212 DAILY ACCOUNT BRIEF</b>" in sent[0]["text"]
-    assert "<b>AAPL_US_EQ</b>" in sent[0]["text"]
+    assert "<b>AAPL</b>" in sent[0]["text"]
+    assert "AAPL_US_EQ" not in sent[0]["text"]
     assert "<a href='https://example.com/news'>Apple update</a>" in sent[0]["text"]
     assert summary.generate_and_send_daily_summary(7, path=path, now=now, request_get=fake_get, request_post=fake_post)["status"] == "already_processed"
     history = summary.get_daily_summary_history(7, path=path)

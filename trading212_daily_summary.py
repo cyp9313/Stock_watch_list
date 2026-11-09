@@ -297,7 +297,15 @@ def build_daily_account_snapshot(
         change_pct = ((current_price - baseline_price) / baseline_price * 100) if baseline_price and baseline_price > 0 else None
         value_change = current_value - baseline_value if current_value is not None and baseline_value is not None else None
         holdings.append({
-            "ticker": position["ticker"], "name": position.get("display_name") or position["ticker"],
+            # The verified mapping is a more reliable public/search identity
+            # than a stale broker instrument name (for example after a rename).
+            # The raw Trading 212 key stays in the database and is used only
+            # for snapshot/state joins.
+            "ticker": monitor.mapped_yfinance_ticker(
+                conn, position["position_key"], fallback=position["ticker"],
+            ),
+            "broker_ticker": position["ticker"],
+            "name": position.get("display_name") or position["ticker"],
             "currency": position.get("currency") or "", "price": current_price,
             "quantity": _number(position.get("quantity")), "current_value": current_value,
             "baseline_price": baseline_price, "change_pct": change_pct, "value_change": value_change,
@@ -417,7 +425,7 @@ def _compact_ai_context(snapshot: dict[str, Any]) -> dict[str, Any]:
     holdings = []
     for item in snapshot.get("focus_holdings") or []:
         holdings.append({key: item.get(key) for key in (
-            "ticker", "name", "price", "current_value", "weight_pct", "change_pct", "value_change", "signals"
+            "ticker", "price", "current_value", "weight_pct", "change_pct", "value_change", "signals"
         )})
     return {
         "as_of": snapshot.get("as_of"), "account": keep_account, "focus_holdings": holdings,
@@ -437,6 +445,8 @@ def _daily_summary_messages(snapshot: dict[str, Any], *, include_news: bool) -> 
     system = (
         "你是账户日报分析助手。必须只输出严格 JSON，不要 Markdown。所有叙述使用简体中文。"
         "Python 提供的数值和持仓是不可修改事实；不得编造金额、收益、新闻、日期、持仓或价格。"
+        "ACCOUNT SNAPSHOT 中的 ticker 是已经验证的 yfinance 标的代码，也是唯一可用于联网检索和报告名称的标识；"
+        "不要使用或猜测经纪商可能过时的公司名称。"
         + (
             "使用联网搜索仅查最近 48 小时与重点持仓或组合风险直接相关的新闻；没有高相关来源时 news 返回空列表。"
             if include_news else "用户关闭了联网新闻；news 必须返回空列表。"

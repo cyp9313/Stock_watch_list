@@ -120,6 +120,18 @@ def test_telegram_alert_html_highlights_trigger_and_escapes_ticker():
     assert "<script>" not in message
 
 
+def test_telegram_ema_alert_identifies_the_exact_period_and_prefers_mapped_ticker():
+    message = monitor._telegram_message([{
+        "ticker": "FB_US_EQ", "report_ticker": "META", "current_price": 612.5, "currency": "USD",
+        "event_type": "technical", "technical_kind": "ema_cross", "ema_period": 50,
+        "direction": "up", "detail": "Price crossed above EMA 50",
+    }], dt.datetime(2026, 11, 2, 12, 0, tzinfo=dt.timezone.utc))
+
+    assert "<b>META</b>" in message
+    assert "FB_US_EQ" not in message
+    assert "<b>PRICE CROSSED ABOVE EMA 50</b>" in message
+
+
 def test_telegram_html_parse_failure_retries_as_plain_text():
     calls = []
 
@@ -258,7 +270,7 @@ def test_technical_alerts_use_cached_completed_history_and_live_price(tmp_path, 
     )
     kinds = {event.get("technical_kind") for event in second["events"]}
     assert {"ema_cross", "macd_cross", "rsi_level_cross"} <= kinds
-    assert "EMA20" in sent[-1]
+    assert "EMA 20" in sent[-1]
     assert "RSI(14)" in sent[-1]
     # Both minute runs reuse the same completed-bar cache; only the live price changes.
     assert history_calls == [("AAPL", dt.date(2026, 11, 2))]
