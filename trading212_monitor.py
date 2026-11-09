@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import datetime as dt
+import html
 import json
 import os
 from pathlib import Path
@@ -1340,33 +1341,62 @@ def _evaluate_volume_surge(
     }
 
 
+def _telegram_text(value: Any) -> str:
+    """Escape broker-derived values for Telegram's limited HTML dialect."""
+    return html.escape(str(value or ""), quote=False)
+
+
+def _telegram_price(event: dict[str, Any]) -> str:
+    price = float(event.get("current_price") or 0.0)
+    currency = _telegram_text(event.get("currency"))
+    return f"{price:.4g}{(' ' + currency) if currency else ''}"
+
+
+def _telegram_technical_heading(event: dict[str, Any]) -> tuple[str, str]:
+    """Return a visually distinct emoji and short, boldable trigger label."""
+    kind = str(event.get("technical_kind") or "")
+    direction = str(event.get("direction") or "")
+    if kind == "ema_cross":
+        return ("🟢" if direction == "up" else "🔴", f"PRICE CROSSED {'ABOVE' if direction == 'up' else 'BELOW'} EMA")
+    if kind == "macd_cross":
+        return ("🟢" if direction == "golden" else "🔴", f"MACD {'GOLDEN' if direction == 'golden' else 'DEATH'} CROSS")
+    if kind == "rsi_level_cross":
+        return ("🟢" if direction == "up" else "🔴", f"RSI(14) CROSSED {'UP' if direction == 'up' else 'DOWN'}")
+    if kind == "volume_surge":
+        return "📊", "UNUSUAL VOLUME SURGE"
+    return "⚠️", "TECHNICAL SIGNAL"
+
+
 def _telegram_message(events: list[dict[str, Any]], now: dt.datetime) -> str:
-    lines = [f"Trading 212 position alert · {now.astimezone(BERLIN_TZ):%Y-%m-%d %H:%M %Z}"]
+    """Build a safe, readable Telegram HTML alert without relying on CSS."""
+    timestamp = now.astimezone(BERLIN_TZ).strftime("%Y-%m-%d %H:%M %Z")
+    lines = [f"🚨 <b>TRADING 212 POSITION ALERT</b>\n🕒 <code>{timestamp}</code>"]
     for event in events:
+        ticker = _telegram_text(event.get("ticker"))
+        detail = _telegram_text(event.get("detail"))
+        live_price = _telegram_price(event)
         if event.get("event_type") == "technical":
-            if event["technical_kind"] == "ema_cross":
-                arrow = "▲" if event["direction"] == "up" else "▼"
-                lines.append(
-                    f"{arrow} {event['ticker']} · {event['detail']} · live {event['current_price']:.4g} "
-                    f"{event.get('currency') or ''}"
-                )
-            elif event["technical_kind"] == "macd_cross":
-                icon = "🟢" if event["direction"] == "golden" else "🔴"
-                lines.append(f"{icon} {event['ticker']} · {event['detail']} · live {event['current_price']:.4g} {event.get('currency') or ''}")
-            elif event["technical_kind"] == "volume_surge":
-                lines.append(f"📊 {event['ticker']} · {event['detail']} · live {event['current_price']:.4g} {event.get('currency') or ''}")
-            else:
-                arrow = "▲" if event["direction"] == "up" else "▼"
-                lines.append(f"{arrow} {event['ticker']} · {event['detail']} · live {event['current_price']:.4g} {event.get('currency') or ''}")
+            icon, heading = _telegram_technical_heading(event)
+            lines.append(
+                f"{icon} <b>{ticker}</b> · <b>{heading}</b>\n"
+                f"↳ {detail}\n"
+                f"💵 Live price: <code>{live_price}</code>"
+            )
             continue
         window = "4h" if event["window_minutes"] == 240 else "24h" if event["window_minutes"] == 1440 else f"{event['window_minutes']}m"
-        arrow = "▲" if event["direction"] == "up" else "▼"
-        resumed = " · resumed after pause" if event.get("resumed_after_pause") else ""
+        upward = event["direction"] == "up"
+        icon = "🟢📈" if upward else "🔴📉"
+        resumed = " <i>(resumed after pause)</i>" if event.get("resumed_after_pause") else ""
         lines.append(
-            f"{arrow} {event['ticker']} · {window} {event['change_pct']:+.2f}% "
-            f"(threshold {event['threshold_pct']:.0f}%) · {event['current_price']:.4g} {event.get('currency') or ''}{resumed}"
+            f"{icon} <b>{ticker}</b> · <b>{window} MOVE {event['change_pct']:+.2f}%</b>\n"
+            f"↳ Trigger: <b>±{event['threshold_pct']:.0f}%</b> · Live price: <code>{live_price}</code>{resumed}"
         )
-    return "\n".join(lines)
+    return "\n\n".join(lines)
+
+
+def _telegram_plain_text(html_message: str) -> str:
+    """Convert our restricted Telegram HTML to a harmless plain-text fallback."""
+    return html.unescape(re.sub(r"</?(?:b|code|i)>", "", html_message))
 
 
 def send_telegram_message(
@@ -1375,13 +1405,25 @@ def send_telegram_message(
     if not bot_token or not chat_id:
         raise MonitorConfigurationError("Telegram Bot Token and Chat ID are required for alerts.")
     try:
+        payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
         response = request_post(
             f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
+            json=payload,
             timeout=max(3, int(os.environ.get("TELEGRAM_REQUEST_TIMEOUT_SECONDS", "15"))),
         )
     except requests.RequestException as exc:
         raise Trading212APIError(f"Telegram delivery failed: {type(exc).__name__}") from exc
+    if response.status_code == 400:
+        # All monitor-generated content is escaped, but retain a safe delivery
+        # fallback if Telegram rejects HTML from a future message format.
+        try:
+            response = request_post(
+                f"https://api.telegram.org/bot{bot_token}/sendMessage",
+                json={"chat_id": chat_id, "text": _telegram_plain_text(text), "disable_web_page_preview": True},
+                timeout=max(3, int(os.environ.get("TELEGRAM_REQUEST_TIMEOUT_SECONDS", "15"))),
+            )
+        except requests.RequestException as exc:
+            raise Trading212APIError(f"Telegram delivery failed: {type(exc).__name__}") from exc
     if response.status_code >= 400:
         raise Trading212APIError(f"Telegram delivery failed (HTTP {response.status_code}).")
 
@@ -1395,7 +1437,11 @@ def send_telegram_test(user_id: int, *, path: Path | None = None, request_post: 
     if row is None:
         raise MonitorConfigurationError("Save Telegram settings first.")
     secrets = _account_secrets(row)
-    send_telegram_message(secrets["telegram_bot_token"], secrets["telegram_chat_id"], "Trading 212 monitor test: Telegram alerts are connected.", request_post=request_post)
+    sample = _telegram_message([{
+        "ticker": "SAMPLE", "current_price": 123.45, "currency": "USD",
+        "window_minutes": 5, "change_pct": 2.25, "threshold_pct": 2.0, "direction": "up",
+    }], _now())
+    send_telegram_message(secrets["telegram_bot_token"], secrets["telegram_chat_id"], sample, request_post=request_post)
 
 
 def is_monitoring_window(now: dt.datetime | None = None) -> bool:

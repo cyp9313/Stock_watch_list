@@ -107,6 +107,47 @@ def test_alert_crossing_rearms_and_uses_rolling_snapshot_retention(tmp_path, mon
         conn.close()
 
 
+def test_telegram_alert_html_highlights_trigger_and_escapes_ticker():
+    message = monitor._telegram_message([{
+        "ticker": "AAPL<US>", "current_price": 101.25, "currency": "USD",
+        "window_minutes": 5, "change_pct": 2.25, "threshold_pct": 2.0, "direction": "up",
+    }], dt.datetime(2026, 11, 2, 12, 0, tzinfo=dt.timezone.utc))
+
+    assert "🚨 <b>TRADING 212 POSITION ALERT</b>" in message
+    assert "🟢📈 <b>AAPL&lt;US&gt;</b>" in message
+    assert "<b>5m MOVE +2.25%</b>" in message
+    assert "Trigger: <b>±2%</b>" in message
+    assert "<script>" not in message
+
+
+def test_telegram_html_parse_failure_retries_as_plain_text():
+    calls = []
+
+    def fake_post(*_args, **kwargs):
+        calls.append(kwargs["json"])
+        return _Response({}, status_code=400 if len(calls) == 1 else 200)
+
+    monitor.send_telegram_message("token", "chat", "<b>Alert</b>", request_post=fake_post)
+    assert calls[0]["parse_mode"] == "HTML"
+    assert calls[1]["text"] == "Alert"
+    assert "parse_mode" not in calls[1]
+
+
+def test_telegram_test_uses_the_same_rich_alert_format(tmp_path, monkeypatch):
+    path = tmp_path / "monitor.db"
+    _configure(monkeypatch, path)
+    sent = []
+
+    def fake_post(*_args, **kwargs):
+        sent.append(kwargs["json"])
+        return _Response({})
+
+    monitor.send_telegram_test(7, path=path, request_post=fake_post)
+    assert sent[0]["parse_mode"] == "HTML"
+    assert "<b>SAMPLE</b>" in sent[0]["text"]
+    assert "<b>5m MOVE +2.25%</b>" in sent[0]["text"]
+
+
 def test_weekend_pauses_without_calling_trading212(tmp_path, monkeypatch):
     path = tmp_path / "monitor.db"
     _configure(monkeypatch, path)
