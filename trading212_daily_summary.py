@@ -45,6 +45,20 @@ def _safe_error(exc: Exception | str) -> str:
     return monitor._safe_error(exc)
 
 
+def _load_us_market_context() -> dict[str, Any]:
+    """Fetch an optional, shared broad-market context for a daily brief."""
+    try:
+        from daily_report.market_recap_service import build_trading212_us_market_context
+
+        return build_trading212_us_market_context()
+    except Exception as exc:
+        # A market-data problem is never allowed to suppress an account brief.
+        return {
+            "status": "unavailable", "as_of_date": None, "indexes": [], "macro": [],
+            "errors": [f"US market context unavailable: {type(exc).__name__}"],
+        }
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -605,7 +619,7 @@ def _daily_account_change(
 
 def build_daily_account_snapshot(
     conn: sqlite3.Connection, user_id: int, positions: list[dict[str, Any]], account_raw: dict[str, Any], now: dt.datetime,
-    *, order_activity: list[dict[str, Any]] | None = None,
+    *, order_activity: list[dict[str, Any]] | None = None, market_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     local = now.astimezone(monitor.BERLIN_TZ)
     day_start = dt.datetime.combine(local.date(), dt.time.min, tzinfo=monitor.BERLIN_TZ).astimezone(monitor.UTC)
@@ -680,6 +694,7 @@ def build_daily_account_snapshot(
         "holdings": holdings, "largest_holdings": largest[:5], "largest_movers": movers[:5], "focus_holdings": focus,
         "position_changes": position_changes,
         "position_changes_source": "orders_history" if uses_order_history else "snapshots",
+        "us_market_context": dict(market_context or {"status": "unavailable", "indexes": [], "macro": []}),
         "data_limitations": limitations,
     }
 
@@ -774,12 +789,23 @@ def _compact_ai_context(snapshot: dict[str, Any]) -> dict[str, Any]:
         holdings.append({key: item.get(key) for key in (
             "ticker", "price", "current_value", "weight_pct", "change_pct", "value_change", "signals"
         )})
+    market_context = dict(snapshot.get("us_market_context") or {})
+    compact_market = {
+        "status": market_context.get("status"), "as_of_date": market_context.get("as_of_date"),
+        "source": market_context.get("source"),
+        "indexes": [{key: item.get(key) for key in ("ticker", "name", "value", "unit", "1d_pct", "5d_pct", "trend", "status")}
+                    for item in market_context.get("indexes") or []],
+        "macro": [{key: item.get(key) for key in ("ticker", "name", "value", "unit", "1d_pct", "5d_pct", "trend", "status")}
+                  for item in market_context.get("macro") or []],
+        "errors": list(market_context.get("errors") or [])[:2],
+    }
     return {
         "as_of": snapshot.get("as_of"), "account": keep_account, "focus_holdings": holdings,
         "largest_movers": [{key: item.get(key) for key in ("ticker", "change_pct", "weight_pct")} for item in snapshot.get("largest_movers") or []],
         "position_changes": [{key: item.get(key) for key in (
             "kind", "ticker", "baseline_quantity", "quantity", "quantity_delta", "quantity_change_pct",
         )} for item in snapshot.get("position_changes") or []][:12],
+        "us_market_context": compact_market,
     }
 
 
@@ -798,9 +824,10 @@ def _daily_summary_messages(snapshot: dict[str, Any], *, include_news: bool) -> 
         "ACCOUNT SNAPSHOT 中的 ticker 是已经验证的 yfinance 标的代码，也是唯一可用于联网检索和报告名称的标识；"
         "不要使用或猜测经纪商可能过时的公司名称。"
         + (
-            "使用联网搜索仅查最近 48 小时与重点持仓或组合风险直接相关的新闻；没有高相关来源时 news 返回空列表。"
+            "使用联网搜索仅查最近 48 小时与重点持仓、组合风险或提供的美股市场环境直接相关的新闻；没有高相关来源时 news 返回空列表。"
             if include_news else "用户关闭了联网新闻；news 必须返回空列表。"
         )
+        + "美股市场环境仅是背景数据：仅在数据支持时解释其与账户风险环境的关系，不得把相关性表述为因果或编造宏观数值。"
         + "不得提供保证收益或自动交易指令；建议仅为观察条件。"
         + f"允许 news.ticker: {allowed + ['MARKET']}。SCHEMA: {json.dumps(schema, ensure_ascii=False)}"
     )
@@ -907,6 +934,37 @@ def _telegram_escape(value: Any) -> str:
     return html.escape(str(value or ""), quote=False)
 
 
+def _format_market_instrument(row: dict[str, Any]) -> str:
+    name = _telegram_escape(row.get("name") or row.get("ticker") or "Unknown")
+    value = _number(row.get("value"))
+    if value is None:
+        return f"{name} N/A"
+    unit = _telegram_escape(row.get("unit"))
+    change = _number(row.get("1d_pct"))
+    change_text = f" · {_format_pct(change)} 1D" if change is not None else ""
+    return f"{name} <code>{value:,.2f}{unit}</code>{change_text}"
+
+
+def _us_market_backdrop_lines(snapshot: dict[str, Any]) -> list[str]:
+    context = snapshot.get("us_market_context") or {}
+    if context.get("status") != "ok":
+        return []
+    indexes = {str(item.get("ticker") or ""): item for item in context.get("indexes") or [] if item.get("status") == "ok"}
+    macro = {str(item.get("ticker") or ""): item for item in context.get("macro") or [] if item.get("status") == "ok"}
+    if not indexes and not macro:
+        return []
+    lines = [f"\n🌐 <b>US market backdrop</b> <i>(as of {_telegram_escape(context.get('as_of_date') or 'latest close')})</i>"]
+    equity = [indexes[key] for key in ("ES=F", "NQ=F", "^DJI", "^RUT") if key in indexes]
+    if equity:
+        lines.append("📈 " + " · ".join(_format_market_instrument(item) for item in equity))
+    if "^VIX" in indexes:
+        lines.append("🌡️ " + _format_market_instrument(indexes["^VIX"]))
+    macro_items = [macro[key] for key in ("^TNX", "BZ=F", "DX-Y.NYB") if key in macro]
+    if macro_items:
+        lines.append("🧭 " + " · ".join(_format_market_instrument(item) for item in macro_items))
+    return lines
+
+
 def render_daily_summary_telegram(snapshot: dict[str, Any], ai: dict[str, Any]) -> str:
     account = snapshot.get("account") or {}
     currency = str(account.get("currency") or "")
@@ -934,6 +992,7 @@ def render_daily_summary_telegram(snapshot: dict[str, Any], ai: dict[str, Any]) 
         )
     else:
         lines.append("⚪ <b>Daily account change</b>: unavailable until a valid opening account snapshot is collected.")
+    lines.extend(_us_market_backdrop_lines(snapshot))
     if ai.get("ok") and ai.get("headline"):
         lines.extend(["", f"🤖 <b>AI view</b>\n{_telegram_escape(ai['headline'])}"])
         if ai.get("summary"):
@@ -1019,6 +1078,7 @@ def generate_and_send_daily_summary(
     request_get: Callable[..., Any] = requests.get,
     request_post: Callable[..., Any] = requests.post,
     ai_runner: Callable[[dict[str, Any]], dict[str, Any]] = _call_ai_summary,
+    market_context_loader: Callable[[], dict[str, Any]] | None = None,
     force: bool = False,
 ) -> dict[str, Any]:
     current = (now or dt.datetime.now(tz=monitor.UTC)).astimezone(monitor.UTC).replace(microsecond=0)
@@ -1055,9 +1115,11 @@ def generate_and_send_daily_summary(
             conn, int(user_id), api_key=secrets["api_key"], api_secret=secrets["api_secret"],
             environment=account["environment"], day_start=local_day_start, now=current, request_get=request_get,
         )
+        market_context = (market_context_loader or _load_us_market_context)()
         snapshot = build_daily_account_snapshot(
             conn, int(user_id), positions, account_raw, current,
             order_activity=order_activity["events"] if order_activity["available"] else None,
+            market_context=market_context,
         )
         if not order_activity["available"]:
             snapshot["data_limitations"].append(

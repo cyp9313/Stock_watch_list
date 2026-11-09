@@ -26,6 +26,9 @@ def _position(price=101.0, value=202.0):
 
 def _configure(monkeypatch, path):
     monkeypatch.setenv("TRADING212_CREDENTIAL_ENCRYPTION_KEY", Fernet.generate_key().decode("ascii"))
+    monkeypatch.setattr(summary, "_load_us_market_context", lambda: {
+        "status": "unavailable", "indexes": [], "macro": [], "errors": ["test"],
+    })
     monitor.save_monitor_settings(
         7, enabled=True, api_key="key", api_secret="secret", telegram_bot_token="token", telegram_chat_id="chat", path=path,
     )
@@ -294,6 +297,40 @@ def test_daily_summary_renders_readable_technical_signal_directions(tmp_path, mo
     ]
     text = summary.render_daily_summary_telegram(snapshot, {"ok": False})
     assert "<b>AAPL_US_EQ</b>: Price crossed above EMA250, Daily MACD death cross" in text
+
+
+def test_daily_summary_includes_us_market_backdrop_in_telegram_and_ai_context(tmp_path, monkeypatch):
+    path = tmp_path / "monitor.db"
+    _configure(monkeypatch, path)
+    position = monitor._position_from_api(_position()[0])
+    assert position is not None
+    market_context = {
+        "status": "ok", "as_of_date": "2026-11-06", "source": "test",
+        "indexes": [
+            {"ticker": "ES=F", "name": "标普 500 E-mini 期货", "value": 6800.0, "unit": "", "1d_pct": 0.5, "5d_pct": 1.0, "status": "ok"},
+            {"ticker": "^VIX", "name": "VIX 波动率指数", "value": 18.0, "unit": "", "1d_pct": -2.0, "5d_pct": -5.0, "status": "ok"},
+        ],
+        "macro": [
+            {"ticker": "^TNX", "name": "十年期美债收益率", "value": 4.2, "unit": "%", "1d_pct": 0.3, "5d_pct": 1.0, "status": "ok"},
+            {"ticker": "BZ=F", "name": "布伦特原油", "value": 65.0, "unit": "", "1d_pct": 1.1, "5d_pct": 2.0, "status": "ok"},
+        ],
+        "errors": [],
+    }
+    conn = monitor._connect(path)
+    try:
+        snapshot = summary.build_daily_account_snapshot(
+            conn, 7, [position], {}, dt.datetime(2026, 11, 2, 21, 15, tzinfo=dt.timezone.utc),
+            market_context=market_context,
+        )
+    finally:
+        conn.close()
+
+    text = summary.render_daily_summary_telegram(snapshot, {"ok": False})
+    assert "US market backdrop" in text
+    assert "标普 500 E-mini 期货" in text
+    assert "十年期美债收益率" in text
+    compact = summary._compact_ai_context(snapshot)
+    assert compact["us_market_context"]["indexes"][0]["ticker"] == "ES=F"
 
 
 def test_due_summaries_skip_weekends_and_before_the_scheduled_time(tmp_path, monkeypatch):

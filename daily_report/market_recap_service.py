@@ -157,6 +157,56 @@ def _save_cached_snapshot(snapshot: dict[str, Any], data_version: str = "v6") ->
         pass
 
 
+def _load_cached_market_context(context_key: str) -> dict[str, Any] | None:
+    """Load a small shared market-data payload without colliding with recaps.
+
+    A Trading 212 daily brief needs only a handful of broad-market instruments.
+    It must not overwrite the substantially richer ``market_recap_snapshots``
+    record used by the Market Recap report.
+    """
+    try:
+        with _cache_connection() as conn:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS market_context_snapshots (
+                context_key TEXT PRIMARY KEY, generated_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL)"""
+            )
+            row = conn.execute(
+                "SELECT generated_at, payload_json FROM market_context_snapshots WHERE context_key=?",
+                (context_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        generated = datetime.fromisoformat(row["generated_at"])
+        if generated.tzinfo is None:
+            generated = generated.replace(tzinfo=timezone.utc)
+        if (datetime.now(timezone.utc) - generated.astimezone(timezone.utc)).total_seconds() > _cache_ttl_seconds():
+            return None
+        value = json.loads(row["payload_json"])
+        return value if isinstance(value, dict) else None
+    except (OSError, sqlite3.Error, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _save_cached_market_context(context_key: str, payload: dict[str, Any]) -> None:
+    try:
+        with _cache_connection() as conn:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS market_context_snapshots (
+                context_key TEXT PRIMARY KEY, generated_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL)"""
+            )
+            conn.execute(
+                "INSERT INTO market_context_snapshots(context_key,generated_at,payload_json) VALUES(?,?,?) "
+                "ON CONFLICT(context_key) DO UPDATE SET generated_at=excluded.generated_at, payload_json=excluded.payload_json",
+                (context_key, datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                 json.dumps(payload, ensure_ascii=False, separators=(",", ":"))),
+            )
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        # The brief must continue when this optional shared cache is busy.
+        pass
+
+
 def _recap_delivery_state(schedule_id: str, snapshots: list[dict[str, Any]]) -> bool:
     """Return whether at least one selected market has a newer completed date."""
     if not schedule_id:
@@ -320,6 +370,49 @@ def _latest_completed_daily_frame(frame: pd.DataFrame) -> pd.DataFrame:
     threshold = max(1, math.ceil(valid.shape[1] * 0.6))
     complete = valid.loc[valid.notna().sum(axis=1) >= threshold]
     return complete if not complete.empty else valid
+
+
+def build_trading212_us_market_context() -> dict[str, Any]:
+    """Return a compact, shared US market backdrop for Trading 212 briefs.
+
+    Only the eight broad-market and macro instruments are requested here.  This
+    deliberately avoids calculating S&P/Nasdaq constituent breadth for every
+    account brief, while reusing the same yfinance + SQLite price-cache path as
+    Market Recap.  The result is shared across accounts for the normal recap
+    cache TTL and does not contain any account-specific information.
+    """
+    cache_key = "trading212_us_market_context_v1"
+    cached = _load_cached_market_context(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        import stock_watch_list_back_end as backend
+
+        tickers = list(_US_INDEXES) + list(_US_MACRO)
+        price_data = backend.get_prices_with_cache(tickers, period="2y")
+        prices = backend.extract_adj_close_frame(price_data) if isinstance(price_data.columns, pd.MultiIndex) else price_data
+        prices = _latest_completed_daily_frame(prices)
+        if prices.empty:
+            raise RuntimeError("yfinance/cache returned no completed daily closes")
+        context = {
+            "status": "ok",
+            "as_of_date": pd.Timestamp(prices.index[-1]).date().isoformat(),
+            "source": "yfinance + shared SQLite price_cache",
+            "indexes": _instrument_rows(prices, _US_INDEXES),
+            "macro": _instrument_rows(prices, _US_MACRO, yield_ticker="^TNX"),
+            "errors": [],
+        }
+    except Exception as exc:
+        context = {
+            "status": "unavailable",
+            "as_of_date": None,
+            "source": "yfinance + shared SQLite price_cache",
+            "indexes": [],
+            "macro": [],
+            "errors": [f"US market context unavailable: {type(exc).__name__}"],
+        }
+    _save_cached_market_context(cache_key, context)
+    return context
 
 
 def _us_snapshot() -> dict[str, Any]:

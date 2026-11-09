@@ -31,6 +31,33 @@ def test_tnx_keeps_already_percent_yahoo_representation():
     assert row["value"] == 4.5
 
 
+def test_trading212_market_context_uses_compact_shared_daily_data(monkeypatch):
+    prices = pd.DataFrame({
+        "ES=F": [6700.0, 6800.0], "NQ=F": [24000.0, 24200.0], "^DJI": [47000.0, 47100.0],
+        "^RUT": [2500.0, 2510.0], "^VIX": [20.0, 19.0], "^TNX": [42.0, 43.0],
+        "BZ=F": [60.0, 61.0], "DX-Y.NYB": [100.0, 101.0],
+    }, index=pd.to_datetime(["2026-11-05", "2026-11-06"]))
+    backend = SimpleNamespace(
+        get_prices_with_cache=lambda tickers, period: prices,
+        extract_adj_close_frame=lambda frame: frame,
+    )
+    monkeypatch.setitem(sys.modules, "stock_watch_list_back_end", backend)
+    monkeypatch.setattr(recap, "_load_cached_market_context", lambda key: None)
+    saved = {}
+    monkeypatch.setattr(recap, "_save_cached_market_context", lambda key, payload: saved.update(key=key, payload=payload))
+
+    context = recap.build_trading212_us_market_context()
+
+    assert context["status"] == "ok"
+    assert context["as_of_date"] == "2026-11-06"
+    assert len(context["indexes"]) == 5
+    assert context["macro"][0] == {
+        "ticker": "^TNX", "name": "十年期美债收益率", "value": 4.3,
+        "1d_pct": 2.38, "5d_pct": None, "trend": "持平", "unit": "%", "status": "ok",
+    }
+    assert saved["key"] == "trading212_us_market_context_v1"
+
+
 def test_a_share_breadth_uses_exchange_specific_limit_rules():
     quotes = pd.DataFrame({
         "代码": ["600001", "300001", "600002", "600003", "600004"],
