@@ -267,6 +267,35 @@ def test_daily_snapshot_uses_monitor_account_opening_baseline_for_total_change(t
     assert "<b>Daily account change</b>: <code>50.00 EUR</code> (+5.00%)" in text
 
 
+def test_daily_summary_renders_readable_technical_signal_directions(tmp_path, monkeypatch):
+    path = tmp_path / "monitor.db"
+    _configure(monkeypatch, path)
+    now = dt.datetime(2026, 11, 2, 21, 15, tzinfo=dt.timezone.utc)
+    conn = monitor._connect(path)
+    try:
+        for key, side in (("ema_250", "above"), ("rsi_30", "below"), ("macd_diff", "negative")):
+            conn.execute(
+                """INSERT INTO technical_signal_state(
+                    user_id, position_key, signal_key, last_value, last_side, last_observed_at, last_triggered_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (7, "AAPL_US_EQ", key, 1.0, side, "2026-11-02T20:00:00+00:00", "2026-11-02T20:00:00+00:00"),
+            )
+        position = monitor._position_from_api(_position()[0])
+        assert position is not None
+        snapshot = summary.build_daily_account_snapshot(conn, 7, [position], {}, now)
+    finally:
+        conn.close()
+
+    labels = snapshot["holdings"][0]["signals"]
+    assert labels == [
+        "Price crossed above EMA250",
+        "Daily MACD death cross (Diff crossed below 0)",
+        "RSI(14) crossed below 30",
+    ]
+    text = summary.render_daily_summary_telegram(snapshot, {"ok": False})
+    assert "<b>AAPL_US_EQ</b>: Price crossed above EMA250, Daily MACD death cross" in text
+
+
 def test_due_summaries_skip_weekends_and_before_the_scheduled_time(tmp_path, monkeypatch):
     path = tmp_path / "monitor.db"
     _configure(monkeypatch, path)

@@ -270,15 +270,45 @@ def _baseline_for_position(
     ).fetchone()
 
 
+def _daily_signal_label(signal_key: str, last_side: Any) -> str:
+    """Turn persisted technical state into a human-readable latest cross."""
+    key = str(signal_key or "").strip().lower()
+    side = str(last_side or "").strip().lower()
+    if key.startswith("ema_"):
+        period = key.removeprefix("ema_")
+        if side == "above":
+            return f"Price crossed above EMA{period}"
+        if side == "below":
+            return f"Price crossed below EMA{period}"
+        return f"Price crossed EMA{period}"
+    if key == "macd_diff":
+        if side == "positive":
+            return "Daily MACD golden cross (Diff crossed above 0)"
+        if side == "negative":
+            return "Daily MACD death cross (Diff crossed below 0)"
+        return "Daily MACD crossover"
+    if key.startswith("rsi_"):
+        level = key.removeprefix("rsi_")
+        if side == "above":
+            return f"RSI(14) crossed above {level}"
+        if side == "below":
+            return f"RSI(14) crossed below {level}"
+        return f"RSI(14) crossed {level}"
+    return key.replace("_", " ") or "Technical signal"
+
+
 def _daily_signals(conn: sqlite3.Connection, user_id: int, day_start: dt.datetime) -> dict[str, list[str]]:
     rows = conn.execute(
-        """SELECT position_key, signal_key, last_triggered_at FROM technical_signal_state
-           WHERE user_id=? AND last_triggered_at IS NOT NULL AND last_triggered_at >= ?""",
+        """SELECT position_key, signal_key, last_side, last_triggered_at FROM technical_signal_state
+           WHERE user_id=? AND last_triggered_at IS NOT NULL AND last_triggered_at >= ?
+           ORDER BY position_key, signal_key""",
         (int(user_id), _iso(day_start)),
     ).fetchall()
     found: dict[str, list[str]] = {}
     for row in rows:
-        found.setdefault(str(row["position_key"]), []).append(str(row["signal_key"]))
+        found.setdefault(str(row["position_key"]), []).append(
+            _daily_signal_label(str(row["signal_key"]), row["last_side"])
+        )
     return found
 
 
