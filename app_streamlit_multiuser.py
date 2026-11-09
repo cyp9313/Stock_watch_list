@@ -104,6 +104,12 @@ from trading212_monitor import (
     test_trading212_connection,
 )
 from trading212_mapping_view import build_mapping_table_html
+from trading212_daily_summary import (
+    generate_and_send_daily_summary,
+    get_daily_summary_history,
+    get_daily_summary_settings,
+    save_daily_summary_settings,
+)
 
 
 _PAGE_ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "survival_hunter_icon.png")
@@ -5206,6 +5212,71 @@ def render_trading212_monitor_settings(user):
                 st.rerun()
             except (ValueError, MonitorConfigurationError) as exc:
                 st.error(str(exc))
+
+    with st.expander("Trading 212 daily AI account brief", expanded=False):
+        st.caption(
+            "A separate worker sends at most one weekday account brief at your selected Europe/Berlin time. "
+            "It uses your broker's account summary and positions, existing snapshots and technical signals. "
+            "When enabled, one bounded AI call can search recent, relevant news for up to five focus holdings."
+        )
+        daily_settings = get_daily_summary_settings(user["id"])
+        if daily_settings.get("last_success_at"):
+            st.caption(f"Last daily brief sent (UTC): {daily_settings['last_success_at']}")
+        if daily_settings.get("last_error"):
+            st.warning(f"Latest daily brief status: {daily_settings['last_error']}")
+        with st.form(f"trading212_daily_summary_settings_{user['id']}"):
+            daily_enabled = st.toggle(
+                "Enable weekday Trading 212 daily account brief",
+                value=bool(daily_settings["enabled"]),
+                key=f"trading212_daily_summary_enabled_{user['id']}",
+                help="Requires the saved read-only Trading 212 and Telegram credentials. The report is sent once per Berlin weekday after the selected time.",
+            )
+            time_col, ai_col, news_col = st.columns(3)
+            with time_col:
+                daily_time = st.time_input(
+                    "Send time (Europe/Berlin)",
+                    value=datetime.time(int(daily_settings["hour"]), int(daily_settings["minute"])),
+                    key=f"trading212_daily_summary_time_{user['id']}",
+                )
+            with ai_col:
+                daily_include_ai = st.checkbox(
+                    "Include AI interpretation", value=bool(daily_settings["include_ai"]),
+                    key=f"trading212_daily_summary_ai_{user['id']}",
+                )
+            with news_col:
+                daily_include_news = st.checkbox(
+                    "Include recent news search", value=bool(daily_settings["include_news"]),
+                    disabled=not daily_include_ai,
+                    key=f"trading212_daily_summary_news_{user['id']}",
+                )
+            daily_submitted = st.form_submit_button("Save daily account brief settings")
+        if daily_submitted:
+            try:
+                save_daily_summary_settings(
+                    user["id"], enabled=daily_enabled, hour=daily_time.hour, minute=daily_time.minute,
+                    include_ai=daily_include_ai, include_news=daily_include_news,
+                )
+                st.success("Daily account brief settings saved. The separate daily-summary worker will apply them within one minute.")
+                st.rerun()
+            except (ValueError, MonitorConfigurationError) as exc:
+                st.error(str(exc))
+        if st.button("Generate and send daily brief now", key=f"trading212_daily_summary_now_{user['id']}"):
+            with st.spinner("Building the account snapshot and optional AI/news brief…"):
+                result = generate_and_send_daily_summary(user["id"], force=True)
+            if result.get("status") == "sent":
+                ai = result.get("ai") or {}
+                st.success(
+                    "Daily account brief sent to Telegram. "
+                    + ("AI/news commentary was included." if ai.get("ok") else "A deterministic brief was sent because AI/news was unavailable.")
+                )
+            else:
+                st.error(result.get("error") or "Daily account brief was not sent.")
+        history = get_daily_summary_history(user["id"], limit=3)
+        if history:
+            st.caption("Recent daily briefs")
+            for item in history:
+                headline = f" · {item['headline']}" if item.get("headline") else ""
+                st.caption(f"{item['summary_date']} · {item['status']}{headline}")
 
     with st.expander("Trading 212 → yfinance ticker mappings", expanded=False):
         st.caption(

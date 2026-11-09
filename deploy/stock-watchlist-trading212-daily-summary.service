@@ -1,0 +1,56 @@
+[Unit]
+Description=Stock Watchlist Trading 212 Daily AI Summary
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/Stock_watch_list
+ExecStart=/opt/Stock_watch_list/venv/bin/python -m trading212_daily_summary_worker
+Restart=always
+RestartSec=15
+
+User=stockwatch
+Group=stockwatch
+
+EnvironmentFile=/opt/Stock_watch_list/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/opt/Stock_watch_list/data
+
+UMask=0077
+KillMode=control-group
+TimeoutStopSec=30
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RemoveIPC=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/Stock_watch_list/data
+RuntimeDirectory=stockwatch-trading212-daily-summary
+RuntimeDirectoryMode=0700
+
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=512M
+TasksMax=128
+LimitNOFILE=1024
+
+[Install]
+WantedBy=multi-user.target

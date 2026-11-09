@@ -107,6 +107,11 @@ if ! runuser -u "$WORKER_USER" -- test -r "$APP_DIR/trading212_monitor_worker.py
   echo "       Grant read/execute access to the application code only; do not relax .env, data/, or daily_report/runs/." >&2
   exit 1
 fi
+if ! runuser -u "$WORKER_USER" -- test -r "$APP_DIR/trading212_daily_summary_worker.py"; then
+  echo "ERROR: $APP_DIR/trading212_daily_summary_worker.py is not readable by $WORKER_USER." >&2
+  echo "       Grant read/execute access to the application code only; do not relax .env, data/, or daily_report/runs/." >&2
+  exit 1
+fi
 
 echo ""
 echo "==> Setup complete."
@@ -114,9 +119,10 @@ echo ""
 echo "Next steps:"
 echo "  1. sudo cp deploy/stock-watchlist-report-worker.service /etc/systemd/system/"
 echo "  2. Optional Trading 212 monitor: sudo cp deploy/stock-watchlist-trading212-monitor.service /etc/systemd/system/"
+echo "     Optional daily AI brief: sudo cp deploy/stock-watchlist-trading212-daily-summary.service /etc/systemd/system/"
 echo "  3. sudo systemctl daemon-reload"
 echo "  4. sudo systemctl enable --now stock-watchlist-report-worker"
-echo "  5. Optional: sudo systemctl enable --now stock-watchlist-trading212-monitor"
+echo "  5. Optional: sudo systemctl enable --now stock-watchlist-trading212-monitor stock-watchlist-trading212-daily-summary"
 echo "  6. sudo systemctl status stock-watchlist-report-worker --no-pager"
 echo ""
 echo "Verify security settings:"
