@@ -618,19 +618,22 @@ def inject_css(dark_mode=False):
             background-color: #ffffff !important;
             box-shadow: 0 1px 4px rgba(15, 23, 42, 0.45) !important;
         }}
-        div[class*="st-key-trading212_monitor_enabled_"] label[data-baseweb="checkbox"] > div:first-child {{
+        div[class*="st-key-trading212_monitor_enabled_"] label[data-baseweb="checkbox"] > div:first-child,
+        div[class*="st-key-trading212_daily_summary_enabled_"] label[data-baseweb="checkbox"] > div:first-child {{
             background: #0ea5e9 !important;
             background-color: #0ea5e9 !important;
             border-color: #0369a1 !important;
             box-shadow: inset 0 0 0 1px rgba(255,255,255,0.40), 0 0 8px rgba(14,165,233,0.35) !important;
         }}
-        div[class*="st-key-trading212_monitor_enabled_"]:has(input:checked) label[data-baseweb="checkbox"] > div:first-child {{
+        div[class*="st-key-trading212_monitor_enabled_"]:has(input:checked) label[data-baseweb="checkbox"] > div:first-child,
+        div[class*="st-key-trading212_daily_summary_enabled_"]:has(input:checked) label[data-baseweb="checkbox"] > div:first-child {{
             background: #ef4444 !important;
             background-color: #ef4444 !important;
             border-color: #fecaca !important;
             box-shadow: inset 0 0 0 1px rgba(255,255,255,0.45), 0 0 12px rgba(239,68,68,0.45) !important;
         }}
-        div[class*="st-key-trading212_monitor_enabled_"] label[data-baseweb="checkbox"] > div:first-child > div {{
+        div[class*="st-key-trading212_monitor_enabled_"] label[data-baseweb="checkbox"] > div:first-child > div,
+        div[class*="st-key-trading212_daily_summary_enabled_"] label[data-baseweb="checkbox"] > div:first-child > div {{
             background: #ffffff !important;
             background-color: #ffffff !important;
             box-shadow: 0 1px 4px rgba(15, 23, 42, 0.45) !important;
@@ -5229,8 +5232,9 @@ def render_trading212_monitor_settings(user):
                 "Enable weekday Trading 212 daily account brief",
                 value=bool(daily_settings["enabled"]),
                 key=f"trading212_daily_summary_enabled_{user['id']}",
-                help="Requires the saved read-only Trading 212 and Telegram credentials. The report is sent once per Berlin weekday after the selected time.",
+                help="Blue means disabled; red means enabled after saving. Requires the saved read-only Trading 212 and Telegram credentials. The report is sent once per Berlin weekday after the selected time.",
             )
+            st.caption("Blue = disabled · Red = enabled. Click Save daily account brief settings to apply this change.")
             time_col, ai_col, news_col = st.columns(3)
             with time_col:
                 daily_time = st.time_input(
