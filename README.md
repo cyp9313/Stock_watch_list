@@ -233,6 +233,7 @@ REPORT_SMTP_AUTH_CODE=your_smtp_authorization_code
 # Leave this blank only when the stable Trading 212 encryption key above is set.
 TELEGRAM_AI_REPORT_ENCRYPTION_KEY=
 TELEGRAM_AI_REPORT_POLL_TIMEOUT_SECONDS=25
+TELEGRAM_AI_REPORT_ERROR_BACKOFF_SECONDS=20
 TELEGRAM_AI_REPORT_LINK_TTL_SECONDS=900
 TELEGRAM_AI_REPORT_DAILY_LIMIT_PER_USER=3
 
@@ -470,7 +471,7 @@ Important settings include:
 - `SEARCH_PROVIDER=priority`, `SEARCH_PROVIDER_PRIORITY`, `SERPER_API_KEY`, `ANSPIRE_*`, `SERPAPI_*`, `SEARXNG_*`, and `ARTICLE_FETCH_*` for evidence gathering. `SERPER_API_KEY` and `SERPAPI_API_KEY` belong to different providers.
 - `REPORT_SMTP_*`, `REPORT_*`, and `PORTFOLIO_*` for email, queues, schedules, limits, and Portfolio AI Reports.
 - `TRADING212_CREDENTIAL_ENCRYPTION_KEY`, `TRADING212_MONITOR_*`, and `TELEGRAM_REQUEST_TIMEOUT_SECONDS` for the optional per-account Trading 212 monitor. The encryption key is mandatory before the UI accepts any broker or Telegram secret; preserve it securely because rotating it makes saved secrets undecryptable.
-- `TELEGRAM_AI_REPORT_ENCRYPTION_KEY`, `TELEGRAM_AI_REPORT_POLL_TIMEOUT_SECONDS`, `TELEGRAM_AI_REPORT_LINK_TTL_SECONDS`, and `TELEGRAM_AI_REPORT_DAILY_LIMIT_PER_USER` for command-driven Telegram AI stock reports. Its encryption key is optional only when the stable Trading 212 encryption key is already configured; otherwise one of the two keys is required before a Bot Token can be saved.
+- `TELEGRAM_AI_REPORT_ENCRYPTION_KEY`, `TELEGRAM_AI_REPORT_POLL_TIMEOUT_SECONDS`, `TELEGRAM_AI_REPORT_ERROR_BACKOFF_SECONDS`, `TELEGRAM_AI_REPORT_LINK_TTL_SECONDS`, and `TELEGRAM_AI_REPORT_DAILY_LIMIT_PER_USER` for command-driven Telegram AI stock reports. Its encryption key is optional only when the stable Trading 212 encryption key is already configured; otherwise one of the two keys is required before a Bot Token can be saved. A failed poll waits 20 seconds by default before retrying.
 
 See [`.env.example`](.env.example) for the complete template. Use model names and API keys available to your own provider account.
 
