@@ -1,0 +1,29 @@
+[Unit]
+Description=Stock Watchlist Telegram AI Report Command Worker
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/Stock_watch_list
+ExecStart=/opt/Stock_watch_list/venv/bin/python -m telegram_ai_report_worker
+Restart=always
+RestartSec=5
+User=stockwatch
+Group=stockwatch
+EnvironmentFile=/opt/Stock_watch_list/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=REPORT_JOB_DB=/opt/Stock_watch_list/data/daily_report_jobs.db
+Environment=HOME=/opt/Stock_watch_list/data
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/Stock_watch_list/data
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

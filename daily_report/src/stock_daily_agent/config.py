@@ -54,6 +54,9 @@ class RunContext:
     output_html: Optional[Path] = None
     min_notes: int = 10
     keep_intermediate: bool = False
+    # ``telegram`` retains the validated data, evidence, and decision artifacts
+    # but intentionally skips the Plotly chart and final HTML renderer.
+    delivery_mode: str = "html"
 
     @property
     def safe_ticker(self) -> str:

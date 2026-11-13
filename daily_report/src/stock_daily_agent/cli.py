@@ -39,6 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--keep-intermediate", action="store_true", help="保留中间文件。默认也会保留 run-dir 中文件；此参数预留给后续清理策略")
     p.add_argument("--holding-context-json", help="当前 run-dir 内的最小化持仓上下文 JSON 文件")
     p.add_argument("--disable-decision-dashboard", action="store_true", help="禁用决策仪表盘（调试/兼容用途）")
+    p.add_argument("--delivery-mode", choices=["html", "telegram"], default="html", help="交付模式；telegram 跳过 HTML 和图表生成")
     p.add_argument("--decision-model", help="本次运行覆盖决策综合模型；默认继承主模型")
     p.add_argument("--decision-provider", choices=["inherit", "dashscope", "deepseek", "openai_compatible"], help="本次运行覆盖决策综合 provider")
     return p
@@ -118,6 +119,7 @@ def main(argv: list[str] | None = None) -> int:
         output_html=output,
         min_notes=args.min_notes,
         keep_intermediate=args.keep_intermediate,
+        delivery_mode=args.delivery_mode,
     )
 
     print("=" * 72)
@@ -144,7 +146,10 @@ def main(argv: list[str] | None = None) -> int:
     print("\n" + "=" * 72)
     if result.ok:
         print("[SUCCESS] 日报生成完成")
-        print(f"HTML: {result.output_html}")
+        if result.output_html:
+            print(f"HTML: {result.output_html}")
+        else:
+            print("Delivery: Telegram text artifacts")
         print(f"Decision dashboard: {'generated' if result.decision_file else 'not generated'}")
         print(f"Decision fallback: {'yes' if result.fallback_used else 'no'}")
         if result.warnings:

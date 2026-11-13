@@ -18,7 +18,7 @@ from .finalizer import finalize_report, minimum_artifacts_exist
 @dataclass
 class AgentRunResult:
     ok: bool
-    output_html: Path
+    output_html: Path | None
     run_dir: Path
     final_messages: list[dict]
     summary_text: str
@@ -166,6 +166,7 @@ def build_agent(ctx: RunContext, model: str, provider: str, enable_builtin_web: 
         min_notes=ctx.min_notes,
         search_status=status,
         builtin_web_available=builtin_web_available,
+        delivery_mode=ctx.delivery_mode,
     )
     llm_cfg = build_llm_cfg(model=model, provider=provider)
     tool_mode = "raw/native" if llm_cfg.get("generate_cfg", {}).get("use_raw_api") else "local/parser"
@@ -223,6 +224,7 @@ def run_agent(
             months=ctx.months,
             output_html=str(ctx.output_html) if ctx.output_html else None,
             report_date=ctx.report_date,
+            delivery_mode=ctx.delivery_mode,
         )
         messages: list[dict] = [{"role": "user", "content": user_task}]
         for response in bot.run(messages=messages):
@@ -257,7 +259,7 @@ def run_agent(
             warnings.append(f"Agent ended with an error after recoverable artifacts were created: {agent_error}")
         return AgentRunResult(
             ok=finalization.ok,
-            output_html=finalization.output_html or ctx.final_output_html,
+            output_html=(None if ctx.delivery_mode == "telegram" else (finalization.output_html or ctx.final_output_html)),
             run_dir=ctx.run_dir,
             final_messages=final_messages,
             summary_text=_plain_text_from_response(final_response),
@@ -266,10 +268,10 @@ def run_agent(
             warnings=warnings + finalization.errors,
         )
 
-    output = ctx.final_output_html
+    output = None if ctx.delivery_mode == "telegram" else ctx.final_output_html
     artifact_state = {
         "data": ctx.data_file.is_file(),
-        "chart": ctx.chart_file.is_file(),
+        "chart": ctx.chart_file.is_file() if ctx.delivery_mode != "telegram" else True,
         "final_notes": ctx.final_notes_json_file.is_file(),
         "notes": ctx.notes_file.is_file(),
     }

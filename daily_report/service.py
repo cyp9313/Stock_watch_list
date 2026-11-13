@@ -102,6 +102,7 @@ def generate_report(
     timeout_seconds: int | None = None,
     holding_context: dict | None = None,
     decision_dashboard: bool = True,
+    delivery_mode: str = "html",
 ) -> dict:
     """Generate a v5.8 report and return its HTML in memory.
 
@@ -118,6 +119,9 @@ def generate_report(
     if not runtime_available():
         return {"success": False, "error": f"Integrated daily report runner not found: {REPORT_RUNNER}"}
 
+    delivery_mode = str(delivery_mode or "html").strip().lower()
+    if delivery_mode not in {"html", "telegram"}:
+        return {"success": False, "error": "Unsupported report delivery mode."}
     report_date = _get_market_date()
     file_name = f"{_safe_ticker(ticker)}_report_{report_date}.html"
     run_dir = (
@@ -127,7 +131,7 @@ def generate_report(
         / _safe_scope(user_scope)
         / f"{_safe_ticker(ticker)}_{uuid.uuid4().hex}"
     )
-    output_html = run_dir / file_name
+    output_html = run_dir / file_name if delivery_mode == "html" else None
     run_dir.mkdir(parents=True, exist_ok=False)
     keep_run_dir = _diagnostic_run_retention_enabled()
     audit_path = run_dir / f"{_safe_ticker(ticker)}_finalization_audit.json"
@@ -148,10 +152,12 @@ def generate_report(
         report_date,
         "--run-dir",
         str(run_dir),
-        "--output",
-        str(output_html),
         "--quiet",
+        "--delivery-mode",
+        delivery_mode,
     ]
+    if output_html is not None:
+        cmd.extend(["--output", str(output_html)])
     if search_provider:
         cmd.extend(["--search-provider", search_provider])
     if no_article_fetch:
@@ -190,7 +196,7 @@ def generate_report(
                 "stdout": stdout,
                 "stderr": stderr,
             }
-        if not output_html.is_file():
+        if output_html is not None and not output_html.is_file():
             return {
                 "success": False,
                 "error": "Daily report command finished but did not create the expected HTML file.",
@@ -205,12 +211,11 @@ def generate_report(
                 decision_payload = json.loads(decision_path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 decision_payload = None
-        return {
+        result = {
             "success": True,
             "ticker": ticker,
             "report_date": report_date,
             "file_name": file_name,
-            "html_bytes": output_html.read_bytes(),
             "elapsed": elapsed,
             "stdout": stdout,
             "stderr": stderr,
@@ -220,6 +225,24 @@ def generate_report(
             "diagnostic_run_dir": str(run_dir) if keep_run_dir else None,
             "diagnostic_audit_file": str(audit_path) if keep_run_dir and audit_path.is_file() else None,
         }
+        if output_html is not None:
+            result["html_bytes"] = output_html.read_bytes()
+        else:
+            data_path = run_dir / f"{_safe_ticker(ticker)}_data.json"
+            notes_path = run_dir / f"{_safe_ticker(ticker)}_final_notes.json"
+            if not data_path.is_file() or not notes_path.is_file():
+                return {"success": False, "error": "Telegram report artifacts were not created.", "stdout": stdout, "stderr": stderr}
+            try:
+                from .telegram_stock_report import render_telegram_stock_report
+                data_payload = json.loads(data_path.read_text(encoding="utf-8"))
+                notes_payload = json.loads(notes_path.read_text(encoding="utf-8"))
+                result["telegram_messages"] = render_telegram_stock_report(
+                    ticker=ticker, report_date=report_date, data=data_payload,
+                    decision=decision_payload, notes=notes_payload,
+                )
+            except (OSError, ValueError, TypeError) as exc:
+                return {"success": False, "error": f"Could not render Telegram report: {exc}", "stdout": stdout, "stderr": stderr}
+        return result
     except subprocess.TimeoutExpired as exc:
         return {
             "success": False,
@@ -232,3 +255,8 @@ def generate_report(
     finally:
         if not keep_run_dir:
             _remove_run_dir(run_dir)
+
+
+def generate_telegram_report(ticker: str, **kwargs) -> dict:
+    """Run the normal research/score pipeline without producing HTML or charts."""
+    return generate_report(ticker, delivery_mode="telegram", **kwargs)

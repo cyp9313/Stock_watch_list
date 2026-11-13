@@ -27,7 +27,8 @@ from .jobs import (
 from .mailer import compute_job_message_id, send_report_email
 from .market_recap_service import generate_market_recap_for_job, mark_market_recap_delivered
 from .portfolio_service import generate_portfolio_report_for_job
-from .service import generate_report, _get_market_date
+from .service import generate_report, generate_telegram_report, _get_market_date
+from telegram_ai_reports import deliver_telegram_job, mark_telegram_job_failure
 
 
 class PermanentReportFailure(RuntimeError):
@@ -58,6 +59,15 @@ def generate_job_report(job: dict) -> dict:
             no_article_fetch=bool(job["no_article_fetch"]),
             decision_dashboard=_job_decision_dashboard_enabled(job),
         )
+    if report_kind == "telegram_ticker":
+        return generate_telegram_report(
+            job["subject_key"] or job["ticker"],
+            user_scope=job["owner_key"],
+            months=int(job["months"]),
+            search_provider=job["search_provider"],
+            no_article_fetch=bool(job["no_article_fetch"]),
+            decision_dashboard=_job_decision_dashboard_enabled(job),
+        )
     raise ValueError(f"Unsupported report kind: {report_kind}")
 
 
@@ -75,6 +85,24 @@ def process_one_job() -> bool:
         flush=True,
     )
     try:
+        if report_kind == "telegram_ticker":
+            result = generate_job_report(job)
+            if not result.get("success"):
+                detail = result.get("stderr") or result.get("stdout") or result.get("error")
+                if result.get("quality_gate_failed"):
+                    raise PermanentReportFailure(result.get("error") or "Telegram report quality gate failed.")
+                raise RuntimeError(detail or "Telegram report generation failed.")
+            messages = result.get("telegram_messages")
+            if not isinstance(messages, list) or not messages:
+                raise PermanentReportFailure("Telegram report generation completed without message content.")
+            deliver_telegram_job(job, messages)
+            mark_job_sent(job_id)
+            print(
+                f"[ReportWorker] Job {job_id[:8]} generated in {result.get('elapsed', 0):.1f}s; sent to Telegram",
+                flush=True,
+            )
+            return True
+
         html_bytes = job.get("report_html")
         file_name = job.get("file_name")
         if html_bytes is None:
@@ -135,6 +163,11 @@ def process_one_job() -> bool:
                     print(f"[ReportWorker] Job {job_id[:8]} delivered but recap schedule marker failed: {type(exc).__name__}", flush=True)
             print(f"[ReportWorker] Job {job_id[:8]} sent successfully", flush=True)
     except Exception as exc:
+        if report_kind == "telegram_ticker":
+            try:
+                mark_telegram_job_failure(job, f"{type(exc).__name__}: {exc}")
+            except Exception as status_exc:
+                print(f"[ReportWorker] Telegram status update failed: {type(status_exc).__name__}", flush=True)
         next_status = mark_job_failure(
             job_id, f"{type(exc).__name__}: {exc}", retry=not isinstance(exc, PermanentReportFailure)
         )
@@ -153,7 +186,7 @@ def main() -> None:
     scheduled = materialize_due_schedules()
     if scheduled:
         print(f"[ReportWorker] Queued {scheduled} due weekly schedule(s)", flush=True)
-    print("[ReportWorker] AI daily report email worker started", flush=True)
+    print("[ReportWorker] AI report delivery worker started", flush=True)
 
     poll_seconds = max(1, int(os.environ.get("REPORT_WORKER_POLL_SECONDS", "3")))
     last_prune = 0.0

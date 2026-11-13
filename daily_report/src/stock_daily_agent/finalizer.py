@@ -29,7 +29,10 @@ class FinalizationResult:
 
 
 def minimum_artifacts_exist(ctx: RunContext) -> bool:
-    return ctx.data_file.is_file() and ctx.chart_file.is_file() and (ctx.final_notes_json_file.is_file() or ctx.notes_file.is_file())
+    has_notes = ctx.final_notes_json_file.is_file() or ctx.notes_file.is_file()
+    if ctx.delivery_mode == "telegram":
+        return ctx.data_file.is_file() and has_notes
+    return ctx.data_file.is_file() and ctx.chart_file.is_file() and has_notes
 
 
 def _rating_class(context: dict[str, Any]) -> str:
@@ -215,6 +218,8 @@ def finalize_report(
             "final_score": None, "fallback_used": False,
         }
         _write_json(ctx.finalization_audit_file, audit)
+        if ctx.delivery_mode == "telegram":
+            return FinalizationResult(True, None, None, False, [], [])
         ok, error = _render_html(ctx)
         if not ok:
             return FinalizationResult(False, None, None, False, [f"report rendering failed: {error}"], [])
@@ -322,6 +327,11 @@ def finalize_report(
         "final_score": decision.final_score, "fallback_used": decision.fallback_used, "fallback_reason": decision.fallback_reason,
     }
     _write_json(ctx.finalization_audit_file, audit)
+    if ctx.delivery_mode == "telegram":
+        if not os.environ.get("DECISION_REPORT_KEEP_CONTEXT", "false").strip().lower() in {"1", "true", "yes"}:
+            ctx.decision_context_file.unlink(missing_ok=True)
+        warnings.extend(integrity.warnings)
+        return FinalizationResult(True, ctx.decision_file, None, decision.fallback_used, [], warnings)
     ok, error = _render_html(ctx)
     if not os.environ.get("DECISION_REPORT_KEEP_CONTEXT", "false").strip().lower() in {"1", "true", "yes"}:
         ctx.decision_context_file.unlink(missing_ok=True)

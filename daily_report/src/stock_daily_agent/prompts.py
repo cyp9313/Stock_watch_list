@@ -50,7 +50,13 @@ read_stock_daily_skill -> read_ticker_reference -> validate_ticker_format -> fet
 """.strip()
 
 
-def build_system_prompt(skill: SkillSpec, min_notes: int, search_status: str | None = None, builtin_web_available: bool = True) -> str:
+def build_system_prompt(
+    skill: SkillSpec,
+    min_notes: int,
+    search_status: str | None = None,
+    builtin_web_available: bool = True,
+    delivery_mode: str = "html",
+) -> str:
     if search_status:
         web_tool_status = search_status
     else:
@@ -59,16 +65,33 @@ def build_system_prompt(skill: SkillSpec, min_notes: int, search_status: str | N
             if builtin_web_available
             else "内置 web_search/web_extractor 未启用；使用 priority_market_research 的 Serper-first 结构化证据链。"
         )
-    return AGENT_SYSTEM_TEMPLATE.format(
+    prompt = AGENT_SYSTEM_TEMPLATE.format(
         skill_text=compact_skill_for_prompt(skill),
         min_notes=min_notes,
         web_tool_status=web_tool_status,
     )
+    if delivery_mode == "telegram":
+        prompt = prompt.replace(
+            "ticker 校验、数据获取、图表生成、HTML 拼装，不能仅口头说明。",
+            "ticker 校验、数据获取与受控证据保存，不能仅口头说明。",
+        ).replace(
+            "5. build_html_report 之前必须已经有 data_file、chart_file、notes_file。\n",
+            "5. 本次 Telegram 交付不调用 build_html_report；必须保存 data_file 与 notes_file。\n",
+        ).replace(
+            " -> generate_technical_chart -> build_html_report -> inspect_search_quality_report",
+            " -> inspect_search_quality_report",
+        )
+        prompt += (
+            "\n\n本次为 Telegram 文本交付：完成 fetch_technical_data、priority_market_research、"
+            "generate_technical_note_items 与 save_news_notes 后立即结束。禁止调用 "
+            "generate_technical_chart 或 build_html_report；Python 会从已验证的 data、notes 和决策文件生成消息。"
+        )
+    return prompt
 
 
-def build_user_task(ticker: str, months: int, output_html: str | None, report_date: str) -> str:
+def build_user_task(ticker: str, months: int, output_html: str | None, report_date: str, *, delivery_mode: str = "html") -> str:
     out = output_html or "自动命名"
-    return f"""
+    task = f"""
 请为 {ticker} 生成股票/加密货币/ETF 每日投资日报。
 
 参数：
@@ -79,3 +102,8 @@ def build_user_task(ticker: str, months: int, output_html: str | None, report_da
 
 请严格按照系统消息中的 Skill 流程执行。必须通过工具生成最终 HTML 文件。
 """.strip()
+    if delivery_mode == "telegram":
+        return task.replace("- 输出 HTML: " + out, "- 交付方式: Telegram 文本（不生成 HTML 或图表）").replace(
+            "必须通过工具生成最终 HTML 文件。", "必须保存已验证的 data 和 final_notes；不要生成 HTML 或图表。"
+        )
+    return task

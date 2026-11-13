@@ -64,6 +64,14 @@ from daily_report.jobs import (
 from daily_report.mailer import smtp_configured
 from daily_report.portfolio_service import generate_portfolio_report, portfolio_runtime_available
 from daily_report.service import generate_report, runtime_available
+from telegram_ai_reports import (
+    TelegramAIReportError,
+    create_link_code,
+    get_telegram_ai_bot_status,
+    remove_telegram_ai_bot_settings,
+    revoke_telegram_chat,
+    save_telegram_ai_bot_settings,
+)
 from daily_report.market_recap_service import (
     generate_market_recap,
     market_recap_enabled,
@@ -5984,6 +5992,108 @@ def render_market_recap_email_controls(user, mail_ready):
         render_email_job_status(user["cache_key"], report_kind="market_recap")
 
 
+def _render_telegram_ai_report_controls(user, runner_ok):
+    """Render bot-token setup and one-time chat pairing for Telegram reports."""
+    if not user:
+        st.info("Sign in to connect a Telegram bot to your own AI report queue.")
+        return
+    try:
+        status = get_telegram_ai_bot_status(user["id"])
+    except TelegramAIReportError as exc:
+        st.error(str(exc))
+        return
+
+    st.caption(
+        "Connect a Telegram Bot API token, then authorize a private chat or group with a one-time pairing code. "
+        "The bot accepts /ai NVDA or @AI NVDA and replies in the same chat. It never exposes the token or uses an unpaired chat."
+    )
+    if not runner_ok:
+        st.warning("The report runtime is unavailable, so Telegram commands cannot generate reports yet.")
+    if status.get("configured"):
+        enabled_text = "enabled" if status.get("enabled") else "disabled"
+        bot_label = f"@{status.get('bot_username')}" if status.get("bot_username") else "connected bot"
+        st.info(f"Bot: {bot_label} · command polling: {enabled_text}.")
+        if status.get("last_error"):
+            st.warning(f"Latest bot worker error: {status['last_error']}")
+        elif status.get("last_polled_at"):
+            st.caption(f"Last polled: {status['last_polled_at']} UTC")
+    else:
+        st.info("No Telegram bot is connected to this account yet.")
+
+    with st.form("telegram_ai_report_bot_settings"):
+        token = st.text_input(
+            "Bot Token",
+            type="password",
+            placeholder="123456:ABC…",
+            help="Leave blank after the first save to keep the stored token. It is encrypted at rest and is never shown again.",
+        )
+        enabled = st.checkbox(
+            "Enable Telegram AI report commands",
+            value=bool(status.get("enabled")),
+            disabled=not runner_ok,
+        )
+        saved = st.form_submit_button("Save Telegram bot settings", disabled=not runner_ok)
+    if saved:
+        try:
+            saved_status = save_telegram_ai_bot_settings(
+                user_id=user["id"], owner_key=user["cache_key"], bot_token=token, enabled=enabled,
+            )
+            st.success(
+                f"Telegram bot settings saved. Polling is {'enabled' if saved_status.get('enabled') else 'disabled'}."
+            )
+            st.rerun()
+        except TelegramAIReportError as exc:
+            st.error(str(exc))
+
+    if not status.get("configured"):
+        return
+    action_left, action_right = st.columns(2)
+    with action_left:
+        if st.button("Create one-time pairing code", key="telegram_ai_create_link", disabled=not runner_ok):
+            try:
+                pairing = create_link_code(user["id"])
+                st.session_state[f"telegram_ai_link_{user['id']}"] = pairing
+            except TelegramAIReportError as exc:
+                st.error(str(exc))
+    with action_right:
+        if st.button("Remove Telegram bot", key="telegram_ai_remove_bot", type="secondary"):
+            try:
+                remove_telegram_ai_bot_settings(user["id"])
+                st.session_state.pop(f"telegram_ai_link_{user['id']}", None)
+                st.success("Telegram bot settings and paired chats were removed.")
+                st.rerun()
+            except TelegramAIReportError as exc:
+                st.error(str(exc))
+
+    pairing = st.session_state.get(f"telegram_ai_link_{user['id']}")
+    if isinstance(pairing, dict) and pairing.get("code"):
+        st.success("Send this command to your bot from the chat or group you want to authorize:")
+        st.code(f"/link {pairing['code']}", language=None)
+        st.caption(f"This code expires at {pairing.get('expires_at')} UTC and can be used once.")
+
+    chats = status.get("chats") if isinstance(status.get("chats"), list) else []
+    st.markdown("**Paired chats**")
+    if not chats:
+        st.caption("No chat has been paired. Create a code above, then send it to the bot.")
+    for index, chat in enumerate(chats):
+        label = str(chat.get("chat_title") or chat.get("chat_id"))
+        detail = f"{chat.get('chat_type', 'chat')} · authorized {chat.get('authorized_at', '')}"
+        row_left, row_right = st.columns([5, 1])
+        with row_left:
+            st.caption(f"• {label} — {detail}")
+        with row_right:
+            if st.button("Revoke", key=f"telegram_ai_revoke_{index}_{chat.get('chat_id')}"):
+                revoke_telegram_chat(user["id"], str(chat.get("chat_id")))
+                st.rerun()
+
+    recent = status.get("recent_requests") if isinstance(status.get("recent_requests"), list) else []
+    if recent:
+        st.markdown("**Recent Telegram requests**")
+        for item in recent[:5]:
+            error = f" — {item.get('error')}" if item.get("error") else ""
+            st.caption(f"• {item.get('ticker')} · {item.get('status')} · {item.get('created_at')}{error}")
+
+
 def render_daily_report(user, config=None):
     st.subheader("AI Agent Stock Daily Report")
     st.caption(
@@ -5995,7 +6105,7 @@ def render_daily_report(user, config=None):
     if not runner_ok:
         st.warning("The integrated v5.8 daily report module is incomplete or unavailable.")
 
-    download_tab, email_tab = st.tabs(["Generate & Download", "Generate & Email"])
+    download_tab, email_tab, telegram_tab = st.tabs(["Generate & Download", "Generate & Email", "Telegram Bot"])
     with download_tab:
         if not user:
             st.info(
@@ -6147,6 +6257,9 @@ def render_daily_report(user, config=None):
 
         render_email_job_status(user["cache_key"], report_kind="ticker")
         render_market_recap_email_controls(user, mail_ready)
+
+    with telegram_tab:
+        _render_telegram_ai_report_controls(user, runner_ok)
 
 SCREENING_METRIC_COLUMNS = {
     "trend_quality": (

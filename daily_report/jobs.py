@@ -371,7 +371,7 @@ def enqueue_report_job(
     report_kind: str,
     subject_key: str,
     subject_name: str,
-    recipient_email: str,
+    recipient_email: str | None,
     months: int = 3,
     search_provider: str = "auto",
     no_article_fetch: bool = False,
@@ -381,15 +381,21 @@ def enqueue_report_job(
     if not owner_key:
         raise ValueError("A signed-in account is required for email delivery.")
     report_kind = str(report_kind or "ticker").strip().lower()
-    if report_kind not in {"ticker", "portfolio", "market_recap"}:
+    if report_kind not in {"ticker", "portfolio", "market_recap", "telegram_ticker"}:
         raise ValueError("Unsupported report kind.")
     subject_key = str(subject_key or "").strip()
     subject_name = str(subject_name or subject_key).strip() or subject_key
     if not subject_key:
         raise ValueError("Report subject is required.")
-    ticker = subject_key.upper() if report_kind == "ticker" else subject_name
-    recipient_email = validate_email(recipient_email)
-    limit_env = "PORTFOLIO_EMAIL_DAILY_LIMIT_PER_USER" if report_kind == "portfolio" else ("MARKET_RECAP_EMAIL_DAILY_LIMIT_PER_USER" if report_kind == "market_recap" else "REPORT_DAILY_LIMIT_PER_USER")
+    ticker = subject_key.upper() if report_kind in {"ticker", "telegram_ticker"} else subject_name
+    if report_kind == "telegram_ticker":
+        recipient_email = None
+        recipient_masked = "Telegram"
+        limit_env = "TELEGRAM_AI_REPORT_DAILY_LIMIT_PER_USER"
+    else:
+        recipient_email = validate_email(recipient_email or "")
+        recipient_masked = mask_email(recipient_email)
+        limit_env = "PORTFOLIO_EMAIL_DAILY_LIMIT_PER_USER" if report_kind == "portfolio" else ("MARKET_RECAP_EMAIL_DAILY_LIMIT_PER_USER" if report_kind == "market_recap" else "REPORT_DAILY_LIMIT_PER_USER")
     daily_limit = max(1, int(os.environ.get(limit_env, os.environ.get("REPORT_DAILY_LIMIT_PER_USER", "3"))))
     max_attempts = max(1, int(os.environ.get("REPORT_EMAIL_MAX_ATTEMPTS", "3")))
     now = _now()
@@ -423,12 +429,22 @@ def enqueue_report_job(
                 f"Please try again later."
             )
 
-        today_count = conn.execute(
-            "SELECT COUNT(*) FROM report_jobs WHERE owner_key=? AND created_at>=? AND schedule_id IS NULL",
-            (owner_key, _iso(day_start)),
-        ).fetchone()[0]
+        # Telegram commands have their own small quota.  Preserve the
+        # existing combined manual-email quota for every pre-existing kind.
+        if report_kind == "telegram_ticker":
+            today_count = conn.execute(
+                """SELECT COUNT(*) FROM report_jobs
+                   WHERE owner_key=? AND created_at>=? AND schedule_id IS NULL AND report_kind=?""",
+                (owner_key, _iso(day_start), report_kind),
+            ).fetchone()[0]
+        else:
+            today_count = conn.execute(
+                "SELECT COUNT(*) FROM report_jobs WHERE owner_key=? AND created_at>=? AND schedule_id IS NULL",
+                (owner_key, _iso(day_start)),
+            ).fetchone()[0]
         if today_count >= daily_limit:
-            raise DailyLimitError(f"Daily email report limit reached ({daily_limit} per account).")
+            delivery_label = "Telegram" if report_kind == "telegram_ticker" else "email"
+            raise DailyLimitError(f"Daily {delivery_label} report limit reached ({daily_limit} per account).")
 
         job_id = uuid.uuid4().hex
         conn.execute(
@@ -445,7 +461,7 @@ def enqueue_report_job(
                 owner_key,
                 ticker,
                 recipient_email,
-                mask_email(recipient_email),
+                recipient_masked,
                 max(1, int(months)),
                 search_provider or "auto",
                 int(bool(no_article_fetch)),
@@ -465,6 +481,40 @@ def enqueue_report_job(
         raise
     finally:
         conn.close()
+
+
+def enqueue_telegram_ticker_job(
+    *,
+    owner_key: str,
+    user_id: int,
+    chat_id: str,
+    reply_to_message_id: int | None,
+    ticker: str,
+    months: int = 3,
+    search_provider: str = "auto",
+    no_article_fetch: bool = False,
+    decision_dashboard: bool = True,
+) -> dict:
+    ticker = str(ticker or "").strip().upper()
+    if not ticker:
+        raise ValueError("Please enter a ticker.")
+    return enqueue_report_job(
+        owner_key=owner_key,
+        report_kind="telegram_ticker",
+        subject_key=ticker,
+        subject_name=ticker,
+        recipient_email=None,
+        months=months,
+        search_provider=search_provider,
+        no_article_fetch=no_article_fetch,
+        payload={
+            "ticker": ticker,
+            "decision_dashboard": bool(decision_dashboard),
+            "telegram_user_id": int(user_id),
+            "telegram_chat_id": str(chat_id),
+            "telegram_reply_to_message_id": int(reply_to_message_id) if reply_to_message_id is not None else None,
+        },
+    )
 
 
 def enqueue_email_job(

@@ -1,5 +1,5 @@
 [Unit]
-Description=Stock Watchlist AI Report Email Worker
+Description=Stock Watchlist AI Report Delivery Worker
 Wants=network-online.target
 After=network-online.target
 
