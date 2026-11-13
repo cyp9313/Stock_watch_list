@@ -80,6 +80,20 @@ def test_initial_bot_setup_advances_past_old_updates(tmp_path: Path, monkeypatch
     assert telegram._enabled_bots()[0]["polling_offset"] == 987
 
 
+def test_repeated_telegram_update_is_processed_only_once(tmp_path: Path, monkeypatch) -> None:
+    _jobs, telegram = _load_modules(tmp_path, monkeypatch)
+    seen: list[dict] = []
+    monkeypatch.setattr(telegram, "_process_update", lambda _bot, update: seen.append(update))
+    monkeypatch.setattr(telegram, "_telegram_api", lambda *_args, **_kwargs: {
+        "result": [{"update_id": 712, "message": {"message_id": 1, "text": "/help", "chat": {"id": 88}}}]
+    })
+    bot = {"user_id": 7, "token": "123:test", "polling_offset": 0}
+    telegram.poll_one_bot(bot)
+    # Simulate a stale cursor / getUpdates retry returning the same update.
+    telegram.poll_one_bot(bot)
+    assert len(seen) == 1
+
+
 def test_telegram_renderer_escapes_provider_text_and_splits_long_content() -> None:
     from daily_report.telegram_stock_report import render_telegram_stock_report
 

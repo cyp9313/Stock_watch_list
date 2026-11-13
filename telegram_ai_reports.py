@@ -132,6 +132,16 @@ def init_telegram_ai_report_db() -> None:
         request_columns = {row[1] for row in conn.execute("PRAGMA table_info(telegram_ai_report_requests)")}
         if "request_kind" not in request_columns:
             conn.execute("ALTER TABLE telegram_ai_report_requests ADD COLUMN request_kind TEXT NOT NULL DEFAULT 'ticker'")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS telegram_ai_consumed_updates (
+                user_id INTEGER NOT NULL,
+                update_id INTEGER NOT NULL,
+                consumed_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, update_id)
+            )
+            """
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_telegram_ai_bot_enabled ON telegram_ai_bot_settings(enabled)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_telegram_ai_requests_user_created ON telegram_ai_report_requests(user_id, created_at DESC)")
 
@@ -349,6 +359,18 @@ def _record_poll_error(user_id: int, error: str | None) -> None:
         )
 
 
+def _claim_update(user_id: int, update_id: int) -> bool:
+    """Return true only for the first processing of an inbound update ID."""
+    init_telegram_ai_report_db()
+    with jobs._connection() as conn:
+        cursor = conn.execute(
+            """INSERT OR IGNORE INTO telegram_ai_consumed_updates(user_id, update_id, consumed_at)
+               VALUES (?, ?, ?)""",
+            (int(user_id), int(update_id), _iso()),
+        )
+    return cursor.rowcount == 1
+
+
 def _send(token: str, chat_id: str, text: str, *, reply_to_message_id: int | None = None) -> None:
     payload: dict[str, Any] = {
         "chat_id": str(chat_id), "text": str(text)[:4096], "parse_mode": "HTML", "disable_web_page_preview": True,
@@ -493,8 +515,10 @@ def poll_one_bot(bot: dict[str, Any]) -> dict[str, int]:
             if not isinstance(update, dict):
                 continue
             update_id = update.get("update_id")
+            is_new = not isinstance(update_id, int) or _claim_update(user_id, update_id)
             try:
-                _process_update(bot, update)
+                if is_new:
+                    _process_update(bot, update)
             except Exception as exc:
                 # Consume malformed/unusable messages as well; otherwise one bad
                 # inbound update would permanently block the polling cursor.
