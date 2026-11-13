@@ -29,6 +29,10 @@ from .market_recap_service import generate_market_recap_for_job, mark_market_rec
 from .portfolio_service import generate_portfolio_report_for_job
 from .service import generate_report, generate_telegram_report, _get_market_date
 from telegram_ai_reports import deliver_telegram_job, mark_telegram_job_failure
+from trading212_daily_summary import generate_daily_summary_for_telegram_command
+
+
+TELEGRAM_REPORT_KINDS = {"telegram_ticker", "telegram_daily_account_brief"}
 
 
 class PermanentReportFailure(RuntimeError):
@@ -68,6 +72,16 @@ def generate_job_report(job: dict) -> dict:
             no_article_fetch=bool(job["no_article_fetch"]),
             decision_dashboard=_job_decision_dashboard_enabled(job),
         )
+    if report_kind == "telegram_daily_account_brief":
+        try:
+            payload = json.loads(job.get("payload_json") or "{}")
+            user_id = int(payload.get("telegram_user_id"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Telegram daily account brief payload is invalid.") from exc
+        result = generate_daily_summary_for_telegram_command(user_id)
+        if not result.get("success"):
+            return {"success": False, "error": result.get("error") or "Daily account brief generation failed."}
+        return {"success": True, "telegram_messages": result.get("telegram_messages"), "elapsed": 0.0}
     raise ValueError(f"Unsupported report kind: {report_kind}")
 
 
@@ -85,7 +99,7 @@ def process_one_job() -> bool:
         flush=True,
     )
     try:
-        if report_kind == "telegram_ticker":
+        if report_kind in TELEGRAM_REPORT_KINDS:
             result = generate_job_report(job)
             if not result.get("success"):
                 detail = result.get("stderr") or result.get("stdout") or result.get("error")
@@ -163,7 +177,7 @@ def process_one_job() -> bool:
                     print(f"[ReportWorker] Job {job_id[:8]} delivered but recap schedule marker failed: {type(exc).__name__}", flush=True)
             print(f"[ReportWorker] Job {job_id[:8]} sent successfully", flush=True)
     except Exception as exc:
-        if report_kind == "telegram_ticker":
+        if report_kind in TELEGRAM_REPORT_KINDS:
             try:
                 mark_telegram_job_failure(job, f"{type(exc).__name__}: {exc}")
             except Exception as status_exc:

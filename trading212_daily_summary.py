@@ -1070,6 +1070,102 @@ def _save_run(conn: sqlite3.Connection, user_id: int, summary_date: str, *, stat
     conn.execute("DELETE FROM daily_summary_runs WHERE user_id=? AND summary_date < ?", (int(user_id), cutoff))
 
 
+def _build_daily_summary_content(
+    conn: sqlite3.Connection,
+    user_id: int,
+    current: dt.datetime,
+    *,
+    request_get: Callable[..., Any] = requests.get,
+    ai_runner: Callable[[dict[str, Any]], dict[str, Any]] = _call_ai_summary,
+    market_context_loader: Callable[[], dict[str, Any]] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Build one account's facts and optional AI view without delivering it."""
+    settings = _settings_from_row(conn.execute(
+        "SELECT * FROM daily_summary_settings WHERE user_id=?", (int(user_id),)
+    ).fetchone())
+    account = conn.execute("SELECT * FROM monitor_accounts WHERE user_id=?", (int(user_id),)).fetchone()
+    if account is None:
+        raise monitor.MonitorConfigurationError("Save Trading 212 credentials before generating a daily summary.")
+    secrets = monitor._account_secrets(account)
+    if not all(secrets[key] for key in ("api_key", "api_secret")):
+        raise monitor.MonitorConfigurationError("Trading 212 credentials are required for the daily summary.")
+    positions = [monitor._position_from_api(item) for item in monitor.fetch_positions(
+        secrets["api_key"], secrets["api_secret"], account["environment"], request_get=request_get
+    )]
+    positions = [item for item in positions if item is not None]
+    try:
+        account_raw = fetch_account_summary(
+            secrets["api_key"], secrets["api_secret"], account["environment"], request_get=request_get,
+        )
+    except monitor.Trading212APIError as exc:
+        account_raw = {"_summary_error": _safe_error(exc)}
+    local_day_start = dt.datetime.combine(
+        current.astimezone(monitor.BERLIN_TZ).date(), dt.time.min, tzinfo=monitor.BERLIN_TZ,
+    ).astimezone(monitor.UTC)
+    order_activity = _fetch_daily_executed_orders(
+        conn, int(user_id), api_key=secrets["api_key"], api_secret=secrets["api_secret"],
+        environment=account["environment"], day_start=local_day_start, now=current, request_get=request_get,
+    )
+    market_context = (market_context_loader or _load_us_market_context)()
+    snapshot = build_daily_account_snapshot(
+        conn, int(user_id), positions, account_raw, current,
+        order_activity=order_activity["events"] if order_activity["available"] else None,
+        market_context=market_context,
+    )
+    if not order_activity["available"]:
+        snapshot["data_limitations"].append(
+            f"Trading 212 order history was unavailable; position changes use snapshot comparison ({order_activity['error']})."
+        )
+    if account_raw.get("_summary_error"):
+        snapshot["data_limitations"].append(
+            "Trading 212 account-summary data was unavailable; account value/cash may be omitted."
+        )
+    if settings["include_ai"]:
+        ai = (
+            _call_ai_summary(snapshot, include_news=settings["include_news"])
+            if ai_runner is _call_ai_summary else ai_runner(snapshot)
+        )
+    else:
+        ai = {"ok": False, "error": "AI commentary disabled by user."}
+    if settings["include_ai"] and not settings["include_news"] and ai.get("ok"):
+        ai = {**ai, "news": []}
+    return settings, snapshot, ai
+
+
+def generate_daily_summary_for_telegram_command(
+    user_id: int,
+    *,
+    path: Path | None = None,
+    now: dt.datetime | None = None,
+    request_get: Callable[..., Any] = requests.get,
+    ai_runner: Callable[[dict[str, Any]], dict[str, Any]] = _call_ai_summary,
+    market_context_loader: Callable[[], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Build an on-demand brief without touching scheduled daily-run state."""
+    current = (now or dt.datetime.now(tz=monitor.UTC)).astimezone(monitor.UTC).replace(microsecond=0)
+    conn = _connect(path)
+    try:
+        _settings, snapshot, ai = _build_daily_summary_content(
+            conn, int(user_id), current, request_get=request_get, ai_runner=ai_runner,
+            market_context_loader=market_context_loader,
+        )
+        return {
+            "success": True,
+            "summary_date": current.astimezone(monitor.BERLIN_TZ).date().isoformat(),
+            "snapshot": snapshot,
+            "ai": ai,
+            "telegram_messages": [render_daily_summary_telegram(snapshot, ai)],
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "summary_date": current.astimezone(monitor.BERLIN_TZ).date().isoformat(),
+            "error": _safe_error(exc),
+        }
+    finally:
+        conn.close()
+
+
 def generate_and_send_daily_summary(
     user_id: int,
     *,
@@ -1085,59 +1181,18 @@ def generate_and_send_daily_summary(
     summary_date = current.astimezone(monitor.BERLIN_TZ).date().isoformat()
     conn = _connect(path)
     try:
-        settings = _settings_from_row(conn.execute("SELECT * FROM daily_summary_settings WHERE user_id=?", (int(user_id),)).fetchone())
-        account = conn.execute("SELECT * FROM monitor_accounts WHERE user_id=?", (int(user_id),)).fetchone()
-        if account is None:
-            raise monitor.MonitorConfigurationError("Save Trading 212 credentials before generating a daily summary.")
         if not force:
             prior = conn.execute("SELECT status FROM daily_summary_runs WHERE user_id=? AND summary_date=?", (int(user_id), summary_date)).fetchone()
             if prior is not None:
                 return {"status": "already_processed", "summary_date": summary_date, "events": []}
-        secrets = monitor._account_secrets(account)
-        if not all(secrets[key] for key in ("api_key", "api_secret", "telegram_bot_token", "telegram_chat_id")):
+        account = conn.execute("SELECT * FROM monitor_accounts WHERE user_id=?", (int(user_id),)).fetchone()
+        secrets = monitor._account_secrets(account) if account is not None else {}
+        if not all(secrets.get(key) for key in ("telegram_bot_token", "telegram_chat_id")):
             raise monitor.MonitorConfigurationError("Trading 212 and Telegram credentials are required for the daily summary.")
-        positions = [monitor._position_from_api(item) for item in monitor.fetch_positions(
-            secrets["api_key"], secrets["api_secret"], account["environment"], request_get=request_get
-        )]
-        positions = [item for item in positions if item is not None]
-        try:
-            account_raw = fetch_account_summary(
-                secrets["api_key"], secrets["api_secret"], account["environment"], request_get=request_get,
-            )
-        except monitor.Trading212APIError as exc:
-            # Some otherwise-valid read-only keys may not include account-
-            # summary permission. Positions still support a useful daily brief.
-            account_raw = {"_summary_error": _safe_error(exc)}
-        local_day_start = dt.datetime.combine(
-            current.astimezone(monitor.BERLIN_TZ).date(), dt.time.min, tzinfo=monitor.BERLIN_TZ,
-        ).astimezone(monitor.UTC)
-        order_activity = _fetch_daily_executed_orders(
-            conn, int(user_id), api_key=secrets["api_key"], api_secret=secrets["api_secret"],
-            environment=account["environment"], day_start=local_day_start, now=current, request_get=request_get,
+        _settings, snapshot, ai = _build_daily_summary_content(
+            conn, int(user_id), current, request_get=request_get, ai_runner=ai_runner,
+            market_context_loader=market_context_loader,
         )
-        market_context = (market_context_loader or _load_us_market_context)()
-        snapshot = build_daily_account_snapshot(
-            conn, int(user_id), positions, account_raw, current,
-            order_activity=order_activity["events"] if order_activity["available"] else None,
-            market_context=market_context,
-        )
-        if not order_activity["available"]:
-            snapshot["data_limitations"].append(
-                f"Trading 212 order history was unavailable; position changes use snapshot comparison ({order_activity['error']})."
-            )
-        if account_raw.get("_summary_error"):
-            snapshot["data_limitations"].append(
-                "Trading 212 account-summary data was unavailable; account value/cash may be omitted."
-            )
-        if settings["include_ai"]:
-            ai = (
-                _call_ai_summary(snapshot, include_news=settings["include_news"])
-                if ai_runner is _call_ai_summary else ai_runner(snapshot)
-            )
-        else:
-            ai = {"ok": False, "error": "AI commentary disabled by user."}
-        if settings["include_ai"] and not settings["include_news"] and ai.get("ok"):
-            ai = {**ai, "news": []}
         text = render_daily_summary_telegram(snapshot, ai)
         monitor.send_telegram_message(secrets["telegram_bot_token"], secrets["telegram_chat_id"], text, request_post=request_post)
         _save_run(conn, int(user_id), summary_date, status="sent", snapshot=snapshot, ai=ai, now=current, sent=True)

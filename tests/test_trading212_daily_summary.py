@@ -99,6 +99,30 @@ def test_daily_summary_sends_one_safe_ai_brief_and_persists_history(tmp_path, mo
     assert summary.run_due_daily_summaries(path=path, now=now) == []
 
 
+def test_command_daily_brief_does_not_create_or_consume_scheduled_daily_run(tmp_path, monkeypatch):
+    path = tmp_path / "monitor.db"
+    _configure(monkeypatch, path)
+    _save_verified_mapping(path)
+
+    def fake_get(url, **_kwargs):
+        if url.endswith("/equity/positions"):
+            return _Response(_position())
+        if url.endswith("/equity/account/summary"):
+            return _Response({"currency": "EUR", "totalValue": 1200.0, "cash": {"availableToTrade": 300.0}})
+        assert url.endswith("/equity/history/orders")
+        return _Response({"items": [], "nextPagePath": None})
+
+    now = dt.datetime(2026, 11, 2, 21, 15, tzinfo=dt.timezone.utc)
+    result = summary.generate_daily_summary_for_telegram_command(
+        7, path=path, now=now, request_get=fake_get,
+        ai_runner=lambda _snapshot: {"ok": False, "error": "disabled"},
+        market_context_loader=lambda: {"status": "unavailable", "indexes": [], "macro": []},
+    )
+    assert result["success"] is True
+    assert "TRADING 212 DAILY ACCOUNT BRIEF" in result["telegram_messages"][0]
+    assert summary.get_daily_summary_history(7, path=path) == []
+
+
 def test_daily_summary_filters_unknown_tickers_and_unsafe_urls():
     snapshot = {"focus_holdings": [{"ticker": "AAPL_US_EQ"}]}
     ai = summary._normalise_ai_payload({

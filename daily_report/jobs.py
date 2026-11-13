@@ -381,14 +381,14 @@ def enqueue_report_job(
     if not owner_key:
         raise ValueError("A signed-in account is required for email delivery.")
     report_kind = str(report_kind or "ticker").strip().lower()
-    if report_kind not in {"ticker", "portfolio", "market_recap", "telegram_ticker"}:
+    if report_kind not in {"ticker", "portfolio", "market_recap", "telegram_ticker", "telegram_daily_account_brief"}:
         raise ValueError("Unsupported report kind.")
     subject_key = str(subject_key or "").strip()
     subject_name = str(subject_name or subject_key).strip() or subject_key
     if not subject_key:
         raise ValueError("Report subject is required.")
-    ticker = subject_key.upper() if report_kind in {"ticker", "telegram_ticker"} else subject_name
-    if report_kind == "telegram_ticker":
+    ticker = subject_key.upper() if report_kind in {"ticker", "telegram_ticker", "telegram_daily_account_brief"} else subject_name
+    if report_kind in {"telegram_ticker", "telegram_daily_account_brief"}:
         recipient_email = None
         recipient_masked = "Telegram"
         limit_env = "TELEGRAM_AI_REPORT_DAILY_LIMIT_PER_USER"
@@ -437,13 +437,17 @@ def enqueue_report_job(
                    WHERE owner_key=? AND created_at>=? AND schedule_id IS NULL AND report_kind=?""",
                 (owner_key, _iso(day_start), report_kind),
             ).fetchone()[0]
+        elif report_kind == "telegram_daily_account_brief":
+            # On-demand `/ai DAB` requests are not part of the scheduled
+            # once-per-Berlin-day brief, nor the generic email-report quota.
+            today_count = 0
         else:
             today_count = conn.execute(
                 "SELECT COUNT(*) FROM report_jobs WHERE owner_key=? AND created_at>=? AND schedule_id IS NULL",
                 (owner_key, _iso(day_start)),
             ).fetchone()[0]
         if today_count >= daily_limit:
-            delivery_label = "Telegram" if report_kind == "telegram_ticker" else "email"
+            delivery_label = "Telegram" if report_kind in {"telegram_ticker", "telegram_daily_account_brief"} else "email"
             raise DailyLimitError(f"Daily {delivery_label} report limit reached ({daily_limit} per account).")
 
         job_id = uuid.uuid4().hex
@@ -510,6 +514,28 @@ def enqueue_telegram_ticker_job(
         payload={
             "ticker": ticker,
             "decision_dashboard": bool(decision_dashboard),
+            "telegram_user_id": int(user_id),
+            "telegram_chat_id": str(chat_id),
+            "telegram_reply_to_message_id": int(reply_to_message_id) if reply_to_message_id is not None else None,
+        },
+    )
+
+
+def enqueue_telegram_daily_account_brief_job(
+    *,
+    owner_key: str,
+    user_id: int,
+    chat_id: str,
+    reply_to_message_id: int | None,
+) -> dict:
+    """Queue a paired-chat daily brief without consuming the daily brief quota."""
+    return enqueue_report_job(
+        owner_key=owner_key,
+        report_kind="telegram_daily_account_brief",
+        subject_key="DAB",
+        subject_name="Trading 212 Daily Account Brief",
+        recipient_email=None,
+        payload={
             "telegram_user_id": int(user_id),
             "telegram_chat_id": str(chat_id),
             "telegram_reply_to_message_id": int(reply_to_message_id) if reply_to_message_id is not None else None,

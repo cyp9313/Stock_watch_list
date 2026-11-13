@@ -129,6 +129,9 @@ def init_telegram_ai_report_db() -> None:
             )
             """
         )
+        request_columns = {row[1] for row in conn.execute("PRAGMA table_info(telegram_ai_report_requests)")}
+        if "request_kind" not in request_columns:
+            conn.execute("ALTER TABLE telegram_ai_report_requests ADD COLUMN request_kind TEXT NOT NULL DEFAULT 'ticker'")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_telegram_ai_bot_enabled ON telegram_ai_bot_settings(enabled)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_telegram_ai_requests_user_created ON telegram_ai_report_requests(user_id, created_at DESC)")
 
@@ -168,7 +171,7 @@ def get_telegram_ai_bot_status(user_id: int) -> dict[str, Any]:
             (int(user_id),),
         ).fetchall()]
         requests_rows = [dict(row) for row in conn.execute(
-            "SELECT ticker, status, error, created_at, updated_at FROM telegram_ai_report_requests WHERE user_id=? ORDER BY created_at DESC LIMIT 8",
+            "SELECT ticker, request_kind, status, error, created_at, updated_at FROM telegram_ai_report_requests WHERE user_id=? ORDER BY created_at DESC LIMIT 8",
             (int(user_id),),
         ).fetchall()]
     if not settings:
@@ -308,7 +311,8 @@ def _command(text: str) -> tuple[str, str | None]:
     if not match:
         match = re.fullmatch(r"@AI\s+([A-Za-z0-9.^=\-]{1,24})", cleaned, flags=re.I)
     if match:
-        return "report", match.group(1).upper()
+        argument = match.group(1).upper()
+        return ("daily_account_brief", None) if argument == "DAB" else ("report", argument)
     if re.fullmatch(r"/(?:help|start)(?:@\w+)?", cleaned, flags=re.I):
         return "help", None
     return "", None
@@ -346,6 +350,16 @@ def _link_chat(bot: dict[str, Any], chat: dict[str, Any], code: str) -> bool:
     return True
 
 
+def _record_queued_request(*, user_id: int, chat_id: str, message_id: int, ticker: str, request_kind: str, job_id: str) -> None:
+    with jobs._connection() as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO telegram_ai_report_requests
+               (id, user_id, chat_id, message_id, ticker, request_kind, job_id, status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)""",
+            (secrets.token_hex(16), int(user_id), str(chat_id), int(message_id), ticker, request_kind, job_id, _iso(), _iso()),
+        )
+
+
 def _queue_report(bot: dict[str, Any], chat_id: str, message_id: int, ticker: str) -> str:
     if not _TICKER_RE.fullmatch(ticker):
         raise TelegramAIReportError("Ticker format is not supported.")
@@ -353,13 +367,18 @@ def _queue_report(bot: dict[str, Any], chat_id: str, message_id: int, ticker: st
         owner_key=str(bot.get("owner_key") or ""), user_id=int(bot["user_id"]), chat_id=str(chat_id),
         reply_to_message_id=message_id, ticker=ticker, decision_dashboard=True,
     )
-    with jobs._connection() as conn:
-        conn.execute(
-            """INSERT OR IGNORE INTO telegram_ai_report_requests
-               (id, user_id, chat_id, message_id, ticker, job_id, status, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?)""",
-            (secrets.token_hex(16), int(bot["user_id"]), str(chat_id), int(message_id), ticker, job["id"], _iso(), _iso()),
-        )
+    _record_queued_request(user_id=int(bot["user_id"]), chat_id=chat_id, message_id=message_id,
+                           ticker=ticker, request_kind="ticker", job_id=str(job["id"]))
+    return str(job["id"])
+
+
+def _queue_daily_account_brief(bot: dict[str, Any], chat_id: str, message_id: int) -> str:
+    job = jobs.enqueue_telegram_daily_account_brief_job(
+        owner_key=str(bot.get("owner_key") or ""), user_id=int(bot["user_id"]), chat_id=str(chat_id),
+        reply_to_message_id=message_id,
+    )
+    _record_queued_request(user_id=int(bot["user_id"]), chat_id=chat_id, message_id=message_id,
+                           ticker="DAB", request_kind="daily_account_brief", job_id=str(job["id"]))
     return str(job["id"])
 
 
@@ -376,14 +395,14 @@ def _process_update(bot: dict[str, Any], update: dict[str, Any]) -> None:
     command, argument = _command(text)
     if command == "link":
         if _link_chat(bot, chat, str(argument)):
-            _send(bot["token"], chat_id, "✅ <b>Connected.</b> Send <code>/ai NVDA</code> or <code>@AI NVDA</code> to request a report.", reply_to_message_id=message_id)
+            _send(bot["token"], chat_id, "✅ <b>Connected.</b> Send <code>/ai NVDA</code> for a stock report or <code>/ai DAB</code> for your Trading 212 account brief.", reply_to_message_id=message_id)
         else:
             _send(bot["token"], chat_id, "❌ This pairing code is invalid or has expired. Create a new one in the website.", reply_to_message_id=message_id)
         return
     if command == "help":
-        _send(bot["token"], chat_id, "Use <code>/link &lt;code&gt;</code> once to authorize this chat, then <code>/ai NVDA</code> or <code>@AI NVDA</code>.", reply_to_message_id=message_id)
+        _send(bot["token"], chat_id, "Use <code>/link &lt;code&gt;</code> once to authorize this chat, then <code>/ai NVDA</code> for a stock report or <code>/ai DAB</code> for a Trading 212 account brief.", reply_to_message_id=message_id)
         return
-    if command != "report":
+    if command not in {"report", "daily_account_brief"}:
         return
     with jobs._connection() as conn:
         authorized = _chat_authorized(conn, int(bot["user_id"]), chat_id)
@@ -393,11 +412,14 @@ def _process_update(bot: dict[str, Any], update: dict[str, Any]) -> None:
         _send(bot["token"], chat_id, "🔒 This chat is not authorized. Create a pairing code on the website, then send <code>/link &lt;code&gt;</code> here.", reply_to_message_id=message_id)
         return
     try:
-        job_id = _queue_report(bot, chat_id, message_id, str(argument))
+        job_id = _queue_daily_account_brief(bot, chat_id, message_id) if command == "daily_account_brief" else _queue_report(bot, chat_id, message_id, str(argument))
     except Exception as exc:
         _send(bot["token"], chat_id, f"❌ Could not queue the report: {str(exc)[:360]}", reply_to_message_id=message_id)
         return
-    _send(bot["token"], chat_id, f"⏳ <b>{argument}</b> report queued (<code>{job_id[:8]}</code>). I will reply here when research is complete.", reply_to_message_id=message_id)
+    if command == "daily_account_brief":
+        _send(bot["token"], chat_id, f"⏳ <b>Trading 212 Daily Account Brief</b> queued (<code>{job_id[:8]}</code>). I will reply here when it is ready.", reply_to_message_id=message_id)
+    else:
+        _send(bot["token"], chat_id, f"⏳ <b>{argument}</b> report queued (<code>{job_id[:8]}</code>). I will reply here when research is complete.", reply_to_message_id=message_id)
 
 
 def poll_one_bot(bot: dict[str, Any]) -> dict[str, int]:

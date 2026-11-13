@@ -20,6 +20,7 @@ def test_command_parser_accepts_private_and_group_forms(tmp_path: Path, monkeypa
     assert telegram._command("/ai nvda") == ("report", "NVDA")
     assert telegram._command("/ai@MyBot BRK-B") == ("report", "BRK-B")
     assert telegram._command("@AI BTC-USD") == ("report", "BTC-USD")
+    assert telegram._command("/ai DAB") == ("daily_account_brief", None)
     assert telegram._command("/link token_12345678") == ("link", "token_12345678")
     assert telegram._command("hello") == ("", None)
 
@@ -44,6 +45,26 @@ def test_pairing_code_authorizes_chat_and_queues_only_paired_command(tmp_path: P
     assert any("queued" in text for text in sent)
     queued = [job for job in jobs.list_owner_jobs("scope-7") if job.get("report_kind") == "telegram_ticker"]
     assert queued[0]["subject_key"] == "NVDA"
+
+
+def test_paired_chat_queues_dab_without_using_ticker_report_quota(tmp_path: Path, monkeypatch) -> None:
+    jobs, telegram = _load_modules(tmp_path, monkeypatch)
+    monkeypatch.setattr(telegram, "_validate_token", lambda token: ("123", "example_bot"))
+    sent: list[str] = []
+    monkeypatch.setattr(telegram, "_send", lambda _token, _chat, text, **_kwargs: sent.append(text))
+    telegram.save_telegram_ai_bot_settings(user_id=7, owner_key="scope-7", bot_token="123:test", enabled=True)
+    pairing = telegram.create_link_code(7)
+    bot = telegram._enabled_bots()[0]
+    telegram._process_update(bot, {
+        "message": {"message_id": 3, "text": f"/link {pairing['code']}", "chat": {"id": 88, "type": "private"}},
+    })
+    telegram._process_update(bot, {
+        "message": {"message_id": 4, "text": "/ai DAB", "chat": {"id": 88, "type": "private"}},
+    })
+    queued = [job for job in jobs.list_owner_jobs("scope-7") if job.get("report_kind") == "telegram_daily_account_brief"]
+    assert len(queued) == 1
+    assert queued[0]["subject_key"] == "DAB"
+    assert any("Daily Account Brief" in text and "queued" in text for text in sent)
 
 
 def test_telegram_renderer_escapes_provider_text_and_splits_long_content() -> None:
