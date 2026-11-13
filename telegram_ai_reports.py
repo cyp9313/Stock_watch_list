@@ -162,6 +162,37 @@ def _validate_token(token: str) -> tuple[str, str | None]:
     return str(bot.get("id")), username
 
 
+def _discard_pending_updates(token: str) -> tuple[int, int]:
+    """Advance a newly connected bot past messages sent before setup.
+
+    Position-alert bots may already have a long chat history.  Those old
+    `/link` messages are not fresh pairing attempts and must never trigger a
+    burst of expired-code replies when command polling is first enabled.
+    """
+    next_offset = 0
+    discarded = 0
+    for _page in range(100):
+        payload: dict[str, Any] = {"timeout": 0, "limit": 100, "allowed_updates": ["message"]}
+        if next_offset:
+            payload["offset"] = next_offset
+        result = _telegram_api(token, "getUpdates", payload=payload, timeout=20)
+        updates = result.get("result") if isinstance(result.get("result"), list) else []
+        if not updates:
+            break
+        page_count = 0
+        for update in updates:
+            if not isinstance(update, dict):
+                continue
+            update_id = update.get("update_id")
+            if isinstance(update_id, int):
+                next_offset = max(next_offset, update_id + 1)
+                page_count += 1
+        discarded += page_count
+        if len(updates) < 100 or page_count == 0:
+            break
+    return next_offset, discarded
+
+
 def get_telegram_ai_bot_status(user_id: int) -> dict[str, Any]:
     init_telegram_ai_report_db()
     with jobs._connection() as conn:
@@ -210,6 +241,13 @@ def save_telegram_ai_bot_settings(*, user_id: int, owner_key: str, bot_token: st
     _, username = _validate_token(supplied)
     fingerprint = _fingerprint(supplied)
     now = _iso()
+    initial_offset = 0
+    discarded_updates = 0
+    # Do this before saving/enabling the new token.  A token change has no
+    # active command poller for the new token, so there is no competing
+    # getUpdates request to race with this initial cursor synchronization.
+    if current is None or current.get("token_fingerprint") != fingerprint:
+        initial_offset, discarded_updates = _discard_pending_updates(supplied)
     with jobs._connection() as conn:
         conflict = conn.execute(
             "SELECT user_id FROM telegram_ai_bot_settings WHERE token_fingerprint=? AND user_id<>?",
@@ -222,20 +260,22 @@ def save_telegram_ai_bot_settings(*, user_id: int, owner_key: str, bot_token: st
         if previous:
             conn.execute(
                 """UPDATE telegram_ai_bot_settings SET owner_key=?, token_encrypted=?, token_fingerprint=?, bot_username=?, enabled=?,
-                   polling_offset=CASE WHEN ? THEN 0 ELSE polling_offset END, link_code_hash=NULL, link_code_expires_at=NULL,
+                   polling_offset=CASE WHEN ? THEN ? ELSE polling_offset END, link_code_hash=NULL, link_code_expires_at=NULL,
                    last_error=NULL, updated_at=? WHERE user_id=?""",
-                (owner_key, _encrypt(supplied), fingerprint, username, int(bool(enabled)), int(token_changed), now, user_id),
+                (owner_key, _encrypt(supplied), fingerprint, username, int(bool(enabled)), int(token_changed), initial_offset, now, user_id),
             )
             if token_changed:
                 conn.execute("DELETE FROM telegram_ai_bot_chats WHERE user_id=?", (user_id,))
         else:
             conn.execute(
                 """INSERT INTO telegram_ai_bot_settings
-                   (user_id, owner_key, token_encrypted, token_fingerprint, bot_username, enabled, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (user_id, owner_key, _encrypt(supplied), fingerprint, username, int(bool(enabled)), now, now),
+                   (user_id, owner_key, token_encrypted, token_fingerprint, bot_username, enabled, polling_offset, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (user_id, owner_key, _encrypt(supplied), fingerprint, username, int(bool(enabled)), initial_offset, now, now),
             )
-    return get_telegram_ai_bot_status(user_id)
+    status = get_telegram_ai_bot_status(user_id)
+    status["discarded_pending_updates"] = discarded_updates
+    return status
 
 
 def remove_telegram_ai_bot_settings(user_id: int) -> None:
@@ -243,6 +283,24 @@ def remove_telegram_ai_bot_settings(user_id: int) -> None:
     with jobs._connection() as conn:
         conn.execute("DELETE FROM telegram_ai_bot_chats WHERE user_id=?", (int(user_id),))
         conn.execute("DELETE FROM telegram_ai_bot_settings WHERE user_id=?", (int(user_id),))
+
+
+def discard_telegram_ai_bot_backlog(user_id: int) -> int:
+    """Ignore queued pre-existing Bot messages, preserving current pairings."""
+    init_telegram_ai_report_db()
+    with jobs._connection() as conn:
+        row = _row_dict(conn.execute(
+            "SELECT token_encrypted FROM telegram_ai_bot_settings WHERE user_id=?", (int(user_id),)
+        ).fetchone())
+    if not row:
+        raise TelegramAIReportError("Save a Telegram bot token first.")
+    offset, discarded = _discard_pending_updates(_decrypt(str(row["token_encrypted"])))
+    with jobs._connection() as conn:
+        conn.execute(
+            "UPDATE telegram_ai_bot_settings SET polling_offset=?, last_error=NULL, updated_at=? WHERE user_id=?",
+            (offset, _iso(), int(user_id)),
+        )
+    return discarded
 
 
 def create_link_code(user_id: int, *, ttl_seconds: int | None = None) -> dict[str, str]:

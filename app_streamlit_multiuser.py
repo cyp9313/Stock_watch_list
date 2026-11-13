@@ -67,6 +67,7 @@ from daily_report.service import generate_report, runtime_available
 from telegram_ai_reports import (
     TelegramAIReportError,
     create_link_code,
+    discard_telegram_ai_bot_backlog,
     get_telegram_ai_bot_status,
     remove_telegram_ai_bot_settings,
     revoke_telegram_chat,
@@ -6005,7 +6006,7 @@ def _render_telegram_ai_report_controls(user, runner_ok):
 
     st.caption(
         "Connect a Telegram Bot API token, then authorize a private chat or group with a one-time pairing code. "
-        "The bot accepts /ai NVDA or @AI NVDA and replies in the same chat. It never exposes the token or uses an unpaired chat."
+        "The bot accepts /ai NVDA, @AI NVDA, or /ai DAB and replies in the same chat. It never exposes the token or uses an unpaired chat."
     )
     if not runner_ok:
         st.warning("The report runtime is unavailable, so Telegram commands cannot generate reports yet.")
@@ -6041,18 +6042,27 @@ def _render_telegram_ai_report_controls(user, runner_ok):
             st.success(
                 f"Telegram bot settings saved. Polling is {'enabled' if saved_status.get('enabled') else 'disabled'}."
             )
+            if saved_status.get("discarded_pending_updates"):
+                st.info(f"Ignored {saved_status['discarded_pending_updates']} older Bot message(s) sent before command polling was connected.")
             st.rerun()
         except TelegramAIReportError as exc:
             st.error(str(exc))
 
     if not status.get("configured"):
         return
-    action_left, action_right = st.columns(2)
+    action_left, action_middle, action_right = st.columns(3)
     with action_left:
         if st.button("Create one-time pairing code", key="telegram_ai_create_link", disabled=not runner_ok):
             try:
                 pairing = create_link_code(user["id"])
                 st.session_state[f"telegram_ai_link_{user['id']}"] = pairing
+            except TelegramAIReportError as exc:
+                st.error(str(exc))
+    with action_middle:
+        if st.button("Ignore older Bot messages", key="telegram_ai_discard_backlog", type="secondary"):
+            try:
+                discarded = discard_telegram_ai_bot_backlog(user["id"])
+                st.success(f"Ignored {discarded} queued older Bot message(s). Create a new pairing code before sending /link.")
             except TelegramAIReportError as exc:
                 st.error(str(exc))
     with action_right:
