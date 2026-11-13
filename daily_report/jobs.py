@@ -498,6 +498,7 @@ def enqueue_telegram_ticker_job(
     search_provider: str = "auto",
     no_article_fetch: bool = False,
     decision_dashboard: bool = True,
+    telegram_bot_id: str | None = None,
 ) -> dict:
     ticker = str(ticker or "").strip().upper()
     if not ticker:
@@ -515,6 +516,7 @@ def enqueue_telegram_ticker_job(
             "ticker": ticker,
             "decision_dashboard": bool(decision_dashboard),
             "telegram_user_id": int(user_id),
+            "telegram_bot_id": str(telegram_bot_id or ""),
             "telegram_chat_id": str(chat_id),
             "telegram_reply_to_message_id": int(reply_to_message_id) if reply_to_message_id is not None else None,
         },
@@ -527,6 +529,7 @@ def enqueue_telegram_daily_account_brief_job(
     user_id: int,
     chat_id: str,
     reply_to_message_id: int | None,
+    telegram_bot_id: str | None = None,
 ) -> dict:
     """Queue a paired-chat daily brief without consuming the daily brief quota."""
     return enqueue_report_job(
@@ -537,6 +540,7 @@ def enqueue_telegram_daily_account_brief_job(
         recipient_email=None,
         payload={
             "telegram_user_id": int(user_id),
+            "telegram_bot_id": str(telegram_bot_id or ""),
             "telegram_chat_id": str(chat_id),
             "telegram_reply_to_message_id": int(reply_to_message_id) if reply_to_message_id is not None else None,
         },

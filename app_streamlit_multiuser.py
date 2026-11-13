@@ -6005,42 +6005,34 @@ def _render_telegram_ai_report_controls(user, runner_ok):
         return
 
     st.caption(
-        "Connect a Telegram Bot API token, then authorize a private chat or group with a one-time pairing code. "
-        "The bot accepts /ai NVDA, @AI NVDA, or /ai DAB and replies in the same chat. It never exposes the token or uses an unpaired chat."
+        "Add one or more Telegram Bot API tokens, then authorize a private chat or group per Bot with a one-time pairing code. "
+        "Each Bot accepts /ai NVDA, @AI NVDA, or /ai DAB and replies in the same chat. Tokens are never exposed or shared between accounts."
     )
     if not runner_ok:
         st.warning("The report runtime is unavailable, so Telegram commands cannot generate reports yet.")
-    if status.get("configured"):
-        enabled_text = "enabled" if status.get("enabled") else "disabled"
-        bot_label = f"@{status.get('bot_username')}" if status.get("bot_username") else "connected bot"
-        st.info(f"Bot: {bot_label} · command polling: {enabled_text}.")
-        if status.get("last_error"):
-            st.warning(f"Latest bot worker error: {status['last_error']}")
-        elif status.get("last_polled_at"):
-            st.caption(f"Last polled: {status['last_polled_at']} UTC")
-    else:
-        st.info("No Telegram bot is connected to this account yet.")
+    bots = status.get("bots") if isinstance(status.get("bots"), list) else []
+    st.info(f"{len(bots)} Telegram Bot(s) connected to this account." if bots else "No Telegram bot is connected to this account yet.")
 
     with st.form("telegram_ai_report_bot_settings"):
         token = st.text_input(
-            "Bot Token",
+            "Add Telegram Bot Token",
             type="password",
             placeholder="123456:ABC…",
-            help="Leave blank after the first save to keep the stored token. It is encrypted at rest and is never shown again.",
+            help="Every new Token adds another Bot. A previously added token is never shown again and is not replaced.",
         )
         enabled = st.checkbox(
-            "Enable Telegram AI report commands",
-            value=bool(status.get("enabled")),
+            "Enable this Bot's AI report commands",
+            value=True,
             disabled=not runner_ok,
         )
-        saved = st.form_submit_button("Save Telegram bot settings", disabled=not runner_ok)
+        saved = st.form_submit_button("Add Telegram Bot", disabled=not runner_ok)
     if saved:
         try:
             saved_status = save_telegram_ai_bot_settings(
                 user_id=user["id"], owner_key=user["cache_key"], bot_token=token, enabled=enabled,
             )
             st.success(
-                f"Telegram bot settings saved. Polling is {'enabled' if saved_status.get('enabled') else 'disabled'}."
+                "Telegram Bot saved without changing your other connected Bots."
             )
             if saved_status.get("discarded_pending_updates"):
                 st.info(f"Ignored {saved_status['discarded_pending_updates']} older Bot message(s) sent before command polling was connected.")
@@ -6048,53 +6040,60 @@ def _render_telegram_ai_report_controls(user, runner_ok):
         except TelegramAIReportError as exc:
             st.error(str(exc))
 
-    if not status.get("configured"):
+    if not bots:
         return
-    action_left, action_middle, action_right = st.columns(3)
-    with action_left:
-        if st.button("Create one-time pairing code", key="telegram_ai_create_link", disabled=not runner_ok):
-            try:
-                pairing = create_link_code(user["id"])
-                st.session_state[f"telegram_ai_link_{user['id']}"] = pairing
-            except TelegramAIReportError as exc:
-                st.error(str(exc))
-    with action_middle:
-        if st.button("Ignore older Bot messages", key="telegram_ai_discard_backlog", type="secondary"):
-            try:
-                discarded = discard_telegram_ai_bot_backlog(user["id"])
-                st.success(f"Ignored {discarded} queued older Bot message(s). Create a new pairing code before sending /link.")
-            except TelegramAIReportError as exc:
-                st.error(str(exc))
-    with action_right:
-        if st.button("Remove Telegram bot", key="telegram_ai_remove_bot", type="secondary"):
-            try:
-                remove_telegram_ai_bot_settings(user["id"])
-                st.session_state.pop(f"telegram_ai_link_{user['id']}", None)
-                st.success("Telegram bot settings and paired chats were removed.")
-                st.rerun()
-            except TelegramAIReportError as exc:
-                st.error(str(exc))
-
-    pairing = st.session_state.get(f"telegram_ai_link_{user['id']}")
-    if isinstance(pairing, dict) and pairing.get("code"):
-        st.success("Send this command to your bot from the chat or group you want to authorize:")
-        st.code(f"/link {pairing['code']}", language=None)
-        st.caption(f"This code expires at {pairing.get('expires_at')} UTC and can be used once.")
-
-    chats = status.get("chats") if isinstance(status.get("chats"), list) else []
-    st.markdown("**Paired chats**")
-    if not chats:
-        st.caption("No chat has been paired. Create a code above, then send it to the bot.")
-    for index, chat in enumerate(chats):
-        label = str(chat.get("chat_title") or chat.get("chat_id"))
-        detail = f"{chat.get('chat_type', 'chat')} · authorized {chat.get('authorized_at', '')}"
-        row_left, row_right = st.columns([5, 1])
-        with row_left:
-            st.caption(f"• {label} — {detail}")
-        with row_right:
-            if st.button("Revoke", key=f"telegram_ai_revoke_{index}_{chat.get('chat_id')}"):
-                revoke_telegram_chat(user["id"], str(chat.get("chat_id")))
-                st.rerun()
+    st.markdown("**Connected Bots**")
+    for index, bot in enumerate(bots):
+        bot_id = str(bot.get("id") or "")
+        bot_label = f"@{bot.get('bot_username')}" if bot.get("bot_username") else "Unnamed Bot"
+        enabled_text = "enabled" if bot.get("enabled") else "disabled"
+        with st.expander(f"{bot_label} · command polling {enabled_text}", expanded=len(bots) == 1):
+            if bot.get("last_error"):
+                st.warning(f"Latest Bot worker error: {bot['last_error']}")
+            elif bot.get("last_polled_at"):
+                st.caption(f"Last polled: {bot['last_polled_at']} UTC")
+            action_left, action_middle, action_right = st.columns(3)
+            with action_left:
+                if st.button("Create pairing code", key=f"telegram_ai_create_link_{bot_id}", disabled=not runner_ok):
+                    try:
+                        pairing = create_link_code(user["id"], bot_id)
+                        st.session_state[f"telegram_ai_link_{user['id']}_{bot_id}"] = pairing
+                        st.rerun()
+                    except TelegramAIReportError as exc:
+                        st.error(str(exc))
+            with action_middle:
+                if st.button("Ignore older messages", key=f"telegram_ai_discard_backlog_{bot_id}", type="secondary"):
+                    try:
+                        discarded = discard_telegram_ai_bot_backlog(user["id"], bot_id)
+                        st.success(f"Ignored {discarded} queued older message(s). Create a new pairing code before sending /link.")
+                    except TelegramAIReportError as exc:
+                        st.error(str(exc))
+            with action_right:
+                if st.button("Remove this Bot", key=f"telegram_ai_remove_bot_{bot_id}", type="secondary"):
+                    try:
+                        remove_telegram_ai_bot_settings(user["id"], bot_id)
+                        st.session_state.pop(f"telegram_ai_link_{user['id']}_{bot_id}", None)
+                        st.rerun()
+                    except TelegramAIReportError as exc:
+                        st.error(str(exc))
+            pairing = st.session_state.get(f"telegram_ai_link_{user['id']}_{bot_id}")
+            if isinstance(pairing, dict) and pairing.get("code"):
+                st.success("Send this command to this Bot from the chat or group you want to authorize:")
+                st.code(f"/link {pairing['code']}", language=None)
+                st.caption(f"This code expires at {pairing.get('expires_at')} UTC and can be used once.")
+            chats = bot.get("chats") if isinstance(bot.get("chats"), list) else []
+            if not chats:
+                st.caption("No chat paired to this Bot yet.")
+            for chat in chats:
+                label = str(chat.get("chat_title") or chat.get("chat_id"))
+                detail = f"{chat.get('chat_type', 'chat')} · authorized {chat.get('authorized_at', '')}"
+                row_left, row_right = st.columns([5, 1])
+                with row_left:
+                    st.caption(f"• {label} — {detail}")
+                with row_right:
+                    if st.button("Revoke", key=f"telegram_ai_revoke_{bot_id}_{chat.get('chat_id')}"):
+                        revoke_telegram_chat(user["id"], bot_id, str(chat.get("chat_id")))
+                        st.rerun()
 
     recent = status.get("recent_requests") if isinstance(status.get("recent_requests"), list) else []
     if recent:

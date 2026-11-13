@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+from datetime import datetime, timezone
 from pathlib import Path
 
 from cryptography.fernet import Fernet
@@ -33,7 +34,8 @@ def test_pairing_code_authorizes_chat_and_queues_only_paired_command(tmp_path: P
     sent: list[str] = []
     monkeypatch.setattr(telegram, "_send", lambda _token, _chat, text, **_kwargs: sent.append(text))
     telegram.save_telegram_ai_bot_settings(user_id=7, owner_key="scope-7", bot_token="123:test", enabled=True)
-    pairing = telegram.create_link_code(7)
+    bot_id = telegram.get_telegram_ai_bot_status(7)["bots"][0]["id"]
+    pairing = telegram.create_link_code(7, bot_id)
     bot = telegram._enabled_bots()[0]
     telegram._process_update(bot, {
         "message": {"message_id": 3, "text": f"/link {pairing['code']}", "chat": {"id": 88, "type": "private", "username": "tester"}},
@@ -55,7 +57,8 @@ def test_paired_chat_queues_dab_without_using_ticker_report_quota(tmp_path: Path
     sent: list[str] = []
     monkeypatch.setattr(telegram, "_send", lambda _token, _chat, text, **_kwargs: sent.append(text))
     telegram.save_telegram_ai_bot_settings(user_id=7, owner_key="scope-7", bot_token="123:test", enabled=True)
-    pairing = telegram.create_link_code(7)
+    bot_id = telegram.get_telegram_ai_bot_status(7)["bots"][0]["id"]
+    pairing = telegram.create_link_code(7, bot_id)
     bot = telegram._enabled_bots()[0]
     telegram._process_update(bot, {
         "message": {"message_id": 3, "text": f"/link {pairing['code']}", "chat": {"id": 88, "type": "private"}},
@@ -80,6 +83,43 @@ def test_initial_bot_setup_advances_past_old_updates(tmp_path: Path, monkeypatch
     assert telegram._enabled_bots()[0]["polling_offset"] == 987
 
 
+def test_one_account_can_add_and_pair_multiple_bots(tmp_path: Path, monkeypatch) -> None:
+    _jobs, telegram = _load_modules(tmp_path, monkeypatch)
+    monkeypatch.setattr(telegram, "_validate_token", lambda token: (token.split(":", 1)[0], f"bot_{token[0]}"))
+    telegram.save_telegram_ai_bot_settings(user_id=7, owner_key="scope-7", bot_token="1:one", enabled=True)
+    telegram.save_telegram_ai_bot_settings(user_id=7, owner_key="scope-7", bot_token="2:two", enabled=True)
+    status = telegram.get_telegram_ai_bot_status(7)
+    assert len(status["bots"]) == 2
+    assert "token_encrypted" not in status["bots"][0]
+    assert len(telegram._enabled_bots()) == 2
+
+
+def test_legacy_single_bot_configuration_is_migrated_without_losing_chat(tmp_path: Path, monkeypatch) -> None:
+    jobs, telegram = _load_modules(tmp_path, monkeypatch)
+    telegram.init_telegram_ai_report_db()
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    token = "123:legacy"
+    with jobs._connection() as conn:
+        conn.execute(
+            """INSERT INTO telegram_ai_bot_settings(
+                user_id, owner_key, token_encrypted, token_fingerprint, bot_username, enabled,
+                polling_offset, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (7, "scope-7", telegram._encrypt(token), telegram._fingerprint(token), "legacy_bot", 1, 44, now, now),
+        )
+        conn.execute(
+            """INSERT INTO telegram_ai_bot_chats(
+                user_id, chat_id, chat_type, chat_title, authorized_at, last_seen_at
+            ) VALUES (?, ?, ?, ?, ?, ?)""",
+            (7, "88", "private", "tester", now, now),
+        )
+    telegram.init_telegram_ai_report_db()
+    status = telegram.get_telegram_ai_bot_status(7)
+    assert len(status["bots"]) == 1
+    assert status["bots"][0]["bot_username"] == "legacy_bot"
+    assert status["bots"][0]["chats"][0]["chat_id"] == "88"
+
+
 def test_repeated_telegram_update_is_processed_only_once(tmp_path: Path, monkeypatch) -> None:
     _jobs, telegram = _load_modules(tmp_path, monkeypatch)
     seen: list[dict] = []
@@ -87,7 +127,7 @@ def test_repeated_telegram_update_is_processed_only_once(tmp_path: Path, monkeyp
     monkeypatch.setattr(telegram, "_telegram_api", lambda *_args, **_kwargs: {
         "result": [{"update_id": 712, "message": {"message_id": 1, "text": "/help", "chat": {"id": 88}}}]
     })
-    bot = {"user_id": 7, "token": "123:test", "polling_offset": 0}
+    bot = {"id": "bot-test", "user_id": 7, "token": "123:test", "polling_offset": 0}
     telegram.poll_one_bot(bot)
     # Simulate a stale cursor / getUpdates retry returning the same update.
     telegram.poll_one_bot(bot)
