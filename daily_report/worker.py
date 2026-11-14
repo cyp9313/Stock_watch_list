@@ -28,7 +28,7 @@ from .mailer import compute_job_message_id, send_report_email
 from .market_recap_service import generate_market_recap_for_job, mark_market_recap_delivered
 from .portfolio_service import generate_portfolio_report_for_job
 from .service import generate_report, generate_telegram_report, _get_market_date
-from telegram_ai_reports import deliver_telegram_job, mark_telegram_job_failure
+from telegram_ai_reports import deliver_telegram_job, mark_telegram_job_failure, notify_telegram_report_failure
 from trading212_daily_summary import generate_daily_summary_for_telegram_command
 
 
@@ -109,7 +109,14 @@ def process_one_job() -> bool:
             messages = result.get("telegram_messages")
             if not isinstance(messages, list) or not messages:
                 raise PermanentReportFailure("Telegram report generation completed without message content.")
-            deliver_telegram_job(job, messages)
+            attachment = None
+            if report_kind == "telegram_ticker":
+                html_bytes = result.get("html_bytes")
+                file_name = result.get("file_name")
+                if not isinstance(html_bytes, bytes) or not html_bytes or not isinstance(file_name, str):
+                    raise PermanentReportFailure("Telegram stock report did not produce its complete HTML attachment.")
+                attachment = (file_name, html_bytes)
+            deliver_telegram_job(job, messages, html_attachment=attachment)
             mark_job_sent(job_id)
             print(
                 f"[ReportWorker] Job {job_id[:8]} generated in {result.get('elapsed', 0):.1f}s; sent to Telegram",
@@ -177,14 +184,19 @@ def process_one_job() -> bool:
                     print(f"[ReportWorker] Job {job_id[:8]} delivered but recap schedule marker failed: {type(exc).__name__}", flush=True)
             print(f"[ReportWorker] Job {job_id[:8]} sent successfully", flush=True)
     except Exception as exc:
-        if report_kind in TELEGRAM_REPORT_KINDS:
+        next_status = mark_job_failure(
+            job_id, f"{type(exc).__name__}: {exc}", retry=not isinstance(exc, PermanentReportFailure)
+        )
+        if report_kind in TELEGRAM_REPORT_KINDS and next_status == "failed":
             try:
                 mark_telegram_job_failure(job, f"{type(exc).__name__}: {exc}")
             except Exception as status_exc:
                 print(f"[ReportWorker] Telegram status update failed: {type(status_exc).__name__}", flush=True)
-        next_status = mark_job_failure(
-            job_id, f"{type(exc).__name__}: {exc}", retry=not isinstance(exc, PermanentReportFailure)
-        )
+        if report_kind == "telegram_ticker" and next_status == "failed":
+            try:
+                notify_telegram_report_failure(job)
+            except Exception as notify_exc:
+                print(f"[ReportWorker] Telegram failure notice could not be sent: {type(notify_exc).__name__}", flush=True)
         print(
             f"[ReportWorker] Job {job_id[:8]} failed; status={next_status}: {type(exc).__name__}: {exc}",
             flush=True,

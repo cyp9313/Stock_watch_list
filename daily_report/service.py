@@ -103,6 +103,7 @@ def generate_report(
     holding_context: dict | None = None,
     decision_dashboard: bool = True,
     delivery_mode: str = "html",
+    include_telegram_summary: bool = False,
 ) -> dict:
     """Generate a v5.8 report and return its HTML in memory.
 
@@ -227,7 +228,7 @@ def generate_report(
         }
         if output_html is not None:
             result["html_bytes"] = output_html.read_bytes()
-        else:
+        if include_telegram_summary or output_html is None:
             data_path = run_dir / f"{_safe_ticker(ticker)}_data.json"
             notes_path = run_dir / f"{_safe_ticker(ticker)}_final_notes.json"
             if not data_path.is_file() or not notes_path.is_file():
@@ -258,5 +259,5 @@ def generate_report(
 
 
 def generate_telegram_report(ticker: str, **kwargs) -> dict:
-    """Run the normal research/score pipeline without producing HTML or charts."""
-    return generate_report(ticker, delivery_mode="telegram", **kwargs)
+    """Generate one complete HTML report and its compact Telegram summary."""
+    return generate_report(ticker, delivery_mode="html", include_telegram_summary=True, **kwargs)

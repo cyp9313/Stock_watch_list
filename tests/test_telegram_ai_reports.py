@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import importlib
+import json
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from cryptography.fernet import Fernet
 
@@ -147,3 +149,67 @@ def test_telegram_renderer_escapes_provider_text_and_splits_long_content() -> No
     assert messages
     assert all(len(message) <= 3800 + 30 for message in messages)
     assert "Apple &lt;unsafe&gt;" in "\n".join(messages)
+
+
+def test_stock_command_generates_full_html_and_existing_summary(tmp_path: Path, monkeypatch) -> None:
+    import daily_report.service as service
+
+    monkeypatch.setattr(service, "REPORT_ROOT", tmp_path)
+    monkeypatch.setattr(service, "runtime_available", lambda: True)
+    monkeypatch.delenv("DECISION_REPORT_KEEP_RUN_DIR", raising=False)
+    commands: list[list[str]] = []
+
+    def fake_run(cmd, **_kwargs):
+        commands.append(cmd)
+        run_dir = Path(cmd[cmd.index("--run-dir") + 1])
+        output = Path(cmd[cmd.index("--output") + 1])
+        output.write_bytes(b"<html>complete chart and report</html>")
+        (run_dir / "NVDA_data.json").write_text(json.dumps({"LONG_NAME": "NVIDIA", "LAST_CLOSE": 100}), encoding="utf-8")
+        (run_dir / "NVDA_final_notes.json").write_text(json.dumps({"items": []}), encoding="utf-8")
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(service.subprocess, "run", fake_run)
+    result = service.generate_telegram_report("NVDA", user_scope="scope-7")
+
+    assert result["success"] is True
+    assert result["html_bytes"] == b"<html>complete chart and report</html>"
+    assert result["file_name"].startswith("NVDA_report_")
+    assert "AI STOCK DAILY REPORT" in result["telegram_messages"][0]
+    assert commands[0][commands[0].index("--delivery-mode") + 1] == "html"
+    assert not Path(commands[0][commands[0].index("--run-dir") + 1]).exists()
+
+
+def test_telegram_delivery_uploads_html_then_summary_from_same_bot(tmp_path: Path, monkeypatch) -> None:
+    jobs, telegram = _load_modules(tmp_path, monkeypatch)
+    monkeypatch.setattr(telegram, "_validate_token", lambda _token: ("123", "example_bot"))
+    telegram.save_telegram_ai_bot_settings(user_id=7, owner_key="scope-7", bot_token="123:test", enabled=True)
+    bot_id = telegram.get_telegram_ai_bot_status(7)["bots"][0]["id"]
+    code = telegram.create_link_code(7, bot_id)["code"]
+    monkeypatch.setattr(telegram, "_send", lambda *_args, **_kwargs: None)
+    telegram._process_update(telegram._enabled_bots()[0], {
+        "message": {"message_id": 3, "text": f"/link {code}", "chat": {"id": 88, "type": "private"}},
+    })
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(telegram, "_send_document", lambda _token, _chat, name, _body, **_kwargs: calls.append(("document", name)))
+    monkeypatch.setattr(telegram, "_send", lambda _token, _chat, message, **_kwargs: calls.append(("message", message)))
+    job = {
+        "id": "job-1",
+        "payload_json": json.dumps({"telegram_user_id": 7, "telegram_bot_id": bot_id, "telegram_chat_id": "88", "telegram_reply_to_message_id": 4}),
+    }
+    telegram.deliver_telegram_job(job, ["summary"], html_attachment=("NVDA_report.html", b"<html/>"))
+    assert calls == [("document", "NVDA_report.html"), ("message", "summary")]
+
+
+def test_telegram_document_uses_multipart_upload(monkeypatch) -> None:
+    import telegram_ai_reports as telegram
+
+    sent: list[dict] = []
+    def fake_post(url, **kwargs):
+        sent.append({"url": url, **kwargs})
+        return SimpleNamespace(ok=True, json=lambda: {"ok": True})
+
+    monkeypatch.setattr(telegram.requests, "post", fake_post)
+    telegram._send_document("123:test", "88", "NVDA_report.html", b"<html/>", reply_to_message_id=4)
+    assert sent[0]["url"].endswith("/sendDocument")
+    assert sent[0]["files"]["document"] == ("NVDA_report.html", b"<html/>", "text/html")
+    assert sent[0]["data"]["reply_to_message_id"] == 4

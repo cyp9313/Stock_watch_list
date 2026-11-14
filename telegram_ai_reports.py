@@ -469,6 +469,36 @@ def _send(token: str, chat_id: str, text: str, *, reply_to_message_id: int | Non
     _telegram_api(token, "sendMessage", payload=payload)
 
 
+def _send_document(
+    token: str, chat_id: str, file_name: str, html_bytes: bytes, *, reply_to_message_id: int | None = None,
+) -> None:
+    """Upload the complete self-contained HTML report as a Telegram document."""
+    if not isinstance(html_bytes, bytes) or not html_bytes:
+        raise TelegramAIReportError("The HTML report attachment is empty.")
+    safe_name = str(file_name or "").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    if not safe_name.lower().endswith(".html"):
+        raise TelegramAIReportError("The HTML report attachment name is invalid.")
+    payload: dict[str, Any] = {
+        "chat_id": str(chat_id),
+        "caption": "📎 Complete HTML stock daily report",
+    }
+    if reply_to_message_id:
+        payload["reply_to_message_id"] = int(reply_to_message_id)
+    try:
+        response = requests.post(
+            BOT_API.format(token=token, method="sendDocument"),
+            data=payload,
+            files={"document": (safe_name, html_bytes, "text/html")},
+            timeout=120,
+        )
+        parsed = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        raise TelegramAIReportError(f"Telegram document upload failed: {type(exc).__name__}.") from exc
+    if not response.ok or not isinstance(parsed, dict) or not parsed.get("ok"):
+        detail = str(parsed.get("description") if isinstance(parsed, dict) else "unknown error")[:240]
+        raise TelegramAIReportError(f"Telegram rejected the HTML attachment: {detail}")
+
+
 def _command(text: str) -> tuple[str, str | None]:
     cleaned = " ".join(str(text or "").strip().split())
     if not cleaned:
@@ -588,7 +618,7 @@ def _process_update(bot: dict[str, Any], update: dict[str, Any]) -> None:
     if command == "daily_account_brief":
         _send(bot["token"], chat_id, f"⏳ <b>Trading 212 Daily Account Brief</b> queued (<code>{job_id[:8]}</code>). I will reply here when it is ready.", reply_to_message_id=message_id)
     else:
-        _send(bot["token"], chat_id, f"⏳ <b>{argument}</b> report queued (<code>{job_id[:8]}</code>). I will reply here when research is complete.", reply_to_message_id=message_id)
+        _send(bot["token"], chat_id, f"⏳ <b>{argument}</b> report queued (<code>{job_id[:8]}</code>). I will send the complete HTML report and a short summary here when ready.", reply_to_message_id=message_id)
 
 
 def poll_one_bot(bot: dict[str, Any]) -> dict[str, int]:
@@ -638,7 +668,7 @@ def poll_configured_bots() -> dict[str, int]:
     return {"bots": len(bots), "processed": processed, "failed": failed}
 
 
-def deliver_telegram_job(job: dict[str, Any], messages: list[str]) -> None:
+def _delivery_target(job: dict[str, Any]) -> tuple[str, str, int | None]:
     try:
         payload = json.loads(job.get("payload_json") or "{}")
     except (TypeError, ValueError) as exc:
@@ -666,10 +696,31 @@ def deliver_telegram_job(job: dict[str, Any], messages: list[str]) -> None:
         raise TelegramAIReportError("Telegram bot or destination chat is no longer authorized.")
     token = _decrypt(str(settings["token_encrypted"]))
     reply_to = payload.get("telegram_reply_to_message_id")
+    return token, chat_id, int(reply_to) if reply_to else None
+
+
+def deliver_telegram_job(
+    job: dict[str, Any], messages: list[str], *, html_attachment: tuple[str, bytes] | None = None,
+) -> None:
+    token, chat_id, reply_to = _delivery_target(job)
+    # Upload first: a failed attachment can be retried without repeating the
+    # readable summary in the chat on every attempt.
+    if html_attachment is not None:
+        _send_document(token, chat_id, html_attachment[0], html_attachment[1], reply_to_message_id=reply_to)
     for index, message in enumerate(messages):
-        _send(token, chat_id, str(message), reply_to_message_id=int(reply_to) if index == 0 and reply_to else None)
+        _send(token, chat_id, str(message), reply_to_message_id=reply_to if index == 0 else None)
     with jobs._connection() as conn:
         conn.execute("UPDATE telegram_ai_report_requests SET status='sent', error=NULL, updated_at=? WHERE job_id=?", (_iso(), str(job["id"])))
+
+
+def notify_telegram_report_failure(job: dict[str, Any]) -> None:
+    """Tell the paired chat when all report or attachment attempts fail."""
+    token, chat_id, reply_to = _delivery_target(job)
+    _send(
+        token, chat_id,
+        "❌ The stock report or its HTML attachment could not be delivered after retrying. Please request it again later.",
+        reply_to_message_id=reply_to,
+    )
 
 
 def mark_telegram_job_failure(job: dict[str, Any], error: str) -> None:
