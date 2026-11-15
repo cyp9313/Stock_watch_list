@@ -24,6 +24,7 @@ from PIL import Image
 from kline_indicator_controls import render_indicator_settings_panel
 from kline_indicators import calculate_configurable_indicators, default_indicator_settings, normalize_indicator_settings
 from kline_fibonacci import add_fibonacci_overlays, calculate_auto_fibonacci
+from chart_hover import candlestick_hover_kwargs
 from ticker_mapping import normalize_yfinance_ticker, stockanalysis_overview_url
 
 # ── Page config ──────────────────────────────────────────────
@@ -947,6 +948,7 @@ def build_kline_chart(kline_data, ticker, fibonacci=None, dark_mode=False, uirev
             low=ohlc["low"], close=ohlc["close"],
             name="OHLC",
             increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
+            **candlestick_hover_kwargs(ohlc["close"], interval),
         ),
         row=1, col=1,
     )

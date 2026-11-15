@@ -4,6 +4,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from kline_indicators import normalize_indicator_settings
+from chart_hover import close_change_labels
 
 
 def build_nav_chart(data, *, dark_mode=False, uirevision=None, indicator_settings=None):
@@ -15,8 +16,12 @@ def build_nav_chart(data, *, dark_mode=False, uirevision=None, indicator_setting
     settings = normalize_indicator_settings(indicator_settings)
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.07,
                         row_heights=[0.6, 0.2, 0.2])
-    fig.add_trace(go.Scatter(x=close.index, y=close, name="Unit NAV", mode="lines",
-                             line=dict(color="#2563eb", width=2)), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=close.index, y=close, name="Unit NAV", mode="lines",
+        line=dict(color="#2563eb", width=2),
+        customdata=close_change_labels(close),
+        hovertemplate="%{x|%Y-%m-%d}<br>Unit NAV: %{y:.4f}<br>Daily change vs previous NAV: %{customdata}<extra></extra>",
+    ), row=1, col=1)
     colors = ("#f59e0b", "#10b981", "#ef4444", "#8b5cf6", "#06b6d4", "#6b7280")
     for ma, color in zip(settings["moving_averages"], colors):
         window = ma["period"]
