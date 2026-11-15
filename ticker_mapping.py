@@ -186,6 +186,8 @@ def should_query_stockanalysis(ticker):
     yf_ticker = normalize_yfinance_ticker(ticker)
     if not yf_ticker or yf_ticker in PSEUDO_TICKERS:
         return False
+    if yf_ticker.startswith("FUND:"):
+        return False
     if yf_ticker in SKIP_EXACT:
         return False
     if yf_ticker.startswith(SKIP_PREFIXES):

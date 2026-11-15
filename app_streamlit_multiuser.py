@@ -25,6 +25,7 @@ import requests
 import streamlit as st
 import streamlit.components.v1 as components
 import yfinance as yf
+from akshare_fallback import is_nav_symbol, mainland_code
 from PIL import Image
 
 from kline_indicator_controls import render_indicator_settings_panel
@@ -2631,6 +2632,8 @@ def should_convert_price_ticker(ticker):
 
 def fallback_currency_from_ticker(ticker):
     ticker_upper = str(ticker).upper()
+    if is_nav_symbol(ticker_upper) or mainland_code(ticker_upper):
+        return "CNY"
     for suffix, currency in TICKER_CURRENCY_SUFFIXES.items():
         if ticker_upper.endswith(suffix):
             return currency
@@ -2651,6 +2654,8 @@ def get_ticker_currency(ticker):
     ticker = normalize_yfinance_ticker(ticker)
     if not should_convert_price_ticker(ticker):
         return None
+    if is_nav_symbol(ticker):
+        return "CNY"
     try:
         fast_info = yf.Ticker(ticker).fast_info
         currency = getattr(fast_info, "currency", None)
@@ -3922,6 +3927,10 @@ def build_kline_chart(kline_data, ticker, fibonacci=None, dark_mode=False, uirev
     if not kline_data or not kline_data.get("success"):
         st.warning("K-line data not available")
         return None
+
+    if kline_data.get("instrument_type") == "MUTUALFUND":
+        from nav_chart import build_nav_chart
+        return build_nav_chart(kline_data, dark_mode=dark_mode, uirevision=uirevision, indicator_settings=indicator_settings)
 
     theme = get_theme(dark_mode)
     ohlc = kline_data["ohlc"]
@@ -5493,7 +5502,7 @@ def render_kline(user, cache_key, display_currency="Local"):
             st.session_state["kline_ticker_cache"] = ticker
             st.session_state["auto_refresh_kline_last"] = now
             st.session_state["auto_refresh_kline_last_key"] = request_key
-        if (
+        if not ticker.startswith("FUND:") and (
             st.session_state.get("kline_options_ticker") != ticker
             or st.session_state.get("kline_options_months") != oi_horizon_months
         ):
@@ -5505,6 +5514,7 @@ def render_kline(user, cache_key, display_currency="Local"):
 
     if (
         not plot
+        and not ticker.startswith("FUND:")
         and st.session_state.get("kline_ticker_cache") == ticker
         and st.session_state.get("kline_options_ticker") == ticker
         and st.session_state.get("kline_options_months") != oi_horizon_months
@@ -5608,9 +5618,11 @@ def render_kline(user, cache_key, display_currency="Local"):
 
         # Calculate after currency conversion so anchors and overlays use exactly
         # the same displayed price scale as the multi-user chart.
-        fibonacci = calculate_auto_fibonacci(chart_data["dates"], chart_data["ohlc"], settings["fibonacci"])
+        fibonacci = None if chart_data.get("instrument_type") == "MUTUALFUND" else calculate_auto_fibonacci(chart_data["dates"], chart_data["ohlc"], settings["fibonacci"])
 
         with chart_column:
+            if chart_data.get("instrument_type") == "MUTUALFUND":
+                st.info(chart_data.get("data_note", "Fund unit NAV is published daily; OHLCV indicators are unavailable."))
             fig = build_kline_chart(
                 chart_data,
                 ticker,
@@ -5624,7 +5636,8 @@ def render_kline(user, cache_key, display_currency="Local"):
                 render_persistent_kline_chart(fig, f"{request_key}_{display_currency}")
             raw_closes = data.get("ohlc", {}).get("close") if isinstance(data.get("ohlc"), dict) else []
             latest_option_price = raw_closes[-1] if raw_closes else None
-            render_option_oi_walls(st.session_state.get("kline_options_oi"), ticker, dark_mode, latest_option_price)
+            if chart_data.get("instrument_type") != "MUTUALFUND":
+                render_option_oi_walls(st.session_state.get("kline_options_oi"), ticker, dark_mode, latest_option_price)
 
     _render_kline_body()
 

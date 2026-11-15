@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 import uuid
+from akshare_fallback import is_nav_symbol
 
 try:
     from zoneinfo import ZoneInfo
@@ -28,7 +29,7 @@ def _get_market_date() -> str:
 REPORT_ROOT = Path(__file__).resolve().parent
 REPORT_RUNNER = REPORT_ROOT / "run_report.py"
 DEFAULT_TIMEOUT_SECONDS = 1800
-_TICKER_PATTERN = re.compile(r"^[A-Z0-9.^=\-]+$")
+_TICKER_PATTERN = re.compile(r"^[A-Z0-9.^=:\-]+$")
 _TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 
 
@@ -38,7 +39,7 @@ def runtime_available() -> bool:
 
 
 def _safe_ticker(ticker: str) -> str:
-    return ticker.replace("-", "_").replace("^", "IDX_").replace(".", "_")
+    return ticker.replace("-", "_").replace("^", "IDX_").replace(".", "_").replace(":", "_")
 
 
 def _safe_scope(scope: str) -> str:
@@ -117,6 +118,14 @@ def generate_report(
         return {"success": False, "error": "Please enter a ticker."}
     if not _TICKER_PATTERN.fullmatch(ticker):
         return {"success": False, "error": f"Invalid ticker format: {ticker}"}
+    if ":" in ticker and not is_nav_symbol(ticker):
+        return {"success": False, "error": f"Unsupported instrument format: {ticker}"}
+    if is_nav_symbol(ticker):
+        try:
+            from .fund_nav_report import generate_fund_nav_report
+            return generate_fund_nav_report(ticker, include_telegram_summary=include_telegram_summary or delivery_mode == "telegram")
+        except Exception as exc:
+            return {"success": False, "error": f"Fund NAV report failed: {type(exc).__name__}: {exc}"}
     if not runtime_available():
         return {"success": False, "error": f"Integrated daily report runner not found: {REPORT_RUNNER}"}
 

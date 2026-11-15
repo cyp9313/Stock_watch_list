@@ -24,7 +24,7 @@ from daily_report import jobs
 
 
 BOT_API = "https://api.telegram.org/bot{token}/{method}"
-_TICKER_RE = re.compile(r"^[A-Za-z0-9.^=\-]{1,24}$")
+_TICKER_RE = re.compile(r"^(?:FUND:\d{6}|[A-Za-z0-9.^=\-]{1,24})$", re.IGNORECASE)
 
 
 class TelegramAIReportError(RuntimeError):
@@ -480,7 +480,7 @@ def _send_document(
         raise TelegramAIReportError("The HTML report attachment name is invalid.")
     payload: dict[str, Any] = {
         "chat_id": str(chat_id),
-        "caption": "📎 Complete HTML stock daily report",
+        "caption": "📎 Fund NAV report" if "_nav_report_" in safe_name else "📎 Complete HTML stock daily report",
     }
     if reply_to_message_id:
         payload["reply_to_message_id"] = int(reply_to_message_id)
@@ -506,9 +506,9 @@ def _command(text: str) -> tuple[str, str | None]:
     match = re.fullmatch(r"/link(?:@\w+)?\s+([A-Za-z0-9_-]{8,80})", cleaned, flags=re.I)
     if match:
         return "link", match.group(1)
-    match = re.fullmatch(r"/(?:ai|report)(?:@\w+)?\s+([A-Za-z0-9.^=\-]{1,24})", cleaned, flags=re.I)
+    match = re.fullmatch(r"/(?:ai|report)(?:@\w+)?\s+([A-Za-z0-9.^=:\-]{1,24})", cleaned, flags=re.I)
     if not match:
-        match = re.fullmatch(r"@AI\s+([A-Za-z0-9.^=\-]{1,24})", cleaned, flags=re.I)
+        match = re.fullmatch(r"@AI\s+([A-Za-z0-9.^=:\-]{1,24})", cleaned, flags=re.I)
     if match:
         argument = match.group(1).upper()
         return ("daily_account_brief", None) if argument == "DAB" else ("report", argument)

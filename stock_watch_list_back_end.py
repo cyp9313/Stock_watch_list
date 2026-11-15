@@ -23,6 +23,7 @@ from stockanalysis_scraper import scrape_batch, should_query_forward_pe
 from short_term_watchlist import candlestick_svg
 from kline_indicators import calculate_adx_series
 from ticker_mapping import is_known_us_etf, normalize_yfinance_ticker
+from akshare_fallback import eligible_for_fallback, fetch_daily as fetch_akshare_daily, is_nav_symbol
 from market_screener import MARKET_PROFILES, market_profile_for_ticker, run_screener, screening_benchmark_tickers
 from options_open_interest import aggregate_open_interest, option_gamma_legs, select_option_expirations
 from portfolio_backtest import BENCHMARK_TICKERS, run_equal_weight_dca_backtest
@@ -163,6 +164,14 @@ def _create_schema(conn):
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_price_cache_ticker
         ON price_cache(ticker)
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS price_cache_source (
+            ticker TEXT PRIMARY KEY,
+            provider TEXT NOT NULL,
+            last_checked TEXT NOT NULL,
+            price_basis TEXT NOT NULL DEFAULT 'qfq'
+        )
     """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS stock_analysis_data (
@@ -763,6 +772,8 @@ def _is_legacy_truncated_ticker_name(name):
 
 
 def _fetch_yfinance_ticker_name(ticker):
+    if is_nav_symbol(ticker):
+        return None
     try:
         info = yf.Ticker(ticker).info
         for key in ("longName", "displayName", "shortName"):
@@ -1264,6 +1275,8 @@ def _price_timestamp_label(value, source=""):
         return ""
     if pd.isna(timestamp):
         return ""
+    if str(source).startswith("AkShare"):
+        return f"{source}: {timestamp.strftime('%Y-%m-%d')} (published daily data)"
     if source:
         timestamp_ny = _timestamp_to_ny(timestamp)
         return f"{source}: {timestamp_ny.strftime('%Y-%m-%d %H:%M %Z')}"
@@ -1462,6 +1475,7 @@ def _backfill_recent_ohlc(conn, tickers, minimum_bars=15):
     batched backfill keeps the normal watchlist request path intact and avoids
     issuing a separate request for every rendered table row.
     """
+    tickers = [ticker for ticker in tickers if not is_nav_symbol(ticker)]
     if not tickers:
         return
     cutoff = (datetime.date.today() - datetime.timedelta(days=75)).isoformat()
@@ -1475,7 +1489,10 @@ def _backfill_recent_ohlc(conn, tickers, minimum_bars=15):
         [*tickers, cutoff],
     ).fetchall()
     counts = dict(rows)
-    missing = [ticker for ticker in tickers if int(counts.get(ticker, 0)) < minimum_bars]
+    ak_cached = {row[0] for row in conn.execute(
+        "SELECT ticker FROM price_cache_source WHERE provider='akshare'"
+    ).fetchall()}
+    missing = [ticker for ticker in tickers if ticker not in ak_cached and int(counts.get(ticker, 0)) < minimum_bars]
     for batch in _chunks(missing, YF_DOWNLOAD_BATCH_SIZE):
         data = yf.download(
             tickers=batch, period="2mo", interval="1d", auto_adjust=False,
@@ -1483,6 +1500,50 @@ def _backfill_recent_ohlc(conn, tickers, minimum_bars=15):
         )
         if data is not None and not data.empty:
             _save_to_price_cache(conn, data, batch)
+
+
+def _cached_fallback_for_missing(conn, tickers, downloaded, period, *, full_period="2y"):
+    """Fetch eligible mainland names missing from a yfinance batch, one time each."""
+    for ticker in tickers:
+        if not eligible_for_fallback(ticker):
+            continue
+        has_prices = False
+        if downloaded is not None and not downloaded.empty:
+            if isinstance(downloaded.columns, pd.MultiIndex):
+                if ("Adj Close", ticker) in downloaded:
+                    has_prices = downloaded[("Adj Close", ticker)].notna().any()
+            elif len(tickers) == 1:
+                has_prices = "Adj Close" in downloaded and downloaded["Adj Close"].notna().any()
+        if has_prices:
+            continue
+        try:
+            old_rows = conn.execute("SELECT COUNT(*) FROM price_cache WHERE ticker=?", (ticker,)).fetchone()[0]
+            frame = fetch_akshare_daily(ticker, period=full_period if old_rows else period)
+            if not frame.empty:
+                conn.execute("SAVEPOINT akshare_price_replace")
+                try:
+                    if old_rows:
+                        # Never mix yfinance, qfq and raw ETF price bases.
+                        conn.execute("DELETE FROM price_cache WHERE ticker=?", (ticker,))
+                    _save_to_price_cache(conn, frame, [ticker])
+                    conn.execute(
+                        "INSERT INTO price_cache_source(ticker, provider, last_checked, price_basis) VALUES (?, 'akshare', ?, ?) "
+                        "ON CONFLICT(ticker) DO UPDATE SET provider='akshare', last_checked=excluded.last_checked, "
+                        "price_basis=excluded.price_basis",
+                        (ticker, datetime.date.today().isoformat(), frame.attrs.get("price_basis", "qfq")),
+                    )
+                    conn.execute("RELEASE SAVEPOINT akshare_price_replace")
+                except Exception:
+                    conn.execute("ROLLBACK TO SAVEPOINT akshare_price_replace")
+                    conn.execute("RELEASE SAVEPOINT akshare_price_replace")
+                    raise
+            elif old_rows:
+                conn.execute(
+                    "UPDATE price_cache_source SET last_checked=? WHERE ticker=? AND provider='akshare'",
+                    (datetime.date.today().isoformat(), ticker),
+                )
+        except Exception as exc:
+            print(f"[PriceCache] AkShare fallback failed for {ticker}: {type(exc).__name__}: {exc}")
 
 
 def get_prices_with_cache(tickers, period="2y", delete_stale=False):
@@ -1520,6 +1581,9 @@ def get_prices_with_cache(tickers, period="2y", delete_stale=False):
     db_tickers = set(
         row[0] for row in conn.execute("SELECT DISTINCT ticker FROM price_cache").fetchall()
     )
+    ak_sources = dict(conn.execute(
+        "SELECT ticker, last_checked FROM price_cache_source WHERE provider='akshare'"
+    ).fetchall())
 
     # 2. 3-way 集合划分
     existing = req_set & db_tickers    # 增量更新
@@ -1534,6 +1598,7 @@ def get_prices_with_cache(tickers, period="2y", delete_stale=False):
             f"DELETE FROM price_cache WHERE ticker IN ({placeholders})",
             stale_list
         )
+        conn.execute(f"DELETE FROM price_cache_source WHERE ticker IN ({placeholders})", stale_list)
         conn.commit()
         print(f"[PriceCache] 删除 {len(stale_list)} 个过期标的: {stale_list}")
 
@@ -1543,16 +1608,22 @@ def get_prices_with_cache(tickers, period="2y", delete_stale=False):
         print(f"[PriceCache] 全量下载 {len(new_list)} 个新标的 (period={period})...")
         for batch in _chunks(new_list, YF_DOWNLOAD_BATCH_SIZE):
             print(f"[PriceCache] 全量下载批次 {len(batch)} 个标的 (period={period})...")
-            df_new = yf.download(
-                tickers=batch, period=period, interval="1d",
-                auto_adjust=False, group_by="column", threads=True, progress=False, timeout=20
-            )
+            yf_batch = [ticker for ticker in batch if not is_nav_symbol(ticker) and ticker not in ak_sources]
+            try:
+                df_new = yf.download(
+                    tickers=yf_batch, period=period, interval="1d",
+                    auto_adjust=False, group_by="column", threads=True, progress=False, timeout=20
+                ) if yf_batch else pd.DataFrame()
+            except Exception as exc:
+                print(f"[PriceCache] yfinance batch failed: {type(exc).__name__}: {exc}")
+                df_new = pd.DataFrame()
             if df_new is not None and not df_new.empty:
-                _save_to_price_cache(conn, df_new, batch)
+                _save_to_price_cache(conn, df_new, yf_batch)
+            _cached_fallback_for_missing(conn, batch, df_new, period, full_period=period)
 
     # 5. 增量更新已有标的
     if existing:
-        existing_list = sorted(existing)
+        existing_list = sorted(existing - ak_sources.keys())
         # 按下载 period 分组，减少 API 调用次数
         download_batches = {}  # period_str -> [tickers]
         placeholders = ','.join('?' * len(existing_list))
@@ -1586,12 +1657,24 @@ def get_prices_with_cache(tickers, period="2y", delete_stale=False):
             print(f"[PriceCache] 增量更新 {len(batch)} 个标的 (period={dl_period})...")
             for sub_batch in _chunks(batch, YF_DOWNLOAD_BATCH_SIZE):
                 print(f"[PriceCache] 增量更新批次 {len(sub_batch)} 个标的 (period={dl_period})...")
-                df_inc = yf.download(
-                    tickers=sub_batch, period=dl_period, interval="1d",
-                    auto_adjust=False, group_by="column", threads=True, progress=False, timeout=20
-                )
+                yf_batch = [ticker for ticker in sub_batch if not is_nav_symbol(ticker)]
+                try:
+                    df_inc = yf.download(
+                        tickers=yf_batch, period=dl_period, interval="1d",
+                        auto_adjust=False, group_by="column", threads=True, progress=False, timeout=20
+                    ) if yf_batch else pd.DataFrame()
+                except Exception as exc:
+                    print(f"[PriceCache] yfinance incremental batch failed: {type(exc).__name__}: {exc}")
+                    df_inc = pd.DataFrame()
                 if df_inc is not None and not df_inc.empty:
-                    _save_to_price_cache(conn, df_inc, sub_batch)
+                    _save_to_price_cache(conn, df_inc, yf_batch)
+                _cached_fallback_for_missing(conn, sub_batch, df_inc, dl_period, full_period=period)
+
+    # A symbol once switched to AkShare remains on that price basis. Refresh
+    # at most once per calendar day; NAV providers often publish after close.
+    for ticker, last_checked in ak_sources.items():
+        if ticker in req_set and last_checked != today.isoformat():
+            _cached_fallback_for_missing(conn, [ticker], pd.DataFrame(), period, full_period=period)
 
     _backfill_recent_ohlc(conn, tickers)
     conn.commit()
@@ -1684,6 +1767,8 @@ def _screening_static_exclusion(ticker):
         return "空 ticker"
     if is_breadth_pseudo_ticker(ticker):
         return "市场宽度伪 ticker"
+    if is_nav_symbol(ticker):
+        return "开放式基金净值"
     if ticker.startswith("^"):
         return "指数"
     if ticker.endswith("=F"):
@@ -2704,7 +2789,7 @@ def get_stock_data():
         tickers_need_info_yf = set()
 
         for ticker_symbol in all_tickers:
-            if ticker_symbol in broad_market_set or is_breadth_pseudo_ticker(ticker_symbol):
+            if ticker_symbol in broad_market_set or is_breadth_pseudo_ticker(ticker_symbol) or is_nav_symbol(ticker_symbol):
                 continue
 
             sa_data = sa_data_dict.get(ticker_symbol)
@@ -2838,6 +2923,15 @@ def get_stock_data():
         beta_benchmark_tickers = beta_benchmarks_for_tickers(all_tickers)
         price_tickers = list(dict.fromkeys(all_tickers + [RELATIVE_RETURN_BENCHMARK] + beta_benchmark_tickers))
         df = get_prices_with_cache(price_tickers, period="2y")
+        fallback_price_sources = {}
+        if any(eligible_for_fallback(ticker) for ticker in all_tickers):
+            source_conn = get_db_connection()
+            try:
+                fallback_price_sources = dict(source_conn.execute(
+                    "SELECT ticker, price_basis FROM price_cache_source WHERE provider='akshare'"
+                ).fetchall())
+            finally:
+                source_conn.close()
 
         if isinstance(df.columns, pd.MultiIndex):
             top_fields = {lvl[0] for lvl in df.columns}
@@ -3118,15 +3212,16 @@ def get_stock_data():
             ticker_relative_sparklines = relative_indicator_sparklines.get(ticker, {})
 
             price_update = extended_updates.get(ticker, {})
-            price_source = price_update.get("source")
+            price_source = ("AkShare published unit NAV" if is_nav_symbol(ticker)
+                            else price_update.get("source") or (f"AkShare {fallback_price_sources[ticker]} daily" if ticker in fallback_price_sources else None))
             price_timestamp = price_update.get("effective_timestamp") or latest.name
             row = {
                 "Ticker": ticker,
                 "Name": ticker_names.get(ticker),
-                "Price": float(round(latest["Adj Close"], 2)),
+                "Price": float(round(latest["Adj Close"], 4 if is_nav_symbol(ticker) else 2)),
                 "Price Timestamp": _price_timestamp_label(price_timestamp, price_source),
-                "Previous Close": float(round(prev["Adj Close"], 2)),
-                "Beta": round(beta, 2) if not pd.isna(beta) else np.nan,
+                "Previous Close": float(round(prev["Adj Close"], 4 if is_nav_symbol(ticker) else 2)),
+                "Beta": round(beta, 2) if not is_nav_symbol(ticker) and not pd.isna(beta) else np.nan,
                 "20D Rel%": round(float(ticker_relative_scores.get("20D Rel%")), 2)
                 if pd.notna(ticker_relative_scores.get("20D Rel%", np.nan)) else np.nan,
                 "60D Rel%": round(float(ticker_relative_scores.get("60D Rel%")), 2)
@@ -3221,8 +3316,9 @@ def portfolio_dca_backtest():
         # A DCA backtest may need more history than the normal application
         # cache retains.  Deliberately download its requested range directly:
         # this avoids both truncating long simulations and bloating price_cache.
+        yf_requested = [ticker for ticker in requested if not is_nav_symbol(ticker)]
         price_data = yf.download(
-            tickers=requested,
+            tickers=yf_requested,
             # Keep a small pre-window history only in this in-memory download.
             # The backtest needs it to distinguish a weekend/holiday start from
             # a ticker that genuinely had not listed by the start date.
@@ -3236,8 +3332,8 @@ def portfolio_dca_backtest():
             timeout=45,
         )
         if price_data is None or price_data.empty:
-            return jsonify({"success": False, "error": "No daily price data was returned for the selected range."}), 502
-        if isinstance(price_data.columns, pd.MultiIndex):
+            adj_close = pd.DataFrame()
+        elif isinstance(price_data.columns, pd.MultiIndex):
             if "Adj Close" not in set(price_data.columns.get_level_values(0)):
                 return jsonify({"success": False, "error": "Adjusted-close data is unavailable for this backtest."}), 502
             adj_close = price_data["Adj Close"].copy()
@@ -3245,6 +3341,23 @@ def portfolio_dca_backtest():
             adj_close = price_data.copy()
             if "Adj Close" in adj_close.columns and len(requested) == 1:
                 adj_close = adj_close[["Adj Close"]].rename(columns={"Adj Close": requested[0]})
+
+        fallback_basis = {}
+        for ticker in tickers:
+            if not eligible_for_fallback(ticker) or ticker in adj_close and adj_close[ticker].notna().any():
+                continue
+            try:
+                fallback = fetch_akshare_daily(
+                    ticker, start=start_date - datetime.timedelta(days=14),
+                    end=end_date + datetime.timedelta(days=1),
+                )
+                if not fallback.empty:
+                    adj_close[ticker] = fallback["Adj Close"]
+                    fallback_basis[ticker] = fallback.attrs.get("price_basis", "unknown")
+            except Exception as exc:
+                print(f"[DCA Backtest] AkShare fallback failed for {ticker}: {type(exc).__name__}: {exc}")
+        if adj_close.empty:
+            return jsonify({"success": False, "error": "No daily price data was returned for the selected range."}), 502
 
         result = run_equal_weight_dca_backtest(
             adj_close,
@@ -3254,7 +3367,11 @@ def portfolio_dca_backtest():
             frequency=frequency,
             monthly_timing=monthly_timing,
         )
-        result["data_source"] = "on-demand yfinance download (not stored in SQLite)"
+        result["data_source"] = ("on-demand yfinance + AkShare download (not stored in SQLite); "
+                                 "fund NAV and raw ETF fallback prices do not represent dividend-adjusted total return"
+                                 if fallback_basis else "on-demand yfinance download (not stored in SQLite)")
+        if fallback_basis:
+            result["fallback_price_basis"] = fallback_basis
         return jsonify(result)
     except ValueError as exc:
         return jsonify({"success": False, "error": str(exc)}), 400
@@ -3504,29 +3621,69 @@ def get_kline_data():
         # 获取股票数据
         end_date = datetime.date.today() + pd.offsets.BusinessDay(1)
         start_date = end_date - datetime.timedelta(days=time_span)
+        if is_nav_symbol(ticker):
+            if interval != "1d":
+                return jsonify({"success": False, "error": "Open-end funds publish daily NAV only; intraday or weekly OHLC candles are unavailable."})
+            nav_data = fetch_akshare_daily(ticker, start=start_date, end=end_date)
+            if nav_data.empty:
+                return jsonify({"success": False, "error": f"No published unit NAV was found for {ticker}."})
+            return jsonify({
+                "success": True, "ticker": ticker, "instrument_type": "MUTUALFUND",
+                "price_source": "AkShare / Eastmoney unit NAV", "price_basis": "unit_nav",
+                "dates": nav_data.index.strftime("%Y-%m-%d %H:%M").tolist(),
+                "ohlc": {"close": nav_data["Close"].tolist()},
+                "indicators": {}, "financials": {},
+                "data_note": "Published unit NAV is not an intraday quote; OHLC, volume, ATR, ADX and VWAP are unavailable.",
+            })
         ticker_info = yf.Ticker(ticker)
         extended_info = None
-        if '1d' in interval:
-            stock_data = ticker_info.history(start=start_date, end=end_date)
-        elif interval in ['5m','15m','1h','4h']:
-            intraday_days = min(time_span, 60)
-            stock_data = ticker_info.history(period=f"{intraday_days}d", interval=interval, prepost=True)
-        elif '1wk' in interval:
-            stock_data = ticker_info.history(start=start_date, end=end_date, interval = interval)
-        else:
-            return jsonify({"success": False, "error": "输入时间间隔无效"})
+        try:
+            if '1d' in interval:
+                stock_data = ticker_info.history(start=start_date, end=end_date)
+            elif interval in ['5m','15m','1h','4h']:
+                intraday_days = min(time_span, 60)
+                stock_data = ticker_info.history(period=f"{intraday_days}d", interval=interval, prepost=True)
+            elif '1wk' in interval:
+                stock_data = ticker_info.history(start=start_date, end=end_date, interval=interval)
+            else:
+                return jsonify({"success": False, "error": "输入时间间隔无效"})
+        except Exception as exc:
+            print(f"[Kline] yfinance failed for {ticker}: {type(exc).__name__}: {exc}")
+            stock_data = pd.DataFrame()
+
+        fallback_source = None
+        fallback_instrument = None
+        fallback_basis = None
+        if (stock_data is None or stock_data.empty or "Close" not in stock_data or stock_data["Close"].dropna().empty) and eligible_for_fallback(ticker):
+            if interval not in {"1d", "1wk"}:
+                return jsonify({"success": False, "error": "AkShare fallback supplies daily bars only; intraday bars are unavailable for this ticker."})
+            stock_data = fetch_akshare_daily(ticker, start=start_date, end=end_date)
+            fallback_instrument = stock_data.attrs.get("instrument_type")
+            fallback_basis = stock_data.attrs.get("price_basis", "qfq")
+            if not stock_data.empty and interval == "1wk":
+                stock_data = stock_data.resample("W-FRI").agg({
+                    "Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum",
+                }).dropna(subset=["Close"])
+            fallback_source = ("AkShare / Sina daily OHLCV (raw)" if fallback_basis == "raw"
+                               else "AkShare / Eastmoney daily OHLCV (qfq)")
 
         
         if stock_data is None or stock_data.empty:
             return jsonify({"success": False, "error": f"未找到股票代码: {ticker}"})
         
         # 计算筹码分布
-        if '1d' in interval:
+        if '1d' in interval and fallback_source is None:
             stock_data, extended_info = apply_extended_hours_to_daily_kline(stock_data, ticker)
 
-        chip_data,chip_peak_price = calculate_chip_distribution(ticker)
-        prices = chip_data['price'].values
-        volumes = chip_data['volume'].values
+        if fallback_source:
+            prices, volumes, chip_peak_price = np.array([]), np.array([]), None
+        else:
+            try:
+                chip_data, chip_peak_price = calculate_chip_distribution(ticker)
+                prices = chip_data['price'].values
+                volumes = chip_data['volume'].values
+            except (KeyError, ValueError, IndexError, TypeError):
+                prices, volumes, chip_peak_price = np.array([]), np.array([]), None
         
         # 计算技术指标
         # MACD
@@ -3581,7 +3738,9 @@ def get_kline_data():
         kline_data = {
             "success": True,
             "ticker": ticker,
-            "price_source": extended_info.get("source") if extended_info else None,
+            "instrument_type": fallback_instrument or "EQUITY",
+            "price_basis": fallback_basis if fallback_source else "yfinance",
+            "price_source": fallback_source or (extended_info.get("source") if extended_info else None),
             "extended_time": extended_info.get("timestamp").strftime('%Y-%m-%d %H:%M') if extended_info else None,
             "dates": stock_data.index.strftime('%Y-%m-%d %H:%M').tolist(), 
             "ohlc": {
@@ -3624,7 +3783,7 @@ def get_kline_data():
             }
         }
         
-        return jsonify(kline_data)
+        return jsonify(_json_finite(kline_data))
         
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})

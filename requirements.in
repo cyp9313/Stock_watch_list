@@ -14,9 +14,10 @@ tksheet>=7.0,<8.0         # Tkinter table widget
 
 # ── Data / Finance ──────────────────────────────────────────────────
 yfinance>=0.2.50,<0.3     # yf.download/Ticker API; 0.2.x stable
-# A-share aggregate market recap: Eastmoney via efinance, with AkShare fallback.
+# A-share aggregate recap and per-symbol daily OHLCV/NAV fallback. The 1.20.4x
+# interface renames removed old aliases; use the current source-qualified APIs.
 efinance>=0.5.5
-akshare>=1.12.0
+akshare>=1.20.65,<1.21
 pandas>=2.0,<4.0          # DataFrame API; 2.x and 3.x compatible
 numpy>=1.24,<3.0          # Array operations; 2.x compatible
 pytz>=2024.1              # Timezone data

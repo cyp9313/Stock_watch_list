@@ -856,6 +856,9 @@ def build_kline_chart(kline_data, ticker, fibonacci=None, dark_mode=False, uirev
     if not kline_data or not kline_data.get("success"):
         st.warning("K-line data not available")
         return None
+    if kline_data.get("instrument_type") == "MUTUALFUND":
+        from nav_chart import build_nav_chart
+        return build_nav_chart(kline_data, dark_mode=dark_mode, uirevision=uirevision, indicator_settings=indicator_settings)
 
     theme = get_theme(dark_mode)
     ohlc = kline_data["ohlc"]
@@ -2073,9 +2076,11 @@ def _render_kline_body():
                 # the previous widget values until the next Apply click.
                 st.rerun()
 
-        fibonacci = calculate_auto_fibonacci(kd["dates"], kd["ohlc"], settings["fibonacci"])
+        fibonacci = None if kd.get("instrument_type") == "MUTUALFUND" else calculate_auto_fibonacci(kd["dates"], kd["ohlc"], settings["fibonacci"])
 
         with chart_column:
+            if kd.get("instrument_type") == "MUTUALFUND":
+                st.info(kd.get("data_note", "Fund unit NAV is published daily; OHLCV indicators are unavailable."))
             fig = build_kline_chart(
                 kd,
                 ticker,

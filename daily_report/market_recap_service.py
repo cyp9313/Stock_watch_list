@@ -668,7 +668,7 @@ def _cn_snapshot() -> dict[str, Any]:
                     errors.append(f"akshare 东方财富全市场行情：{type(exc).__name__}")
             if not breadth:
                 try:
-                    breadth = _a_share_breadth_from_spot(ak.stock_zh_a_spot())
+                    breadth = _a_share_breadth_from_spot(ak.stock_zh_a_spot_sina())
                     if breadth:
                         source_parts.append("Sina Finance 全市场行情（AkShare）")
                 except Exception as exc:

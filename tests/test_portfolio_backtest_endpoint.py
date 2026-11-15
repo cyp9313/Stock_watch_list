@@ -80,3 +80,30 @@ def test_portfolio_dca_backtest_endpoint_rejects_future_end_date():
 
     assert response.status_code == 400
     assert response.get_json()["success"] is False
+
+
+def test_portfolio_dca_fund_nav_fallback_is_explicit_and_not_cached(monkeypatch):
+    today = datetime.date.today()
+    start = today - datetime.timedelta(days=70)
+    dates = pd.date_range(start, today, freq="B")
+    def fake_download(tickers, **kwargs):
+        assert "FUND:000001" not in tickers
+        return pd.DataFrame({
+            ("Adj Close", "SPY"): np.linspace(100, 110, len(dates)),
+            ("Adj Close", "QQQ"): np.linspace(200, 220, len(dates)),
+        }, index=dates)
+    def fake_fund(ticker, **kwargs):
+        result = pd.DataFrame({"Adj Close": np.linspace(1, 1.1, len(dates))}, index=dates)
+        result.attrs["price_basis"] = "unit_nav"
+        return result
+    monkeypatch.setattr(backend.yf, "download", fake_download)
+    monkeypatch.setattr(backend, "fetch_akshare_daily", fake_fund)
+    monkeypatch.setattr(backend, "get_prices_with_cache", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("no SQLite")))
+    with backend.app.test_client() as client:
+        payload = client.post("/api/portfolio_dca_backtest", json={
+            "tickers": ["FUND:000001"], "start_date": start.isoformat(),
+            "end_date": today.isoformat(), "frequency": "weekly",
+        }).get_json()
+    assert payload["success"] is True
+    assert payload["fallback_price_basis"] == {"FUND:000001": "unit_nav"}
+    assert "not represent dividend-adjusted total return" in payload["data_source"]

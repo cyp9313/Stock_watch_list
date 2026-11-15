@@ -37,6 +37,7 @@ from typing import Any
 
 import pandas as pd
 import yfinance as yf
+from akshare_fallback import eligible_for_fallback, fetch_daily, is_nav_symbol, mainland_code
 
 try:
     from zoneinfo import ZoneInfo
@@ -113,16 +114,26 @@ class MarketDataService:
             auto_adjust=False), Volume.  MultiIndex columns are flattened to
             simple column names.
         """
-        data = yf.download(
-            ticker,
-            period=period,
-            interval=interval,
-            auto_adjust=auto_adjust,
-        )
+        if is_nav_symbol(ticker):
+            if interval != "1d":
+                return pd.DataFrame()
+            return fetch_daily(ticker, period=period)
+        try:
+            data = yf.download(ticker, period=period, interval=interval, auto_adjust=auto_adjust)
+        except Exception as exc:
+            if interval != "1d" or not eligible_for_fallback(ticker):
+                raise
+            print(f"[MarketData] yfinance failed for {ticker}: {type(exc).__name__}: {exc}")
+            data = pd.DataFrame()
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = [
                 c[0] if isinstance(c, tuple) else c for c in data.columns
             ]
+        if (data is None or data.empty or "Close" not in data or data["Close"].dropna().empty) and interval == "1d" and eligible_for_fallback(ticker):
+            try:
+                return fetch_daily(ticker, period=period)
+            except Exception as exc:
+                print(f"[MarketData] AkShare fallback failed for {ticker}: {type(exc).__name__}: {exc}")
         return data
 
     @staticmethod
@@ -142,26 +153,35 @@ class MarketDataService:
         tickers = list(dict.fromkeys(tickers))
         if not tickers:
             return pd.DataFrame()
-        data = yf.download(
-            tickers=tickers,
-            period=period,
-            interval=interval,
-            auto_adjust=False,
-            threads=True,
-            group_by="column",
-            progress=False,
-        )
+        yf_tickers = [ticker for ticker in tickers if not is_nav_symbol(ticker)]
+        try:
+            data = yf.download(
+                tickers=yf_tickers, period=period, interval=interval,
+                auto_adjust=False, threads=True, group_by="column", progress=False,
+            ) if yf_tickers else pd.DataFrame()
+        except Exception:
+            data = pd.DataFrame()
         if data is None or data.empty:
-            return pd.DataFrame()
-        if isinstance(data.columns, pd.MultiIndex):
+            close = pd.DataFrame()
+        elif isinstance(data.columns, pd.MultiIndex):
             fields = list(data.columns.get_level_values(0))
             field = "Adj Close" if "Adj Close" in fields else "Close"
             close = data.xs(field, axis=1, level=0)
         else:
             field = "Adj Close" if "Adj Close" in data.columns else "Close"
-            close = data[[field]].rename(columns={field: tickers[0]})
+            close = data[[field]].rename(columns={field: yf_tickers[0]})
         close = close.copy()
         close.columns = [MarketDataService.normalize_ticker(c) for c in close.columns]
+        if interval == "1d":
+            for ticker in tickers:
+                if not eligible_for_fallback(ticker) or ticker in close and close[ticker].notna().any():
+                    continue
+                try:
+                    fallback = fetch_daily(ticker, period=period)
+                    if not fallback.empty:
+                        close[ticker] = fallback["Adj Close"]
+                except Exception as exc:
+                    print(f"[MarketData] AkShare close fallback failed for {ticker}: {type(exc).__name__}: {exc}")
         close = close.dropna(axis=1, how="all")
         ordered = [ticker for ticker in tickers if ticker in close.columns]
         return close[ordered] if ordered else pd.DataFrame()
@@ -238,10 +258,18 @@ class MarketDataService:
         Returns an empty dict on failure (same behavior as the original
         fetch_and_calc.py try/except block).
         """
+        if is_nav_symbol(ticker):
+            return {"quoteType": "MUTUALFUND", "currency": "CNY", "shortName": ticker}
         try:
-            return yf.Ticker(ticker).info or {}
+            info = yf.Ticker(ticker).info or {}
         except (KeyError, ValueError, AttributeError, TypeError, RuntimeError):
-            return {}
+            info = {}
+        if mainland_code(ticker):
+            suffix = ticker.upper().rsplit(".", 1)[-1] if "." in ticker else ""
+            info.setdefault("currency", "CNY")
+            info.setdefault("exchange", {"SS": "SSE", "SZ": "SZSE", "BJ": "BSE"}.get(suffix, "CN"))
+            info.setdefault("quoteType", "EQUITY")
+        return info
 
     # -- StockAnalysis fundamentals ------------------------------------------
 

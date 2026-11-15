@@ -22,6 +22,7 @@ import requests
 from cryptography.fernet import Fernet, InvalidToken
 
 from ticker_mapping import normalize_yfinance_ticker
+from akshare_fallback import eligible_for_fallback, fetch_daily as fetch_akshare_daily
 
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -846,7 +847,14 @@ def _download_yfinance_daily_history(yfinance_ticker: str, end_date: dt.date) ->
             actions=False,
         )
     except Exception as exc:
-        raise Trading212APIError(f"yfinance daily history failed for {yfinance_ticker}: {type(exc).__name__}") from exc
+        if not eligible_for_fallback(yfinance_ticker):
+            raise Trading212APIError(f"yfinance daily history failed for {yfinance_ticker}: {type(exc).__name__}") from exc
+        frame = None
+    if (frame is None or frame.empty or "Close" not in frame or frame["Close"].dropna().empty) and eligible_for_fallback(yfinance_ticker):
+        try:
+            frame = fetch_akshare_daily(yfinance_ticker, period="2y", end=end_date)
+        except Exception as exc:
+            raise Trading212APIError(f"Daily history unavailable from yfinance and AkShare for {yfinance_ticker}: {type(exc).__name__}") from exc
     if frame is None or frame.empty or "Close" not in frame:
         return []
     rows: list[tuple[str, float, float | None]] = []

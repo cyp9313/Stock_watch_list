@@ -91,7 +91,7 @@ def test_cn_snapshot_uses_akshare_sina_fallback_for_spot_and_industry(monkeypatc
     fake_efinance = SimpleNamespace(stock=SimpleNamespace(get_realtime_quotes=fail))
     fake_akshare = SimpleNamespace(
         stock_zh_a_spot_em=fail,
-        stock_zh_a_spot=lambda: spot,
+        stock_zh_a_spot_sina=lambda: spot,
         stock_board_industry_name_em=fail,
         stock_sector_spot=lambda indicator: industry if indicator == "行业" else pd.DataFrame(),
     )

@@ -51,6 +51,8 @@ print(f"[INFO] 获取 {TICKER} 数据...")
 # Use MarketDataService for unified data fetching. Save a snapshot so
 # gen_chart.py can reuse the same OHLCV data instead of re-downloading.
 raw = MarketDataService.fetch_ohlcv(TICKER, period='1y', interval='1d', auto_adjust=False)
+price_data_source = raw.attrs.get("provider", "yfinance")
+price_basis = raw.attrs.get("price_basis", "yfinance adjusted close")
 MarketDataService.save_ohlcv_snapshot(raw, TICKER, run_dir=os.getcwd())
 if isinstance(raw.columns, pd.MultiIndex):
     raw.columns = [c[0] if isinstance(c, tuple) else c for c in raw.columns]
@@ -648,6 +650,8 @@ result = {
     "data_days": len(df),
     "data_start": str(df.index[0].date()),
     "data_end":   str(df.index[-1].date()),
+    "PRICE_DATA_SOURCE": price_data_source,
+    "PRICE_BASIS": price_basis,
 }
 
 with open(OUT_FILE, 'w', encoding='utf-8') as f:
