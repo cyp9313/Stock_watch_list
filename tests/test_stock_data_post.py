@@ -180,6 +180,35 @@ def test_post_valid_json(client, valid_payload):
     assert "ADX (20)" not in data["data"][0]
 
 
+def test_post_open_end_fund_shows_nav_line_in_candles_cell(client):
+    """A close-only fund must display a NAV line, never fabricated candles."""
+    import sqlite3
+    import numpy as np
+    import pandas as pd
+
+    dates = pd.date_range("2026-10-01", periods=30, freq="B")
+    prices = pd.DataFrame({
+        ("Adj Close", "FUND:023313"): np.linspace(1.0, 1.2, len(dates)),
+        ("Adj Close", "^GSPC"): np.linspace(5000, 5100, len(dates)),
+    }, index=dates)
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE price_cache_source (ticker TEXT, provider TEXT, price_basis TEXT)")
+    conn.execute("INSERT INTO price_cache_source VALUES ('FUND:023313', 'akshare', 'unit_nav')")
+    with _common_mocks(), patch.object(backend, "get_prices_with_cache", return_value=prices), \
+            patch.object(backend, "get_db_connection", return_value=conn):
+        response = client.post("/api/stock_data", json={"groups": {"Funds": ["FUND:023313"]},
+                                                        "broad_market_tickers": []})
+    assert response.status_code == 200
+    rows = response.get_json()["data"]
+    assert len(rows) == 1
+    svg = rows[0]["Candles (20)"]
+    assert "Last 20 published daily unit NAV values" in svg
+    assert "<polyline" in svg
+    assert "<rect" not in svg
+    assert "Last 15 published daily unit NAV values" in rows[0]["NAV (15)"]
+    assert rows[0]["ADX"] is None
+
+
 # ──────────────────────────────────────────────────────────────
 # 2. 空 JSON
 # ──────────────────────────────────────────────────────────────

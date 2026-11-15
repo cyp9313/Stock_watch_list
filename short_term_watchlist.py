@@ -26,6 +26,21 @@ SHORT_TERM_COLUMNS = (
     "VWAP / Close", "RSI", "RSI (30/70)", "ATR", "ATR (15)",
 )
 
+
+def daily_nav_reference_row(ticker: str, reference: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Show a fund's published daily NAV without fabricating intraday signals."""
+    values = reference if isinstance(reference, Mapping) else {}
+    sparkline = values.get("NAV (15)")
+    return {
+        "Ticker": ticker,
+        "Interval": "Daily NAV",
+        "Price": values.get("Price", np.nan),
+        "Price Timestamp": values.get("Price Timestamp", ""),
+        "Price Source": values.get("Price Source", "Published daily unit NAV"),
+        "Candles (15)": sparkline if isinstance(sparkline, str) else "",
+        "Error": "" if isinstance(sparkline, str) and sparkline else "Published daily unit NAV unavailable",
+    }
+
 _DEFAULT_SETTINGS = {
     "ma_1": {"period": 9, "type": "EMA"},
     "ma_2": {"period": 21, "type": "EMA"},

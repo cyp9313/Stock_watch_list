@@ -37,6 +37,7 @@ from short_term_watchlist import (
     SHORT_TERM_COLUMNS,
     calculate_short_term_row,
     consume_macd_alert_events,
+    daily_nav_reference_row,
     normalize_short_term_watchlist,
     short_term_history_days,
     short_term_tickers,
@@ -221,7 +222,7 @@ WATCHLIST_COLUMN_TOOLTIPS = {
     "Ticker": "Yahoo Finance ticker。悬浮 ticker 单元格可查看名称和 Beta。",
     "Name": "标的名称，来自本地名称缓存或 Yahoo Finance 元数据。",
     "Price": "最新可用价格；常规时段为最新复权收盘价，盘前/盘后价格会使用对应时段的估算更新。",
-    "Candles (20)": "最近 20 根日线蜡烛图；绿色为收涨、红色为收跌。",
+    "Candles (20)": "股票/ETF：最近 20 根日线蜡烛图，绿色收涨、红色收跌；开放式基金：最近 20 个已公布单位净值的折线图。",
     "ADX": "14 日平均趋向指数。通常高于 25 表示趋势较强，低于 20 表示趋势较弱或震荡。",
     "1D%": "最新价格相对上一交易日复权收盘价的涨跌幅。",
     "5D%": "最新复权收盘价相对 5 个交易日前的累计涨跌幅。",
@@ -276,6 +277,8 @@ WATCHLIST_COLUMN_TOOLTIPS = {
 
 def watchlist_column_tooltip(column):
     column = str(column)
+    if column == "Candles (15)":
+        return "最近 15 根对应周期 K 线；开放式基金则显示最近 15 个已公布单位净值的折线，不代表盘中行情。"
     if column.startswith("Diff_EMA"):
         return f"(Price - {column.replace('Diff_', '').replace('%', '')}) / {column.replace('Diff_', '').replace('%', '')} × 100。"
     return WATCHLIST_COLUMN_TOOLTIPS.get(column, column)
@@ -1092,7 +1095,7 @@ def format_money_value(value, ticker, display_currency="Local"):
         return ""
     currency = price_unit_for_ticker(ticker, display_currency)
     try:
-        formatted = f"{float(value):.2f}"
+        formatted = f"{float(value):.4f}" if is_nav_symbol(ticker) else f"{float(value):.2f}"
     except (TypeError, ValueError):
         return ""
     if not currency:
@@ -3004,9 +3007,13 @@ def short_term_reference_metrics(stock_data):
         if ticker and ticker not in metrics:
             name = item.get("Name")
             metrics[ticker] = {
+                "Price": pd.to_numeric(item.get("Price"), errors="coerce"),
                 "Previous Close": pd.to_numeric(item.get("Previous Close"), errors="coerce"),
                 "Beta": pd.to_numeric(item.get("Beta"), errors="coerce"),
                 "Name": str(name).strip() if pd.notna(name) else "",
+                "Price Timestamp": item.get("Price Timestamp", ""),
+                "Price Source": item.get("Price Source", ""),
+                "NAV (15)": item.get("NAV (15)", ""),
             }
     return metrics
 
@@ -3015,7 +3022,7 @@ def render_short_term_table(
     rows_by_pair, groups, settings, *, reference_metrics=None, alert_pairs=None,
     dark_mode=False, display_currency="Local",
 ):
-    """Render paired 5m/15m rows for each ticker in one comparison table."""
+    """Render intraday pairs, or one published daily NAV row for open-end funds."""
     theme = get_theme(dark_mode)
     columns = _short_term_columns(settings)
     value_keys = list(SHORT_TERM_COLUMNS)
@@ -3034,7 +3041,7 @@ def render_short_term_table(
     }
     widths = [
         ticker_column_width(ticker for tickers in groups.values() for ticker in tickers),
-        48, 82, 64, 68, 88, 54, 88, 82, 88, 76, 88, 76, 88, 88, 88, 80, 88, 58, 88, 70, 88,
+        68, 82, 64, 68, 88, 54, 88, 82, 88, 76, 88, 76, 88, 88, 88, 80, 88, 58, 88, 70, 88,
     ]
     table_width = sum(widths)
     html_table = f"""
@@ -3051,13 +3058,21 @@ def render_short_term_table(
     for group_name, tickers in groups.items():
         html_table += f"<tr><td colspan='{len(columns)}' style='padding:5px; font-weight:bold; background-color:{theme['table_group_bg']}; color:{theme['text']}; border:1px solid {theme['table_border']};'>{html.escape(group_name)}</td></tr>"
         for ticker in tickers:
-            for interval_index, interval in enumerate(intervals):
-                row = dict(rows_by_pair.get((ticker, interval), {"Ticker": ticker, "Error": "No intraday data"}))
+            display_intervals = ("NAV",) if is_nav_symbol(ticker) else intervals
+            for interval_index, interval in enumerate(display_intervals):
                 reference = (reference_metrics or {}).get(ticker, {})
+                default_row = (
+                    daily_nav_reference_row(ticker, reference)
+                    if interval == "NAV" else {"Ticker": ticker, "Error": "No intraday data"}
+                )
+                row = dict(rows_by_pair.get((ticker, interval), default_row))
                 previous_daily_close = reference.get("Previous Close", np.nan)
                 row["Beta"] = reference.get("Beta", np.nan)
                 if pd.notna(row.get("Price", np.nan)) and pd.notna(previous_daily_close) and float(previous_daily_close) != 0:
                     row["1D%"] = (float(row["Price"]) - float(previous_daily_close)) / float(previous_daily_close) * 100.0
+                if interval == "NAV" and display_currency == "EUR":
+                    multiplier, _ = eur_multiplier_for_ticker(ticker)
+                    row["Price"] = convert_value_to_eur(row.get("Price"), multiplier)
                 html_table += "<tr>"
                 if interval_index == 0:
                     ticker_background = beta_color(row.get("Beta", np.nan))
@@ -3068,11 +3083,11 @@ def render_short_term_table(
                         quote=True,
                     )
                     ticker_text_color = theme["text"] if ticker_background == theme["table_bg"] else readable_text_color(ticker_background)
-                    html_table += f"<td rowspan='2' title='{ticker_title}' style='padding:4px; text-align:left; {sticky_first_column_style(ticker_background)} color:{ticker_text_color}; background-color:{ticker_background}; border:1px solid {theme['table_border']}; white-space:normal; overflow-wrap:anywhere; word-break:break-word;'>{html.escape(ticker)}</td>"
+                    html_table += f"<td rowspan='{len(display_intervals)}' title='{ticker_title}' style='padding:4px; text-align:left; {sticky_first_column_style(ticker_background)} color:{ticker_text_color}; background-color:{ticker_background}; border:1px solid {theme['table_border']}; white-space:normal; overflow-wrap:anywhere; word-break:break-word;'>{html.escape(ticker)}</td>"
                 for index, (display_column, key) in enumerate(zip(columns[1:], value_keys[1:]), start=1):
-                    value = interval if key == "Interval" else row.get(key, np.nan)
+                    value = row.get("Interval", interval) if key == "Interval" else row.get(key, np.nan)
                     if key in {"Candles (15)", "ADX (15)", "MA 1 / MA 2", "Volume (15)", "MACD / Signal", "BB / Close", "VWAP / Close", "RSI (30/70)", "ATR (15)"}:
-                        content = str(value or "")
+                        content = value if isinstance(value, str) else ""
                     else:
                         content = _short_term_value_text(key, value, ticker, display_currency)
 
@@ -3108,7 +3123,10 @@ def render_short_term_table(
                     active_signals = set((active_alerts.get((ticker, interval)) or {}).get("signals", []))
                     is_alerted = any(key in alert_columns.get(signal, set()) for signal in active_signals)
                     alert_class = " short-term-macd-alert-cell" if is_alerted else ""
-                    price_title = price_timestamp_tooltip(row) if key == "Price" else ""
+                    price_title = price_timestamp_tooltip(row) if key == "Price" else (
+                        "Published daily unit NAV; no intraday signals or alerts"
+                        if key == "Interval" and interval == "NAV" else ""
+                    )
                     title_attr = f" title='{html.escape(price_title, quote=True)}'" if price_title else ""
                     html_table += f"<td{title_attr} class='{alert_class.strip()}' style='padding:4px; text-align:{align}; color:{text_color}; background-color:{background}; border:1px solid {theme['table_border']}; white-space:nowrap; overflow:hidden;'>{content}</td>"
                 html_table += "</tr>"
@@ -3138,7 +3156,7 @@ def _short_term_alert_signature(short_config, tickers):
 def render_short_term_watchlist(config, user, *, stock_data=None, dark_mode=False, display_currency="Local"):
     """Render account-scoped 5m/15m watchlists with an independent fragment refresh."""
     st.subheader("Short-term Watchlist")
-    st.caption("5-minute and 15-minute signals use the existing K-line API. Its refresh is independent of Auto-refresh stocks.")
+    st.caption("5-minute and 15-minute signals use the existing K-line API. Open-end funds show published daily NAV instead; their line updates with Refresh stocks / Auto-refresh stocks, not the short-term intraday refresh.")
     short_config = normalize_short_term_watchlist(config.get("short_term_watchlist"))
     if not user:
         st.info("Sign in to configure and auto-refresh a short-term watchlist.")
@@ -3359,7 +3377,7 @@ def render_short_term_watchlist(config, user, *, stock_data=None, dark_mode=Fals
     st.caption(
         "Price cell: green = regular session (including 24/7 crypto), blue = pre-market, yellow = after-hours. "
         "Ticker cell: greener beta is below 1; redder beta is above 1. "
-        "Candles: teal = up, red = down. MA 1 = green; MA 2 = purple. Volume bars = light blue. "
+        "Candles: teal = up, red = down; open-end funds show a daily NAV line instead. MA 1 = green; MA 2 = purple. Volume bars = light blue. "
         "MACD = blue; signal = orange; its dashed gray line is 0. Close = blue; VWAP = teal; VWAP ±1σ and Bollinger upper/lower are dashed gray. "
         "RSI = purple; its dashed gray lines are 30 and 70. ATR = dark blue. ADX = green; below 20 is range-like and above 25 is trend-like. "
         "VWAP values are blank outside a regular-session bar or when the latest bar has no volume."
@@ -3380,9 +3398,10 @@ def render_short_term_watchlist(config, user, *, stock_data=None, dark_mode=Fals
                 force_refresh = True
                 st.session_state["short_term_last_refresh"] = now.strftime("%Y-%m-%d %H:%M:%S")
                 st.session_state["short_term_next_due"] = now + datetime.timedelta(seconds=short_config["refresh"]["interval_seconds"])
+        intraday_tickers = [ticker for ticker in tickers if not is_nav_symbol(ticker)]
         payloads = load_short_term_payloads(
-            tickers, ("5m", "15m"), history_days=history_days, force_refresh=force_refresh,
-        )
+            intraday_tickers, ("5m", "15m"), history_days=history_days, force_refresh=force_refresh,
+        ) if intraday_tickers else {}
         if st.session_state.get("short_term_last_refresh"):
             st.caption(f"Last short-term refresh: {st.session_state['short_term_last_refresh']}")
         if short_config["refresh"]["enabled"]:
@@ -3391,9 +3410,13 @@ def render_short_term_watchlist(config, user, *, stock_data=None, dark_mode=Fals
                 st.caption(f"Automatic refresh is ON; next refresh: {next_due.strftime('%Y-%m-%d %H:%M:%S')}")
         else:
             st.caption("Automatic refresh is OFF.")
-        rows_by_pair = {}
+        reference_metrics = short_term_reference_metrics(stock_data)
+        rows_by_pair = {
+            (ticker, "NAV"): daily_nav_reference_row(ticker, reference_metrics.get(ticker))
+            for ticker in tickers if is_nav_symbol(ticker)
+        }
         for interval in ("5m", "15m"):
-            for ticker in tickers:
+            for ticker in intraday_tickers:
                 payload = payloads.get((ticker, interval, history_days))
                 if not payload or not payload.get("success"):
                     rows_by_pair[(ticker, interval)] = {"Ticker": ticker, "Error": (payload or {}).get("error", "K-line data unavailable")}
@@ -3457,7 +3480,7 @@ def render_short_term_watchlist(config, user, *, stock_data=None, dark_mode=Fals
             rows_by_pair,
             short_config["groups"],
             short_config["settings"],
-            reference_metrics=short_term_reference_metrics(stock_data),
+            reference_metrics=reference_metrics,
             alert_pairs=active_alerts,
             dark_mode=dark_mode,
             display_currency=display_currency,

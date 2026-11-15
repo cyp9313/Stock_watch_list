@@ -110,6 +110,21 @@ def test_nav_chart_is_not_candlestick():
     assert all(trace.type == "scatter" for trace in fig.data)
 
 
+def test_nav_watchlist_sparkline_uses_only_published_closes():
+    import stock_watch_list_back_end as backend
+    svg = backend.nav_sparkline_svg([1.0, None, float("nan"), 1.1, 1.2])
+    assert "<svg" in svg
+    assert "width='96' height='36'" in svg
+    assert "Last 3 published daily unit NAV values" in svg
+    assert "<polyline" in svg and "<circle" in svg
+    assert "<rect" not in svg and "<line" not in svg
+    assert backend.nav_sparkline_svg([None, float("nan")]) == ""
+    assert "<circle" in backend.nav_sparkline_svg([1.1])
+    short_svg = backend.nav_sparkline_svg(range(20), width=80, height=30, limit=15)
+    assert "width='80' height='30'" in short_svg
+    assert "Last 15 published daily unit NAV values" in short_svg
+
+
 def test_cache_provider_switch_replaces_old_price_basis(monkeypatch):
     import stock_watch_list_back_end as backend
     conn = sqlite3.connect(":memory:")

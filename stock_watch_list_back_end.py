@@ -513,6 +513,39 @@ def _relative_indicator_sparkline(values, aria_label):
     )
 
 
+def nav_sparkline_svg(values, *, width=96, height=36, limit=20):
+    """Render published unit NAV as a close-only line in the watchlist candle cell."""
+    series = pd.to_numeric(pd.Series(values), errors="coerce").replace([np.inf, -np.inf], np.nan)
+    series = series.loc[series > 0].dropna().tail(limit)
+    if series.empty:
+        return ""
+
+    width, height, pad = max(int(width), 16), max(int(height), 16), 3
+    low, high = float(series.min()), float(series.max())
+    span = high - low
+    if span == 0:
+        span = max(abs(high), 1.0) * 0.02
+        low -= span / 2
+        high += span / 2
+        span = high - low
+
+    points = " ".join(
+        f"{pad + (width - 2 * pad) * i / max(len(series) - 1, 1):.1f},"
+        f"{pad + (high - float(value)) * (height - 2 * pad) / span:.1f}"
+        for i, value in enumerate(series)
+    )
+    color = "#16a34a" if series.iloc[-1] > series.iloc[0] else "#dc2626" if series.iloc[-1] < series.iloc[0] else "#2563eb"
+    last_point = points.split(" ")[-1]
+    line = (f"<polyline fill='none' stroke='{color}' stroke-width='1.8' "
+            f"stroke-linecap='round' stroke-linejoin='round' points='{points}'/>" if len(series) > 1 else "")
+    return (
+        f"<svg viewBox='0 0 {width} {height}' width='{width}' height='{height}' role='img' "
+        f"aria-label='Last {len(series)} published daily unit NAV values'>"
+        f"{line}<circle cx='{last_point.split(',')[0]}' cy='{last_point.split(',')[1]}' "
+        f"r='2.2' fill='{color}'/></svg>"
+    )
+
+
 def compute_relative_indicator_sparklines(
     adj_close,
     tickers,
@@ -3247,20 +3280,26 @@ def get_stock_data():
                 "Price Source": price_source,
             }
 
-            candle_parts = []
-            for field in ("Open", "High", "Low", "Close"):
-                field_data = daily_ohlc[field]
-                series = field_data[ticker] if not field_data.empty and ticker in field_data else pd.Series(dtype=float)
-                candle_parts.append(pd.to_numeric(series, errors="coerce"))
-            if all(len(series) for series in candle_parts):
-                candle_frame = pd.concat(candle_parts, axis=1).dropna().tail(20)
-                row["Candles (20)"] = candlestick_svg(
-                    candle_frame.iloc[:, 0].tolist(), candle_frame.iloc[:, 1].tolist(),
-                    candle_frame.iloc[:, 2].tolist(), candle_frame.iloc[:, 3].tolist(),
-                    width=96, height=36,
-                )
+            if is_nav_symbol(ticker):
+                # Use the published NAV series, not an extended-hours quote.
+                nav_values = df[("Adj Close", ticker)] if ("Adj Close", ticker) in df else price_series
+                row["Candles (20)"] = nav_sparkline_svg(nav_values)
+                row["NAV (15)"] = nav_sparkline_svg(nav_values, width=80, height=30, limit=15)
             else:
-                row["Candles (20)"] = ""
+                candle_parts = []
+                for field in ("Open", "High", "Low", "Close"):
+                    field_data = daily_ohlc[field]
+                    series = field_data[ticker] if not field_data.empty and ticker in field_data else pd.Series(dtype=float)
+                    candle_parts.append(pd.to_numeric(series, errors="coerce"))
+                if all(len(series) for series in candle_parts):
+                    candle_frame = pd.concat(candle_parts, axis=1).dropna().tail(20)
+                    row["Candles (20)"] = candlestick_svg(
+                        candle_frame.iloc[:, 0].tolist(), candle_frame.iloc[:, 1].tolist(),
+                        candle_frame.iloc[:, 2].tolist(), candle_frame.iloc[:, 3].tolist(),
+                        width=96, height=36,
+                    )
+                else:
+                    row["Candles (20)"] = ""
             for n in [5, 10, 20, 50, 100, 200]:
                 ema = latest.get(f"EMA{n}", np.nan)
                 row[f"Diff_EMA{n}%"] = pct(latest["Adj Close"], ema) if pd.notna(ema) and ema != 0 else np.nan

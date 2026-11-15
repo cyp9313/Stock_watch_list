@@ -16,7 +16,7 @@ Stock Watch List 是一个可部署的股票与跨市场监控应用，而不只
 
 - 可编辑的股票 Watchlist、Market Dashboard 和 Portfolio 页面；支持按组管理标的、Yahoo Finance 搜索添加标的、暗色模式和本币/EUR 显示。Ticker 列会完整显示长代码；悬停 Ticker 可查看标的名称及 Beta，悬停 Price 可查看该价格对应的交易日期，盘前/盘后估算价还会显示美国东部时间。
 - 日线市场数据：价格、最近 20 根日线 K 线蜡烛图、`1D%` / `5D%` / `1M%` / `YTD%`、RSI、成交量比、EMA 偏离、布林带、相对 `^GSPC` 的收益/动量、估值、分析师评级、目标价、市值和 Beta；相对动量列可展开为各自最近 20 根日线的内嵌趋势曲线，灰色虚线为 0 轴。
-- A 股/场内 ETF 日线优先用 yfinance；查不到时回退到新版 AkShare（`stock_zh_a_hist_em` / `fund_etf_hist_em`），东财 ETF 接口限流时再试 `fund_etf_hist_sina`。东财数据为前复权，新浪 ETF 日线为未复权；SQLite 会在切换来源时整体替换该标的历史，不混算两种口径，并在价格提示中标示来源。开放式基金请使用 `FUND:000001` 这种明确代码；其来源是 `fund_open_fund_info_em` 公布的**单位净值**，不是盘中报价。普通 Watchlist 可显示净值及仅依赖收盘价的指标；成交量、ADX 和蜡烛图等需要 OHLCV 的数据会缺失。K 线页面改显示净值线及 MA/MACD/RSI，不虚构 OHLC、成交量、筹码峰、期权墙；5m/15m 短线监视不可用。AkShare 数据可能滞后、限流或地区不可达。
+- A 股/场内 ETF 日线优先用 yfinance；查不到时回退到新版 AkShare（`stock_zh_a_hist_em` / `fund_etf_hist_em`），东财 ETF 接口限流时再试 `fund_etf_hist_sina`。东财数据为前复权，新浪 ETF 日线为未复权；SQLite 会在切换来源时整体替换该标的历史，不混算两种口径，并在价格提示中标示来源。开放式基金请使用 `FUND:000001` 这种明确代码；其来源是 `fund_open_fund_info_em` 公布的**单位净值**，不是盘中报价。普通 Watchlist 的 Candles 列对基金显示最近 20 个已公布净值的折线，并保留仅依赖收盘价的指标；成交量、ADX 和真实蜡烛图等需要 OHLCV 的数据仍缺失。K 线页面显示净值线及 MA/MACD/RSI，不虚构 OHLC、成交量、筹码峰、期权墙；5m/15m 短线监视不可用。AkShare 数据可能滞后、限流或地区不可达。
 - 顶部市场情绪卡片：CNN Fear & Greed、VIX 和 Crypto Fear & Greed。
 - **Market Breadth & Screener**：S&P 500 与 Nasdaq 100 的 20/50/200 日均线上方比例、历史图和 treemap；登录用户还可在同一次 **Refresh Breadth & Screen** 中筛选“指数成分股 + 自己全部 Watchlist/Portfolio/Short-term 标的”的并集。选股会过滤 ETF、指数、期货、汇率和加密资产，并仅允许已验证的个股进入趋势质量、放量突破和超跌反转三套规则策略。评分按市场原币种处理：A 股使用沪指、港股使用恒指等本地基准；流动性采用 20 日平均成交额，不会把美元门槛直接用于非美元标的。
 - Screener 复用 Breadth 的两年日线 SQLite 缓存：三套策略不重复下载行情；以动量、估值、流动性、活跃度、稳定性等透明因子构成基础分，再单列风险扣分。PE/PB/市值优先读取当日 SQLite 基本面缓存；为避免每次刷新全量爬取，最多只补全三套技术初筛候选的 75 个标的。结果按账户保存完整规则快照（90 天、每策略最多 100 次）。每个策略可手动对规则前 15 名执行一次无工具的 AI 复排；默认继承 `LLM_PROVIDER` / `QWEN_MODEL`，只发送已计算技术数据，不联网、不新增 ticker、不改写规则评分。
@@ -26,7 +26,7 @@ Stock Watch List 是一个可部署的股票与跨市场监控应用，而不只
 
 #### Short-term Watchlist（多用户登录后）
 
-Short-term Watchlist 位于 **Market Dashboard** 与 **Market Breadth** 之间，仅对登录用户开放。每个标的在同一张表中占两行，分别显示 5m 与 15m 信号，便于直接对照：
+Short-term Watchlist 位于 **Market Dashboard** 与 **Market Breadth** 之间，仅对登录用户开放。普通标的在同一张表中占两行，分别显示 5m 与 15m 信号，便于直接对照：
 
 - Price、`1D%`（最新价相对上一交易日复权收盘价）、`Bar Diff%`、15 根 K 线蜡烛图。
 - 两条可配置的 SMA/EMA、以万分之一符号 `‱` 显示的 MA Spread、均线对比图。
@@ -38,6 +38,8 @@ Short-term Watchlist 位于 **Market Dashboard** 与 **Market Breadth** 之间�
 - 主 Watchlist、Market Dashboard 与 Portfolios & Reports 的表格会在窄列中自动换行表头；将鼠标悬停在任一表头上可查看完整列名。
 
 默认情况下它请求最近 2 天的 5m/15m K 线。所需历史窗口会按当前最大指标周期自动增加；例如更长的 MA/BB/RSI/MACD 设置会请求更多天数。短线 K 线只保存在当前 Streamlit 会话内，自动刷新会覆盖该会话数据，不写入账户数据库。
+
+`FUND:六位代码` 在 Short-term Watchlist 中只占一行 **Daily NAV**：显示最新公布的单位净值、相对上一有效净值的 `1D%` 和最近 15 个净值的折线。其余盘中指标与提醒留空；不会请求 5m/15m 数据。净值折线随共享 Watchlist 的日线数据更新，不受短线自动刷新驱动。
 
 #### Portfolios & AI Portfolio Reports（多用户登录后）
 
@@ -373,7 +375,7 @@ Stock Watch List is a deployable market-monitoring and AI-reporting application,
 
 #### Short-term Watchlist (authenticated multi-user app)
 
-The Short-term Watchlist sits between **Market Dashboard** and **Market Breadth**. Each ticker has adjacent 5m and 15m rows in one comparison table. It includes:
+The Short-term Watchlist sits between **Market Dashboard** and **Market Breadth**. Each intraday ticker has adjacent 5m and 15m rows in one comparison table. It includes:
 
 - Price, 1D% versus the prior trading day's adjusted close, bar change, and a 15-candle SVG.
 - Two configurable SMA/EMA lines, MA spread in per-ten-thousand units (`‱`), and an MA comparison sparkline.
@@ -383,9 +385,11 @@ The Short-term Watchlist sits between **Market Dashboard** and **Market Breadth*
 - Account-scoped groups, ticker search/add, indicator parameters, and independent 10/20/30-second refresh.
 - Optional short-term browser audio alerts for near and confirmed MACD, configurable-MA, close/Bollinger upper-lower, close/VWAP, close/VWAP ±1σ-band, and RSI 30/70 crossovers. Each signal has its own enable switch and threshold, and alerts can be enabled per ticker. They require short-term auto-refresh plus a one-time **Enable sound & test** browser gesture. Each new alert repeats short tones and flashes its relevant table cell for a configurable 5/10/15/30/60 seconds (15 by default); preferences are account-scoped and de-duplication is browser-session-only.
 - In the main Watchlist, Market Dashboard, and Portfolios & Reports tables, narrow headers wrap automatically; hover any header to see its full column title.
-- For mainland shares and exchange-traded ETFs, missing yfinance daily bars fall back to current AkShare `stock_zh_a_hist_em` / `fund_etf_hist_em` APIs. An Eastmoney ETF rate limit triggers a `fund_etf_hist_sina` fallback. Eastmoney is qfq-adjusted while Sina ETF prices are raw; the SQLite cache replaces a symbol's entire history on a source switch instead of mixing price bases, and the price tooltip labels its source. Enter an open-end fund explicitly as `FUND:000001`; its published unit NAV is close-only, not a live quote or OHLCV. Watchlists can show close-based metrics, while OHLCV-dependent metrics remain unavailable. The K-line page shows a NAV line with MA/MACD/RSI instead of inventing candles, volume, chip profile, or option walls. No 5m/15m NAV bars are synthesized. AkShare may be delayed, rate-limited, or unavailable by region.
+- For mainland shares and exchange-traded ETFs, missing yfinance daily bars fall back to current AkShare `stock_zh_a_hist_em` / `fund_etf_hist_em` APIs. An Eastmoney ETF rate limit triggers a `fund_etf_hist_sina` fallback. Eastmoney is qfq-adjusted while Sina ETF prices are raw; the SQLite cache replaces a symbol's entire history on a source switch instead of mixing price bases, and the price tooltip labels its source. Enter an open-end fund explicitly as `FUND:000001`; its published unit NAV is close-only, not a live quote or OHLCV. The watchlist Candles cell shows a line for the last 20 published fund NAV values, while OHLCV-dependent metrics remain unavailable. The K-line page shows a NAV line with MA/MACD/RSI instead of inventing candles, volume, chip profile, or option walls. No 5m/15m NAV bars are synthesized. AkShare may be delayed, rate-limited, or unavailable by region.
 
 The default history request is two days. The request window scales automatically when the active MA, MACD, Bollinger, or RSI periods require more history. Intraday payloads are session-only; they are overwritten on refresh and are not stored in the account database.
+
+An open-end `FUND:six-digit-code` has one **Daily NAV** row instead: latest published unit NAV, 1D% versus the prior available NAV, and a 15-value NAV line. Intraday indicators and alerts remain empty; no 5m/15m request is made. The line follows the shared watchlist daily-data refresh, not short-term auto-refresh.
 
 #### Portfolios and AI Portfolio Reports
 

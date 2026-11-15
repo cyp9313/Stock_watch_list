@@ -7,6 +7,7 @@ from short_term_watchlist import (
     _ny_timestamps,
     calculate_short_term_row,
     consume_macd_alert_events,
+    daily_nav_reference_row,
     default_short_term_watchlist,
     macd_alert_event,
     normalize_short_term_watchlist,
@@ -352,6 +353,30 @@ def test_macd_alert_consumption_bootstraps_and_deduplicates_per_bar():
     assert events == []
 
 
+def test_open_end_fund_uses_one_daily_nav_row_without_intraday_alerts():
+    reference = {
+        "Price": 1.2345,
+        "Previous Close": 1.23,
+        "Price Timestamp": "2026-11-13",
+        "Price Source": "akshare unit NAV",
+        "NAV (15)": "<svg role='img'></svg>",
+    }
+    row = daily_nav_reference_row("FUND:023313", reference)
+    assert row["Interval"] == "Daily NAV"
+    assert row["Price"] == 1.2345
+    assert row["Candles (15)"] == reference["NAV (15)"]
+    assert row["Price Timestamp"] == "2026-11-13"
+    assert "MACD Diff‱" not in row
+    assert "Alert Bar Timestamp" not in row
+    alerts = {**default_short_term_watchlist()["alerts"], "enabled": True}
+    events, _ = consume_macd_alert_events(
+        {("FUND:023313", "NAV"): row}, alerts, None,
+        monitoring_enabled=True, signal_signature="fund-nav",
+    )
+    assert events == []
+    assert daily_nav_reference_row("FUND:023313", None)["Error"]
+
+
 def test_multiuser_tab_has_its_own_kline_request_and_fragment_refresh():
     source = (REPO_ROOT / "app_streamlit_multiuser.py").read_text(encoding="utf-8")
     assert '"Short-term Watchlist"' in source
@@ -383,6 +408,9 @@ def test_multiuser_tab_has_its_own_kline_request_and_fragment_refresh():
     assert '"Candles (20)": 104' in source
     assert "min-width:100%" not in source
     assert "short_term_reference_metrics(stock_data)" in section
+    assert 'intraday_tickers = [ticker for ticker in tickers if not is_nav_symbol(ticker)]' in section
+    assert 'daily_nav_reference_row(ticker, reference_metrics.get(ticker))' in section
+    assert 'display_intervals = ("NAV",) if is_nav_symbol(ticker) else intervals' in source
     assert "ticker_background = beta_color" in source
     assert source.count('tooltip_text = ticker_tooltip(ticker_name,') == 2
     assert source.count('price_timestamp_tooltip(') >= 4
