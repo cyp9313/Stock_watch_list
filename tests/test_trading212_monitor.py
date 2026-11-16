@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 from cryptography.fernet import Fernet
 
@@ -263,6 +264,22 @@ def test_trading212_tickers_map_to_conservative_yfinance_candidates():
     assert monitor._t212_yfinance_candidates({"ticker": "AAPL_US_EQ", "exchange_code": ""})[0] == "AAPL"
     assert monitor._t212_yfinance_candidates({"ticker": "VUSA_L_EQ", "exchange_code": ""})[0] == "VUSA.L"
     assert monitor._t212_yfinance_candidates({"ticker": "BAD_UNKNOWN_EQ", "exchange_code": ""}) == ["BAD_UNKNOWN_EQ"]
+
+
+def test_monitor_configures_an_isolated_yfinance_cache_before_polling(tmp_path, monkeypatch):
+    target = tmp_path / "monitor-yfinance-cache"
+    monkeypatch.setenv("TRADING212_YFINANCE_CACHE_DIR", str(target))
+    configured = []
+    fake_yfinance = SimpleNamespace(
+        cache=SimpleNamespace(set_cache_location=lambda value: configured.append(value)),
+    )
+
+    result = monitor.configure_monitor_yfinance_cache(yf_module=fake_yfinance)
+
+    assert result == target.resolve()
+    assert target.is_dir()
+    assert configured == [str(target.resolve())]
+    assert result != monitor.DEFAULT_YFINANCE_CACHE_DIR
 
 
 def test_technical_alerts_use_cached_completed_history_and_live_price(tmp_path, monkeypatch):

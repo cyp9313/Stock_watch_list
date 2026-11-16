@@ -22,6 +22,13 @@ def test_monitor_service_is_hardened_and_non_root():
     assert "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX" in text
 
 
+def test_monitor_worker_initializes_its_own_yfinance_cache_before_polling():
+    worker = (Path(__file__).resolve().parent.parent / "trading212_monitor_worker.py").read_text(encoding="utf-8")
+    assert "configure_monitor_yfinance_cache" in worker
+    assert "cache_dir = configure_monitor_yfinance_cache()" in worker
+    assert worker.index("cache_dir = configure_monitor_yfinance_cache()") < worker.index("run_all_monitors()")
+
+
 def test_monitor_enabled_toggle_has_a_stable_key_and_visible_state_styles():
     source = (Path(__file__).resolve().parent.parent / "app_streamlit_multiuser.py").read_text(encoding="utf-8")
     assert 'key=f"trading212_monitor_enabled_{user[\'id\']}"' in source

@@ -27,6 +27,7 @@ from akshare_fallback import eligible_for_fallback, fetch_daily as fetch_akshare
 
 APP_ROOT = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = APP_ROOT / "data" / "trading212_monitor.db"
+DEFAULT_YFINANCE_CACHE_DIR = APP_ROOT / "data" / ".cache" / "trading212-yfinance"
 BERLIN_TZ = ZoneInfo("Europe/Berlin")
 UTC = dt.timezone.utc
 
@@ -94,6 +95,46 @@ class Trading212APIError(RuntimeError):
 def monitor_db_path() -> Path:
     configured = os.environ.get("TRADING212_MONITOR_DB", "").strip()
     return Path(configured) if configured else DEFAULT_DB_PATH
+
+
+def monitor_yfinance_cache_dir() -> Path:
+    """Return the monitor-only yfinance cache location.
+
+    yfinance keeps ticker-timezone and cookie data in SQLite files.  The
+    long-running monitor must not share those files with the web/API process,
+    otherwise concurrent market-data requests can raise ``database is locked``.
+    """
+    configured = os.environ.get("TRADING212_YFINANCE_CACHE_DIR", "").strip()
+    return Path(configured).expanduser() if configured else DEFAULT_YFINANCE_CACHE_DIR
+
+
+def configure_monitor_yfinance_cache(*, yf_module: Any | None = None) -> Path:
+    """Configure yfinance's process-global cache before the monitor polls."""
+    cache_dir = monitor_yfinance_cache_dir().resolve()
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RuntimeError(f"Unable to create Trading 212 yfinance cache directory: {cache_dir}") from exc
+
+    if yf_module is None:
+        try:
+            import yfinance as yf_module
+        except ImportError as exc:  # pragma: no cover - dependency is production-required
+            raise RuntimeError("yfinance is not installed for Trading 212 monitoring.") from exc
+
+    cache_module = getattr(yf_module, "cache", None)
+    set_location = getattr(cache_module, "set_cache_location", None)
+    if not callable(set_location):
+        # Older supported yfinance releases expose the same function at top
+        # level under this legacy name.
+        set_location = getattr(yf_module, "set_tz_cache_location", None)
+    if not callable(set_location):
+        raise RuntimeError("Installed yfinance does not support an isolated cache location.")
+    try:
+        set_location(str(cache_dir))
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError(f"Unable to configure Trading 212 yfinance cache directory: {cache_dir}") from exc
+    return cache_dir
 
 
 def _now() -> dt.datetime:

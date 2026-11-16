@@ -12,7 +12,7 @@ if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
 from config_loader import load_project_env
-from trading212_monitor import run_all_monitors
+from trading212_monitor import configure_monitor_yfinance_cache, run_all_monitors
 
 
 def _poll_seconds() -> int:
@@ -25,7 +25,8 @@ def _poll_seconds() -> int:
 def main() -> None:
     load_project_env()
     poll_seconds = _poll_seconds()
-    print(f"[Trading212Monitor] started; interval={poll_seconds}s", flush=True)
+    cache_dir = configure_monitor_yfinance_cache()
+    print(f"[Trading212Monitor] started; interval={poll_seconds}s; yfinance_cache={cache_dir}", flush=True)
     try:
         while True:
             results = run_all_monitors()
